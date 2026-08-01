@@ -1,0 +1,14 @@
+# Built plugin binaries (installed to GOPATH/bin by `task tools`).
+/bin/
+protoc-gen-es-lite
+
+# Local SQLite databases created by examples / manual runs.
+*.db
+*.db-wal
+*.db-shm
+
+# OS cruft.
+.DS_Store
+
+# NOTE: gen/ is intentionally NOT ignored — generated code is checked in,
+# and `task generate:check` gates it in CI.

@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: build · vet · unit · codegen-drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2 # installs go/buf/task pinned in .mise.toml
+      - run: task generate:check # buf lint + regenerate, fail on drift
+      - run: task vet
+      - run: task test           # unit tests (integration suites skip without env)
+
+  integration:
+    name: integration (postgres · nats · openbao · pipeline)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      # Each target spins up its own throwaway container (Docker is preinstalled
+      # on the runner) and tears it down via `defer`.
+      - run: task test:pg
+      - run: task test:nats
+      - run: task test:openbao
+      - run: task test:pipeline

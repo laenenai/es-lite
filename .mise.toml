@@ -1,0 +1,11 @@
+# Toolchain versions pinned for reproducible builds across devs and CI.
+# Run `mise install` (or `mise i`) on a fresh checkout to install everything.
+
+[tools]
+go   = "1.26.5"
+buf  = "1.65.0"
+task = "3.48.0"
+
+# protoc-gen-go is installed into the module's tool dependencies via
+# `task tools` (go install), so its version is pinned by go.mod rather
+# than mise. buf drives generation; see Taskfile `generate`.

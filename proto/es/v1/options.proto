@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package es.v1;
+
+import "google/protobuf/descriptor.proto";
+
+option go_package = "github.com/laenenai/es-lite/gen/es/v1;esv1";
+
+// es-lite's single framework option. Kept deliberately minimal — the
+// parent framework's options.proto carries a dozen options (data
+// classification, subject fields, schema versions, projection specs);
+// lite has exactly one: the sum-type marker.
+extend google.protobuf.MessageOptions {
+  // Marks this message as a sum-type container: a message holding exactly
+  // one `oneof` whose variants form a sealed Go interface. The value is
+  // the interface name (by convention "Command" or "Event").
+  //
+  // protoc-gen-es-lite emits, into the message's own package:
+  //   - `type <Name> interface { is<Name>() }`  (sealed)
+  //   - a marker method on each variant message
+  //   - `type <Name>Codec struct{}` implementing es.Codec[<Name>],
+  //     marshalling each variant as canonical proto bytes tagged with
+  //     its full proto type name.
+  string sum_type = 50002;
+
+  // The event's schema version — a monotonic uint32 (default 1), set on an
+  // individual event variant message. Bump it when the event's meaning
+  // changes in a way proto's wire compatibility cannot detect (units shift,
+  // enum semantics change, a field is reinterpreted). The generated codec
+  // stamps this onto every EncodedEvent as its upcaster dispatch key; it
+  // rides the wire in the envelope and the Es-Schema-Version NATS header.
+  //
+  //   message Incremented {
+  //     option (es.v1.schema_version) = 2;
+  //     int64 by_millicents = 1; // was by_cents in v1
+  //   }
+  uint32 schema_version = 50001;
+}

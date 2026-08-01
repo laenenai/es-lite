@@ -1,0 +1,113 @@
+# Task runner for es-lite. Toolchain versions are pinned in .mise.toml;
+# run `mise install` first. See docs/adr for the design.
+version: "3"
+
+vars:
+  GOBIN:
+    sh: go env GOPATH
+
+env:
+  # es-lite is a standalone module; isolate it from any parent go.work.
+  GOWORK: "off"
+  # Make go-installed and locally-built plugins discoverable by buf.
+  PATH: "{{.GOBIN}}/bin:{{.PATH}}"
+
+tasks:
+  default:
+    desc: List available tasks.
+    cmds:
+      - task --list
+    silent: true
+
+  tools:
+    desc: Install/build the code-generation plugins.
+    cmds:
+      - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+      - go build -o "{{.GOBIN}}/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
+
+  generate:
+    desc: Generate proto Go + es-lite sum-types/codecs (buf).
+    deps: [tools]
+    cmds:
+      - buf lint
+      - buf generate
+
+  generate:bootstrap:
+    desc: >
+      Cold-start generation for a clean checkout where gen/es/v1 does not
+      yet exist (protoc-gen-es-lite imports it). Generates the framework
+      options with protoc-gen-go only, builds the plugin, then runs the
+      full generate.
+    cmds:
+      - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+      - buf generate --template buf.gen.bootstrap.yaml
+      - go build -o "{{.GOBIN}}/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
+      - buf generate
+
+  generate:check:
+    desc: Fail if generated code is out of date (CI gate).
+    deps: [generate]
+    cmds:
+      - git diff --exit-code -- gen/ || (echo "generated code is stale; run 'task generate'" && exit 1)
+
+  build:
+    desc: Build every package.
+    cmds:
+      - go build ./...
+
+  test:
+    desc: Run the unit test suite (integration tests skip without live services).
+    cmds:
+      - go test ./...
+
+  test:pg:
+    desc: Postgres integration tests against a throwaway Docker Postgres.
+    cmds:
+      - docker rm -f es-lite-pg 2>/dev/null || true
+      - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
+      - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      - defer: docker rm -f es-lite-pg
+      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -count=1 ./postgres/...
+
+  test:openbao:
+    desc: OpenBao KeyStore integration test against a throwaway Docker OpenBao.
+    cmds:
+      - docker rm -f es-lite-bao 2>/dev/null || true
+      - docker run -d --rm --name es-lite-bao -p 8200:8200 --cap-add=IPC_LOCK -e BAO_DEV_ROOT_TOKEN_ID=root openbao/openbao server -dev
+      - until curl -sf http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1; do sleep 1; done
+      - defer: docker rm -f es-lite-bao
+      - OPENBAO_ADDR=http://127.0.0.1:8200 OPENBAO_TOKEN=root go test -count=1 ./keystore/openbao/...
+
+  test:nats:
+    desc: NATS/JetStream integration test against a throwaway Docker NATS.
+    cmds:
+      - docker rm -f es-lite-nats 2>/dev/null || true
+      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
+      - until nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
+      - defer: docker rm -f es-lite-nats
+      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./natsjs/...
+
+  test:pipeline:
+    desc: Full-pipeline integration test (Postgres + NATS) end to end.
+    cmds:
+      - docker rm -f es-lite-pg es-lite-nats 2>/dev/null || true
+      - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
+      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
+      - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1 && nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
+      - defer: docker rm -f es-lite-pg es-lite-nats
+      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/pipeline/...
+
+  vet:
+    desc: go vet across the module.
+    cmds:
+      - go vet ./...
+
+  lint:proto:
+    desc: buf lint + breaking-change check against the checked-in schema.
+    cmds:
+      - buf lint
+
+  tidy:
+    desc: Tidy go.mod/go.sum.
+    cmds:
+      - go mod tidy

@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package counter.v1;
+
+import "es/v1/options.proto";
+
+option go_package = "github.com/laenenai/es-lite/gen/counter/v1;counterv1";
+
+// Counter is the aggregate's folded State — the value produced by
+// replaying a stream through Decider.Evolve. es-lite uses the proto
+// State message directly as the Go state type.
+message Counter {
+  bool  initialized = 1;
+  int64 count       = 2;
+  int64 min         = 3;
+  int64 max         = 4;
+  bool  closed      = 5; // set by Close; makes the stream terminal
+}
+
+// ---- Commands: each variant is a top-level message. -----------------
+
+message Init {
+  int64 min     = 1;
+  int64 max     = 2;
+  int64 initial = 3;
+}
+message Increment { int64 by = 1; }
+message Decrement { int64 by = 1; }
+message Close {}
+
+// Commands is the sum-type container. Codegen (future) reads the oneof to
+// emit the sealed `Command` interface + codec; today those are
+// hand-written in counter.go. The container documents the closed variant
+// set regardless.
+message Commands {
+  option (es.v1.sum_type) = "Command";
+
+  oneof variant {
+    Init      init      = 1;
+    Increment increment = 2;
+    Decrement decrement = 3;
+    Close     close     = 4;
+  }
+}
+
+// ---- Events: each variant is a top-level message. -------------------
+
+message Initialized {
+  int64 min   = 1;
+  int64 max   = 2;
+  int64 value = 3;
+}
+// Demonstrates a per-event schema version bump (default is 1).
+message Incremented {
+  option (es.v1.schema_version) = 2;
+  int64 by = 1;
+}
+message Decremented { int64 by = 1; }
+message Closed {}
+
+message Events {
+  option (es.v1.sum_type) = "Event";
+
+  oneof variant {
+    Initialized initialized = 1;
+    Incremented incremented = 2;
+    Decremented decremented = 3;
+    Closed      closed      = 4;
+  }
+}

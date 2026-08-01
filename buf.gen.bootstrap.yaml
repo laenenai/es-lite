@@ -1,0 +1,8 @@
+# Cold-start template: protoc-gen-go only. Used by `task generate:bootstrap`
+# to produce gen/es/v1 (the framework options) before protoc-gen-es-lite —
+# which imports that package — can be built. The normal path is buf.gen.yaml.
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: gen
+    opt: paths=source_relative
