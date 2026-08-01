@@ -20,6 +20,7 @@ than editing history.
 | 0004 | [Workspaces and Tenant Isolation](./0004-workspaces-and-tenant-isolation.md)               | Accepted (amends 0001) |
 | 0005 | [Projection Rebuild](./0005-projection-rebuild.md)                                         | Accepted (design; primitive deferred) |
 | 0006 | [OpenBao KeyStore Adapter](./0006-openbao-keystore.md)                                     | Accepted (implemented) |
+| 0007 | [Snapshots (Deferred)](./0007-snapshots-deferred.md)                                       | Deferred |
 
 ## Conventions
 
