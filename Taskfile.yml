@@ -2,15 +2,14 @@
 # run `mise install` first. See docs/adr for the design.
 version: "3"
 
-vars:
-  GOBIN:
-    sh: go env GOPATH
-
 env:
   # es-lite is a standalone module; isolate it from any parent go.work.
   GOWORK: "off"
-  # Make go-installed and locally-built plugins discoverable by buf.
-  PATH: "{{.GOBIN}}/bin:{{.PATH}}"
+
+# Codegen plugins are installed/built into $(go env GOPATH)/bin and made
+# discoverable to buf by prepending that dir to PATH *in the shell command*
+# (plain $PATH expansion — Task's env-template PATH does not resolve
+# reliably across environments, e.g. CI runners).
 
 tasks:
   default:
@@ -20,17 +19,17 @@ tasks:
     silent: true
 
   tools:
-    desc: Install/build the code-generation plugins.
+    desc: Install/build the code-generation plugins into $(go env GOPATH)/bin.
     cmds:
       - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
-      - go build -o "{{.GOBIN}}/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
+      - go build -o "$(go env GOPATH)/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
 
   generate:
     desc: Generate proto Go + es-lite sum-types/codecs (buf).
     deps: [tools]
     cmds:
       - buf lint
-      - buf generate
+      - PATH="$(go env GOPATH)/bin:$PATH" buf generate
 
   generate:bootstrap:
     desc: >
@@ -40,9 +39,9 @@ tasks:
       full generate.
     cmds:
       - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
-      - buf generate --template buf.gen.bootstrap.yaml
-      - go build -o "{{.GOBIN}}/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
-      - buf generate
+      - PATH="$(go env GOPATH)/bin:$PATH" buf generate --template buf.gen.bootstrap.yaml
+      - go build -o "$(go env GOPATH)/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
+      - PATH="$(go env GOPATH)/bin:$PATH" buf generate
 
   generate:check:
     desc: Fail if generated code is out of date (CI gate).
