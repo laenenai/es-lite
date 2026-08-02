@@ -1,8 +1,9 @@
-# Built plugin binaries (installed to GOPATH/bin by `task tools`).
-# NOTE: anchor to repo root — a bare `protoc-gen-es-lite` would also ignore
-# the plugin SOURCE directory cmd/protoc-gen-es-lite/.
+# Built binaries. Anchor to repo root so the SOURCE dirs (cmd/es-lited,
+# cmd/protoc-gen-es-lite) are NOT ignored — only the compiled outputs that a
+# bare `go build ./cmd/...` drops in the working directory.
 /bin/
 /protoc-gen-es-lite
+/es-lited
 
 # Local SQLite databases created by examples / manual runs.
 *.db
