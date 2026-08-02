@@ -113,13 +113,22 @@ func main() {
 // partitioning); SQLite is single-workspace (the Scoper ignores the workspace
 // argument), for single-tenant / edge deployments.
 func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(), error) {
+	// AUTO_MIGRATE=false: assume the schema is already migrated (a separate
+	// es-migrate init container ran it) — so replicas never touch DDL on boot
+	// (ADR 0010). Default true keeps dev/single-node zero-config.
+	autoMigrate := os.Getenv("AUTO_MIGRATE") != "false"
+
 	switch backend {
 	case "postgres":
 		dsn := os.Getenv("PG_DSN")
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("PG_DSN is required for BACKEND=postgres")
 		}
-		store, err := postgres.Open(ctx, dsn, nil)
+		var opts []postgres.Option
+		if !autoMigrate {
+			opts = append(opts, postgres.WithoutAutoMigrate())
+		}
+		store, err := postgres.Open(ctx, dsn, nil, opts...)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -130,7 +139,11 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(),
 		if dsn == "" {
 			dsn = "file:eslite.db"
 		}
-		store, err := sqlite.Open(ctx, dsn)
+		var opts []sqlite.Option
+		if !autoMigrate {
+			opts = append(opts, sqlite.WithoutAutoMigrate())
+		}
+		store, err := sqlite.Open(ctx, dsn, opts...)
 		if err != nil {
 			return nil, nil, err
 		}

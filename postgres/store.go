@@ -14,7 +14,7 @@ package postgres
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"errors"
 	"fmt"
 
@@ -25,11 +25,34 @@ import (
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/keystore"
+	"github.com/laenenai/es-lite/migrate"
 	"github.com/laenenai/es-lite/shred"
 )
 
-//go:embed schema.sql
-var schemaSQL string
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// migrateLockKey is the fixed advisory-lock key held while migrating, so
+// concurrent migrators serialize (ADR 0010).
+const migrateLockKey int64 = 0x65736C697465 // "eslite"
+
+// Option configures Open.
+type Option func(*openConfig)
+
+type openConfig struct{ autoMigrate bool }
+
+// WithoutAutoMigrate skips applying migrations on Open. Application replicas
+// use this and rely on a separate Migrate step / init container (ADR 0010);
+// the default auto-migrates so dev/single-node stays zero-config.
+func WithoutAutoMigrate() Option { return func(c *openConfig) { c.autoMigrate = false } }
+
+func newOpenConfig(opts []Option) openConfig {
+	c := openConfig{autoMigrate: true}
+	for _, o := range opts {
+		o(&c)
+	}
+	return c
+}
 
 // Store is the Postgres-backed event store. Construct per process; it holds
 // a connection pool and (optionally) the crypto-shredding layer.
@@ -38,23 +61,79 @@ type Store struct {
 	shredder *shred.Shredder // nil => payloads stored/returned as plaintext
 }
 
-// Open connects to Postgres, applies the schema, and — when ks is non-nil —
-// wires per-workspace crypto-shredding, using this store's workspace_keys
-// table as the wrapped-DEK store.
-func Open(ctx context.Context, dsn string, ks keystore.KeyStore) (*Store, error) {
+// Open connects to Postgres, applies migrations (unless WithoutAutoMigrate),
+// and — when ks is non-nil — wires per-workspace crypto-shredding, using this
+// store's workspace_keys table as the wrapped-DEK store.
+func Open(ctx context.Context, dsn string, ks keystore.KeyStore, opts ...Option) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
-	}
-	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("postgres: apply schema: %w", err)
 	}
 	s := &Store{pool: pool}
 	if ks != nil {
 		s.shredder = shred.New(ks, s) // Store is its own WrappedDEKStore
 	}
+	if newOpenConfig(opts).autoMigrate {
+		if err := s.Migrate(ctx); err != nil {
+			pool.Close()
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+// Migrate applies pending versioned migrations under a session advisory lock,
+// so concurrent migrators are safe (ADR 0010). Each migration runs in its own
+// transaction and is recorded in schema_migrations. Idempotent.
+func (s *Store) Migrate(ctx context.Context) error {
+	migs, err := migrate.Load(migrationsFS, "migrations")
+	if err != nil {
+		return err
+	}
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: acquire: %w", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrateLockKey); err != nil {
+		return fmt.Errorf("postgres: advisory lock: %w", err)
+	}
+	defer conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrateLockKey)
+
+	if _, err := conn.Exec(ctx,
+		`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    int         PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		)`); err != nil {
+		return fmt.Errorf("postgres: schema_migrations: %w", err)
+	}
+	for _, m := range migs {
+		var exists bool
+		if err := conn.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&exists); err != nil {
+			return fmt.Errorf("postgres: check migration %d: %w", m.Version, err)
+		}
+		if exists {
+			continue
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, m.SQL); err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("postgres: migration %04d_%s: %w", m.Version, m.Name, err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
+			tx.Rollback(ctx)
+			return fmt.Errorf("postgres: record migration %d: %w", m.Version, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("postgres: commit migration %d: %w", m.Version, err)
+		}
+	}
+	return nil
 }
 
 // Close releases the pool.

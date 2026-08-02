@@ -2,7 +2,9 @@
 
 - **Filed:** 2026-08-02
 - **Area:** storage / operations
-- **Status:** Open
+- **Status:** Resolved 2026-08-02 — see [ADR 0010](../adr/0010-schema-migrations.md)
+  (versioned migrations + `schema_migrations`, advisory lock, `WithoutAutoMigrate`,
+  `cmd/es-migrate` init container).
 
 ## Problem
 

@@ -35,12 +35,28 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
+      # Run migrations once, before any replica starts (ADR 0010) — so app
+      # replicas never race on DDL at boot. Same image, /es-migrate entrypoint.
+      initContainers:
+        - name: migrate
+          image: ghcr.io/laenenai/es-lited:latest # replace (same tag as below)
+          command: ["/es-migrate"]
+          env:
+            - { name: BACKEND, value: postgres }
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef: { name: es-lited-pg, key: dsn }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
       containers:
         - name: es-lited
           image: ghcr.io/laenenai/es-lited:latest # replace
           imagePullPolicy: IfNotPresent
           env:
             - { name: BACKEND, value: postgres }
+            - { name: AUTO_MIGRATE, value: "false" } # migrations run in the init container
             - { name: NATS_URL, value: "nats://nats.svc:4222" }
             - { name: NATS_SUBJECT_PREFIX, value: "svc.eslite" } # per-shard/region knob
             - { name: HEALTH_ADDR, value: ":8080" }

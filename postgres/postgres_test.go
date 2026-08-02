@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/laenenai/es-lite/aggregate"
@@ -273,6 +274,34 @@ func rawValueKey(t *testing.T, s *postgres.Store, ws, scope string) []byte {
 		t.Fatalf("raw value_key: %v", err)
 	}
 	return vk
+}
+
+func TestMigrateIdempotentAndConcurrent(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t) // auto-migrated on Open
+
+	var v int
+	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
+		t.Fatalf("schema_migrations: %v", err)
+	}
+	if v != 1 {
+		t.Fatalf("applied version = %d, want 1", v)
+	}
+
+	// Concurrent migrators serialize on the advisory lock and all no-op safely.
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() { defer wg.Done(); errs <- s.Migrate(ctx) }()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent migrate: %v", err)
+		}
+	}
 }
 
 // rawPayload reads the stored (encrypted) payload bytes, bypassing RLS and

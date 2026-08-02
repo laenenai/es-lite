@@ -10,7 +10,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	_ "embed"
+	"embed"
 	"errors"
 	"fmt"
 	"strings"
@@ -21,10 +21,29 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/laenenai/es-lite/es"
+	"github.com/laenenai/es-lite/migrate"
 )
 
-//go:embed schema.sql
-var schemaSQL string
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+// Option configures Open/NewWithDB.
+type Option func(*openConfig)
+
+type openConfig struct{ autoMigrate bool }
+
+// WithoutAutoMigrate skips applying migrations on Open. Application replicas
+// use this and rely on a separate Migrate step (ADR 0010); the default is to
+// auto-migrate (dev/SQLite/tests stay zero-config).
+func WithoutAutoMigrate() Option { return func(c *openConfig) { c.autoMigrate = false } }
+
+func newOpenConfig(opts []Option) openConfig {
+	c := openConfig{autoMigrate: true}
+	for _, o := range opts {
+		o(&c)
+	}
+	return c
+}
 
 // tsLayout is a fixed-width RFC3339 UTC layout: 9-digit nanoseconds and a
 // literal Z. Fixed width matters — it makes lexical string ordering match
@@ -47,7 +66,7 @@ var _ es.Store = (*Store)(nil)
 // the schema. dsn is a modernc.org/sqlite DSN, e.g.
 // "file:events.db" or "file:mem?mode=memory&cache=shared". Pragmas for
 // WAL, busy-timeout, and foreign keys are set automatically.
-func Open(ctx context.Context, dsn string) (*Store, error) {
+func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	dsn = withPragmas(dsn)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -57,20 +76,68 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	// and commit-ordered, and so an in-memory shared-cache DB stays alive.
 	db.SetMaxOpenConns(1)
 
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply schema: %w", err)
+	s := &Store{db: db}
+	if newOpenConfig(opts).autoMigrate {
+		if err := s.Migrate(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
-	return &Store{db: db}, nil
+	return s, nil
 }
 
-// NewWithDB wraps an already-open *sql.DB and applies the schema. Useful
-// for tests that manage the handle themselves.
-func NewWithDB(ctx context.Context, db *sql.DB) (*Store, error) {
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
-		return nil, fmt.Errorf("apply schema: %w", err)
+// NewWithDB wraps an already-open *sql.DB. Useful for tests that manage the
+// handle themselves. Applies migrations unless WithoutAutoMigrate is passed.
+func NewWithDB(ctx context.Context, db *sql.DB, opts ...Option) (*Store, error) {
+	s := &Store{db: db}
+	if newOpenConfig(opts).autoMigrate {
+		if err := s.Migrate(ctx); err != nil {
+			return nil, err
+		}
 	}
-	return &Store{db: db}, nil
+	return s, nil
+}
+
+// Migrate applies pending versioned migrations (ADR 0010). SQLite is
+// single-writer, so no lock is needed; each migration runs in its own
+// transaction and is recorded in schema_migrations. Idempotent.
+func (s *Store) Migrate(ctx context.Context) error {
+	migs, err := migrate.Load(migrationsFS, "migrations")
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version    INTEGER PRIMARY KEY,
+			applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+		)`); err != nil {
+		return fmt.Errorf("sqlite: schema_migrations: %w", err)
+	}
+	for _, m := range migs {
+		var exists int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT 1 FROM schema_migrations WHERE version = ?`, m.Version).Scan(&exists); err == nil {
+			continue // already applied
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("sqlite: check migration %d: %w", m.Version, err)
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("sqlite: migration %04d_%s: %w", m.Version, m.Name, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (?)`, m.Version); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("sqlite: record migration %d: %w", m.Version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("sqlite: commit migration %d: %w", m.Version, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying database.

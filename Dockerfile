@@ -24,10 +24,14 @@ COPY . .
 RUN --mount=type=secret,id=go_modules_token \
     git config --global url."https://x-access-token:$(cat /run/secrets/go_modules_token)@github.com/".insteadOf "https://github.com/" && \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/es-lited ./cmd/es-lited
+    go build -trimpath -ldflags="-s -w" -o /out/es-lited ./cmd/es-lited && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/es-migrate ./cmd/es-migrate
 
 FROM gcr.io/distroless/static-debian12:nonroot
+# es-migrate (init container / deploy step) + es-lited (the service).
 COPY --from=build /out/es-lited /es-lited
+COPY --from=build /out/es-migrate /es-migrate
 # NATS req/reply service (no inbound port); 8080 is the kubelet health probe.
 EXPOSE 8080
 USER nonroot:nonroot

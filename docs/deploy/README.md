@@ -95,11 +95,16 @@ keys, since payloads are ciphertext everywhere.
 
 ## Migrations
 
-es-lited applies the schema on `Open` (idempotent `CREATE ... IF NOT EXISTS`).
-For **multi-replica Postgres**, prefer running migrations **once** (an init
-job / leader) rather than on every replica boot — concurrent `CREATE`/`POLICY`
-DDL can race. Tracked in
-[`../backlog/2026-08-02_migrations.md`](../backlog/2026-08-02_migrations.md).
+Schema is **versioned** (numbered files + a `schema_migrations` history table;
+[ADR 0010](../adr/0010-schema-migrations.md)). For **multi-replica Postgres**,
+run migrations **once** via the `es-migrate` **init container** (same image,
+`command: ["/es-migrate"]`) and set **`AUTO_MIGRATE=false`** on the app
+container so replicas never touch DDL on boot — see the init container in
+[`deploy/k8s/deployment.yaml`](../../deploy/k8s/deployment.yaml). (A Postgres
+advisory lock serializes migrators as a backstop.) For SQLite / dev /
+single-node, leave `AUTO_MIGRATE` unset — `Open` migrates automatically.
+Evolving the schema = a new numbered migration file, never an edit to an
+applied one.
 
 ## NATS account
 
