@@ -106,6 +106,15 @@ tasks:
       - defer: docker rm -f es-lite-pg es-lite-nats
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/zeroknowledge/...
 
+  test:snapshots:
+    desc: Snapshot-cache integration test (NATS KV).
+    cmds:
+      - docker rm -f es-lite-nats 2>/dev/null || true
+      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
+      - until nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
+      - defer: docker rm -f es-lite-nats
+      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/snapshots/...
+
   vet:
     desc: go vet across the module.
     cmds:

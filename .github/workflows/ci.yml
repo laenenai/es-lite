@@ -38,3 +38,4 @@ jobs:
       - run: task test:openbao
       - run: task test:pipeline
       - run: task test:zeroknowledge
+      - run: task test:snapshots

@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/laenenai/es-lite/es"
+	"github.com/laenenai/es-lite/snapshot"
 )
 
 // Runtime handles commands for one aggregate type.
@@ -24,6 +25,14 @@ type Runtime[S, C, E any] struct {
 	decider  es.Decider[S, C, E]
 	codec    es.Codec[E]
 	upcaster es.Upcaster[E] // optional; applied after decode on the read path
+
+	// Optional snapshot cache (ADR 0007/0009). When set, Load seeds from a
+	// cached state and folds only the tail, and Handle writes the state
+	// through after appending. foldVersion invalidates snapshots on a
+	// decider/upcaster/state-shape change.
+	cache       snapshot.Cache
+	stateCodec  es.StateCodec[S]
+	foldVersion uint32
 }
 
 // NewRuntime wires a Runtime against a Store, a Decider, and the event
@@ -38,6 +47,19 @@ func NewRuntime[S, C, E any](store es.Store, decider es.Decider[S, C, E], codec 
 // chaining.
 func (r *Runtime[S, C, E]) WithUpcaster(u es.Upcaster[E]) *Runtime[S, C, E] {
 	r.upcaster = u
+	return r
+}
+
+// WithSnapshots enables the snapshot cache: Load seeds from a cached state and
+// folds only the tail, and Handle writes the new state through after append.
+// stateCodec serializes S; foldVersion is a monotonic counter you bump when a
+// decider/upcaster/state-shape change makes old snapshots wrong (they are then
+// ignored and refolded — snapshots are a pure cache). Returns the runtime for
+// chaining.
+func (r *Runtime[S, C, E]) WithSnapshots(cache snapshot.Cache, stateCodec es.StateCodec[S], foldVersion uint32) *Runtime[S, C, E] {
+	r.cache = cache
+	r.stateCodec = stateCodec
+	r.foldVersion = foldVersion
 	return r
 }
 
@@ -125,6 +147,19 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 		state = r.decider.Evolve(state, ev)
 	}
 
+	// Write the new state through to the snapshot cache (best-effort: a
+	// failure only costs a longer fold next time — snapshots are a pure cache).
+	if r.cache != nil {
+		if b, encErr := r.stateCodec.Encode(state); encErr == nil {
+			_ = r.cache.Save(ctx, sid.Canonical(), snapshot.Snapshot{
+				Version:     res.ToVersion,
+				FoldVersion: r.foldVersion,
+				RecordedAt:  time.Now().UTC(),
+				State:       b,
+			})
+		}
+	}
+
 	return Result[S, E]{
 		State:       state,
 		Events:      events,
@@ -153,11 +188,46 @@ func (r *Runtime[S, C, E]) LoadAsOfTime(ctx context.Context, sid es.StreamID, t 
 	return state, err
 }
 
+// LoadStale is a bounded-staleness read (ADR 0009): if a snapshot exists,
+// matches the fold version, and is within maxAge, it returns the cached state
+// directly WITHOUT reading the log — zero store round-trips. Otherwise it falls
+// back to a strong Load (snapshot + tail fold). The bool reports whether the
+// fast, cache-only path was taken. maxAge<=0 accepts any snapshot age.
+//
+// Safe because snapshots are a pure cache; use it for reads that tolerate a
+// little staleness (dashboards, list views) to skip the store entirely.
+func (r *Runtime[S, C, E]) LoadStale(ctx context.Context, sid es.StreamID, maxAge time.Duration) (state S, version uint64, fresh bool, err error) {
+	if r.cache != nil {
+		if snap, ok, serr := r.cache.Load(ctx, sid.Canonical()); serr == nil && ok && snap.FoldVersion == r.foldVersion {
+			if maxAge <= 0 || time.Since(snap.RecordedAt) <= maxAge {
+				if s, derr := r.stateCodec.Decode(snap.State); derr == nil {
+					return s, snap.Version, true, nil
+				}
+			}
+		}
+	}
+	state, version, err = r.Load(ctx, sid)
+	return state, version, false, err
+}
+
 // load folds a stream into state. Exactly one of upToVersion / asOf
 // bounds the fold: upToVersion>0 caps by version, a non-zero asOf caps
 // by RecordedAt, and neither means "the whole stream".
 func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersion uint64, asOf time.Time) (S, uint64, error) {
 	state := r.decider.Initial()
+
+	// Snapshot seed — only for current (non-time-travel) loads. Time-travel
+	// must never start from a snapshot newer than the target (ADR 0007). Any
+	// miss/mismatch/error falls through to a full fold (pure cache).
+	var from uint64
+	if r.cache != nil && upToVersion == 0 && asOf.IsZero() {
+		if snap, ok, serr := r.cache.Load(ctx, sid.Canonical()); serr == nil && ok && snap.FoldVersion == r.foldVersion {
+			if s, derr := r.stateCodec.Decode(snap.State); derr == nil {
+				state = s
+				from = snap.Version
+			}
+		}
+	}
 
 	var (
 		envs []es.Envelope
@@ -167,13 +237,13 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 	case !asOf.IsZero():
 		envs, err = r.store.ReadStreamAsOf(ctx, sid, asOf)
 	default:
-		envs, err = r.store.ReadStream(ctx, sid, 0, upToVersion)
+		envs, err = r.store.ReadStream(ctx, sid, from, upToVersion)
 	}
 	if err != nil && !errors.Is(err, es.ErrStreamNotFound) {
 		return state, 0, err
 	}
 
-	var version uint64
+	version := from
 	for _, env := range envs {
 		ev, err := r.codec.Decode(es.EncodedEvent{
 			TypeURL:       env.TypeURL,
