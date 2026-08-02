@@ -1,0 +1,50 @@
+# Autoscaling es-lited on request latency (NOT CPU — it is I/O-bound, and core
+# NATS req/reply has no queue depth, so latency is the saturation signal).
+# See docs/deploy/README.md. Requires KEDA + Prometheus fed by the NATS Micro
+# $SRV.STATS (via prometheus-nats-exporter or an OTel bridge). Metric names are
+# illustrative — match your exporter.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: es-lited
+spec:
+  scaleTargetRef:
+    name: es-lited
+  minReplicaCount: 2
+  maxReplicaCount: 20 # BOUND: Postgres is the ceiling — shard past this, don't add pods
+  cooldownPeriod: 120
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        # p95 request latency (seconds) across es-lited endpoints; scale to
+        # keep it under ~50ms.
+        query: |
+          histogram_quantile(0.95, sum(rate(nats_micro_request_duration_seconds_bucket{service="eslite"}[1m])) by (le))
+        threshold: "0.05"
+    # Secondary: requests/sec per pod (keep each pod under a concurrency target).
+    # - type: prometheus
+    #   metadata:
+    #     serverAddress: http://prometheus.monitoring:9090
+    #     query: sum(rate(nats_micro_num_requests_total{service="eslite"}[1m]))
+    #     threshold: "200"   # per-replica target RPS
+---
+# Delivery relay / projection consumers scale DIFFERENTLY — JetStream durable
+# consumers have a real backlog, so scale on consumer lag (num_pending), not
+# latency. Example for a projection Deployment named es-projection:
+#
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata: { name: es-projection }
+# spec:
+#   scaleTargetRef: { name: es-projection }
+#   minReplicaCount: 1
+#   maxReplicaCount: 10
+#   triggers:
+#     - type: nats-jetstream
+#       metadata:
+#         natsServerMonitoringEndpoint: "nats.svc:8222"
+#         account: "ESLITE"
+#         stream: "ES_EVENTS"
+#         consumer: "counter-view"
+#         lagThreshold: "100"

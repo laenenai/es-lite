@@ -1,0 +1,75 @@
+# es-lited — zero-knowledge eventstore NATS service (ADR 0009).
+# A stateless service over shared Postgres; scale horizontally. See
+# docs/deploy/README.md. Replace image, secretRefs, and OpenBao roles.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-lited
+  labels: { app: es-lited }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: es-lited }
+  template:
+    metadata:
+      labels: { app: es-lited }
+      annotations:
+        # --- OpenBao/Vault Agent: inject dynamic infra secrets (no static
+        # creds in the pod). Uncomment and set your roles/mounts.
+        # vault.hashicorp.com/agent-inject: "true"
+        # vault.hashicorp.com/role: "es-lited"
+        # Dynamic Postgres creds -> render PG_DSN:
+        # vault.hashicorp.com/agent-inject-secret-pg: "database/creds/es-lited"
+        # vault.hashicorp.com/agent-inject-template-pg: |
+        #   {{- with secret "database/creds/es-lited" -}}
+        #   export PG_DSN="postgres://{{ .Data.username }}:{{ .Data.password }}@pg:5432/eslite?sslmode=verify-full"
+        #   {{- end -}}
+        # NATS creds + mTLS (PKI) injected similarly.
+        {}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: es-lited
+          image: ghcr.io/laenenai/es-lited:latest # replace
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: BACKEND, value: postgres }
+            - { name: NATS_URL, value: "nats://nats.svc:4222" }
+            - { name: NATS_SUBJECT_PREFIX, value: "svc.eslite" } # per-shard/region knob
+            - { name: HEALTH_ADDR, value: ":8080" }
+            # PG_DSN: prefer the OpenBao Agent template above. Fallback to a
+            # Secret for non-OpenBao environments:
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef: { name: es-lited-pg, key: dsn }
+          ports:
+            - { name: health, containerPort: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "1", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+# Optional Service — es-lited is reached over NATS (no inbound traffic), so
+# this only exposes the health/metrics port for scraping if desired.
+apiVersion: v1
+kind: Service
+metadata:
+  name: es-lited
+  labels: { app: es-lited }
+spec:
+  selector: { app: es-lited }
+  ports:
+    - { name: health, port: 8080, targetPort: health }

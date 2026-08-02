@@ -1,13 +1,24 @@
 // Command es-lited runs es-lite as a NATS eventstore service (ADR 0009): it
-// serves an es.Store over NATS request/reply, backed by Postgres. It holds no
-// keys and never decrypts — clients encrypt payloads client-side, so the
-// service is zero-knowledge about payload content.
+// serves an es.Store over NATS request/reply. It holds no keys and never
+// decrypts — clients encrypt payloads client-side, so the service is
+// zero-knowledge about payload content.
 //
-// Config via env: PG_DSN (required), NATS_URL (default nats://127.0.0.1:4222).
+// Config (env):
+//
+//	BACKEND             postgres (default) | sqlite
+//	PG_DSN              Postgres DSN (required for BACKEND=postgres)
+//	SQLITE_DSN          SQLite DSN (BACKEND=sqlite; default file:eslite.db)
+//	NATS_URL            NATS endpoint (default nats://127.0.0.1:4222)
+//	NATS_SUBJECT_PREFIX subject prefix / shard knob (default svc.eslite)
+//	HEALTH_ADDR         kubelet health probe addr (default :8080)
+//
+// BACKEND=sqlite is single-workspace (SQLite has no workspace_id/RLS) — for
+// single-tenant or edge deployments. Multi-workspace uses Postgres.
 package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -17,29 +28,32 @@ import (
 
 	"github.com/nats-io/nats.go"
 
+	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/natsstore"
 	"github.com/laenenai/es-lite/postgres"
+	"github.com/laenenai/es-lite/sqlite"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pgDSN := os.Getenv("PG_DSN")
-	if pgDSN == "" {
-		log.Fatal("es-lited: PG_DSN is required")
-	}
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = nats.DefaultURL
 	}
 
-	// No keystore on the server: it stores only ciphertext (zero-knowledge).
-	store, err := postgres.Open(ctx, pgDSN, nil)
-	if err != nil {
-		log.Fatalf("es-lited: open postgres: %v", err)
+	// Select the storage backend. The server passes no keystore either way:
+	// it stores only ciphertext (zero-knowledge).
+	backend := os.Getenv("BACKEND")
+	if backend == "" {
+		backend = "postgres"
 	}
-	defer store.Close()
+	scope, closeStore, err := openBackend(ctx, backend)
+	if err != nil {
+		log.Fatalf("es-lited: open %s backend: %v", backend, err)
+	}
+	defer closeStore()
 
 	nc, err := nats.Connect(natsURL, nats.Name("es-lited"))
 	if err != nil {
@@ -85,11 +99,45 @@ func main() {
 	if prefix == "" {
 		prefix = natsstore.DefaultPrefix
 	}
-	srv := natsstore.NewServer(store.Workspace, natsstore.WithServerPrefix(prefix))
-	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend postgres",
-		natsURL, prefix)
+	srv := natsstore.NewServer(scope, natsstore.WithServerPrefix(prefix))
+	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",
+		natsURL, prefix, backend)
 	if err := srv.Serve(ctx, nc); err != nil && ctx.Err() == nil {
 		log.Fatalf("es-lited: serve: %v", err)
 	}
 	log.Print("es-lited: shut down")
+}
+
+// openBackend opens the selected storage backend and returns a workspace
+// Scoper plus a close function. Postgres is multi-workspace (RLS +
+// partitioning); SQLite is single-workspace (the Scoper ignores the workspace
+// argument), for single-tenant / edge deployments.
+func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(), error) {
+	switch backend {
+	case "postgres":
+		dsn := os.Getenv("PG_DSN")
+		if dsn == "" {
+			return nil, nil, fmt.Errorf("PG_DSN is required for BACKEND=postgres")
+		}
+		store, err := postgres.Open(ctx, dsn, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return store.Workspace, func() { store.Close() }, nil
+
+	case "sqlite":
+		dsn := os.Getenv("SQLITE_DSN")
+		if dsn == "" {
+			dsn = "file:eslite.db"
+		}
+		store, err := sqlite.Open(ctx, dsn)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Single-workspace: ignore the workspace argument.
+		return func(string) es.Store { return store }, func() { store.Close() }, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unknown BACKEND %q (want postgres|sqlite)", backend)
+	}
 }
