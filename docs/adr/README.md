@@ -22,6 +22,7 @@ than editing history.
 | 0006 | [OpenBao KeyStore Adapter](./0006-openbao-keystore.md)                                     | Accepted (implemented) |
 | 0007 | [Snapshots (Deferred)](./0007-snapshots-deferred.md)                                       | Deferred |
 | 0008 | [Uniqueness Constraints](./0008-uniqueness-constraints.md)                                 | Accepted (amends 0003) |
+| 0009 | [NATS Eventstore Service (zero-knowledge client)](./0009-nats-eventstore-service.md)       | Accepted (design; service deferred) |
 
 ## Conventions
 
