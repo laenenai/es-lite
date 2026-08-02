@@ -68,6 +68,18 @@ The relay's DB checkpoint dedup window must exceed the maximum relay lag
 plus failover time, so a newly-elected leader's replays fall inside the
 JetStream dedup window. This is the one tunable to get right.
 
+**Implemented (NATS KV lease).** The `leader` package does exactly this:
+candidates race to `Create` a key in a TTL'd KV bucket and the winner
+refreshes it with an `Update` revision-CAS; on death the key expires and a
+standby takes over. `es-lited` with `RELAY=true` runs the relay inside every
+serving replica under this election (election key `relay.<subject-prefix>`, so
+each region elects independently) — folding the relay into the normal process,
+no dedicated Deployment. The dedicated `es-relayd` singleton remains for
+deployments that want the relay isolated from the serving path. The lease is
+time-fenced (not session-fenced like a Postgres advisory lock), so a brief
+two-leader overlap is possible during failover — harmless here because drain
+claims rows `SKIP LOCKED` and publish dedups on `global_position`.
+
 ### Projections are JetStream durable consumers
 
 Each projection is a durable consumer that acks after updating its read

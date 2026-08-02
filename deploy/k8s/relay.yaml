@@ -1,8 +1,16 @@
 # es-relayd — the delivery relay (ADR 0003): drains Postgres -> JetStream.
+#
+# OPTIONAL / LEGACY: the preferred deployment folds the relay into es-lited via
+# RELAY=true (deployment.yaml), where every replica campaigns for a NATS KV
+# lease and the elected leader drains — HA with automatic failover, no separate
+# Deployment. Use this dedicated singleton only if you want the relay isolated
+# from the serving path (its own resources / blast radius / rollout cadence).
+#
 # Run as a SINGLETON (replicas: 1). It publishes ciphertext (zero-knowledge,
 # holds no keys); idempotent publish (Nats-Msg-Id=global_position) makes an
-# accidental double-run safe, but one is enough. For HA, add leader election
-# (a K8s Lease) rather than raising replicas. Same image, /es-relayd entrypoint.
+# accidental double-run safe, but one is enough. Do NOT run this AND es-lited
+# RELAY=true against the same stream — they'd both drain (harmless but wasteful).
+# Same image, /es-relayd entrypoint.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

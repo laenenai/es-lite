@@ -11,6 +11,12 @@
 //	NATS_URL            NATS endpoint (default nats://127.0.0.1:4222)
 //	NATS_SUBJECT_PREFIX subject prefix / shard knob (default svc.eslite)
 //	HEALTH_ADDR         kubelet health probe addr (default :8080)
+//	RELAY               true runs the delivery relay in-process under NATS KV
+//	                    leader election (Postgres only); default off
+//	ES_STREAM           relay target JetStream stream (default ES_EVENTS)
+//	ES_BATCH            relay drain batch size (default 200)
+//	ES_ENSURE_STREAM    false assumes an ops-provisioned stream (default true
+//	                    auto-creates it, R1 / infinite retention)
 //
 // BACKEND=sqlite is single-workspace (SQLite has no workspace_id/RLS) — for
 // single-tenant or edge deployments. Multi-workspace uses Postgres.
@@ -23,12 +29,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
+	"github.com/laenenai/es-lite/delivery"
 	"github.com/laenenai/es-lite/es"
+	"github.com/laenenai/es-lite/leader"
+	"github.com/laenenai/es-lite/natsjs"
 	"github.com/laenenai/es-lite/natsstore"
 	"github.com/laenenai/es-lite/obs"
 	"github.com/laenenai/es-lite/postgres"
@@ -60,7 +74,7 @@ func main() {
 	if backend == "" {
 		backend = "postgres"
 	}
-	scope, closeStore, err := openBackend(ctx, backend)
+	scope, drainer, closeStore, err := openBackend(ctx, backend)
 	if err != nil {
 		log.Fatalf("es-lited: open %s backend: %v", backend, err)
 	}
@@ -111,6 +125,19 @@ func main() {
 	if prefix == "" {
 		prefix = natsstore.DefaultPrefix + ".local" // default local region
 	}
+	// RELAY=true folds the delivery relay (ADR 0003) into the normal process
+	// instead of a dedicated es-relayd singleton: every replica campaigns for a
+	// NATS KV lease and only the elected leader drains Postgres -> JetStream, so
+	// the relay fails over automatically without a separate Deployment. Requires
+	// a gap-safe Drainer — Postgres only; SQLite uses the in-process Poller.
+	if os.Getenv("RELAY") == "true" {
+		if drainer == nil {
+			log.Printf("es-lited: RELAY=true ignored: backend %s has no gap-safe drainer", backend)
+		} else {
+			go runElectedRelay(ctx, nc, drainer, prefix)
+		}
+	}
+
 	srv := natsstore.NewServer(scope,
 		natsstore.WithServerPrefix(prefix),
 		natsstore.WithMiddleware(natsstore.ObservabilityMiddleware("es-lited")))
@@ -122,11 +149,94 @@ func main() {
 	log.Print("es-lited: shut down")
 }
 
+// runElectedRelay campaigns for the relay lease and, while leader, drains the
+// Postgres log to JetStream. The election key is scoped to the subject prefix
+// so each region/shard elects its own relay leader independently. Blocks until
+// ctx is cancelled.
+func runElectedRelay(ctx context.Context, nc *nats.Conn, drainer delivery.Drainer, prefix string) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		log.Printf("es-lited: relay: jetstream: %v", err)
+		return
+	}
+	streamName := os.Getenv("ES_STREAM")
+	if streamName == "" {
+		streamName = "ES_EVENTS"
+	}
+	// ES_ENSURE_STREAM=false: assume the JetStream stream is provisioned by ops
+	// (with the right replicas/retention) — es-lited never touches topology.
+	// Default true keeps dev/single-node zero-config; note auto-create defaults
+	// to R1 / infinite retention, which is not what you want in prod.
+	if os.Getenv("ES_ENSURE_STREAM") != "false" {
+		if _, err := natsjs.EnsureStream(ctx, js, natsjs.StreamConfig{Name: streamName}); err != nil {
+			log.Printf("es-lited: relay: ensure stream: %v", err)
+			return
+		}
+	}
+	batch := 200
+	if v, err := strconv.Atoi(os.Getenv("ES_BATCH")); err == nil && v > 0 {
+		batch = v
+	}
+
+	pub := natsjs.NewPublisher(js, nil) // evt.<ws>.<aggregate>.<event> subjects
+	relayed, _ := otel.Meter("es-lited").Int64Counter("eslite.relayed",
+		metric.WithDescription("events relayed to jetstream"))
+	publish := func(ctx context.Context, evs []es.Envelope) error {
+		if err := pub.Handle(ctx, evs); err != nil {
+			return err
+		}
+		relayed.Add(ctx, int64(len(evs)))
+		return nil
+	}
+	relay := delivery.NewRelay(drainer, publish, delivery.RelayConfig{
+		BatchSize:    batch,
+		PollInterval: time.Second,
+	})
+
+	// Election key is per-prefix (region/shard) so relays don't contend across
+	// regions. KV keys allow dots, but sanitize any stray chars just in case.
+	key := "relay." + strings.Map(kvKeyRune, prefix)
+	id := instanceID()
+	log.Printf("es-lited: relay enabled, campaigning for leadership (key %s, id %s)", key, id)
+	err = leader.Run(ctx, js, leader.Config{Key: key, ID: id}, func(leaderCtx context.Context) {
+		log.Print("es-lited: became relay leader, draining postgres -> jetstream")
+		if err := relay.Run(leaderCtx); err != nil && leaderCtx.Err() == nil {
+			log.Printf("es-lited: relay: %v", err)
+		}
+		log.Print("es-lited: relinquished relay leadership")
+	})
+	if err != nil && ctx.Err() == nil {
+		log.Printf("es-lited: relay election: %v", err)
+	}
+}
+
+// instanceID is a best-effort unique id for this process (host-pid).
+func instanceID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return host + "-" + strconv.Itoa(os.Getpid())
+}
+
+// kvKeyRune maps a rune to a JetStream KV-key-safe rune (-/_=.a-zA-Z0-9),
+// replacing anything else with '_'.
+func kvKeyRune(r rune) rune {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return r
+	case r == '-' || r == '_' || r == '=' || r == '.' || r == '/':
+		return r
+	default:
+		return '_'
+	}
+}
+
 // openBackend opens the selected storage backend and returns a workspace
 // Scoper plus a close function. Postgres is multi-workspace (RLS +
 // partitioning); SQLite is single-workspace (the Scoper ignores the workspace
 // argument), for single-tenant / edge deployments.
-func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(), error) {
+func openBackend(ctx context.Context, backend string) (natsstore.Scoper, delivery.Drainer, func(), error) {
 	// AUTO_MIGRATE=false: assume the schema is already migrated (a separate
 	// es-migrate init container ran it) — so replicas never touch DDL on boot
 	// (ADR 0010). Default true keeps dev/single-node zero-config.
@@ -136,7 +246,7 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(),
 	case "postgres":
 		dsn := os.Getenv("PG_DSN")
 		if dsn == "" {
-			return nil, nil, fmt.Errorf("PG_DSN is required for BACKEND=postgres")
+			return nil, nil, nil, fmt.Errorf("PG_DSN is required for BACKEND=postgres")
 		}
 		var opts []postgres.Option
 		if !autoMigrate {
@@ -144,9 +254,11 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(),
 		}
 		store, err := postgres.Open(ctx, dsn, nil, opts...)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return store.Workspace, func() { store.Close() }, nil
+		// Postgres drains gap-safe (FOR UPDATE SKIP LOCKED), so it can back the
+		// in-process relay under leader election (RELAY=true).
+		return store.Workspace, store, func() { store.Close() }, nil
 
 	case "sqlite":
 		dsn := os.Getenv("SQLITE_DSN")
@@ -159,12 +271,13 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, func(),
 		}
 		store, err := sqlite.Open(ctx, dsn, opts...)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		// Single-workspace: ignore the workspace argument.
-		return func(string) es.Store { return store }, func() { store.Close() }, nil
+		// Single-workspace: ignore the workspace argument. No Drainer — SQLite is
+		// single-node; use the in-process Poller, not the relay.
+		return func(string) es.Store { return store }, nil, func() { store.Close() }, nil
 
 	default:
-		return nil, nil, fmt.Errorf("unknown BACKEND %q (want postgres|sqlite)", backend)
+		return nil, nil, nil, fmt.Errorf("unknown BACKEND %q (want postgres|sqlite)", backend)
 	}
 }

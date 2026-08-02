@@ -104,16 +104,37 @@ Two caveats:
    adding pods. Latency-based HPA is self-correcting: if latency stops
    improving as pods are added, you have hit the DB ceiling.
 
-## Delivery relay (es-relayd)
+## Delivery relay
 
-`es-lited` serves reads/writes; **`es-relayd`** publishes the log to JetStream
+`es-lited` serves reads/writes; the **relay** publishes the log to JetStream
 (ADR 0003). It drains Postgres and publishes each event with
 `Nats-Msg-Id = global_position` (dedup). It is **zero-knowledge** — no keys, so
-it publishes **ciphertext**; crypto-capable projections decrypt. Run it as a
+it publishes **ciphertext**; crypto-capable projections decrypt. There are two
+ways to run it:
+
+**Folded in (preferred) — `RELAY=true` on es-lited.** Every replica campaigns
+for a **NATS KV lease** (`es_leader` bucket, key `relay.<prefix>`); only the
+elected leader drains, and if it dies a follower takes over within ~one lease
+TTL (≈15 s). No separate Deployment, HA for free. The lease is time-fenced, not
+session-fenced, so a brief two-leader overlap during failover is possible — but
+harmless: the drain claims rows `FOR UPDATE SKIP LOCKED` and publish dedups on
+`global_position`. The election key is **per subject prefix**, so each
+region/shard elects its own relay leader independently. Extra config on es-lited:
+`ES_STREAM` (default `ES_EVENTS`), `ES_BATCH` (default 200), `ES_ENSURE_STREAM`.
+
+**Stream provisioning.** By default the relay auto-creates the target stream
+(`CreateOrUpdateStream`, defaults **R1 / infinite retention**) — fine for
+dev/single-node. In prod, **pre-provision the stream** (R3, bounded `MaxAge`)
+and set **`ES_ENSURE_STREAM=false`** so es-lited never touches JetStream
+topology — the sample manifest does this. Same flag exists on `es-relayd`.
+
+**Dedicated singleton (optional) — `es-relayd`.** Isolates the relay from the
+serving path (its own resources, blast radius, rollout cadence). Run it as a
 **singleton** (`deploy/k8s/relay.yaml`, `replicas: 1`, `strategy: Recreate`) —
-do **not** scale it by raising replicas; for HA add leader election (a K8s
-`Lease`). Same image, `/es-relayd` entrypoint. Config: `PG_DSN`, `NATS_URL`,
-`ES_STREAM` (default `ES_EVENTS`), `ES_BATCH`, `HEALTH_ADDR`.
+do **not** scale it by raising replicas. Same image, `/es-relayd` entrypoint.
+Config: `PG_DSN`, `NATS_URL`, `ES_STREAM`, `ES_BATCH`, `HEALTH_ADDR`,
+`ES_ENSURE_STREAM`. Do **not** run this *and* es-lited `RELAY=true` against the
+same stream (double drain — wasteful, not unsafe).
 
 Downstream **projection consumers** are the pieces you *do* autoscale — on
 JetStream `num_pending` (see the autoscaling section).

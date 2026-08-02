@@ -62,6 +62,17 @@ spec:
             # es-lited per region on its own prefix — data residency is a deploy.
             - { name: NATS_SUBJECT_PREFIX, value: "svc.eslite.eu" }
             - { name: HEALTH_ADDR, value: ":8080" }
+            # RELAY=true folds the delivery relay into every replica under NATS KV
+            # leader election: exactly one replica drains Postgres -> JetStream at
+            # a time, failing over automatically — so no separate es-relayd
+            # Deployment (relay.yaml) is needed. Election key is per-prefix, so
+            # each region elects its own relay leader.
+            - { name: RELAY, value: "true" }
+            - { name: ES_STREAM, value: "ES_EVENTS" }
+            # false = the stream is provisioned by ops (R3, bounded MaxAge) — the
+            # relay must NOT auto-create it (that defaults to R1 / infinite
+            # retention). Flip to "true" only for dev/single-node convenience.
+            - { name: ES_ENSURE_STREAM, value: "false" }
             # Observability: OTLP metrics + traces -> OpenObserve (inert if unset).
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://openobserve:5081" }
             # - { name: OTEL_EXPORTER_OTLP_HEADERS, value: "..." } # auth via a Secret in prod

@@ -6,7 +6,8 @@
 // (replicas: 1) or leader-elected to avoid wasted work.
 //
 // Config (env): PG_DSN (required), NATS_URL, ES_STREAM (default ES_EVENTS),
-// ES_BATCH (default 200), HEALTH_ADDR (default :8080).
+// ES_BATCH (default 200), HEALTH_ADDR (default :8080), ES_ENSURE_STREAM
+// (default true auto-creates the stream; false assumes ops-provisioned).
 package main
 
 import (
@@ -78,8 +79,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("es-relayd: jetstream: %v", err)
 	}
-	if _, err := natsjs.EnsureStream(ctx, js, natsjs.StreamConfig{Name: streamName}); err != nil {
-		log.Fatalf("es-relayd: ensure stream: %v", err)
+	// ES_ENSURE_STREAM=false: assume the stream is provisioned by ops (with the
+	// right replicas/retention) — the relay never touches JetStream topology.
+	if os.Getenv("ES_ENSURE_STREAM") != "false" {
+		if _, err := natsjs.EnsureStream(ctx, js, natsjs.StreamConfig{Name: streamName}); err != nil {
+			log.Fatalf("es-relayd: ensure stream: %v", err)
+		}
 	}
 
 	startHealth(nc)
