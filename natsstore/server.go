@@ -89,7 +89,14 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 		natskit.RequireSubjectWorkspace(wsIndex),
 	}, s.middleware...)
 
-	svc, err := natskit.NewService(nc, natskit.ServiceConfig{
+	// es-lited is zero-knowledge (clients encrypt event payloads client-side), so the
+	// transport codec is Nop — the bus is protected by mTLS + account isolation, and
+	// the sensitive bytes are already ciphertext before they arrive.
+	conn, err := natskit.Wrap(nc, natskit.NopCodec{})
+	if err != nil {
+		return err
+	}
+	svc, err := conn.Service(natskit.ServiceConfig{
 		Name:        "eslite",
 		Version:     s.version,
 		Description: "es-lite eventstore — es.Store over NATS",
