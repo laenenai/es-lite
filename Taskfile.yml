@@ -120,3 +120,12 @@ tasks:
     desc: Tidy go.mod/go.sum.
     cmds:
       - go mod tidy
+
+  docker:build:
+    desc: >
+      Build the es-lited container image. Needs GO_MODULES_TOKEN in the
+      environment (a GitHub PAT/token with read access to the private
+      github.com/laenenai/natskit repo), passed as a BuildKit secret so it
+      never lands in an image layer. Locally: GO_MODULES_TOKEN=$(gh auth token) task docker:build
+    cmds:
+      - docker build --secret id=go_modules_token,env=GO_MODULES_TOKEN -t "{{.IMAGE | default \"es-lited:dev\"}}" .

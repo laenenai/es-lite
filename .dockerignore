@@ -1,0 +1,10 @@
+.git
+.github
+docs
+*.md
+*.db
+*.db-wal
+*.db-shm
+bin/
+# gen/ and examples/ are not needed to build cmd/es-lited, but are cheap to
+# leave in; exclude the obviously-irrelevant to keep the build context small.

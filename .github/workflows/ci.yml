@@ -5,12 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # es-lite depends on the private module github.com/laenenai/natskit.
+  GOPRIVATE: github.com/laenenai/*
+
 jobs:
   check:
     name: build · vet · unit · codegen-drift
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Private module access # natskit is a private repo
+        run: git config --global url."https://x-access-token:${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: jdx/mise-action@v2 # installs go/buf/task pinned in .mise.toml
       - run: task generate:check # buf lint + regenerate, fail on drift
       - run: task vet
@@ -22,6 +28,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
+      - name: Private module access
+        run: git config --global url."https://x-access-token:${{ secrets.GO_MODULES_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: jdx/mise-action@v2
       # Each target spins up its own throwaway container (Docker is preinstalled
       # on the runner) and tears it down via `defer`.
