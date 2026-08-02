@@ -30,6 +30,7 @@ spec:
             - { name: NATS_URL, value: "nats://nats.svc:4222" }
             - { name: ES_STREAM, value: "ES_EVENTS" }
             - { name: HEALTH_ADDR, value: ":8080" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://openobserve:5081" } # OTLP -> OpenObserve
             - name: PG_DSN
               valueFrom:
                 secretKeyRef: { name: es-lited-pg, key: dsn }

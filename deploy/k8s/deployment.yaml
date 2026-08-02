@@ -62,6 +62,9 @@ spec:
             # es-lited per region on its own prefix — data residency is a deploy.
             - { name: NATS_SUBJECT_PREFIX, value: "svc.eslite.eu" }
             - { name: HEALTH_ADDR, value: ":8080" }
+            # Observability: OTLP metrics + traces -> OpenObserve (inert if unset).
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://openobserve:5081" }
+            # - { name: OTEL_EXPORTER_OTLP_HEADERS, value: "..." } # auth via a Secret in prod
             # PG_DSN: prefer the OpenBao Agent template above. Fallback to a
             # Secret for non-OpenBao environments:
             - name: PG_DSN

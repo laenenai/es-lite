@@ -30,13 +30,24 @@ import (
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/natsstore"
+	"github.com/laenenai/es-lite/obs"
 	"github.com/laenenai/es-lite/postgres"
 	"github.com/laenenai/es-lite/sqlite"
 )
 
+// version is stamped into telemetry; override at build with -ldflags.
+var version = "dev"
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Optional OTLP -> OpenObserve (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT set).
+	shutdownObs, err := obs.Setup(ctx, "es-lited", version)
+	if err != nil {
+		log.Fatalf("es-lited: observability: %v", err)
+	}
+	defer func() { _ = shutdownObs(context.Background()) }()
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
@@ -100,7 +111,9 @@ func main() {
 	if prefix == "" {
 		prefix = natsstore.DefaultPrefix + ".local" // default local region
 	}
-	srv := natsstore.NewServer(scope, natsstore.WithServerPrefix(prefix))
+	srv := natsstore.NewServer(scope,
+		natsstore.WithServerPrefix(prefix),
+		natsstore.WithMiddleware(natsstore.ObservabilityMiddleware("es-lited")))
 	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",
 		natsURL, prefix, backend)
 	if err := srv.Serve(ctx, nc); err != nil && ctx.Err() == nil {

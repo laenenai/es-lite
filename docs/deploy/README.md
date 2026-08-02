@@ -59,6 +59,25 @@ The pod ideally holds **no static secret** — the Agent injects all three.
 - **Kubelet:** `GET /healthz` on `HEALTH_ADDR` — 200 when connected to NATS,
   503 otherwise. Used for liveness/readiness in the manifest.
 
+## Observability (OpenTelemetry → OpenObserve)
+
+`es-lited` and `es-relayd` export **OTLP metrics + traces** to the mesh's
+OpenObserve collector — enabled by the standard `OTEL_*` env, and **inert when
+unset** (dev/single-node stay zero-config):
+
+| Env | Example |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://openobserve:5081` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Basic …,organization=default,stream-name=default` |
+| `OTEL_SERVICE_NAME` | defaults to `es-lited` / `es-relayd` |
+
+**Metrics:** `eslite.requests` (count, labelled `method`+`outcome`) and
+`eslite.request.duration` (histogram, seconds) — request rate/latency of
+`es-lited`; `eslite.relayed` (count) — events `es-relayd` published to JetStream.
+**Traces:** one server span per request, with W3C trace context propagated from
+the message headers (via `natskit`'s correlation), so traces span the async NATS
+hops. **Logs** go to stdout and are collected by OpenObserve.
+
 ## Autoscaling
 
 This is an I/O-bound req/reply service — **do not scale on CPU.** Core NATS
@@ -68,8 +87,10 @@ not queue depth:
 - **Primary: p95/p99 request latency** (scale out past your SLO).
 - **Secondary: requests/sec per pod** or **in-flight concurrency per pod**.
 
-Feed these from the NATS Micro `$SRV.STATS` (scrape into Prometheus) and drive
-**KEDA**'s Prometheus scaler (see `deploy/k8s/keda-scaledobject.yaml`).
+Drive these from the OTLP metric `eslite.request.duration` (histogram) exported
+to OpenObserve (above) via **KEDA** — query the p95 in OpenObserve/Prometheus
+(see `deploy/k8s/keda-scaledobject.yaml`). NATS Micro `$SRV.STATS` is also
+available (`nats micro stats eslite`) as an ad-hoc source.
 
 Two caveats:
 

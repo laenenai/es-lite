@@ -189,6 +189,10 @@ mesh, `es-lited` also registers as a **NATS Micro** service — `nats micro ls` 
 **`es-relayd`:** `PG_DSN`, `NATS_URL`, `ES_STREAM` (default `ES_EVENTS`),
 `ES_BATCH` (default 200), `HEALTH_ADDR`.
 
+**Observability:** `es-lited` and `es-relayd` export **OTLP** metrics + traces
+when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (→ OpenObserve), inert otherwise — see
+[the deploy guide](./docs/deploy/README.md#observability-opentelemetry--openobserve).
+
 Secrets are best injected by an **OpenBao/Vault Agent sidecar** (dynamic
 Postgres creds via the database secrets engine, NATS creds, mTLS via PKI) — the
 pod then holds no static secrets. See [`docs/deploy`](./docs/deploy).

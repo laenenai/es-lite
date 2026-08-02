@@ -21,15 +21,28 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/laenenai/es-lite/delivery"
+	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/natsjs"
+	"github.com/laenenai/es-lite/obs"
 	"github.com/laenenai/es-lite/postgres"
 )
+
+// version is stamped into telemetry; override at build with -ldflags.
+var version = "dev"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	shutdownObs, err := obs.Setup(ctx, "es-relayd", version)
+	if err != nil {
+		log.Fatalf("es-relayd: observability: %v", err)
+	}
+	defer func() { _ = shutdownObs(context.Background()) }()
 
 	pgDSN := os.Getenv("PG_DSN")
 	if pgDSN == "" {
@@ -72,7 +85,16 @@ func main() {
 	startHealth(nc)
 
 	pub := natsjs.NewPublisher(js, nil) // evt.<ws>.<aggregate>.<event> subjects
-	relay := delivery.NewRelay(store, pub.Handle, delivery.RelayConfig{
+	relayed, _ := otel.Meter("es-relayd").Int64Counter("eslite.relayed",
+		metric.WithDescription("events relayed to jetstream"))
+	publish := func(ctx context.Context, evs []es.Envelope) error {
+		if err := pub.Handle(ctx, evs); err != nil {
+			return err
+		}
+		relayed.Add(ctx, int64(len(evs)))
+		return nil
+	}
+	relay := delivery.NewRelay(store, publish, delivery.RelayConfig{
 		BatchSize:    batch,
 		PollInterval: time.Second,
 	})
