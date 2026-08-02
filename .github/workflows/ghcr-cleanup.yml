@@ -1,0 +1,35 @@
+name: GHCR cleanup
+
+# Keep GHCR small: prune untagged image versions (orphans left when a moving
+# tag re-points) and cap the retained release history. Runs weekly; safe to
+# run manually.
+on:
+  schedule:
+    - cron: "0 3 * * 0" # Sundays 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old / untagged es-lited versions
+        uses: snok/container-retention-policy@v3.0.0
+        with:
+          account: laenenai
+          image-names: es-lited
+          # GITHUB_TOKEN works if the package grants this repo delete access;
+          # otherwise use a PAT with `delete:packages` (e.g. GHCR_CLEANUP_TOKEN).
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Delete versions older than the cut-off...
+          cut-off: 4w
+          # ...but always keep the most recent N (so recent releases + their
+          # untagged children survive).
+          keep-n-most-recent: 20
+          # Consider both tagged and untagged; untagged orphans are the main
+          # reclaim. Never touch a tag matching a current release line.
+          tag-selection: both
+          # Protect the moving/major tags from deletion.
+          exclude-tags: latest,*.*

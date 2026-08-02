@@ -9,11 +9,13 @@
 #
 # (locally: GO_MODULES_TOKEN=$(gh auth token) docker build --secret ... .)
 
-FROM golang:1.26-bookworm AS build
+# --platform=$BUILDPLATFORM: run the builder natively and cross-compile to the
+# target (pure Go, CGO off) — fast multi-arch without QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+ARG TARGETOS TARGETARCH
 WORKDIR /src
 ENV GOPRIVATE=github.com/laenenai/* \
-    CGO_ENABLED=0 \
-    GOOS=linux
+    CGO_ENABLED=0
 
 # Build cmd/es-lited directly so only ITS dependency graph is fetched (pgx,
 # nats, natskit — not modernc/sqlite, which the server never uses). The
@@ -21,6 +23,7 @@ ENV GOPRIVATE=github.com/laenenai/* \
 COPY . .
 RUN --mount=type=secret,id=go_modules_token \
     git config --global url."https://x-access-token:$(cat /run/secrets/go_modules_token)@github.com/".insteadOf "https://github.com/" && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/es-lited ./cmd/es-lited
 
 FROM gcr.io/distroless/static-debian12:nonroot

@@ -138,3 +138,12 @@ tasks:
       never lands in an image layer. Locally: GO_MODULES_TOKEN=$(gh auth token) task docker:build
     cmds:
       - docker build --secret id=go_modules_token,env=GO_MODULES_TOKEN -t "{{.IMAGE | default \"es-lited:dev\"}}" .
+
+  docker:push:
+    desc: >
+      Build and push the multi-arch es-lited image. Needs GO_MODULES_TOKEN in the
+      environment and a registry login (e.g. `docker login ghcr.io`). Override the
+      tag with IMAGE=..., e.g. IMAGE=ghcr.io/laenenai/es-lited:v0.1.0 task docker:push.
+      CI publishes on release tags (release.yml) — this is for manual/local pushes.
+    cmds:
+      - docker buildx build --secret id=go_modules_token,env=GO_MODULES_TOKEN --platform linux/amd64,linux/arm64 --push -t "{{.IMAGE | default \"ghcr.io/laenenai/es-lited:dev\"}}" .
