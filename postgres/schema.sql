@@ -84,3 +84,26 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     position   bigint      NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- unique_claims: cross-stream uniqueness, per-workspace (ADR 0008). value_key
+-- is the plaintext value for non-PII scopes, or an HMAC under the workspace
+-- key for PII scopes (so shredding the workspace key unlinks it). The PK is
+-- the uniqueness constraint; a colliding Claim rolls back the whole append
+-- with es.ErrConstraintViolated. RLS scopes it like events.
+CREATE TABLE IF NOT EXISTS unique_claims (
+    workspace_id text        NOT NULL,
+    scope        text        NOT NULL,
+    value_key    bytea       NOT NULL,
+    stream_id    text        NOT NULL,
+    claimed_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, scope, value_key)
+);
+
+ALTER TABLE unique_claims ENABLE ROW LEVEL SECURITY;
+ALTER TABLE unique_claims FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS unique_claims_workspace_isolation ON unique_claims;
+CREATE POLICY unique_claims_workspace_isolation ON unique_claims
+    USING (workspace_id = current_setting('app.workspace_id', true)
+           OR current_setting('app.bypass_rls', true) = 'on')
+    WITH CHECK (workspace_id = current_setting('app.workspace_id', true)
+           OR current_setting('app.bypass_rls', true) = 'on');

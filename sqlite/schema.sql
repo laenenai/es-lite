@@ -53,3 +53,16 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     position   INTEGER NOT NULL,
     updated_at TEXT    NOT NULL
 );
+
+-- unique_claims: cross-stream uniqueness (ADR 0008). A Claim inserts a row;
+-- the PRIMARY KEY makes a duplicate fail, rolling back the whole append with
+-- es.ErrConstraintViolated. A Release deletes the owning stream's row.
+-- SQLite is single-workspace, so no workspace_id column and values are stored
+-- as plaintext (the PII flag applies only to keystore-backed Postgres).
+CREATE TABLE IF NOT EXISTS unique_claims (
+    scope      TEXT NOT NULL,
+    value_key  BLOB NOT NULL,
+    stream_id  TEXT NOT NULL,
+    claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (scope, value_key)
+);

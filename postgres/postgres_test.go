@@ -33,7 +33,7 @@ func openStore(t *testing.T) *postgres.Store {
 	}
 	// Isolate each test: tests run sequentially, so a truncate is safe and
 	// keeps the shared partitioned tables clean.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, workspace_keys, checkpoints`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, workspace_keys, checkpoints, unique_claims`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -207,6 +207,72 @@ func TestDrainClaimDelivery(t *testing.T) {
 	if n2 != 0 {
 		t.Fatalf("second drain claimed %d, want 0", n2)
 	}
+}
+
+func TestUniqueClaimsWorkspaceScopedAndHashed(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	appendClaim := func(ws, stream string, expected uint64, ops ...es.ConstraintOp) error {
+		sid, _ := es.NewStreamID("thing", stream)
+		_, err := s.Workspace(ws).Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: expected,
+			Events:          []es.EventData{{TypeURL: "test.v1.E", SchemaVersion: 1, Payload: []byte("x")}},
+			Constraints:     ops,
+		})
+		return err
+	}
+
+	// Uniqueness is per-workspace: the same PII value in two workspaces is
+	// independent.
+	if err := appendClaim("ws1", "a", 0, es.Claim("email", "x@y.com", true)); err != nil {
+		t.Fatalf("ws1 claim: %v", err)
+	}
+	if err := appendClaim("ws2", "a", 0, es.Claim("email", "x@y.com", true)); err != nil {
+		t.Fatalf("same value in ws2 must be independent: %v", err)
+	}
+	// Within ws1 it collides.
+	if err := appendClaim("ws1", "b", 0, es.Claim("email", "x@y.com", true)); !errors.Is(err, es.ErrConstraintViolated) {
+		t.Fatalf("intra-workspace conflict: got %v, want ErrConstraintViolated", err)
+	}
+
+	// PII value is stored as an HMAC, not plaintext.
+	vk := rawValueKey(t, s, "ws1", "email")
+	if bytes.Contains(vk, []byte("x@y.com")) {
+		t.Fatal("plaintext PII value found in unique_claims.value_key")
+	}
+	if len(vk) != 32 {
+		t.Fatalf("value_key len = %d, want 32 (HMAC-SHA256)", len(vk))
+	}
+
+	// The two workspaces hash the same value to DIFFERENT keys (per-workspace
+	// key), so the hashes are not cross-linkable.
+	vk2 := rawValueKey(t, s, "ws2", "email")
+	if bytes.Equal(vk, vk2) {
+		t.Fatal("same PII value hashed identically across workspaces — keys not per-workspace")
+	}
+}
+
+// rawValueKey reads one stored value_key for (workspace, scope), bypassing RLS.
+func rawValueKey(t *testing.T, s *postgres.Store, ws, scope string) []byte {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.bypass_rls', 'on', true)`); err != nil {
+		t.Fatal(err)
+	}
+	var vk []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT value_key FROM unique_claims WHERE workspace_id=$1 AND scope=$2 LIMIT 1`, ws, scope,
+	).Scan(&vk); err != nil {
+		t.Fatalf("raw value_key: %v", err)
+	}
+	return vk
 }
 
 // rawPayload reads the stored (encrypted) payload bytes, bypassing RLS and

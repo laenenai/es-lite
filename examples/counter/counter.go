@@ -27,48 +27,51 @@ var (
 var Decider = es.Decider[*counterv1.Counter, counterv1.Command, counterv1.Event]{
 	Initial: func() *counterv1.Counter { return &counterv1.Counter{} },
 
-	Decide: func(s *counterv1.Counter, c counterv1.Command) ([]counterv1.Event, error) {
+	// The counter has no cross-stream uniqueness, so Decide always returns
+	// nil constraints. See examples/uniqueness (and ADR 0008) for a Decider
+	// that emits Claim/Release ops.
+	Decide: func(s *counterv1.Counter, c counterv1.Command) ([]counterv1.Event, []es.ConstraintOp, error) {
 		switch cmd := c.(type) {
 		case *counterv1.Init:
 			if s.GetInitialized() {
-				return nil, ErrAlreadyInitialized
+				return nil, nil, ErrAlreadyInitialized
 			}
 			if cmd.GetMin() > cmd.GetMax() {
-				return nil, ErrBadRange
+				return nil, nil, ErrBadRange
 			}
 			if cmd.GetInitial() < cmd.GetMin() || cmd.GetInitial() > cmd.GetMax() {
-				return nil, ErrOutOfRange
+				return nil, nil, ErrOutOfRange
 			}
 			return []counterv1.Event{&counterv1.Initialized{
 				Min: cmd.GetMin(), Max: cmd.GetMax(), Value: cmd.GetInitial(),
-			}}, nil
+			}}, nil, nil
 
 		case *counterv1.Increment:
 			if !s.GetInitialized() {
-				return nil, ErrNotInitialized
+				return nil, nil, ErrNotInitialized
 			}
 			if s.GetCount()+cmd.GetBy() > s.GetMax() {
-				return nil, ErrOutOfRange
+				return nil, nil, ErrOutOfRange
 			}
-			return []counterv1.Event{&counterv1.Incremented{By: cmd.GetBy()}}, nil
+			return []counterv1.Event{&counterv1.Incremented{By: cmd.GetBy()}}, nil, nil
 
 		case *counterv1.Decrement:
 			if !s.GetInitialized() {
-				return nil, ErrNotInitialized
+				return nil, nil, ErrNotInitialized
 			}
 			if s.GetCount()-cmd.GetBy() < s.GetMin() {
-				return nil, ErrOutOfRange
+				return nil, nil, ErrOutOfRange
 			}
-			return []counterv1.Event{&counterv1.Decremented{By: cmd.GetBy()}}, nil
+			return []counterv1.Event{&counterv1.Decremented{By: cmd.GetBy()}}, nil, nil
 
 		case *counterv1.Close:
 			if !s.GetInitialized() {
-				return nil, ErrNotInitialized
+				return nil, nil, ErrNotInitialized
 			}
-			return []counterv1.Event{&counterv1.Closed{}}, nil
+			return []counterv1.Event{&counterv1.Closed{}}, nil, nil
 
 		default:
-			return nil, ErrUnknownCommand
+			return nil, nil, ErrUnknownCommand
 		}
 	},
 

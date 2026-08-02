@@ -14,6 +14,12 @@ var (
 	// has never been written to.
 	ErrStreamNotFound = errors.New("es-lite: stream not found")
 
+	// ErrConstraintViolated reports that a uniqueness Claim collided with an
+	// existing claim: the (workspace, scope, value) was already taken. The
+	// whole append is rolled back — no event is persisted. Callers decide
+	// whether this is a domain error to surface (ADR 0008).
+	ErrConstraintViolated = errors.New("es-lite: unique constraint violated")
+
 	// ErrInvalidStreamID reports that a StreamID failed validation.
 	ErrInvalidStreamID = errors.New("es-lite: invalid stream id")
 

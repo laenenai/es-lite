@@ -122,6 +122,10 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		}
 	}
 
+	if err := w.applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
+		return zero, err
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return zero, fmt.Errorf("commit: %w", err)
 	}
@@ -130,6 +134,56 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// applyClaims applies uniqueness ops in the append transaction (ADR 0008):
+// releases first (so a same-value rename does not self-collide), then claims.
+// PII values are HMAC'd under the workspace key; non-PII stored plaintext. A
+// colliding claim returns es.ErrConstraintViolated, rolling back the append.
+func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, ops []es.ConstraintOp) error {
+	for _, op := range ops {
+		if op.Op != es.ReleaseOp {
+			continue
+		}
+		vk, err := w.valueKey(ctx, op)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM unique_claims WHERE workspace_id=$1 AND scope=$2 AND value_key=$3 AND stream_id=$4`,
+			w.ws, op.Scope, vk, streamID,
+		); err != nil {
+			return fmt.Errorf("release claim %s: %w", op.Scope, err)
+		}
+	}
+	for _, op := range ops {
+		if op.Op != es.ClaimOp {
+			continue
+		}
+		vk, err := w.valueKey(ctx, op)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
+			w.ws, op.Scope, vk, streamID,
+		); err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("%w: %s=%q", es.ErrConstraintViolated, op.Scope, op.Value)
+			}
+			return fmt.Errorf("claim %s: %w", op.Scope, err)
+		}
+	}
+	return nil
+}
+
+// valueKey returns the stored uniqueness key for a constraint: an HMAC under
+// the workspace key for PII values (erasure-safe), plaintext bytes otherwise.
+func (w *wsStore) valueKey(ctx context.Context, op es.ConstraintOp) ([]byte, error) {
+	if op.PII && w.store.shredder != nil {
+		return w.store.shredder.MAC(ctx, w.ws, []byte(op.Value))
+	}
+	return []byte(op.Value), nil
 }
 
 func (w *wsStore) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {

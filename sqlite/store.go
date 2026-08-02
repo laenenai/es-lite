@@ -174,6 +174,10 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		}
 	}
 
+	if err := applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
+		return zero, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return zero, fmt.Errorf("commit: %w", err)
 	}
@@ -182,6 +186,40 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// applyClaims applies uniqueness ops in the append transaction: releases
+// first (so a same-value rename does not self-collide), then claims. A
+// colliding claim returns es.ErrConstraintViolated, rolling back the append.
+// Values are stored plaintext (SQLite has no keystore; PII is a Postgres
+// concern).
+func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.ConstraintOp) error {
+	for _, op := range ops {
+		if op.Op != es.ReleaseOp {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM unique_claims WHERE scope = ? AND value_key = ? AND stream_id = ?`,
+			op.Scope, []byte(op.Value), streamID,
+		); err != nil {
+			return fmt.Errorf("release claim %s=%q: %w", op.Scope, op.Value, err)
+		}
+	}
+	for _, op := range ops {
+		if op.Op != es.ClaimOp {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO unique_claims (scope, value_key, stream_id) VALUES (?, ?, ?)`,
+			op.Scope, []byte(op.Value), streamID,
+		); err != nil {
+			if isConstraintViolation(err) {
+				return fmt.Errorf("%w: %s=%q", es.ErrConstraintViolated, op.Scope, op.Value)
+			}
+			return fmt.Errorf("claim %s=%q: %w", op.Scope, op.Value, err)
+		}
+	}
+	return nil
 }
 
 // ReadStream implements es.Store.

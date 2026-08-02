@@ -13,7 +13,9 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -149,6 +151,30 @@ func (s *Shredder) dek(ctx context.Context, workspaceID string, provision bool) 
 	s.cache[workspaceID] = dek
 	s.mu.Unlock()
 	return dek, nil
+}
+
+// MAC returns a deterministic keyed hash of data under the workspace key,
+// for PII uniqueness claims (ADR 0008). Uniqueness holds while the workspace
+// lives (the HMAC is deterministic); shredding the workspace key makes the
+// stored hash unlinkable to any value, keeping erasure complete. It
+// provisions a DEK if the workspace has none yet (this runs on the write
+// path, inside the same command that claims the value).
+//
+// The MAC key is a subkey derived from the DEK (domain-separated), not the
+// DEK itself, so uniqueness hashing never shares key material with payload
+// encryption.
+func (s *Shredder) MAC(ctx context.Context, workspaceID string, data []byte) ([]byte, error) {
+	dek, err := s.dek(ctx, workspaceID, true)
+	if err != nil {
+		return nil, err
+	}
+	sub := hmac.New(sha256.New, dek)
+	sub.Write([]byte("es-lite/uniqueness-subkey"))
+	key := sub.Sum(nil)
+
+	m := hmac.New(sha256.New, key)
+	m.Write(data)
+	return m.Sum(nil), nil
 }
 
 // Forget crypto-shreds a workspace: destroy the KEK, evict the cached DEK,

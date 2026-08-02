@@ -69,7 +69,7 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 		return zero, fmt.Errorf("%w: %s", es.ErrTerminal, sid)
 	}
 
-	events, err := r.decider.Decide(state, cmd)
+	events, constraints, err := r.decider.Decide(state, cmd)
 	if err != nil {
 		return zero, err // domain rejection — surfaced verbatim to the caller
 	}
@@ -108,6 +108,7 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 		StreamID:        sid,
 		ExpectedVersion: version,
 		Events:          encoded,
+		Constraints:     constraints,
 		CommandID:       meta.CommandID,
 		CorrelationID:   meta.CorrelationID,
 		CausationID:     meta.CausationID,

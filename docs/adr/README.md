@@ -21,6 +21,7 @@ than editing history.
 | 0005 | [Projection Rebuild](./0005-projection-rebuild.md)                                         | Accepted (design; primitive deferred) |
 | 0006 | [OpenBao KeyStore Adapter](./0006-openbao-keystore.md)                                     | Accepted (implemented) |
 | 0007 | [Snapshots (Deferred)](./0007-snapshots-deferred.md)                                       | Deferred |
+| 0008 | [Uniqueness Constraints](./0008-uniqueness-constraints.md)                                 | Accepted (amends 0003) |
 
 ## Conventions
 

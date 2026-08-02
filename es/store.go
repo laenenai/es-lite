@@ -61,6 +61,11 @@ type AppendParams struct {
 	// ExpectedVersion+1, +2, ...
 	Events []EventData
 
+	// Constraints are uniqueness Claim/Release operations applied in the
+	// same transaction as the events (ADR 0008). A colliding Claim rolls the
+	// whole append back with ErrConstraintViolated.
+	Constraints []ConstraintOp
+
 	// Command-scoped audit metadata, copied onto every produced Envelope.
 	CommandID     uuid.UUID
 	CorrelationID uuid.UUID

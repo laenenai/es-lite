@@ -10,8 +10,10 @@ package es
 //
 //   - Initial returns the zero-value state for a stream with no events.
 //   - Decide is the business rule: given current state and a command,
-//     return the events to append, or an error to reject the command
-//     with no state change.
+//     return the events to append plus any uniqueness constraint
+//     operations (ADR 0008; nil when the aggregate has no cross-stream
+//     uniqueness), or an error to reject the command with no state change.
+//     Events and constraints commit atomically.
 //   - Evolve folds one event into state. It runs during replay to
 //     rebuild state from history, so it must never call time.Now,
 //     generate IDs, perform I/O, or depend on anything outside its two
@@ -24,7 +26,7 @@ package es
 // C and E are sealed interfaces (proto oneof containers); see the codec.
 type Decider[S, C, E any] struct {
 	Initial    func() S
-	Decide     func(state S, cmd C) (events []E, err error)
+	Decide     func(state S, cmd C) (events []E, constraints []ConstraintOp, err error)
 	Evolve     func(state S, event E) S
 	IsTerminal func(state S) bool
 }
