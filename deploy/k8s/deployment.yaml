@@ -58,7 +58,9 @@ spec:
             - { name: BACKEND, value: postgres }
             - { name: AUTO_MIGRATE, value: "false" } # migrations run in the init container
             - { name: NATS_URL, value: "nats://nats.svc:4222" }
-            - { name: NATS_SUBJECT_PREFIX, value: "svc.eslite" } # per-shard/region knob
+            # <prefix>.<ws>.<method>; region in the prefix per cell (ADR 0005). One
+            # es-lited per region on its own prefix — data residency is a deploy.
+            - { name: NATS_SUBJECT_PREFIX, value: "svc.eslite.eu" }
             - { name: HEALTH_ADDR, value: ":8080" }
             # PG_DSN: prefer the OpenBao Agent template above. Fallback to a
             # Secret for non-OpenBao environments:

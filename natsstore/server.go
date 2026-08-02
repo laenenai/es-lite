@@ -3,6 +3,8 @@ package natsstore
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/nats-io/nats.go"
 
@@ -92,7 +94,10 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 		{mCurrentVersion, s.handleCurrentVersion},
 	}
 	for _, e := range endpoints {
-		if err := svc.Endpoint(e.method, s.prefix+"."+e.method, e.handler); err != nil {
+		// Subscribe on a workspace wildcard: subjects are
+		// <prefix>.<ws>.<method> (architecture ADR 0005), and the handler
+		// derives the workspace from the actual subject.
+		if err := svc.Endpoint(e.method, s.prefix+".*."+e.method, e.handler); err != nil {
 			_ = svc.Stop()
 			return err
 		}
@@ -101,13 +106,30 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 	return svc.Stop()
 }
 
-// resolveWorkspace prefers the authenticated workspace from ctx; otherwise it
-// falls back to the client-supplied value (dev/tests).
-func (s *Server) resolveWorkspace(ctx context.Context, reqWorkspace string) string {
-	if ws, ok := WorkspaceFrom(ctx); ok {
-		return ws
+// resolveWorkspace derives the workspace from the message SUBJECT (the token
+// before the method), and cross-checks it against the authenticated workspace
+// (architecture ADR 0005 §D). Auth is authoritative: when an authenticated ws
+// is present in ctx (set by an identity/Tenant middleware, e.g. natsauthd), a
+// subject that names a different ws is REJECTED fail-closed — never silently
+// trusted, never silently fallen back. When no auth ws is present (pre-callout
+// dev/tests), the subject ws is used; production must wire the auth middleware.
+// The service never reads a workspace from the request body.
+func (s *Server) resolveWorkspace(ctx context.Context, subject string) (string, error) {
+	toks := strings.Split(subject, ".")
+	if len(toks) < 3 {
+		return "", fmt.Errorf("subject %q has no workspace token", subject)
 	}
-	return reqWorkspace
+	subjectWS := toks[len(toks)-2]
+	if subjectWS == "" || subjectWS == "*" || subjectWS == ">" {
+		return "", fmt.Errorf("subject %q has an invalid workspace token", subject)
+	}
+	if authWS, ok := WorkspaceFrom(ctx); ok {
+		if authWS != subjectWS {
+			return "", fmt.Errorf("workspace mismatch: subject=%q auth=%q (fail-closed)", subjectWS, authWS)
+		}
+		return authWS, nil // authenticated ws is authoritative
+	}
+	return subjectWS, nil
 }
 
 func (s *Server) handleAppend(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
@@ -119,7 +141,11 @@ func (s *Server) handleAppend(ctx context.Context, m natskit.MsgContext) ([]byte
 	if err != nil {
 		return json.Marshal(appendResp{ErrKind: "invalid_stream", ErrMsg: err.Error()})
 	}
-	res, err := s.scope(s.resolveWorkspace(ctx, req.Workspace)).Append(ctx, es.AppendParams{
+	ws, err := s.resolveWorkspace(ctx, m.Subject)
+	if err != nil {
+		return json.Marshal(appendResp{ErrKind: "workspace", ErrMsg: err.Error()})
+	}
+	res, err := s.scope(ws).Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: req.ExpectedVersion,
 		Events:          fromEventDataWire(req.Events),
@@ -148,7 +174,11 @@ func (s *Server) handleReadStream(ctx context.Context, m natskit.MsgContext) ([]
 	if err != nil {
 		return json.Marshal(readResp{ErrKind: "invalid_stream", ErrMsg: err.Error()})
 	}
-	store := s.scope(s.resolveWorkspace(ctx, req.Workspace))
+	ws, err := s.resolveWorkspace(ctx, m.Subject)
+	if err != nil {
+		return json.Marshal(readResp{ErrKind: "workspace", ErrMsg: err.Error()})
+	}
+	store := s.scope(ws)
 	var envs []es.Envelope
 	if req.AsOf != "" {
 		envs, err = store.ReadStreamAsOf(ctx, sid, parseTS(req.AsOf))
@@ -168,7 +198,11 @@ func (s *Server) handleReadAll(ctx context.Context, m natskit.MsgContext) ([]byt
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(readResp{ErrKind: "internal", ErrMsg: err.Error()})
 	}
-	envs, err := s.scope(s.resolveWorkspace(ctx, req.Workspace)).ReadAll(ctx, req.FromPosition, req.Limit)
+	ws, err := s.resolveWorkspace(ctx, m.Subject)
+	if err != nil {
+		return json.Marshal(readResp{ErrKind: "workspace", ErrMsg: err.Error()})
+	}
+	envs, err := s.scope(ws).ReadAll(ctx, req.FromPosition, req.Limit)
 	kind, msg := errKind(err)
 	resp := readResp{ErrKind: kind, ErrMsg: msg}
 	if err == nil {
@@ -186,7 +220,11 @@ func (s *Server) handleCurrentVersion(ctx context.Context, m natskit.MsgContext)
 	if err != nil {
 		return json.Marshal(versionResp{ErrKind: "invalid_stream", ErrMsg: err.Error()})
 	}
-	v, err := s.scope(s.resolveWorkspace(ctx, req.Workspace)).CurrentStreamVersion(ctx, sid)
+	ws, err := s.resolveWorkspace(ctx, m.Subject)
+	if err != nil {
+		return json.Marshal(versionResp{ErrKind: "workspace", ErrMsg: err.Error()})
+	}
+	v, err := s.scope(ws).CurrentStreamVersion(ctx, sid)
 	kind, msg := errKind(err)
 	return json.Marshal(versionResp{ErrKind: kind, ErrMsg: msg, Version: v})
 }

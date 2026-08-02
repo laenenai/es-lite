@@ -67,15 +67,25 @@ non-PII, `shred.MAC` for PII) and sends it in the constraint op; the
 server enforces the `UNIQUE` index on opaque bytes without knowing the
 plaintext. The design choice made in ADR 0008 pays off precisely here.
 
-### Workspace comes from NATS auth, not the client
+### Workspace comes from the subject (validated against auth), not the body
 
-Even though payloads are opaque, the server scopes every operation to the
-**authenticated** identity's workspace (RLS, ADR 0004) — never a
-client-supplied field. Ciphertext is useless without keys, but it is not
-handed across workspaces. The server still sees metadata (stream ids,
+Per the platform's subject-addressing decision (architecture ADR 0005),
+subjects are `svc.eslite.<region>.<ws>.<method>`. The server subscribes on a
+**ws-wildcard** (`svc.eslite.<region>.*.<method>`) and derives the workspace
+from the subject — the request body carries **no** workspace field. When an
+authenticated workspace is present in context (set by an identity/Tenant
+middleware / `natsauthd`), the subject ws is **cross-checked** against it and a
+mismatch is **rejected fail-closed** (ADR 0005 §D) — never silently trusted or
+fallen back. Region is present in the prefix from day 1 (single-valued today);
+adding a region is deploying another instance on a new prefix, not a subject
+migration (ADR 0005 §B). `ws` in the subject is a routing/scoping token, not an
+authorization one (authorization is the authenticated principal + RLS scope);
+it also unlocks broker-enforced per-ws ACLs, canary/A-B, and taps (§C).
+
+Even so, payloads are opaque, and the server still sees metadata (stream ids,
 workspace, actor, correlation, **type URLs**, timestamps, claim *scopes*):
-zero-knowledge on payload, not on shape. The client↔server hop therefore
-runs over **mTLS** to protect that metadata in transit.
+zero-knowledge on payload, not on shape. The client↔server hop therefore runs
+over **mTLS** to protect that metadata in transit.
 
 ### The embeddable library stays first-class
 

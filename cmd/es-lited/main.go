@@ -92,12 +92,13 @@ func main() {
 	}()
 	log.Printf("es-lited: health probe on %s/healthz", healthAddr)
 
-	// Subject prefix — also the shard/region routing knob (ADR 0009): run
-	// one es-lited per shard on its own prefix (e.g. svc.eslite.eu), and
-	// clients target the matching prefix.
+	// Subject prefix carries the region from day 1 (architecture ADR 0005 §B):
+	// subjects are <prefix>.<ws>.<method>, so the prefix is svc.eslite.<region>.
+	// It is also the shard/region routing knob (ADR 0009) — run one es-lited
+	// per region on its own prefix; clients target the matching prefix.
 	prefix := os.Getenv("NATS_SUBJECT_PREFIX")
 	if prefix == "" {
-		prefix = natsstore.DefaultPrefix
+		prefix = natsstore.DefaultPrefix + ".local" // default local region
 	}
 	srv := natsstore.NewServer(scope, natsstore.WithServerPrefix(prefix))
 	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",

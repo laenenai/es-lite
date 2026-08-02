@@ -65,8 +65,9 @@ type envelopeWire struct {
 	Payload        []byte `json:"payload"`
 }
 
+// Request structs carry NO workspace field: the workspace is the subject's
+// <ws> token (architecture ADR 0005), cross-checked against auth server-side.
 type appendReq struct {
-	Workspace       string           `json:"workspace"`
 	StreamType      string           `json:"stream_type"`
 	StreamID        string           `json:"stream_id"`
 	ExpectedVersion uint64           `json:"expected_version"`
@@ -89,7 +90,6 @@ type appendResp struct {
 }
 
 type readStreamReq struct {
-	Workspace   string `json:"workspace"`
 	StreamType  string `json:"stream_type"`
 	StreamID    string `json:"stream_id"`
 	FromVersion uint64 `json:"from_version"`
@@ -98,13 +98,11 @@ type readStreamReq struct {
 }
 
 type readAllReq struct {
-	Workspace    string `json:"workspace"`
 	FromPosition uint64 `json:"from_position"`
 	Limit        int    `json:"limit"`
 }
 
 type currentVersionReq struct {
-	Workspace  string `json:"workspace"`
 	StreamType string `json:"stream_type"`
 	StreamID   string `json:"stream_id"`
 }

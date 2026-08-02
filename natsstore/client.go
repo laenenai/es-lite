@@ -60,7 +60,9 @@ func (cs *clientStore) request(ctx context.Context, method string, req, resp any
 		ctx, cancel = context.WithTimeout(ctx, cs.c.timeout)
 		defer cancel()
 	}
-	msg, err := cs.c.nc.RequestWithContext(ctx, cs.c.prefix+"."+method, b)
+	// Subject carries the workspace: <prefix>.<ws>.<method> (architecture
+	// ADR 0005). The server derives the workspace from the subject.
+	msg, err := cs.c.nc.RequestWithContext(ctx, cs.c.prefix+"."+cs.ws+"."+method, b)
 	if err != nil {
 		return fmt.Errorf("natsstore: request %s: %w", method, err)
 	}
@@ -69,7 +71,6 @@ func (cs *clientStore) request(ctx context.Context, method string, req, resp any
 
 func (cs *clientStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResult, error) {
 	req := appendReq{
-		Workspace:       cs.ws,
 		StreamType:      p.StreamID.Type,
 		StreamID:        p.StreamID.ID,
 		ExpectedVersion: p.ExpectedVersion,
@@ -98,20 +99,20 @@ func (cs *clientStore) Append(ctx context.Context, p es.AppendParams) (es.Append
 
 func (cs *clientStore) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	return cs.read(ctx, mReadStream, readStreamReq{
-		Workspace: cs.ws, StreamType: sid.Type, StreamID: sid.ID,
+		StreamType: sid.Type, StreamID: sid.ID,
 		FromVersion: fromVersion, ToVersion: toVersion,
 	})
 }
 
 func (cs *clientStore) ReadStreamAsOf(ctx context.Context, sid es.StreamID, asOf time.Time) ([]es.Envelope, error) {
 	return cs.read(ctx, mReadStreamAsOf, readStreamReq{
-		Workspace: cs.ws, StreamType: sid.Type, StreamID: sid.ID, AsOf: fmtTS(asOf),
+		StreamType: sid.Type, StreamID: sid.ID, AsOf: fmtTS(asOf),
 	})
 }
 
 func (cs *clientStore) ReadAll(ctx context.Context, fromPosition uint64, limit int) ([]es.Envelope, error) {
 	var resp readResp
-	if err := cs.request(ctx, mReadAll, readAllReq{Workspace: cs.ws, FromPosition: fromPosition, Limit: limit}, &resp); err != nil {
+	if err := cs.request(ctx, mReadAll, readAllReq{FromPosition: fromPosition, Limit: limit}, &resp); err != nil {
 		return nil, err
 	}
 	if resp.ErrKind != "" {
@@ -122,7 +123,7 @@ func (cs *clientStore) ReadAll(ctx context.Context, fromPosition uint64, limit i
 
 func (cs *clientStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint64, error) {
 	var resp versionResp
-	if err := cs.request(ctx, mCurrentVersion, currentVersionReq{Workspace: cs.ws, StreamType: sid.Type, StreamID: sid.ID}, &resp); err != nil {
+	if err := cs.request(ctx, mCurrentVersion, currentVersionReq{StreamType: sid.Type, StreamID: sid.ID}, &resp); err != nil {
 		return 0, err
 	}
 	if resp.ErrKind != "" {
