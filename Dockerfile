@@ -26,12 +26,15 @@ RUN --mount=type=secret,id=go_modules_token \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/es-lited ./cmd/es-lited && \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/es-migrate ./cmd/es-migrate
+    go build -trimpath -ldflags="-s -w" -o /out/es-migrate ./cmd/es-migrate && \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/es-relayd ./cmd/es-relayd
 
 FROM gcr.io/distroless/static-debian12:nonroot
-# es-migrate (init container / deploy step) + es-lited (the service).
+# es-lited (service) + es-migrate (init container) + es-relayd (relay).
 COPY --from=build /out/es-lited /es-lited
 COPY --from=build /out/es-migrate /es-migrate
+COPY --from=build /out/es-relayd /es-relayd
 # NATS req/reply service (no inbound port); 8080 is the kubelet health probe.
 EXPOSE 8080
 USER nonroot:nonroot

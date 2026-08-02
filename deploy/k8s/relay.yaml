@@ -1,0 +1,52 @@
+# es-relayd — the delivery relay (ADR 0003): drains Postgres -> JetStream.
+# Run as a SINGLETON (replicas: 1). It publishes ciphertext (zero-knowledge,
+# holds no keys); idempotent publish (Nats-Msg-Id=global_position) makes an
+# accidental double-run safe, but one is enough. For HA, add leader election
+# (a K8s Lease) rather than raising replicas. Same image, /es-relayd entrypoint.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-relayd
+  labels: { app: es-relayd }
+spec:
+  replicas: 1 # singleton — do NOT scale on lag by raising this; see note above
+  strategy: { type: Recreate } # never two relays during a rollout
+  selector:
+    matchLabels: { app: es-relayd }
+  template:
+    metadata:
+      labels: { app: es-relayd }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: es-relayd
+          image: ghcr.io/laenenai/es-lited:latest # replace (same image as es-lited)
+          command: ["/es-relayd"]
+          env:
+            - { name: NATS_URL, value: "nats://nats.svc:4222" }
+            - { name: ES_STREAM, value: "ES_EVENTS" }
+            - { name: HEALTH_ADDR, value: ":8080" }
+            - name: PG_DSN
+              valueFrom:
+                secretKeyRef: { name: es-lited-pg, key: dsn }
+          ports:
+            - { name: health, containerPort: 8080 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

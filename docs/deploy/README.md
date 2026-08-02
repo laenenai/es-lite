@@ -83,6 +83,20 @@ Two caveats:
    adding pods. Latency-based HPA is self-correcting: if latency stops
    improving as pods are added, you have hit the DB ceiling.
 
+## Delivery relay (es-relayd)
+
+`es-lited` serves reads/writes; **`es-relayd`** publishes the log to JetStream
+(ADR 0003). It drains Postgres and publishes each event with
+`Nats-Msg-Id = global_position` (dedup). It is **zero-knowledge** — no keys, so
+it publishes **ciphertext**; crypto-capable projections decrypt. Run it as a
+**singleton** (`deploy/k8s/relay.yaml`, `replicas: 1`, `strategy: Recreate`) —
+do **not** scale it by raising replicas; for HA add leader election (a K8s
+`Lease`). Same image, `/es-relayd` entrypoint. Config: `PG_DSN`, `NATS_URL`,
+`ES_STREAM` (default `ES_EVENTS`), `ES_BATCH`, `HEALTH_ADDR`.
+
+Downstream **projection consumers** are the pieces you *do* autoscale — on
+JetStream `num_pending` (see the autoscaling section).
+
 ## Sharding, regions, and data residency
 
 `NATS_SUBJECT_PREFIX` is the routing knob. Run one es-lited (+ its Postgres,
