@@ -86,6 +86,41 @@ loosely-coupled services use the **NATS client**. A service can move
 between the two as a one-line wiring change. Not everything routes through
 NATS.
 
+### Sharding, data residency, and read tiers
+
+The `Scoper` (`workspace → es.Store`) is also the **routing seam**, and it
+serves three purposes with one mechanism:
+
+- **Horizontal scale past one Postgres.** When 100k workspaces outgrow a
+  single cluster (ADR 0004 assumed one DB), route workspaces to different
+  physical backends — server-side via a sharding `Scoper` (clients stay
+  thin), or at the NATS layer via a shard segment in the subject
+  (`svc.eslite.<shard>.*`) with one Server per shard. **Shard by
+  workspace, never by aggregate:** `global_position` and `unique_claims`
+  are per-store, so a workspace must stay whole in one shard or its
+  uniqueness and per-workspace ordering break. "Global" position is
+  therefore per-shard, not cross-shard — fine, since per-stream and
+  per-workspace order is what matters.
+
+- **Data residency.** Residency is region-pinned sharding, where the shard
+  is a self-contained **regional cell**: Postgres + OpenBao + the NATS
+  domain (event stream, KV) + read models, all in-region. A workspace is
+  created in a region and routed to its home cell. Because a workspace
+  never spans cells, uniqueness, ordering, and crypto-shred erasure are
+  region-local by construction. Zero-knowledge helps here: payloads are
+  ciphertext everywhere, so residency scope narrows to metadata and keys
+  (which stay in the cell) rather than the sensitive content.
+
+- **Read tiers (bounded staleness).** The snapshot carries its as-of
+  version and time, so reads have two consistencies: a **strong read**
+  (snapshot@vN + fold the tail from the eventstore — current, costs the
+  read hop) and a **bounded-staleness read** (if the cached snapshot is
+  within the caller's tolerance, e.g. ≤5 min, return it as-is and skip the
+  eventstore — zero hops, straight from KV). It is safe because the
+  snapshot is a pure cache, so staleness is an explicit per-read opt-in;
+  the KV TTL sets the maximum staleness and the per-read tolerance is
+  chosen ≤ that.
+
 ### Network hops, and the NATS-KV snapshot cache that mitigates them
 
 A command folds state (a read) then appends — ~**2 NATS round-trips**,

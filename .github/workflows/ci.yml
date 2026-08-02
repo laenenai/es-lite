@@ -29,3 +29,4 @@ jobs:
       - run: task test:nats
       - run: task test:openbao
       - run: task test:pipeline
+      - run: task test:zeroknowledge
