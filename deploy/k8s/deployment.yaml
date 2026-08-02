@@ -29,6 +29,11 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        # 65532 = distroless 'nonroot' UID. The image sets USER by name, which
+        # kubelet cannot verify against runAsNonRoot without a numeric UID
+        # (else: CreateContainerConfigError).
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: es-lited
