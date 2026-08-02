@@ -11,9 +11,11 @@ horizontally.
 
 **Image publishing.** CI publishes `ghcr.io/laenenai/es-lited` **only on version
 tags** (`release.yml`, multi-arch amd64/arm64), so GHCR gets one image per
-release — not per commit. A weekly retention job (`ghcr-cleanup.yml`) prunes
-untagged orphans and caps retained versions, keeping GHCR small (and cheap).
-Manual push: `IMAGE=ghcr.io/laenenai/es-lited:vX task docker:push`.
+release — not per commit. GHCR **retention is org-wide and central**: a weekly
+job in `laenen-infra` (`.github/workflows/ghcr-retention.yml`) prunes untagged
+orphans and caps retained versions across all `laenenai` packages — es-lite
+carries no cleanup workflow of its own. Manual push:
+`IMAGE=ghcr.io/laenenai/es-lited:vX task docker:push`.
 - Design: [ADR 0009](../adr/0009-nats-eventstore-service.md),
   [ADR 0002](../adr/0002-deployment-topology-and-delivery.md).
 
