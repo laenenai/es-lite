@@ -289,7 +289,8 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 ## Status
 
 Broad and integration-tested against real infrastructure (Postgres 17, NATS 2.10
-+ JetStream, OpenBao 2.6.1). Pre-1.0: the API may still shift. Full
-authorization *enforcement* depends on the mesh's `natsauthd` callout (the
-subject cross-check and RLS scoping are in place and ready). See
++ JetStream, OpenBao 2.6.1). Identity is wired through **natskit v0.3.0**
+(`Tenant` + `RequireSubjectWorkspace`), so the authoritative workspace comes
+from the `natsauthd`-scoped subject and the subject cross-check is enforced
+fail-closed. Pre-1.0: the API may still shift. See
 [Status in each ADR](./docs/adr/README.md) for what is implemented vs. designed.

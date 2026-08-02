@@ -66,6 +66,11 @@ func (cs *clientStore) request(ctx context.Context, method string, req, resp any
 	if err != nil {
 		return fmt.Errorf("natsstore: request %s: %w", method, err)
 	}
+	// A NATS Micro error (e.g. the fail-closed identity/tenant middleware
+	// rejecting the request) rides in headers with no body.
+	if e := msg.Header.Get("Nats-Service-Error"); e != "" {
+		return fmt.Errorf("natsstore: %s (%s)", e, msg.Header.Get("Nats-Service-Error-Code"))
+	}
 	return json.Unmarshal(msg.Data, resp)
 }
 

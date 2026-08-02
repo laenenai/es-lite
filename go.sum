@@ -40,6 +40,8 @@ github.com/klauspost/compress v1.19.0 h1:sXLILfc9jV2QYWkzFOPWStmcUVH2RHEB1JCdY2o
 github.com/klauspost/compress v1.19.0/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/laenenai/natskit v0.2.0 h1:eVzsJDtF0PD62ei9qsWcfbTWCg9hYpjW5vFoOxQTS5A=
 github.com/laenenai/natskit v0.2.0/go.mod h1:QfYVMA+22LlRAQqxDOAOaj+/zJ2dRMHAhbL2Vjdcu7k=
+github.com/laenenai/natskit v0.3.0 h1:+sCbSiRDthpYKVHPjHs88HLv79pqY2LM2bOzgddYQfU=
+github.com/laenenai/natskit v0.3.0/go.mod h1:QfYVMA+22LlRAQqxDOAOaj+/zJ2dRMHAhbL2Vjdcu7k=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/minio/highwayhash v1.0.4 h1:asJizugGgchQod2ja9NJlGOWq4s7KsAWr5XUc9Clgl4=

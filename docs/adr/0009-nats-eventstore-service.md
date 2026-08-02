@@ -82,6 +82,17 @@ migration (ADR 0005 §B). `ws` in the subject is a routing/scoping token, not an
 authorization one (authorization is the authenticated principal + RLS scope);
 it also unlocks broker-enforced per-ws ACLs, canary/A-B, and taps (§C).
 
+**Implemented via natskit v0.3.0's identity middleware** (`Tenant` +
+`RequireSubjectWorkspace`), which `natsstore.Server` installs. The default
+`IdentityExtractor` reads the workspace from the subject's ws token — trusted
+because `natsauthd` scopes the connection's creds to that workspace's subtree —
+and `RequireSubjectWorkspace` re-checks subject == identity fail-closed.
+Edge/callout-stamped-header deployments pass
+`natsstore.WithIdentity(natskit.HeaderIdentity("X-Workspace", …))`. es-lite
+holds no workspace context key of its own; `natskit.WorkspaceFrom` is the
+authoritative source, and `natskit.AuthorizePDP` / `Audit` can be added as
+further middleware.
+
 Even so, payloads are opaque, and the server still sees metadata (stream ids,
 workspace, actor, correlation, **type URLs**, timestamps, claim *scopes*):
 zero-knowledge on payload, not on shape. The client↔server hop therefore runs
