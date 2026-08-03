@@ -26,6 +26,7 @@ const (
 	mReadStreamAsOf = "read_stream_asof"
 	mReadAll        = "read_all"
 	mCurrentVersion = "current_version"
+	mLookupClaim    = "lookup_claim"
 
 	defaultTimeout = 5 * time.Second
 )
@@ -105,6 +106,19 @@ type readAllReq struct {
 type currentVersionReq struct {
 	StreamType string `json:"stream_type"`
 	StreamID   string `json:"stream_id"`
+}
+
+type lookupClaimReq struct {
+	Scope string `json:"scope"`
+	Value string `json:"value"` // opaque key (client may have HMAC'd PII)
+	PII   bool   `json:"pii"`
+}
+
+type lookupClaimResp struct {
+	ErrKind  string `json:"err_kind,omitempty"`
+	ErrMsg   string `json:"err_msg,omitempty"`
+	StreamID string `json:"stream_id"`
+	Found    bool   `json:"found"`
 }
 
 type readResp struct {

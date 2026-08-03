@@ -20,6 +20,35 @@ func openClaimsStore(t *testing.T) *sqlite.Store {
 	return s
 }
 
+func TestLookupClaim(t *testing.T) {
+	s := openClaimsStore(t)
+	ctx := context.Background()
+	want, _ := es.NewStreamID("thing", "u1")
+
+	if err := appendWith(t, s, "u1", 0, es.Claim("user.identity", "idp|sub-1", false)); err != nil {
+		t.Fatal(err)
+	}
+	// held claim → resolves to the claiming stream
+	got, ok, err := s.LookupClaim(ctx, "user.identity", "idp|sub-1", false)
+	if err != nil || !ok {
+		t.Fatalf("lookup held: ok=%v err=%v", ok, err)
+	}
+	if got != want.Canonical() {
+		t.Fatalf("stream=%q want %q", got, want.Canonical())
+	}
+	// unknown value → not found, no error
+	if _, ok, err := s.LookupClaim(ctx, "user.identity", "idp|missing", false); ok || err != nil {
+		t.Fatalf("missing: ok=%v err=%v", ok, err)
+	}
+	// released claim → no longer found
+	if err := appendWith(t, s, "u1", 1, es.Release("user.identity", "idp|sub-1", false)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.LookupClaim(ctx, "user.identity", "idp|sub-1", false); ok {
+		t.Fatal("released claim still resolves")
+	}
+}
+
 // appendWith writes one dummy event plus the given constraints to a stream.
 func appendWith(t *testing.T, s *sqlite.Store, streamID string, expected uint64, ops ...es.ConstraintOp) error {
 	t.Helper()

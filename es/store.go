@@ -44,6 +44,18 @@ type Store interface {
 	// CurrentStreamVersion returns the highest committed version for a
 	// stream, or 0 if the stream has no events.
 	CurrentStreamVersion(ctx context.Context, sid StreamID) (uint64, error)
+
+	// LookupClaim returns the stream that currently holds the uniqueness
+	// claim (scope, value) — the reverse of Claim. `value` and `pii` are the
+	// same as passed to Claim; the store keys the value identically, so a PII
+	// claim is looked up by the same keyed HMAC. `found` is false when no
+	// stream holds it (never claimed, or since released).
+	//
+	// This exposes the uniqueness index as a read: any aggregate that Claims a
+	// value gets reverse lookup (e.g. external-identity → user_id) with
+	// read-your-writes consistency, since the claim commits in the append
+	// transaction — no separate, eventually-consistent projection needed.
+	LookupClaim(ctx context.Context, scope, value string, pii bool) (streamID string, found bool, err error)
 }
 
 // AppendParams is the input to Store.Append. The audit/causality fields

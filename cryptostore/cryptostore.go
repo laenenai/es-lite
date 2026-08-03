@@ -110,6 +110,20 @@ func (s *Store) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint
 	return s.inner.CurrentStreamVersion(ctx, sid)
 }
 
+// LookupClaim keys a PII value the same way Append does (HMAC → opaque
+// value_key, PII cleared) before forwarding, so the inner store matches what it
+// stored. Non-PII values pass through unchanged.
+func (s *Store) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
+	if pii {
+		mac, err := s.shredder.MAC(ctx, s.ws, []byte(value))
+		if err != nil {
+			return "", false, err
+		}
+		value = base64.RawStdEncoding.EncodeToString(mac)
+	}
+	return s.inner.LookupClaim(ctx, scope, value, false)
+}
+
 // decryptAll decrypts each envelope's payload in place. It fetches the read
 // cipher only when there is something to decrypt, so an empty result needs no
 // key and a shredded workspace surfaces keystore.ErrShredded.

@@ -114,6 +114,7 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 		{mReadStreamAsOf, s.handleReadStream}, // dispatched by AsOf on the request
 		{mReadAll, s.handleReadAll},
 		{mCurrentVersion, s.handleCurrentVersion},
+		{mLookupClaim, s.handleLookupClaim},
 	}
 	for _, e := range endpoints {
 		// Subscribe on a workspace wildcard: subjects are
@@ -212,4 +213,14 @@ func (s *Server) handleCurrentVersion(ctx context.Context, m natskit.MsgContext)
 	v, err := s.scope(natskit.WorkspaceFrom(ctx)).CurrentStreamVersion(ctx, sid)
 	kind, msg := errKind(err)
 	return json.Marshal(versionResp{ErrKind: kind, ErrMsg: msg, Version: v})
+}
+
+func (s *Server) handleLookupClaim(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
+	var req lookupClaimReq
+	if err := json.Unmarshal(m.Data, &req); err != nil {
+		return json.Marshal(lookupClaimResp{ErrKind: "internal", ErrMsg: err.Error()})
+	}
+	streamID, found, err := s.scope(natskit.WorkspaceFrom(ctx)).LookupClaim(ctx, req.Scope, req.Value, req.PII)
+	kind, msg := errKind(err)
+	return json.Marshal(lookupClaimResp{ErrKind: kind, ErrMsg: msg, StreamID: streamID, Found: found})
 }

@@ -137,6 +137,17 @@ func (cs *clientStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID
 	return resp.Version, nil
 }
 
+func (cs *clientStore) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
+	var resp lookupClaimResp
+	if err := cs.request(ctx, mLookupClaim, lookupClaimReq{Scope: scope, Value: value, PII: pii}, &resp); err != nil {
+		return "", false, err
+	}
+	if resp.ErrKind != "" {
+		return "", false, errFromKind(resp.ErrKind, resp.ErrMsg)
+	}
+	return resp.StreamID, resp.Found, nil
+}
+
 func (cs *clientStore) read(ctx context.Context, method string, req readStreamReq) ([]es.Envelope, error) {
 	var resp readResp
 	if err := cs.request(ctx, method, req, &resp); err != nil {

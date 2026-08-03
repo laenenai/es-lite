@@ -328,6 +328,24 @@ func (s *Store) ReadAll(ctx context.Context, fromPosition uint64, limit int) ([]
 }
 
 // CurrentStreamVersion implements es.Store.
+// LookupClaim reads the uniqueness index for the stream holding (scope, value).
+// SQLite is single-workspace with plaintext value_keys (no keystore), so pii is
+// irrelevant to the stored key — matching applyClaims.
+func (s *Store) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
+	var streamID string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT stream_id FROM unique_claims WHERE scope = ? AND value_key = ?`,
+		scope, []byte(value),
+	).Scan(&streamID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return streamID, true, nil
+}
+
 func (s *Store) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint64, error) {
 	if err := sid.Validate(); err != nil {
 		return 0, err

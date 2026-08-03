@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -242,6 +243,37 @@ func (w *wsStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (ui
 		w.ws, sid.Canonical(),
 	).Scan(&v)
 	return v, err
+}
+
+// LookupClaim reads the uniqueness index (unique_claims) for the stream holding
+// (scope, value). The value is keyed exactly as applyClaims stores it (HMAC for
+// PII when a keystore is present, plaintext otherwise), so writes and lookups
+// agree regardless of deployment.
+func (w *wsStore) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return "", false, err
+	}
+	vk, err := w.valueKey(ctx, es.ConstraintOp{Op: es.ClaimOp, Scope: scope, Value: value, PII: pii})
+	if err != nil {
+		return "", false, err
+	}
+	var streamID string
+	err = tx.QueryRow(ctx,
+		`SELECT stream_id FROM unique_claims WHERE workspace_id = $1 AND scope = $2 AND value_key = $3`,
+		w.ws, scope, vk,
+	).Scan(&streamID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return streamID, true, nil
 }
 
 // query runs a workspace-scoped read: a transaction with the RLS variable
