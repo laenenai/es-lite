@@ -3,8 +3,10 @@ package shred_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/laenenai/es-lite/internal/memdek"
 	"github.com/laenenai/es-lite/keystore"
 	kmem "github.com/laenenai/es-lite/keystore/memory"
 	"github.com/laenenai/es-lite/shred"
@@ -12,7 +14,7 @@ import (
 
 func TestRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	s := shred.New(kmem.New(), shred.NewMemDEKStore())
+	s := shred.New(kmem.New(), memdek.New())
 
 	c, err := s.Cipher(ctx, "ws_1")
 	if err != nil {
@@ -40,7 +42,7 @@ func TestRoundTrip(t *testing.T) {
 func TestUnwrapAfterColdCache(t *testing.T) {
 	ctx := context.Background()
 	ks := kmem.New()
-	deks := shred.NewMemDEKStore()
+	deks := memdek.New()
 
 	warm := shred.New(ks, deks)
 	c, _ := warm.Cipher(ctx, "ws_1")
@@ -63,7 +65,7 @@ func TestUnwrapAfterColdCache(t *testing.T) {
 func TestForgetShreds(t *testing.T) {
 	ctx := context.Background()
 	ks := kmem.New()
-	deks := shred.NewMemDEKStore()
+	deks := memdek.New()
 	s := shred.New(ks, deks)
 
 	c, _ := s.Cipher(ctx, "ws_1")
@@ -100,7 +102,7 @@ func TestForgetShreds(t *testing.T) {
 // Workspaces are isolated: ws_2's cipher cannot open ws_1's ciphertext.
 func TestWorkspaceIsolation(t *testing.T) {
 	ctx := context.Background()
-	s := shred.New(kmem.New(), shred.NewMemDEKStore())
+	s := shred.New(kmem.New(), memdek.New())
 
 	c1, _ := s.Cipher(ctx, "ws_1")
 	blob, _ := c1.Encrypt([]byte("ws1 data"))
@@ -108,5 +110,61 @@ func TestWorkspaceIsolation(t *testing.T) {
 	c2, _ := s.Cipher(ctx, "ws_2")
 	if _, err := c2.Decrypt(blob); err == nil {
 		t.Fatal("ws_2 decrypted ws_1 ciphertext")
+	}
+}
+
+// A first-write race must never lose data (2026-08-05 review C6). Many goroutines write a
+// brand-new workspace at once; each mints a DEK, but SaveWrappedDEK is insert-if-absent so
+// only one is persisted. Every writer must converge on the PERSISTED key — otherwise a
+// writer that lost the race encrypts under a key that was never stored, and its ciphertext
+// is permanently unrecoverable. We prove convergence by decrypting every writer's ciphertext
+// with a COLD reader, which holds only the persisted DEK. Run with -race.
+func TestFirstWriteRaceConverges(t *testing.T) {
+	ctx := context.Background()
+	ks := kmem.New()
+	deks := memdek.New()
+	s := shred.New(ks, deks)
+
+	const n = 32
+	var wg sync.WaitGroup
+	blobs := make([][]byte, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all goroutines together to maximise first-write contention
+			c, err := s.WriteCipher(ctx, "ws_race")
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			blobs[i], errs[i] = c.Encrypt([]byte("payload"))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("writer %d: %v", i, err)
+		}
+	}
+
+	// Cold reader: fresh cache, so it can only use the persisted DEK. If any writer had
+	// used its own unpersisted DEK, its ciphertext fails to open here — that is the C6 bug.
+	cold := shred.New(ks, deks)
+	rc, err := cold.ReadCipher(ctx, "ws_race")
+	if err != nil {
+		t.Fatalf("cold read cipher: %v", err)
+	}
+	for i, blob := range blobs {
+		got, err := rc.Decrypt(blob)
+		if err != nil {
+			t.Fatalf("writer %d ciphertext undecryptable under the persisted DEK (data loss): %v", i, err)
+		}
+		if string(got) != "payload" {
+			t.Fatalf("writer %d: got %q", i, got)
+		}
 	}
 }

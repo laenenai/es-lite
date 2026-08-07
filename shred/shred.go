@@ -131,15 +131,30 @@ func (s *Shredder) dek(ctx context.Context, workspaceID string, provision bool) 
 		if !provision {
 			return nil, fmt.Errorf("%w: %s", keystore.ErrShredded, workspaceID)
 		}
-		// First write for this workspace: mint and persist a DEK.
-		plaintext, wrappedNew, kekVersion, err := s.ks.GenerateDEK(ctx, workspaceID)
-		if err != nil {
+		// First write for this workspace: mint a DEK and persist it. SaveWrappedDEK is
+		// insert-if-absent (ON CONFLICT (workspace_id) DO NOTHING), so under a concurrent
+		// first write another writer may already have persisted a DIFFERENT wrapped DEK.
+		// The PERSISTED bytes are the single source of truth: re-load and unwrap THOSE,
+		// never the just-minted plaintext — otherwise the writer that lost the race would
+		// encrypt every event under a key that was never stored, leaving that ciphertext
+		// permanently undecryptable. Whoever wins, all writers converge on the stored key.
+		// (The loser's minted DEK is simply discarded; a wasted mint, not lost data.)
+		if _, wrappedNew, kekVersion, err := s.ks.GenerateDEK(ctx, workspaceID); err != nil {
 			return nil, fmt.Errorf("shred: generate dek: %w", err)
-		}
-		if err := s.deks.SaveWrappedDEK(ctx, workspaceID, wrappedNew, kekVersion); err != nil {
+		} else if err := s.deks.SaveWrappedDEK(ctx, workspaceID, wrappedNew, kekVersion); err != nil {
 			return nil, fmt.Errorf("shred: save wrapped dek: %w", err)
 		}
-		dek = plaintext
+		persisted, pok, perr := s.deks.LoadWrappedDEK(ctx, workspaceID)
+		if perr != nil {
+			return nil, fmt.Errorf("shred: reload wrapped dek: %w", perr)
+		}
+		if !pok {
+			return nil, fmt.Errorf("shred: wrapped dek missing immediately after save: %s", workspaceID)
+		}
+		dek, err = s.ks.UnwrapDEK(ctx, workspaceID, persisted)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		dek, err = s.ks.UnwrapDEK(ctx, workspaceID, wrapped)
 		if err != nil {

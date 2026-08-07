@@ -15,6 +15,7 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
+	"github.com/laenenai/es-lite/internal/memdek"
 	kmem "github.com/laenenai/es-lite/keystore/memory"
 	"github.com/laenenai/es-lite/natsstore"
 	"github.com/laenenai/es-lite/postgres"
@@ -56,7 +57,7 @@ func TestZeroKnowledgeRoundTrip(t *testing.T) {
 	}
 	defer clientNC.Close()
 	client := natsstore.NewClient(clientNC)
-	shredder := shred.New(kmem.New(), shred.NewMemDEKStore())
+	shredder := shred.New(kmem.New(), memdek.New())
 	const ws = "wszk"
 	inner := client.Workspace(ws)
 	encStore := cryptostore.New(inner, shredder, ws)
