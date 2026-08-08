@@ -17,6 +17,7 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
+	"github.com/laenenai/es-lite/internal/memdek"
 	kmem "github.com/laenenai/es-lite/keystore/memory"
 	"github.com/laenenai/es-lite/shred"
 	"github.com/laenenai/es-lite/snapshot/natskv"
@@ -54,7 +55,7 @@ func TestSnapshotCache(t *testing.T) {
 
 	const ws = "wssnap"
 	bucket := "es_snap_" + suffix
-	shredder := shred.New(kmem.New(), shred.NewMemDEKStore())
+	shredder := shred.New(kmem.New(), memdek.New())
 	cache, err := natskv.New(ctx, js, shredder, ws, natskv.Config{Bucket: bucket, TTL: time.Hour})
 	if err != nil {
 		t.Fatalf("cache: %v", err)
