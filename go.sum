@@ -38,8 +38,8 @@ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo
 github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/klauspost/compress v1.19.0 h1:sXLILfc9jV2QYWkzFOPWStmcUVH2RHEB1JCdY2oVvCQ=
 github.com/klauspost/compress v1.19.0/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
-github.com/laenenai/natskit v0.7.0 h1:ZY0YAkCc5Q5P8lolydqhQLsPm9LFg7RSGy34B+RdeRo=
-github.com/laenenai/natskit v0.7.0/go.mod h1:JAoDvbP9cqN4X04C+5QU9AOhKydqaZqGDTV/j+LJLN8=
+github.com/laenenai/natskit v0.8.0 h1:wqG1fuSYPCPqVM0JXoih5nqD6947NtMfmGo6hfZe3po=
+github.com/laenenai/natskit v0.8.0/go.mod h1:JAoDvbP9cqN4X04C+5QU9AOhKydqaZqGDTV/j+LJLN8=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/minio/highwayhash v1.0.4 h1:asJizugGgchQod2ja9NJlGOWq4s7KsAWr5XUc9Clgl4=
