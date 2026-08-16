@@ -82,6 +82,11 @@ func main() {
 	}
 	defer closeStore()
 
+	// The backing store may also persist per-workspace WRAPPED DEKs (the postgres backend
+	// does — workspace_keys). Serving them lets a client-side Shredder store its opaque
+	// wrapped DEK next to the ciphertext, keeping es-lited zero-knowledge (ADR 0014 C).
+	deks, _ := drainer.(natsstore.WrappedDEKStore)
+
 	// Via natskit so TLS (NATS_CA / client cert) is applied uniformly (architecture ADR 0013).
 	nc, err := natskit.Connect("es-lited", natsURL, os.Getenv("NATS_CREDS"))
 	if err != nil {
@@ -143,6 +148,7 @@ func main() {
 
 	srv := natsstore.NewServer(scope,
 		natsstore.WithServerPrefix(prefix),
+		natsstore.WithWrappedDEKStore(deks), // nil for backends without one → RPCs not registered
 		natsstore.WithMiddleware(natsstore.ObservabilityMiddleware("es-lited")))
 	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",
 		natsURL, prefix, backend)

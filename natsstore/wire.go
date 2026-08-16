@@ -27,9 +27,34 @@ const (
 	mReadAll        = "read_all"
 	mCurrentVersion = "current_version"
 	mLookupClaim    = "lookup_claim"
+	// Wrapped-DEK store (architecture ADR 0014 C): the client encrypts with a per-workspace
+	// DEK and persists only its WRAPPED form here. es-lited stores it opaquely (it cannot
+	// unwrap without keyd + the KEK), so co-locating it with the ciphertext keeps es-lited
+	// zero-knowledge and gives crypto-shred-by-locality.
+	mLoadWrappedDEK   = "load_wrapped_dek"
+	mSaveWrappedDEK   = "save_wrapped_dek"
+	mDeleteWrappedDEK = "delete_wrapped_dek"
 
 	defaultTimeout = 5 * time.Second
 )
+
+type saveWrappedDEKReq struct {
+	Wrapped    []byte `json:"wrapped"`
+	KEKVersion int    `json:"kek_version"`
+}
+
+type loadWrappedDEKResp struct {
+	Wrapped []byte `json:"wrapped,omitempty"`
+	Found   bool   `json:"found"`
+	ErrKind string `json:"err_kind,omitempty"`
+	ErrMsg  string `json:"err_msg,omitempty"`
+}
+
+// errResp is the bare error envelope for methods that return only success/failure.
+type errResp struct {
+	ErrKind string `json:"err_kind,omitempty"`
+	ErrMsg  string `json:"err_msg,omitempty"`
+}
 
 // ---- wire messages (JSON; both ends are Go in model A) --------------------
 

@@ -43,6 +43,46 @@ func (c *Client) Workspace(workspace string) es.Store {
 	return &clientStore{c: c, ws: workspace}
 }
 
+// The Client also serves as a shred.WrappedDEKStore against a WithWrappedDEKStore-enabled
+// es-lited (architecture ADR 0014 C): a client-side Shredder persists the workspace's OPAQUE
+// wrapped DEK next to its ciphertext, and es-lited never unwraps it.
+
+// LoadWrappedDEK fetches a workspace's wrapped DEK (ok=false if none yet).
+func (c *Client) LoadWrappedDEK(ctx context.Context, workspace string) ([]byte, bool, error) {
+	var resp loadWrappedDEKResp
+	if err := (&clientStore{c: c, ws: workspace}).request(ctx, mLoadWrappedDEK, struct{}{}, &resp); err != nil {
+		return nil, false, err
+	}
+	if resp.ErrKind != "" {
+		return nil, false, errFromKind(resp.ErrKind, resp.ErrMsg)
+	}
+	return resp.Wrapped, resp.Found, nil
+}
+
+// SaveWrappedDEK persists a workspace's wrapped DEK (insert-if-absent server-side).
+func (c *Client) SaveWrappedDEK(ctx context.Context, workspace string, wrapped []byte, kekVersion int) error {
+	var resp errResp
+	if err := (&clientStore{c: c, ws: workspace}).request(ctx, mSaveWrappedDEK, saveWrappedDEKReq{Wrapped: wrapped, KEKVersion: kekVersion}, &resp); err != nil {
+		return err
+	}
+	if resp.ErrKind != "" {
+		return errFromKind(resp.ErrKind, resp.ErrMsg)
+	}
+	return nil
+}
+
+// DeleteWrappedDEK drops a workspace's wrapped DEK.
+func (c *Client) DeleteWrappedDEK(ctx context.Context, workspace string) error {
+	var resp errResp
+	if err := (&clientStore{c: c, ws: workspace}).request(ctx, mDeleteWrappedDEK, struct{}{}, &resp); err != nil {
+		return err
+	}
+	if resp.ErrKind != "" {
+		return errFromKind(resp.ErrKind, resp.ErrMsg)
+	}
+	return nil
+}
+
 type clientStore struct {
 	c  *Client
 	ws string
