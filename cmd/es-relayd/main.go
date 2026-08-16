@@ -26,6 +26,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/laenenai/es-lite/delivery"
+	"github.com/laenenai/natskit"
+
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/natsjs"
 	"github.com/laenenai/es-lite/obs"
@@ -70,7 +72,8 @@ func main() {
 	}
 	defer store.Close()
 
-	nc, err := nats.Connect(natsURL, nats.Name("es-relayd"))
+	// Via natskit so TLS (NATS_CA / client cert) is applied uniformly (architecture ADR 0013).
+	nc, err := natskit.Connect("es-relayd", natsURL, os.Getenv("NATS_CREDS"))
 	if err != nil {
 		log.Fatalf("es-relayd: connect nats: %v", err)
 	}

@@ -39,6 +39,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/laenenai/natskit"
+
 	"github.com/laenenai/es-lite/delivery"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/leader"
@@ -80,7 +82,8 @@ func main() {
 	}
 	defer closeStore()
 
-	nc, err := nats.Connect(natsURL, nats.Name("es-lited"))
+	// Via natskit so TLS (NATS_CA / client cert) is applied uniformly (architecture ADR 0013).
+	nc, err := natskit.Connect("es-lited", natsURL, os.Getenv("NATS_CREDS"))
 	if err != nil {
 		log.Fatalf("es-lited: connect nats: %v", err)
 	}

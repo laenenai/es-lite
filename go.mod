@@ -5,7 +5,7 @@ go 1.26.5
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/laenenai/natskit v0.6.0
+	github.com/laenenai/natskit v0.7.0
 	github.com/nats-io/nats.go v1.51.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.44.0
