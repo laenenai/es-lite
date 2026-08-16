@@ -12,6 +12,36 @@ import (
 	"github.com/laenenai/es-lite/shred"
 )
 
+func TestAADBinding(t *testing.T) {
+	ctx := context.Background()
+	s := shred.New(kmem.New(), memdek.New())
+	c, err := s.Cipher(ctx, "ws_1")
+	if err != nil {
+		t.Fatalf("cipher: %v", err)
+	}
+	plain := []byte("bound to a stream")
+	aadA := []byte("ws_1|user:alice")
+	aadB := []byte("ws_1|user:mallory")
+
+	blob, err := c.EncryptWithAAD(plain, aadA)
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	// Same AAD opens.
+	got, err := c.DecryptWithAAD(blob, aadA)
+	if err != nil || string(got) != string(plain) {
+		t.Fatalf("same-AAD decrypt: got %q err %v", got, err)
+	}
+	// Different AAD (replay into another stream) MUST fail.
+	if _, err := c.DecryptWithAAD(blob, aadB); err == nil {
+		t.Fatal("decrypt under different AAD succeeded — replay not prevented")
+	}
+	// Nil AAD (unbound) also fails against an AAD-bound ciphertext.
+	if _, err := c.Decrypt(blob); err == nil {
+		t.Fatal("decrypt with nil AAD opened an AAD-bound ciphertext")
+	}
+}
+
 func TestRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := shred.New(kmem.New(), memdek.New())

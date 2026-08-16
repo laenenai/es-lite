@@ -39,22 +39,32 @@ type Cipher struct {
 	aead cipher.AEAD
 }
 
-// Encrypt seals plaintext, prefixing a random nonce.
-func (c Cipher) Encrypt(plaintext []byte) ([]byte, error) {
+// Encrypt seals plaintext, prefixing a random nonce (no additional-authenticated data).
+func (c Cipher) Encrypt(plaintext []byte) ([]byte, error) { return c.EncryptWithAAD(plaintext, nil) }
+
+// EncryptWithAAD seals plaintext with additional-authenticated data bound into the tag —
+// the AAD is authenticated but not encrypted, so a ciphertext opened under different AAD
+// fails. Callers bind AAD to the payload's context (e.g. workspace|stream) so a ciphertext
+// cannot be replayed into another stream/workspace (architecture ADR 0014 E). Decrypt must
+// pass the SAME AAD. A random nonce is prefixed.
+func (c Cipher) EncryptWithAAD(plaintext, aad []byte) ([]byte, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("shred: nonce: %w", err)
 	}
-	return c.aead.Seal(nonce, nonce, plaintext, nil), nil
+	return c.aead.Seal(nonce, nonce, plaintext, aad), nil
 }
 
-// Decrypt opens a nonce-prefixed ciphertext.
-func (c Cipher) Decrypt(blob []byte) ([]byte, error) {
+// Decrypt opens a nonce-prefixed ciphertext sealed with no AAD.
+func (c Cipher) Decrypt(blob []byte) ([]byte, error) { return c.DecryptWithAAD(blob, nil) }
+
+// DecryptWithAAD opens a nonce-prefixed ciphertext, verifying the same AAD it was sealed with.
+func (c Cipher) DecryptWithAAD(blob, aad []byte) ([]byte, error) {
 	ns := c.aead.NonceSize()
 	if len(blob) < ns {
 		return nil, errors.New("shred: ciphertext too short")
 	}
-	pt, err := c.aead.Open(nil, blob[:ns], blob[ns:], nil)
+	pt, err := c.aead.Open(nil, blob[:ns], blob[ns:], aad)
 	if err != nil {
 		return nil, fmt.Errorf("shred: open: %w", err)
 	}

@@ -35,6 +35,11 @@ func New(inner es.Store, shredder *shred.Shredder, workspace string) *Store {
 	return &Store{inner: inner, shredder: shredder, ws: workspace}
 }
 
+// aad binds a payload's ciphertext to its workspace + stream (ADR 0014 E): the AAD is
+// authenticated (not encrypted), so a ciphertext moved to another stream/workspace fails to
+// open. Write and read derive it identically from the envelope's own StreamID.
+func (s *Store) aad(sid es.StreamID) []byte { return []byte(s.ws + "|" + sid.Canonical()) }
+
 // Append encrypts payloads and HMACs PII constraint values, then forwards.
 func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult, error) {
 	cipher, err := s.shredder.WriteCipher(ctx, s.ws)
@@ -42,9 +47,10 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		return es.AppendResult{}, err
 	}
 
+	aad := s.aad(p.StreamID)
 	enc := make([]es.EventData, len(p.Events))
 	for i, ev := range p.Events {
-		ct, err := cipher.Encrypt(ev.Payload)
+		ct, err := cipher.EncryptWithAAD(ev.Payload, aad)
 		if err != nil {
 			return es.AppendResult{}, err
 		}
@@ -136,7 +142,7 @@ func (s *Store) decryptAll(ctx context.Context, envs []es.Envelope) error {
 		return err
 	}
 	for i := range envs {
-		pt, err := cipher.Decrypt(envs[i].Payload)
+		pt, err := cipher.DecryptWithAAD(envs[i].Payload, s.aad(envs[i].StreamID))
 		if err != nil {
 			return err
 		}
