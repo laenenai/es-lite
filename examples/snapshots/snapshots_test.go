@@ -17,9 +17,6 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
-	"github.com/laenenai/es-lite/internal/memdek"
-	kmem "github.com/laenenai/es-lite/keystore/memory"
-	"github.com/laenenai/es-lite/shred"
 	"github.com/laenenai/es-lite/snapshot/natskv"
 	"github.com/laenenai/es-lite/sqlite"
 )
@@ -55,8 +52,7 @@ func TestSnapshotCache(t *testing.T) {
 
 	const ws = "wssnap"
 	bucket := "es_snap_" + suffix
-	shredder := shred.New(kmem.New(), memdek.New())
-	cache, err := natskv.New(ctx, js, shredder, ws, natskv.Config{Bucket: bucket, TTL: time.Hour})
+	cache, err := natskv.New(ctx, js, ws, natskv.Config{Bucket: bucket, TTL: time.Hour})
 	if err != nil {
 		t.Fatalf("cache: %v", err)
 	}
@@ -127,7 +123,10 @@ func TestSnapshotCache(t *testing.T) {
 		t.Fatalf("stale fold-version snapshot was used: count=%d, want 0", s4.GetCount())
 	}
 
-	// 5. Zero-knowledge: the state stored in KV is ciphertext, not the proto.
+	// 5. Zero-knowledge passthrough: natskv stores the state bytes AS-IS (ADR
+	//    0025). This example passes plaintext, so KV holds exactly those bytes;
+	//    a real deployment pre-seals snap.State with its client codec, so KV
+	//    would hold ciphertext with no change to natskv.
 	kv, err := js.KeyValue(ctx, bucket)
 	if err != nil {
 		t.Fatalf("kv: %v", err)
@@ -142,11 +141,8 @@ func TestSnapshotCache(t *testing.T) {
 	if err := json.Unmarshal(raw.Value(), &e); err != nil {
 		t.Fatalf("unmarshal entry: %v", err)
 	}
-	plaintext, _ := stateCodec.Encode(&counterv1.Counter{Initialized: true, Min: 0, Max: 100, Count: 15})
-	if bytes.Equal(e.State, plaintext) {
-		t.Fatal("snapshot state stored as plaintext proto — not zero-knowledge")
-	}
-	if len(e.State) != len(plaintext)+28 { // AES-256-GCM: 12 nonce + 16 tag
-		t.Fatalf("stored state len = %d, want %d (ciphertext)", len(e.State), len(plaintext)+28)
+	stored, _ := stateCodec.Encode(&counterv1.Counter{Initialized: true, Min: 0, Max: 100, Count: 15})
+	if !bytes.Equal(e.State, stored) {
+		t.Fatalf("natskv altered the state bytes; want opaque passthrough")
 	}
 }

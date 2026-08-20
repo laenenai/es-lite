@@ -2,15 +2,12 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/laenenai/es-lite/es"
-	"github.com/laenenai/es-lite/keystore"
-	"github.com/laenenai/es-lite/shred"
 )
 
 // Drain is the gap-safe delivery relay for Postgres (ADR 0001 §5). Unlike a
@@ -20,11 +17,9 @@ import (
 // Publishing before commit makes it at-least-once: a crash after publish but
 // before commit re-delivers the batch (dedup on the consumer side, ADR 0003).
 //
-// It reads across all workspaces (RLS bypassed) and decrypts each event with
-// its workspace DEK. Events whose workspace has been shredded cannot be
-// decrypted; they are excluded from the batch but still marked published so
-// they are not re-claimed forever. Returns the number of rows claimed
-// (including skipped-shredded), so a caller can loop until it returns 0.
+// It reads across all workspaces (RLS bypassed). Payloads are relayed opaquely
+// (ADR 0025) — es-lite performs no decryption. Returns the number of rows
+// claimed, so a caller can loop until it returns 0.
 func (s *Store) Drain(ctx context.Context, limit int, publish func(context.Context, []es.Envelope) error) (int, error) {
 	if limit <= 0 {
 		limit = 100
@@ -48,25 +43,13 @@ func (s *Store) Drain(ctx context.Context, limit int, publish func(context.Conte
 		return 0, fmt.Errorf("claim: %w", err)
 	}
 
-	// Decrypt with a per-workspace cipher cache. A nil entry marks a
-	// shredded workspace whose events must be skipped.
-	ciphers := map[string]*shred.Cipher{}
-	fetched := map[string]bool{}
 	var (
 		batch     []es.Envelope
 		positions []uint64
 		claimed   int
 	)
-	// Materialize rows first (can't call cipher()/new queries while rows open).
-	type rawRow struct {
-		env         es.Envelope
-		wsID        string
-		ciphertext  []byte
-	}
-	var raws []rawRow
 	for rows.Next() {
 		var (
-			r                                     rawRow
 			e                                     es.Envelope
 			eventID, streamType, streamID         string
 			correlationID, causationID, commandID string
@@ -95,53 +78,16 @@ func (s *Store) Drain(ctx context.Context, limit int, publish func(context.Conte
 		e.CommandID, _ = uuid.Parse(commandID)
 		e.Actor = es.Actor{Type: actorType, ID: actorID}
 		e.Workspace = wsID
-		r.env, r.wsID, r.ciphertext = e, wsID, payload
-		raws = append(raws, r)
+		e.Payload = payload // opaque bytes, relayed unchanged (ADR 0025)
+		claimed++
+		positions = append(positions, e.GlobalPosition)
+		batch = append(batch, e)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return 0, err
 	}
 	rows.Close()
-
-	for _, r := range raws {
-		claimed++
-		positions = append(positions, r.env.GlobalPosition)
-
-		// Plaintext mode (no keystore wired): payload is stored as-is.
-		if s.shredder == nil {
-			env := r.env
-			env.Payload = r.ciphertext
-			batch = append(batch, env)
-			continue
-		}
-
-		if !fetched[r.wsID] {
-			fetched[r.wsID] = true
-			cip, err := s.readCipher(ctx, r.wsID)
-			if err != nil {
-				if errors.Is(err, keystore.ErrShredded) {
-					ciphers[r.wsID] = nil // shredded: skip this workspace's events
-				} else {
-					return 0, fmt.Errorf("cipher %s: %w", r.wsID, err)
-				}
-			} else {
-				ciphers[r.wsID] = cip
-			}
-		}
-		cipher := ciphers[r.wsID]
-		if cipher == nil {
-			continue // shredded workspace
-		}
-		pt, err := cipher.Decrypt(r.ciphertext)
-		if err != nil {
-			// Undecryptable (mid-shred race): skip but still mark published.
-			continue
-		}
-		env := r.env
-		env.Payload = pt
-		batch = append(batch, env)
-	}
 
 	if claimed == 0 {
 		return 0, nil

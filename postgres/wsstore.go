@@ -14,8 +14,8 @@ import (
 
 // wsStore is an es.Store scoped to one workspace. Every operation runs in a
 // transaction that sets app.workspace_id (RLS) and, for partition pruning,
-// filters by workspace_id explicitly. Payloads are encrypted on write and
-// decrypted on read via the workspace DEK.
+// filters by workspace_id explicitly. Payloads are stored and returned as
+// opaque bytes (ADR 0025) — es-lite performs no encryption.
 type wsStore struct {
 	store *Store
 	ws    string
@@ -38,11 +38,6 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 	}
 	if len(p.Events) == 0 {
 		return es.AppendResult{FromVersion: p.ExpectedVersion, ToVersion: p.ExpectedVersion}, nil
-	}
-
-	cipher, err := w.store.writeCipher(ctx, w.ws)
-	if err != nil {
-		return zero, err
 	}
 
 	occurred := p.OccurredAt
@@ -79,14 +74,10 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		if eventID == uuid.Nil {
 			eventID = newV7()
 		}
-		ciphertext, err := w.store.encrypt(cipher, ev.Payload)
-		if err != nil {
-			return zero, fmt.Errorf("encrypt v%d: %w", version, err)
-		}
 
 		var gp uint64
 		var recorded time.Time
-		err = tx.QueryRow(ctx,
+		err := tx.QueryRow(ctx,
 			`INSERT INTO events (
 				workspace_id, event_id, stream_type, stream_id, version,
 				type_url, schema_version, occurred_at,
@@ -97,7 +88,7 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, occurred,
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
-			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ciphertext,
+			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
 		).Scan(&gp, &recorded)
 		if err != nil {
 			if isUniqueViolation(err) {
@@ -119,7 +110,7 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 			CausationID:    p.CausationID,
 			CommandID:      p.CommandID,
 			Actor:          p.Actor,
-			Payload:        ev.Payload, // return plaintext to the caller
+			Payload:        ev.Payload, // opaque bytes, echoed back unchanged
 		}
 	}
 
@@ -139,8 +130,9 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 
 // applyClaims applies uniqueness ops in the append transaction (ADR 0008):
 // releases first (so a same-value rename does not self-collide), then claims.
-// PII values are HMAC'd under the workspace key; non-PII stored plaintext. A
-// colliding claim returns es.ErrConstraintViolated, rolling back the append.
+// The value_key is stored opaquely (ADR 0025): for PII the caller's codec
+// supplies a keyed MAC as the value; es-lite stores whatever bytes it is given.
+// A colliding claim returns es.ErrConstraintViolated, rolling back the append.
 func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
@@ -178,12 +170,11 @@ func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, o
 	return nil
 }
 
-// valueKey returns the stored uniqueness key for a constraint: an HMAC under
-// the workspace key for PII values (erasure-safe), plaintext bytes otherwise.
-func (w *wsStore) valueKey(ctx context.Context, op es.ConstraintOp) ([]byte, error) {
-	if op.PII && w.store.shredder != nil {
-		return w.store.shredder.MAC(ctx, w.ws, []byte(op.Value))
-	}
+// valueKey returns the stored uniqueness key for a constraint. es-lite stores
+// the value opaquely (ADR 0025): for PII the caller's codec has already
+// replaced op.Value with a keyed MAC before it reaches the store, so es-lite
+// just stores the bytes it is given regardless of the PII flag.
+func (w *wsStore) valueKey(_ context.Context, op es.ConstraintOp) ([]byte, error) {
 	return []byte(op.Value), nil
 }
 
@@ -246,9 +237,9 @@ func (w *wsStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (ui
 }
 
 // LookupClaim reads the uniqueness index (unique_claims) for the stream holding
-// (scope, value). The value is keyed exactly as applyClaims stores it (HMAC for
-// PII when a keystore is present, plaintext otherwise), so writes and lookups
-// agree regardless of deployment.
+// (scope, value). The value is keyed exactly as applyClaims stores it — opaque
+// bytes as given (ADR 0025) — so writes and lookups agree: a PII lookup must
+// pass the same codec-computed MAC the write used.
 func (w *wsStore) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
@@ -276,10 +267,8 @@ func (w *wsStore) LookupClaim(ctx context.Context, scope, value string, pii bool
 	return streamID, true, nil
 }
 
-// query runs a workspace-scoped read: a transaction with the RLS variable
-// set. Rows are scanned encrypted, then decrypted after the result set is
-// materialized — so an empty stream never needs a cipher, and a decrypt of a
-// shredded workspace surfaces keystore.ErrShredded.
+// query runs a workspace-scoped read: a transaction with the RLS variable set.
+// Payloads are returned opaquely (ADR 0025) — es-lite performs no decryption.
 func (w *wsStore) query(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
@@ -293,37 +282,18 @@ func (w *wsStore) query(ctx context.Context, q string, args ...any) ([]es.Envelo
 	if err != nil {
 		return nil, err
 	}
-	var (
-		out   []es.Envelope
-		blobs [][]byte
-	)
+	var out []es.Envelope
 	for rows.Next() {
-		e, ciphertext, err := scanEnvelope(rows)
+		e, err := scanEnvelope(rows)
 		if err != nil {
 			rows.Close()
 			return nil, err
 		}
 		out = append(out, e)
-		blobs = append(blobs, ciphertext)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
-	}
-	if len(out) == 0 {
-		return nil, nil
-	}
-
-	cipher, err := w.store.readCipher(ctx, w.ws)
-	if err != nil {
-		return nil, err // keystore.ErrShredded when the workspace is forgotten
-	}
-	for i := range out {
-		pt, err := w.store.decrypt(cipher, blobs[i])
-		if err != nil {
-			return nil, err
-		}
-		out[i].Payload = pt
 	}
 	return out, nil
 }

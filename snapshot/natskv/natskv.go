@@ -1,8 +1,9 @@
 // Package natskv implements snapshot.Cache over a NATS KV bucket. It is
-// workspace-scoped and encrypts the state blob under the workspace key
-// (client-side), so KV holds only ciphertext — consistent with the
-// zero-knowledge model (ADR 0009). Give the bucket a TTL to bound staleness
-// and auto-evict; a snapshot is a pure cache, so expiry is always safe.
+// workspace-scoped and zero-knowledge (ADR 0025): it stores the snapshot state
+// bytes it is given AS-IS, exactly as the event store treats payloads. Any
+// sealing is the caller's job — pre-seal snap.State with your client codec and
+// KV holds only ciphertext. Give the bucket a TTL to bound staleness and
+// auto-evict; a snapshot is a pure cache, so expiry is always safe.
 package natskv
 
 import (
@@ -15,7 +16,6 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
-	"github.com/laenenai/es-lite/shred"
 	"github.com/laenenai/es-lite/snapshot"
 )
 
@@ -27,15 +27,14 @@ type Config struct {
 
 // Cache is a workspace-scoped snapshot.Cache backed by NATS KV.
 type Cache struct {
-	kv       jetstream.KeyValue
-	shredder *shred.Shredder
-	ws       string
+	kv jetstream.KeyValue
+	ws string
 }
 
 var _ snapshot.Cache = (*Cache)(nil)
 
 // New creates/opens the bucket and returns a Cache scoped to workspace.
-func New(ctx context.Context, js jetstream.JetStream, shredder *shred.Shredder, workspace string, cfg Config) (*Cache, error) {
+func New(ctx context.Context, js jetstream.JetStream, workspace string, cfg Config) (*Cache, error) {
 	if cfg.Bucket == "" {
 		cfg.Bucket = "es_snapshots"
 	}
@@ -46,10 +45,10 @@ func New(ctx context.Context, js jetstream.JetStream, shredder *shred.Shredder, 
 	if err != nil {
 		return nil, fmt.Errorf("natskv: bucket %q: %w", cfg.Bucket, err)
 	}
-	return &Cache{kv: kv, shredder: shredder, ws: workspace}, nil
+	return &Cache{kv: kv, ws: workspace}, nil
 }
 
-// entry is the KV-stored form: metadata + ciphertext state ([]byte is base64
+// entry is the KV-stored form: metadata + opaque state bytes ([]byte is base64
 // in JSON).
 type entry struct {
 	Version     uint64 `json:"version"`
@@ -77,33 +76,17 @@ func (c *Cache) Load(ctx context.Context, streamID string) (snapshot.Snapshot, b
 	if err := json.Unmarshal(kve.Value(), &e); err != nil {
 		return snapshot.Snapshot{}, false, err
 	}
-	cipher, err := c.shredder.ReadCipher(ctx, c.ws)
-	if err != nil {
-		return snapshot.Snapshot{}, false, err // includes keystore.ErrShredded
-	}
-	plain, err := cipher.Decrypt(e.State)
-	if err != nil {
-		return snapshot.Snapshot{}, false, err
-	}
 	rec, _ := time.Parse(time.RFC3339Nano, e.RecordedAt)
-	return snapshot.Snapshot{Version: e.Version, FoldVersion: e.FoldVersion, RecordedAt: rec, State: plain}, true, nil
+	return snapshot.Snapshot{Version: e.Version, FoldVersion: e.FoldVersion, RecordedAt: rec, State: e.State}, true, nil
 }
 
-// Save implements snapshot.Cache.
+// Save implements snapshot.Cache. The state is stored opaquely (ADR 0025).
 func (c *Cache) Save(ctx context.Context, streamID string, snap snapshot.Snapshot) error {
-	cipher, err := c.shredder.WriteCipher(ctx, c.ws)
-	if err != nil {
-		return err
-	}
-	ct, err := cipher.Encrypt(snap.State)
-	if err != nil {
-		return err
-	}
 	b, err := json.Marshal(entry{
 		Version:     snap.Version,
 		FoldVersion: snap.FoldVersion,
 		RecordedAt:  snap.RecordedAt.UTC().Format(time.RFC3339Nano),
-		State:       ct,
+		State:       snap.State,
 	})
 	if err != nil {
 		return err

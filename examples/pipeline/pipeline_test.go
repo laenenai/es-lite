@@ -15,7 +15,6 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
-	kmem "github.com/laenenai/es-lite/keystore/memory"
 	"github.com/laenenai/es-lite/natsjs"
 	"github.com/laenenai/es-lite/postgres"
 )
@@ -34,13 +33,13 @@ func TestFullPipeline(t *testing.T) {
 	defer cancel()
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 
-	// --- Storage: workspace-scoped Postgres with crypto-shredding. ---
-	store, err := postgres.Open(ctx, pgDSN, kmem.New())
+	// --- Storage: workspace-scoped Postgres (zero-knowledge; opaque payloads). ---
+	store, err := postgres.Open(ctx, pgDSN)
 	if err != nil {
 		t.Fatalf("open postgres: %v", err)
 	}
 	defer store.Close()
-	if _, err := store.Pool().Exec(ctx, `TRUNCATE events, workspace_keys, checkpoints`); err != nil {
+	if _, err := store.Pool().Exec(ctx, `TRUNCATE events, checkpoints`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	ws := "wspipe" + suffix

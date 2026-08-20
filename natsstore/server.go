@@ -32,21 +32,7 @@ type Server struct {
 	version    string
 	middleware []natskit.Middleware
 	identity   natskit.IdentityExtractor // how the authoritative workspace is derived
-	deks       WrappedDEKStore           // optional; exposes the wrapped-DEK RPCs (ADR 0014 C)
 }
-
-// WrappedDEKStore persists one OPAQUE wrapped DEK per workspace (architecture ADR 0014 C).
-// es-lited's backing store (postgres.Store) satisfies it; the Server never unwraps — it can't,
-// holding no KEK — so serving the wrapped DEK keeps es-lited zero-knowledge.
-type WrappedDEKStore interface {
-	LoadWrappedDEK(ctx context.Context, workspaceID string) (wrapped []byte, ok bool, err error)
-	SaveWrappedDEK(ctx context.Context, workspaceID string, wrapped []byte, kekVersion int) error
-	DeleteWrappedDEK(ctx context.Context, workspaceID string) error
-}
-
-// WithWrappedDEKStore serves the wrapped-DEK load/save/delete RPCs backed by d. Omit it (the
-// default) and those endpoints are simply not registered.
-func WithWrappedDEKStore(d WrappedDEKStore) ServerOption { return func(s *Server) { s.deks = d } }
 
 // ServerOption configures a Server.
 type ServerOption func(*Server)
@@ -129,22 +115,6 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 		{mReadAll, s.handleReadAll},
 		{mCurrentVersion, s.handleCurrentVersion},
 		{mLookupClaim, s.handleLookupClaim},
-	}
-	if s.deks != nil { // wrapped-DEK RPCs only when a store is wired (ADR 0014 C)
-		endpoints = append(endpoints,
-			struct {
-				method  string
-				handler natskit.SvcHandler
-			}{mLoadWrappedDEK, s.handleLoadWrappedDEK},
-			struct {
-				method  string
-				handler natskit.SvcHandler
-			}{mSaveWrappedDEK, s.handleSaveWrappedDEK},
-			struct {
-				method  string
-				handler natskit.SvcHandler
-			}{mDeleteWrappedDEK, s.handleDeleteWrappedDEK},
-		)
 	}
 	for _, e := range endpoints {
 		// Subscribe on a workspace wildcard: subjects are
@@ -253,30 +223,4 @@ func (s *Server) handleLookupClaim(ctx context.Context, m natskit.MsgContext) ([
 	streamID, found, err := s.scope(natskit.WorkspaceFrom(ctx)).LookupClaim(ctx, req.Scope, req.Value, req.PII)
 	kind, msg := errKind(err)
 	return json.Marshal(lookupClaimResp{ErrKind: kind, ErrMsg: msg, StreamID: streamID, Found: found})
-}
-
-// handleLoadWrappedDEK returns the workspace's opaque wrapped DEK (ADR 0014 C). The workspace
-// is the authenticated one (subject/identity), never client-supplied.
-func (s *Server) handleLoadWrappedDEK(ctx context.Context, _ natskit.MsgContext) ([]byte, error) {
-	wrapped, ok, err := s.deks.LoadWrappedDEK(ctx, natskit.WorkspaceFrom(ctx))
-	kind, msg := errKind(err)
-	return json.Marshal(loadWrappedDEKResp{Wrapped: wrapped, Found: ok, ErrKind: kind, ErrMsg: msg})
-}
-
-// handleSaveWrappedDEK persists the workspace's wrapped DEK (insert-if-absent, per the store).
-func (s *Server) handleSaveWrappedDEK(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
-	var req saveWrappedDEKReq
-	if err := json.Unmarshal(m.Data, &req); err != nil {
-		return json.Marshal(errResp{ErrKind: "internal", ErrMsg: err.Error()})
-	}
-	err := s.deks.SaveWrappedDEK(ctx, natskit.WorkspaceFrom(ctx), req.Wrapped, req.KEKVersion)
-	kind, msg := errKind(err)
-	return json.Marshal(errResp{ErrKind: kind, ErrMsg: msg})
-}
-
-// handleDeleteWrappedDEK drops the workspace's wrapped DEK (crypto-shred by locality).
-func (s *Server) handleDeleteWrappedDEK(ctx context.Context, _ natskit.MsgContext) ([]byte, error) {
-	err := s.deks.DeleteWrappedDEK(ctx, natskit.WorkspaceFrom(ctx))
-	kind, msg := errKind(err)
-	return json.Marshal(errResp{ErrKind: kind, ErrMsg: msg})
 }

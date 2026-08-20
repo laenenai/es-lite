@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS events (
     actor_type      text        NOT NULL,
     actor_id        text        NOT NULL,
     actor_principal text        NOT NULL,
-    payload         bytea       NOT NULL,   -- AEAD ciphertext (per-workspace DEK)
+    payload         bytea       NOT NULL,   -- opaque bytes (client-sealed; ADR 0025)
     published_at    timestamptz,            -- NULL until the relay publishes it
 
     -- Optimistic concurrency + partition key lead. UNIQUE constraints on a
@@ -67,17 +67,6 @@ CREATE POLICY events_workspace_isolation ON events
     WITH CHECK (workspace_id = current_setting('app.workspace_id', true)
            OR current_setting('app.bypass_rls', true) = 'on');
 
--- workspace_keys: one wrapped DEK per workspace (shred.WrappedDEKStore).
--- No RLS: the wrapped bytes are cryptographically inert without the KEK in
--- OpenBao, and the DEK-provisioning path queries them by explicit id outside
--- a workspace-scoped transaction.
-CREATE TABLE IF NOT EXISTS workspace_keys (
-    workspace_id text        PRIMARY KEY,
-    wrapped_dek  bytea       NOT NULL,
-    kek_version  int         NOT NULL,
-    created_at   timestamptz NOT NULL DEFAULT now()
-);
-
 -- checkpoints: per-subscriber delivery progress (SQLite-style poller path).
 CREATE TABLE IF NOT EXISTS checkpoints (
     subscriber text        PRIMARY KEY,
@@ -86,10 +75,11 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 
 -- unique_claims: cross-stream uniqueness, per-workspace (ADR 0008). value_key
--- is the plaintext value for non-PII scopes, or an HMAC under the workspace
--- key for PII scopes (so shredding the workspace key unlinks it). The PK is
--- the uniqueness constraint; a colliding Claim rolls back the whole append
--- with es.ErrConstraintViolated. RLS scopes it like events.
+-- is opaque bytes as given by the caller (ADR 0025): the client's codec
+-- supplies a keyed MAC for PII scopes so shredding the scope key unlinks it;
+-- es-lite stores the bytes verbatim. The PK is the uniqueness constraint; a
+-- colliding Claim rolls back the whole append with es.ErrConstraintViolated.
+-- RLS scopes it like events.
 CREATE TABLE IF NOT EXISTS unique_claims (
     workspace_id text        NOT NULL,
     scope        text        NOT NULL,

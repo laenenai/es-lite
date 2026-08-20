@@ -64,9 +64,9 @@ func main() {
 		batch = v
 	}
 
-	// No keystore: the relay only moves ciphertext (zero-knowledge, ADR 0003).
+	// The relay only moves opaque bytes (zero-knowledge, ADR 0025).
 	// WithoutAutoMigrate — es-migrate owns schema.
-	store, err := postgres.Open(ctx, pgDSN, nil, postgres.WithoutAutoMigrate())
+	store, err := postgres.Open(ctx, pgDSN, postgres.WithoutAutoMigrate())
 	if err != nil {
 		log.Fatalf("es-relayd: open postgres: %v", err)
 	}

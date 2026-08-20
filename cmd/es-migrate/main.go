@@ -27,7 +27,7 @@ func main() {
 		if dsn == "" {
 			log.Fatal("es-migrate: PG_DSN is required for BACKEND=postgres")
 		}
-		store, err := postgres.Open(ctx, dsn, nil, postgres.WithoutAutoMigrate())
+		store, err := postgres.Open(ctx, dsn, postgres.WithoutAutoMigrate())
 		if err != nil {
 			log.Fatalf("es-migrate: open postgres: %v", err)
 		}

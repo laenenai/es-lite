@@ -68,15 +68,6 @@ tasks:
       - defer: docker rm -f es-lite-pg
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -count=1 ./postgres/...
 
-  test:openbao:
-    desc: OpenBao KeyStore integration test against a throwaway Docker OpenBao.
-    cmds:
-      - docker rm -f es-lite-bao 2>/dev/null || true
-      - docker run -d --rm --name es-lite-bao -p 8200:8200 --cap-add=IPC_LOCK -e BAO_DEV_ROOT_TOKEN_ID=root openbao/openbao server -dev
-      - until curl -sf http://127.0.0.1:8200/v1/sys/health >/dev/null 2>&1; do sleep 1; done
-      - defer: docker rm -f es-lite-bao
-      - OPENBAO_ADDR=http://127.0.0.1:8200 OPENBAO_TOKEN=root go test -count=1 ./keystore/openbao/...
-
   test:nats:
     desc: NATS/JetStream integration test against a throwaway Docker NATS.
     cmds:
@@ -95,16 +86,6 @@ tasks:
       - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1 && nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
       - defer: docker rm -f es-lite-pg es-lite-nats
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/pipeline/...
-
-  test:zeroknowledge:
-    desc: Zero-knowledge NATS eventstore service round-trip (Postgres + NATS).
-    cmds:
-      - docker rm -f es-lite-pg es-lite-nats 2>/dev/null || true
-      - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
-      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
-      - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1 && nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
-      - defer: docker rm -f es-lite-pg es-lite-nats
-      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/zeroknowledge/...
 
   test:snapshots:
     desc: Snapshot-cache integration test (NATS KV).

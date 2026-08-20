@@ -12,8 +12,6 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
-	"github.com/laenenai/es-lite/keystore"
-	kmem "github.com/laenenai/es-lite/keystore/memory"
 	"github.com/laenenai/es-lite/postgres"
 )
 
@@ -28,13 +26,13 @@ func openStore(t *testing.T) *postgres.Store {
 		t.Skip("set PG_DSN to run the Postgres integration tests")
 	}
 	ctx := context.Background()
-	s, err := postgres.Open(ctx, dsn, kmem.New())
+	s, err := postgres.Open(ctx, dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	// Isolate each test: tests run sequentially, so a truncate is safe and
 	// keeps the shared partitioned tables clean.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, workspace_keys, checkpoints, unique_claims`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -129,41 +127,36 @@ func TestOptimisticConcurrency(t *testing.T) {
 	}
 }
 
-func TestEncryptionAtRestAndShred(t *testing.T) {
+// TestOpaquePayloadRoundTrip proves es-lite stores payloads verbatim (ADR
+// 0025): what goes on disk is exactly what was appended (no crypto), and reads
+// echo the same bytes back.
+func TestOpaquePayloadRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	ws := s.Workspace("ws_secret")
 	sid := streamID(t)
 
-	marker := []byte("PLAINTEXT-CANARY-abc123")
+	payload := []byte("client-sealed-opaque-bytes-abc123")
 	if _, err := ws.Append(ctx, es.AppendParams{
 		StreamID: sid, ExpectedVersion: 0,
-		Events: []es.EventData{{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: marker}},
+		Events: []es.EventData{{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: payload}},
 	}); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
-	// Raw column must be ciphertext: the plaintext canary must not appear.
+	// The raw column holds exactly the bytes given — es-lite adds no crypto.
 	raw := rawPayload(t, s, "ws_secret", sid.Canonical(), 1)
-	if bytes.Contains(raw, marker) {
-		t.Fatal("plaintext canary found in stored payload; not encrypted at rest")
+	if !bytes.Equal(raw, payload) {
+		t.Fatalf("stored payload = %q, want verbatim %q", raw, payload)
 	}
 
-	// Normal read decrypts back to the canary.
+	// A normal read echoes the same bytes back.
 	evs, err := ws.ReadStream(ctx, sid, 0, 0)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if len(evs) != 1 || !bytes.Equal(evs[0].Payload, marker) {
-		t.Fatalf("decrypted read mismatch: %v", evs)
-	}
-
-	// Crypto-shred the workspace: the same read now fails ErrShredded.
-	if err := s.ForgetWorkspace(ctx, "ws_secret"); err != nil {
-		t.Fatalf("forget: %v", err)
-	}
-	if _, err := ws.ReadStream(ctx, sid, 0, 0); !errors.Is(err, keystore.ErrShredded) {
-		t.Fatalf("read after shred: got %v, want ErrShredded", err)
+	if len(evs) != 1 || !bytes.Equal(evs[0].Payload, payload) {
+		t.Fatalf("read payload mismatch: %v", evs)
 	}
 }
 
@@ -210,7 +203,7 @@ func TestDrainClaimDelivery(t *testing.T) {
 	}
 }
 
-func TestUniqueClaimsWorkspaceScopedAndHashed(t *testing.T) {
+func TestUniqueClaimsWorkspaceScoped(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
@@ -225,8 +218,8 @@ func TestUniqueClaimsWorkspaceScopedAndHashed(t *testing.T) {
 		return err
 	}
 
-	// Uniqueness is per-workspace: the same PII value in two workspaces is
-	// independent.
+	// Uniqueness is per-workspace (PK includes workspace_id): the same value in
+	// two workspaces is independent even though es-lite stores it verbatim.
 	if err := appendClaim("ws1", "a", 0, es.Claim("email", "x@y.com", true)); err != nil {
 		t.Fatalf("ws1 claim: %v", err)
 	}
@@ -238,20 +231,12 @@ func TestUniqueClaimsWorkspaceScopedAndHashed(t *testing.T) {
 		t.Fatalf("intra-workspace conflict: got %v, want ErrConstraintViolated", err)
 	}
 
-	// PII value is stored as an HMAC, not plaintext.
+	// es-lite stores the value opaquely — the bytes given, verbatim (ADR 0025).
+	// A real caller HMACs PII in its codec before it reaches the store; here the
+	// raw value flows through, so we see it verbatim.
 	vk := rawValueKey(t, s, "ws1", "email")
-	if bytes.Contains(vk, []byte("x@y.com")) {
-		t.Fatal("plaintext PII value found in unique_claims.value_key")
-	}
-	if len(vk) != 32 {
-		t.Fatalf("value_key len = %d, want 32 (HMAC-SHA256)", len(vk))
-	}
-
-	// The two workspaces hash the same value to DIFFERENT keys (per-workspace
-	// key), so the hashes are not cross-linkable.
-	vk2 := rawValueKey(t, s, "ws2", "email")
-	if bytes.Equal(vk, vk2) {
-		t.Fatal("same PII value hashed identically across workspaces — keys not per-workspace")
+	if !bytes.Equal(vk, []byte("x@y.com")) {
+		t.Fatalf("value_key = %q, want verbatim %q", vk, "x@y.com")
 	}
 }
 

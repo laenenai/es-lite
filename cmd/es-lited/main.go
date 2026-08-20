@@ -70,8 +70,8 @@ func main() {
 		natsURL = nats.DefaultURL
 	}
 
-	// Select the storage backend. The server passes no keystore either way:
-	// it stores only ciphertext (zero-knowledge).
+	// Select the storage backend. The server holds no keys either way: it
+	// stores whatever opaque bytes clients send (zero-knowledge, ADR 0025).
 	backend := os.Getenv("BACKEND")
 	if backend == "" {
 		backend = "postgres"
@@ -81,11 +81,6 @@ func main() {
 		log.Fatalf("es-lited: open %s backend: %v", backend, err)
 	}
 	defer closeStore()
-
-	// The backing store may also persist per-workspace WRAPPED DEKs (the postgres backend
-	// does — workspace_keys). Serving them lets a client-side Shredder store its opaque
-	// wrapped DEK next to the ciphertext, keeping es-lited zero-knowledge (ADR 0014 C).
-	deks, _ := drainer.(natsstore.WrappedDEKStore)
 
 	// Via natskit so TLS (NATS_CA / client cert) is applied uniformly (architecture ADR 0013).
 	nc, err := natskit.Connect("es-lited", natsURL, os.Getenv("NATS_CREDS"))
@@ -148,7 +143,6 @@ func main() {
 
 	srv := natsstore.NewServer(scope,
 		natsstore.WithServerPrefix(prefix),
-		natsstore.WithWrappedDEKStore(deks), // nil for backends without one → RPCs not registered
 		natsstore.WithMiddleware(natsstore.ObservabilityMiddleware("es-lited")))
 	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",
 		natsURL, prefix, backend)
@@ -261,7 +255,7 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, deliver
 		if !autoMigrate {
 			opts = append(opts, postgres.WithoutAutoMigrate())
 		}
-		store, err := postgres.Open(ctx, dsn, nil, opts...)
+		store, err := postgres.Open(ctx, dsn, opts...)
 		if err != nil {
 			return nil, nil, nil, err
 		}
