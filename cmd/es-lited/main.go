@@ -40,13 +40,13 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/laenenai/natskit"
+	"github.com/laenenai/natskit/obs"
 
 	"github.com/laenenai/es-lite/delivery"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/leader"
 	"github.com/laenenai/es-lite/natsjs"
 	"github.com/laenenai/es-lite/natsstore"
-	"github.com/laenenai/es-lite/obs"
 	"github.com/laenenai/es-lite/postgres"
 	"github.com/laenenai/es-lite/sqlite"
 )
@@ -58,7 +58,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Optional OTLP -> OpenObserve (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT set).
+	// Shared observability (natskit/obs, ADR 0028): structured logging + optional OTLP →
+	// OpenObserve (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT set). obs.Setup also wires the
+	// nats_reconnects_total counter, so es-lited reports credential-rotation churn too.
+	obs.InitLogging("es-lited")
 	shutdownObs, err := obs.Setup(ctx, "es-lited", version)
 	if err != nil {
 		log.Fatalf("es-lited: observability: %v", err)
@@ -143,7 +146,7 @@ func main() {
 
 	srv := natsstore.NewServer(scope,
 		natsstore.WithServerPrefix(prefix),
-		natsstore.WithMiddleware(natsstore.ObservabilityMiddleware("es-lited")))
+		natsstore.WithMiddleware(obs.ServerMiddleware("es-lited")))
 	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",
 		natsURL, prefix, backend)
 	if err := srv.Serve(ctx, nc); err != nil && ctx.Err() == nil {

@@ -30,8 +30,8 @@ import (
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/natsjs"
-	"github.com/laenenai/es-lite/obs"
 	"github.com/laenenai/es-lite/postgres"
+	"github.com/laenenai/natskit/obs"
 )
 
 // version is stamped into telemetry; override at build with -ldflags.
@@ -41,6 +41,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	obs.InitLogging("es-relayd")
 	shutdownObs, err := obs.Setup(ctx, "es-relayd", version)
 	if err != nil {
 		log.Fatalf("es-relayd: observability: %v", err)
