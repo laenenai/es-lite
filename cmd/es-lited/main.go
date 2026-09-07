@@ -39,9 +39,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/laenenai/natskit"
-	"github.com/laenenai/natskit/obs"
-
 	"github.com/laenenai/es-lite/delivery"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/leader"
@@ -58,11 +55,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Shared observability (natskit/obs, ADR 0028): structured logging + optional OTLP →
-	// OpenObserve (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT set). obs.Setup also wires the
-	// nats_reconnects_total counter, so es-lited reports credential-rotation churn too.
-	obs.InitLogging("es-lited")
-	shutdownObs, err := obs.Setup(ctx, "es-lited", version)
+	// Local observability stand-in for natskit/obs (ADR 0028): structured
+	// logging + optional OTLP → OpenObserve (no-op unless
+	// OTEL_EXPORTER_OTLP_ENDPOINT set). natsConnect wires the
+	// nats_reconnects_total counter, so es-lited reports credential-rotation
+	// churn too.
+	initLogging("es-lited")
+	shutdownObs, err := setupObs(ctx, "es-lited", version)
 	if err != nil {
 		log.Fatalf("es-lited: observability: %v", err)
 	}
@@ -85,8 +84,7 @@ func main() {
 	}
 	defer closeStore()
 
-	// Via natskit so TLS (NATS_CA / client cert) is applied uniformly (architecture ADR 0013).
-	nc, err := natskit.Connect("es-lited", natsURL, os.Getenv("NATS_CREDS"))
+	nc, err := natsConnect("es-lited", natsURL, os.Getenv("NATS_CREDS"))
 	if err != nil {
 		log.Fatalf("es-lited: connect nats: %v", err)
 	}
@@ -146,7 +144,7 @@ func main() {
 
 	srv := natsstore.NewServer(scope,
 		natsstore.WithServerPrefix(prefix),
-		natsstore.WithMiddleware(obs.ServerMiddleware("es-lited")))
+		natsstore.WithMiddleware(serverMiddleware("es-lited")))
 	log.Printf("es-lited: serving es.Store over NATS at %s (prefix %s), backend %s",
 		natsURL, prefix, backend)
 	if err := srv.Serve(ctx, nc); err != nil && ctx.Err() == nil {

@@ -17,7 +17,8 @@ import (
 var _ delivery.Handler = (&Publisher{}).Handle
 
 // Connect opens a NATS connection. Callers may instead bring their own
-// *nats.Conn (e.g. from natskit.Connect) and pass it to jetstream.New.
+// *nats.Conn (e.g. cmd/es-lited's natsConnect helper) and pass it to
+// jetstream.New.
 func Connect(url string, opts ...nats.Option) (*nats.Conn, error) {
 	nc, err := nats.Connect(url, opts...)
 	if err != nil {

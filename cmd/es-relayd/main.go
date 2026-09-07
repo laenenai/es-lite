@@ -26,12 +26,10 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/laenenai/es-lite/delivery"
-	"github.com/laenenai/natskit"
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/natsjs"
 	"github.com/laenenai/es-lite/postgres"
-	"github.com/laenenai/natskit/obs"
 )
 
 // version is stamped into telemetry; override at build with -ldflags.
@@ -41,8 +39,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	obs.InitLogging("es-relayd")
-	shutdownObs, err := obs.Setup(ctx, "es-relayd", version)
+	initLogging("es-relayd")
+	shutdownObs, err := setupObs(ctx, "es-relayd", version)
 	if err != nil {
 		log.Fatalf("es-relayd: observability: %v", err)
 	}
@@ -73,8 +71,7 @@ func main() {
 	}
 	defer store.Close()
 
-	// Via natskit so TLS (NATS_CA / client cert) is applied uniformly (architecture ADR 0013).
-	nc, err := natskit.Connect("es-relayd", natsURL, os.Getenv("NATS_CREDS"))
+	nc, err := natsConnect("es-relayd", natsURL, os.Getenv("NATS_CREDS"))
 	if err != nil {
 		log.Fatalf("es-relayd: connect nats: %v", err)
 	}

@@ -6,9 +6,9 @@ import (
 	"strings"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/micro"
 
 	"github.com/laenenai/es-lite/es"
-	"github.com/laenenai/natskit"
 )
 
 // Scoper returns an es.Store scoped to a workspace. postgres.Store.Workspace
@@ -17,21 +17,22 @@ import (
 // or regional cells.
 type Scoper func(workspace string) es.Store
 
-// The authoritative workspace comes from natskit's identity system
-// (natskit.Identity / WorkspaceFrom), set by the Tenant middleware the Server
-// installs — see Serve. es-lite no longer carries its own workspace context
-// key; the cross-check is natskit.RequireSubjectWorkspace (architecture ADR 0005).
+// The authoritative workspace comes from the local identity layer in
+// middleware.go (Identity / WorkspaceFrom), set by the Tenant middleware the
+// Server installs — see Serve. es-lite carries no other workspace context
+// key; the cross-check is RequireSubjectWorkspace (architecture ADR 0005).
 
-// Server serves an es.Store over NATS as a natskit micro service, so it
-// self-registers for discovery, versioning, stats, and health
-// (`nats micro ls/info/stats`). It holds no keys — in the zero-knowledge
-// deployment the client encrypts, so the Server only sees ciphertext.
+// Server serves an es.Store over NATS as a NATS Micro service (nats-io/
+// nats.go's micro package), so it self-registers for discovery, versioning,
+// stats, and health (`nats micro ls/info/stats`). It holds no keys — in the
+// zero-knowledge deployment the client encrypts, so the Server only sees
+// ciphertext.
 type Server struct {
 	scope      Scoper
 	prefix     string
 	version    string
-	middleware []natskit.Middleware
-	identity   natskit.IdentityExtractor // how the authoritative workspace is derived
+	middleware []Middleware
+	identity   IdentityExtractor // how the authoritative workspace is derived
 }
 
 // ServerOption configures a Server.
@@ -43,21 +44,21 @@ func WithServerPrefix(p string) ServerOption { return func(s *Server) { s.prefix
 // WithServerVersion sets the service version (semver; default "0.1.0").
 func WithServerVersion(v string) ServerOption { return func(s *Server) { s.version = v } }
 
-// WithMiddleware installs additional natskit middleware on every endpoint
-// (e.g. observability, PDP authorization, audit). It runs AFTER the identity/
+// WithMiddleware installs additional middleware on every endpoint (e.g.
+// observability, PDP authorization, audit). It runs AFTER the identity/
 // tenant middleware the Server installs.
-func WithMiddleware(mw ...natskit.Middleware) ServerOption {
+func WithMiddleware(mw ...Middleware) ServerOption {
 	return func(s *Server) { s.middleware = append(s.middleware, mw...) }
 }
 
 // WithIdentity sets how the authoritative workspace (and principal) is derived
-// for each request — a natskit.IdentityExtractor. The default reads the
-// workspace from the subject's ws token: trusted when the connection's creds
-// are subject-scoped per workspace by natsauthd (the standard deployment). For
+// for each request — an IdentityExtractor. The default reads the workspace
+// from the subject's ws token: trusted when the connection's creds are
+// subject-scoped per workspace by natsauthd (the standard deployment). For
 // edge/callout-stamped-header deployments, pass
-// natskit.HeaderIdentity("X-Workspace", …) — the Server always additionally
+// natsstore.HeaderIdentity("X-Workspace") — the Server always additionally
 // enforces subject==identity via RequireSubjectWorkspace (ADR 0005 §E).
-func WithIdentity(extract natskit.IdentityExtractor) ServerOption {
+func WithIdentity(extract IdentityExtractor) ServerOption {
 	return func(s *Server) { s.identity = extract }
 }
 
@@ -80,34 +81,31 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 	wsIndex := wsTokenIndex(s.prefix)
 	extract := s.identity
 	if extract == nil {
-		extract = func(m natskit.MsgContext) (natskit.Identity, error) {
-			return natskit.Identity{Workspace: natskit.SubjectToken(m.Subject, wsIndex)}, nil
+		extract = func(m MsgContext) (Identity, error) {
+			return Identity{Workspace: SubjectToken(m.Subject, wsIndex)}, nil
 		}
 	}
-	mw := append([]natskit.Middleware{
-		natskit.Tenant(extract),
-		natskit.RequireSubjectWorkspace(wsIndex),
+	mw := append([]Middleware{
+		Tenant(extract),
+		RequireSubjectWorkspace(wsIndex),
 	}, s.middleware...)
 
-	// es-lited is zero-knowledge (clients encrypt event payloads client-side), so the
-	// transport codec is Nop — the bus is protected by mTLS + account isolation, and
-	// the sensitive bytes are already ciphertext before they arrive.
-	conn, err := natskit.Wrap(nc, natskit.NopCodec{})
-	if err != nil {
-		return err
-	}
-	svc, err := conn.Service(natskit.ServiceConfig{
+	// es-lited is zero-knowledge (clients encrypt event payloads client-side), so
+	// handlers exchange raw bytes with no transport codec — the bus is protected
+	// by mTLS + account isolation, and the sensitive bytes are already
+	// ciphertext before they arrive.
+	svc, err := micro.AddService(nc, micro.Config{
 		Name:        "eslite",
 		Version:     s.version,
 		Description: "es-lite eventstore — es.Store over NATS",
-		Middleware:  mw,
+		QueueGroup:  DefaultQueue,
 	})
 	if err != nil {
 		return err
 	}
 	endpoints := []struct {
 		method  string
-		handler natskit.SvcHandler
+		handler SvcHandler
 	}{
 		{mAppend, s.handleAppend},
 		{mReadStream, s.handleReadStream},
@@ -119,8 +117,11 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 	for _, e := range endpoints {
 		// Subscribe on a workspace wildcard: subjects are
 		// <prefix>.<ws>.<method> (architecture ADR 0005), and the handler
-		// derives the workspace from the actual subject.
-		if err := svc.Endpoint(e.method, s.prefix+".*."+e.method, e.handler); err != nil {
+		// derives the workspace from the actual subject. Identity/tenant
+		// middleware runs first (fail-closed), then any user middleware.
+		h := chain(e.handler, mw...)
+		opt := micro.WithEndpointSubject(s.prefix + ".*." + e.method)
+		if err := svc.AddEndpoint(e.method, asMicroHandler(ctx, h), opt); err != nil {
 			_ = svc.Stop()
 			return err
 		}
@@ -134,7 +135,7 @@ func (s *Server) Serve(ctx context.Context, nc *nats.Conn) error {
 // (3 tokens) ⇒ ws at index 3.
 func wsTokenIndex(prefix string) int { return strings.Count(prefix, ".") + 1 }
 
-func (s *Server) handleAppend(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
+func (s *Server) handleAppend(ctx context.Context, m MsgContext) ([]byte, error) {
 	var req appendReq
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(appendResp{ErrKind: "internal", ErrMsg: "bad request: " + err.Error()})
@@ -143,7 +144,7 @@ func (s *Server) handleAppend(ctx context.Context, m natskit.MsgContext) ([]byte
 	if err != nil {
 		return json.Marshal(appendResp{ErrKind: "invalid_stream", ErrMsg: err.Error()})
 	}
-	res, err := s.scope(natskit.WorkspaceFrom(ctx)).Append(ctx, es.AppendParams{
+	res, err := s.scope(WorkspaceFrom(ctx)).Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: req.ExpectedVersion,
 		Events:          fromEventDataWire(req.Events),
@@ -163,7 +164,7 @@ func (s *Server) handleAppend(ctx context.Context, m natskit.MsgContext) ([]byte
 	return json.Marshal(resp)
 }
 
-func (s *Server) handleReadStream(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
+func (s *Server) handleReadStream(ctx context.Context, m MsgContext) ([]byte, error) {
 	var req readStreamReq
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(readResp{ErrKind: "internal", ErrMsg: err.Error()})
@@ -172,7 +173,7 @@ func (s *Server) handleReadStream(ctx context.Context, m natskit.MsgContext) ([]
 	if err != nil {
 		return json.Marshal(readResp{ErrKind: "invalid_stream", ErrMsg: err.Error()})
 	}
-	store := s.scope(natskit.WorkspaceFrom(ctx))
+	store := s.scope(WorkspaceFrom(ctx))
 	var envs []es.Envelope
 	if req.AsOf != "" {
 		envs, err = store.ReadStreamAsOf(ctx, sid, parseTS(req.AsOf))
@@ -187,12 +188,12 @@ func (s *Server) handleReadStream(ctx context.Context, m natskit.MsgContext) ([]
 	return json.Marshal(resp)
 }
 
-func (s *Server) handleReadAll(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
+func (s *Server) handleReadAll(ctx context.Context, m MsgContext) ([]byte, error) {
 	var req readAllReq
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(readResp{ErrKind: "internal", ErrMsg: err.Error()})
 	}
-	envs, err := s.scope(natskit.WorkspaceFrom(ctx)).ReadAll(ctx, req.FromPosition, req.Limit)
+	envs, err := s.scope(WorkspaceFrom(ctx)).ReadAll(ctx, req.FromPosition, req.Limit)
 	kind, msg := errKind(err)
 	resp := readResp{ErrKind: kind, ErrMsg: msg}
 	if err == nil {
@@ -201,7 +202,7 @@ func (s *Server) handleReadAll(ctx context.Context, m natskit.MsgContext) ([]byt
 	return json.Marshal(resp)
 }
 
-func (s *Server) handleCurrentVersion(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
+func (s *Server) handleCurrentVersion(ctx context.Context, m MsgContext) ([]byte, error) {
 	var req currentVersionReq
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(versionResp{ErrKind: "internal", ErrMsg: err.Error()})
@@ -210,17 +211,17 @@ func (s *Server) handleCurrentVersion(ctx context.Context, m natskit.MsgContext)
 	if err != nil {
 		return json.Marshal(versionResp{ErrKind: "invalid_stream", ErrMsg: err.Error()})
 	}
-	v, err := s.scope(natskit.WorkspaceFrom(ctx)).CurrentStreamVersion(ctx, sid)
+	v, err := s.scope(WorkspaceFrom(ctx)).CurrentStreamVersion(ctx, sid)
 	kind, msg := errKind(err)
 	return json.Marshal(versionResp{ErrKind: kind, ErrMsg: msg, Version: v})
 }
 
-func (s *Server) handleLookupClaim(ctx context.Context, m natskit.MsgContext) ([]byte, error) {
+func (s *Server) handleLookupClaim(ctx context.Context, m MsgContext) ([]byte, error) {
 	var req lookupClaimReq
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(lookupClaimResp{ErrKind: "internal", ErrMsg: err.Error()})
 	}
-	streamID, found, err := s.scope(natskit.WorkspaceFrom(ctx)).LookupClaim(ctx, req.Scope, req.Value, req.PII)
+	streamID, found, err := s.scope(WorkspaceFrom(ctx)).LookupClaim(ctx, req.Scope, req.Value, req.PII)
 	kind, msg := errKind(err)
 	return json.Marshal(lookupClaimResp{ErrKind: kind, ErrMsg: msg, StreamID: streamID, Found: found})
 }
