@@ -58,24 +58,72 @@ func newOpenConfig(opts []Option) openConfig {
 
 // Store is the Postgres-backed event store. Construct per process; it holds a
 // connection pool. It is zero-knowledge — payloads are stored opaquely.
+//
+// Pool ownership depends on which constructor was used: Open creates the pool
+// and Close releases it, whereas OpenWithPool borrows a caller-provided pool
+// and Close leaves it alone.
 type Store struct {
 	pool *pgxpool.Pool
+
+	// ownsPool records whether this Store created the pool and may therefore
+	// close it. False for a pool handed in by OpenWithPool, where the caller
+	// may still be using it for other work.
+	ownsPool bool
 }
 
 // Open connects to Postgres and applies migrations (unless WithoutAutoMigrate).
+// The Store owns the pool it creates, so Close releases it.
+//
+// Open builds the pool with pgxpool.New and default settings. A caller that
+// needs control over pool construction — connection limits, application_name,
+// a pgx.QueryTracer for OpenTelemetry, an AfterConnect hook — should build the
+// pool itself and use OpenWithPool.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
 	}
-	s := &Store{pool: pool}
-	if newOpenConfig(opts).autoMigrate {
-		if err := s.Migrate(ctx); err != nil {
-			pool.Close()
-			return nil, err
-		}
+	s := &Store{pool: pool, ownsPool: true}
+	if err := s.migrateIfConfigured(ctx, opts); err != nil {
+		pool.Close()
+		return nil, err
 	}
 	return s, nil
+}
+
+// OpenWithPool wraps a pool the caller already built, instead of opening one.
+//
+// Use it when pool construction has to be the caller's: connection limits and
+// lifetimes, application_name, a pgx.QueryTracer so every query is reported as
+// an OpenTelemetry span, an AfterConnect hook registering extension types — none
+// of which Open exposes. It also lets a process that already holds a pool share
+// it rather than opening a second one against the same database.
+//
+// Ownership stays with the caller. Close does NOT close a pool passed here, so
+// the caller remains free to use it for other work and is responsible for
+// closing it once nothing needs it. Closing it while this Store is still in use
+// is the caller's bug to avoid.
+//
+// Migrations behave exactly as in Open: applied unless WithoutAutoMigrate. If
+// they fail, the pool is left open, since it is not this Store's to close.
+func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Store, error) {
+	if pool == nil {
+		return nil, fmt.Errorf("postgres: open with pool: pool is nil")
+	}
+	s := &Store{pool: pool, ownsPool: false}
+	if err := s.migrateIfConfigured(ctx, opts); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// migrateIfConfigured applies migrations unless the options disable them. It
+// exists so Open and OpenWithPool cannot drift apart on migration behaviour.
+func (s *Store) migrateIfConfigured(ctx context.Context, opts []Option) error {
+	if !newOpenConfig(opts).autoMigrate {
+		return nil
+	}
+	return s.Migrate(ctx)
 }
 
 // Migrate applies pending versioned migrations under a session advisory lock,
@@ -132,8 +180,14 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// Close releases the pool.
-func (s *Store) Close() { s.pool.Close() }
+// Close releases the pool, but only if this Store created it. A pool supplied
+// through OpenWithPool belongs to the caller and is left untouched, so Close
+// stays safe to call either way.
+func (s *Store) Close() {
+	if s.ownsPool {
+		s.pool.Close()
+	}
+}
 
 // Pool exposes the underlying pool (for read-model projections colocated in
 // the same database).
