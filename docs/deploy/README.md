@@ -1,10 +1,10 @@
 # Deploying es-lited
 
 `es-lited` is the es-lite eventstore as a **NATS service** (ADR 0009): it
-serves an `es.Store` over NATS request/reply. It is **zero-knowledge** — it
-holds no keys and stores only ciphertext; clients encrypt payloads
-client-side. It is a stateless service over a shared backend, so it scales
-horizontally.
+serves an `es.Store` over NATS request/reply. It is **keyless** — it holds no
+keys and stores only the opaque bytes clients send; encryption, PII hashing and
+erasure are client-owned (ADR 0025). It is a stateless service over a shared
+backend, so it scales horizontally.
 
 - Image: build with [`../../Dockerfile`](../../Dockerfile) (`task docker:build`).
 - Manifests: [`../../deploy/k8s`](../../deploy/k8s).
@@ -35,21 +35,23 @@ partitioning, ADR 0004). SQLite is **single-workspace** (no `workspace_id`),
 for single-tenant or edge deployments — the server ignores the workspace
 argument.
 
-## Secrets: OpenBao provides the *infrastructure* secrets
+## Secrets and TLS
 
-es-lited is zero-knowledge, so OpenBao's **Transit** (payload) keys live on
-the *clients*, not here. What the server gets from OpenBao is its
-**infrastructure** secrets, ideally dynamic, via an OpenBao/Vault **Agent
-sidecar** (or the CSI provider):
+es-lited is keyless, so payload-encryption keys never live here. Keep them in
+the client's KMS/keystore; es-lite has no `ForgetWorkspace` and no server-side
+crypto-shredding (ADR 0025). The server still needs **infrastructure** secrets,
+ideally injected dynamically by your platform's secret manager (for example an
+OpenBao/Vault Agent sidecar or CSI provider):
 
-- **Postgres credentials** from the **database secrets engine** — short-lived,
-  rotated creds templated into `PG_DSN`, instead of a static password.
+- **Postgres credentials** — short-lived, rotated creds templated into `PG_DSN`.
 - **NATS credentials** for the `ESLITE` account (the `.creds`/JWT).
-- **mTLS** material (CA + cert/key) from OpenBao **PKI** for the client↔service
-  hop — this protects the *metadata* the server does see (stream ids, actors,
-  type URLs, claim scopes; ADR 0009). Payloads are already ciphertext.
+- **TLS material** (CA + cert/key) for the client↔service hop — this protects
+  the metadata the server sees (stream ids, actors, type URLs, claim scopes).
+  The repo does not wire `NATS_CA`/client certificates yet; configure TLS in
+  the NATS connection/deployment.
 
-The pod ideally holds **no static secret** — the Agent injects all three.
+The pod ideally holds **no static secret**. Payloads are opaque; whether they
+are ciphertext depends on the client.
 
 ## Health
 
@@ -74,9 +76,9 @@ unset** (dev/single-node stay zero-config):
 **Metrics:** `eslite.requests` (count, labelled `method`+`outcome`) and
 `eslite.request.duration` (histogram, seconds) — request rate/latency of
 `es-lited`; `eslite.relayed` (count) — events `es-relayd` published to JetStream.
-**Traces:** one server span per request, with W3C trace context propagated from
-the message headers (via `natskit`'s correlation), so traces span the async NATS
-hops. **Logs** go to stdout and are collected by OpenObserve.
+**Traces:** one server span per request, with W3C trace context extracted from
+message headers by the in-repo middleware (ADR 0028), so traces span the async
+NATS hops. **Logs** go to stdout and are collected by OpenObserve.
 
 ## Autoscaling
 
@@ -108,9 +110,9 @@ Two caveats:
 
 `es-lited` serves reads/writes; the **relay** publishes the log to JetStream
 (ADR 0003). It drains Postgres and publishes each event with
-`Nats-Msg-Id = global_position` (dedup). It is **zero-knowledge** — no keys, so
-it publishes **ciphertext**; crypto-capable projections decrypt. There are two
-ways to run it:
+`Nats-Msg-Id = global_position` (dedup). It is **keyless** — no keys, so it
+publishes the same opaque bytes it read; projections decrypt if the client
+sealed them. There are two ways to run it:
 
 **Folded in (preferred) — `RELAY=true` on es-lited.** Every replica campaigns
 for a **NATS KV lease** (`es_leader` bucket, key `relay.<prefix>`); only the
@@ -147,7 +149,7 @@ NATS domain, read models) per **shard** — and, for **data residency**, per
 Clients target the prefix for their workspace's home shard/region. **Shard by
 workspace, never by aggregate** (uniqueness and per-workspace ordering are
 per-store; ADR 0009). Zero-knowledge narrows residency scope to metadata +
-keys, since payloads are ciphertext everywhere.
+keys; whether payloads are ciphertext depends on the client.
 
 ## Migrations
 

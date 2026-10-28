@@ -260,8 +260,8 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 // applyClaims applies uniqueness ops in the append transaction: releases
 // first (so a same-value rename does not self-collide), then claims. A
 // colliding claim returns es.ErrConstraintViolated, rolling back the append.
-// Values are stored plaintext (SQLite has no keystore; PII is a Postgres
-// concern).
+// Values are stored exactly as given; callers must pre-hash personal data
+// (ADR 0025).
 func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
@@ -329,11 +329,10 @@ func (s *Store) ReadAll(ctx context.Context, fromPosition uint64, limit int) ([]
 	return s.queryEnvelopes(ctx, q, fromPosition, limit)
 }
 
-// CurrentStreamVersion implements es.Store.
 // LookupClaim reads the uniqueness index for the stream holding (scope, value).
-// SQLite is single-workspace with plaintext value_keys (no keystore), so pii is
-// irrelevant to the stored key — matching applyClaims.
-func (s *Store) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
+// The value is stored exactly as given; callers must pass the same pre-hashed
+// value both times (ADR 0025).
+func (s *Store) LookupClaim(ctx context.Context, scope, value string) (string, bool, error) {
 	var streamID string
 	err := s.db.QueryRowContext(ctx,
 		`SELECT stream_id FROM unique_claims WHERE scope = ? AND value_key = ?`,
@@ -348,6 +347,7 @@ func (s *Store) LookupClaim(ctx context.Context, scope, value string, pii bool) 
 	return streamID, true, nil
 }
 
+// CurrentStreamVersion implements es.Store.
 func (s *Store) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint64, error) {
 	if err := sid.Validate(); err != nil {
 		return 0, err

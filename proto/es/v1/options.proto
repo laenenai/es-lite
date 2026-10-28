@@ -6,10 +6,10 @@ import "google/protobuf/descriptor.proto";
 
 option go_package = "github.com/laenenai/es-lite/gen/es/v1;esv1";
 
-// es-lite's single framework option. Kept deliberately minimal — the
-// parent framework's options.proto carries a dozen options (data
-// classification, subject fields, schema versions, projection specs);
-// lite has exactly one: the sum-type marker.
+// es-lite's framework options. Kept deliberately minimal — the parent
+// framework's options.proto carries a dozen options (data classification,
+// subject fields, projection specs); lite has two: the sum-type marker and
+// the per-event schema version.
 extend google.protobuf.MessageOptions {
   // Marks this message as a sum-type container: a message holding exactly
   // one `oneof` whose variants form a sealed Go interface. The value is

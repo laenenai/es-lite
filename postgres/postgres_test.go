@@ -220,20 +220,20 @@ func TestUniqueClaimsWorkspaceScoped(t *testing.T) {
 
 	// Uniqueness is per-workspace (PK includes workspace_id): the same value in
 	// two workspaces is independent even though es-lite stores it verbatim.
-	if err := appendClaim("ws1", "a", 0, es.Claim("email", "x@y.com", true)); err != nil {
+	if err := appendClaim("ws1", "a", 0, es.Claim("email", "x@y.com")); err != nil {
 		t.Fatalf("ws1 claim: %v", err)
 	}
-	if err := appendClaim("ws2", "a", 0, es.Claim("email", "x@y.com", true)); err != nil {
+	if err := appendClaim("ws2", "a", 0, es.Claim("email", "x@y.com")); err != nil {
 		t.Fatalf("same value in ws2 must be independent: %v", err)
 	}
 	// Within ws1 it collides.
-	if err := appendClaim("ws1", "b", 0, es.Claim("email", "x@y.com", true)); !errors.Is(err, es.ErrConstraintViolated) {
+	if err := appendClaim("ws1", "b", 0, es.Claim("email", "x@y.com")); !errors.Is(err, es.ErrConstraintViolated) {
 		t.Fatalf("intra-workspace conflict: got %v, want ErrConstraintViolated", err)
 	}
 
 	// es-lite stores the value opaquely — the bytes given, verbatim (ADR 0025).
-	// A real caller HMACs PII in its codec before it reaches the store; here the
-	// raw value flows through, so we see it verbatim.
+	// A real caller hashes personal data before it reaches the store; here the raw
+	// value flows through, so we see it verbatim.
 	vk := rawValueKey(t, s, "ws1", "email")
 	if !bytes.Equal(vk, []byte("x@y.com")) {
 		t.Fatalf("value_key = %q, want verbatim %q", vk, "x@y.com")
@@ -331,11 +331,11 @@ func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 	if _, err := ws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 1,
-		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com", false)},
+		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
 	}); err != nil {
 		t.Fatalf("claim-only append: %v", err)
 	}
-	if _, found, err := ws.LookupClaim(ctx, "email", "a@b.com", false); err != nil || !found {
+	if _, found, err := ws.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
 	}
 }

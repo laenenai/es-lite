@@ -132,7 +132,7 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 
 // applyClaims applies uniqueness ops in the append transaction (ADR 0008):
 // releases first (so a same-value rename does not self-collide), then claims.
-// The value_key is stored opaquely (ADR 0025): for PII the caller's codec
+// The value_key is stored opaquely (ADR 0025): for personal data the caller
 // supplies a keyed MAC as the value; es-lite stores whatever bytes it is given.
 // A colliding claim returns es.ErrConstraintViolated, rolling back the append.
 func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, ops []es.ConstraintOp) error {
@@ -140,13 +140,9 @@ func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, o
 		if op.Op != es.ReleaseOp {
 			continue
 		}
-		vk, err := w.valueKey(ctx, op)
-		if err != nil {
-			return err
-		}
 		if _, err := tx.Exec(ctx,
 			`DELETE FROM unique_claims WHERE workspace_id=$1 AND scope=$2 AND value_key=$3 AND stream_id=$4`,
-			w.ws, op.Scope, vk, streamID,
+			w.ws, op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			return fmt.Errorf("release claim %s: %w", op.Scope, err)
 		}
@@ -155,13 +151,9 @@ func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, o
 		if op.Op != es.ClaimOp {
 			continue
 		}
-		vk, err := w.valueKey(ctx, op)
-		if err != nil {
-			return err
-		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
-			w.ws, op.Scope, vk, streamID,
+			w.ws, op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			if isUniqueViolation(err) {
 				return fmt.Errorf("%w: %s=%q", es.ErrConstraintViolated, op.Scope, op.Value)
@@ -170,14 +162,6 @@ func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, o
 		}
 	}
 	return nil
-}
-
-// valueKey returns the stored uniqueness key for a constraint. es-lite stores
-// the value opaquely (ADR 0025): for PII the caller's codec has already
-// replaced op.Value with a keyed MAC before it reaches the store, so es-lite
-// just stores the bytes it is given regardless of the PII flag.
-func (w *wsStore) valueKey(_ context.Context, op es.ConstraintOp) ([]byte, error) {
-	return []byte(op.Value), nil
 }
 
 func (w *wsStore) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
@@ -240,9 +224,9 @@ func (w *wsStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (ui
 
 // LookupClaim reads the uniqueness index (unique_claims) for the stream holding
 // (scope, value). The value is keyed exactly as applyClaims stores it — opaque
-// bytes as given (ADR 0025) — so writes and lookups agree: a PII lookup must
-// pass the same codec-computed MAC the write used.
-func (w *wsStore) LookupClaim(ctx context.Context, scope, value string, pii bool) (string, bool, error) {
+// bytes as given (ADR 0025) — so writes and lookups agree. A personal-data
+// lookup must pass the same caller-computed MAC the write used.
+func (w *wsStore) LookupClaim(ctx context.Context, scope, value string) (string, bool, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
 		return "", false, err
@@ -251,14 +235,10 @@ func (w *wsStore) LookupClaim(ctx context.Context, scope, value string, pii bool
 	if err := setWorkspace(ctx, tx, w.ws); err != nil {
 		return "", false, err
 	}
-	vk, err := w.valueKey(ctx, es.ConstraintOp{Op: es.ClaimOp, Scope: scope, Value: value, PII: pii})
-	if err != nil {
-		return "", false, err
-	}
 	var streamID string
 	err = tx.QueryRow(ctx,
 		`SELECT stream_id FROM unique_claims WHERE workspace_id = $1 AND scope = $2 AND value_key = $3`,
-		w.ws, scope, vk,
+		w.ws, scope, []byte(value),
 	).Scan(&streamID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil

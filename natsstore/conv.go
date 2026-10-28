@@ -120,7 +120,7 @@ func toConstraintsWire(ops []es.ConstraintOp) []constraintWire {
 	}
 	out := make([]constraintWire, len(ops))
 	for i, op := range ops {
-		out[i] = constraintWire{Op: uint8(op.Op), Scope: op.Scope, Value: op.Value, PII: op.PII}
+		out[i] = constraintWire{Op: uint8(op.Op), Scope: op.Scope, Value: op.Value}
 	}
 	return out
 }
@@ -131,7 +131,7 @@ func fromConstraintsWire(ws []constraintWire) []es.ConstraintOp {
 	}
 	out := make([]es.ConstraintOp, len(ws))
 	for i, w := range ws {
-		out[i] = es.ConstraintOp{Op: es.ConstraintOpKind(w.Op), Scope: w.Scope, Value: w.Value, PII: w.PII}
+		out[i] = es.ConstraintOp{Op: es.ConstraintOpKind(w.Op), Scope: w.Scope, Value: w.Value}
 	}
 	return out
 }

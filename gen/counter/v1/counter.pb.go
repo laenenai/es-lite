@@ -285,10 +285,9 @@ func (*Close) Descriptor() ([]byte, []int) {
 	return file_counter_v1_counter_proto_rawDescGZIP(), []int{4}
 }
 
-// Commands is the sum-type container. Codegen (future) reads the oneof to
-// emit the sealed `Command` interface + codec; today those are
-// hand-written in counter.go. The container documents the closed variant
-// set regardless.
+// Commands is the sum-type container. protoc-gen-es-lite reads the oneof to
+// emit the sealed `Command` interface + codec; the container documents the
+// closed variant set.
 type Commands struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Variant:

@@ -77,7 +77,7 @@ func TestHandleAppliesConstraintsWithoutEvents(t *testing.T) {
 	decider := es.Decider[noEventState, noEventCommand, noEvent]{
 		Initial: func() noEventState { return noEventState{} },
 		Decide: func(noEventState, noEventCommand) ([]noEvent, []es.ConstraintOp, error) {
-			return nil, []es.ConstraintOp{es.Claim("email", "a@b.com", false)}, nil
+			return nil, []es.ConstraintOp{es.Claim("email", "a@b.com")}, nil
 		},
 		Evolve: func(s noEventState, _ noEvent) noEventState { return s },
 	}
@@ -90,7 +90,7 @@ func TestHandleAppliesConstraintsWithoutEvents(t *testing.T) {
 	if res.FromVersion != 0 || res.ToVersion != 0 {
 		t.Fatalf("claim-only versions = %d/%d, want 0/0", res.FromVersion, res.ToVersion)
 	}
-	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com", false); err != nil || !found {
+	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
 	}
 }
@@ -115,11 +115,11 @@ func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 	if _, err := store.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 1,
-		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com", false)},
+		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
 	}); err != nil {
 		t.Fatalf("claim-only append: %v", err)
 	}
-	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com", false); err != nil || !found {
+	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
 	}
 }

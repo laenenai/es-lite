@@ -8,8 +8,8 @@ package counter
 import (
 	"errors"
 
-	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
 	"github.com/laenenai/es-lite/es"
+	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
 )
 
 // Domain errors, surfaced verbatim by aggregate.Runtime.Handle when
@@ -28,8 +28,8 @@ var Decider = es.Decider[*counterv1.Counter, counterv1.Command, counterv1.Event]
 	Initial: func() *counterv1.Counter { return &counterv1.Counter{} },
 
 	// The counter has no cross-stream uniqueness, so Decide always returns
-	// nil constraints. See examples/uniqueness (and ADR 0008) for a Decider
-	// that emits Claim/Release ops.
+	// nil constraints. See ADR 0008 for a Decider that emits Claim/Release
+	// ops.
 	Decide: func(s *counterv1.Counter, c counterv1.Command) ([]counterv1.Event, []es.ConstraintOp, error) {
 		switch cmd := c.(type) {
 		case *counterv1.Init:

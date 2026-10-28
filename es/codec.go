@@ -10,10 +10,9 @@ type EncodedEvent struct {
 	Payload       []byte
 }
 
-// Codec encodes and decodes an aggregate's event sum type E. By
-// convention it is generated from the .proto (future codegen; for now
-// hand-written per aggregate) and marshals each variant as canonical
-// proto bytes tagged with the variant's full type name.
+// Codec encodes and decodes an aggregate's event sum type E. It is
+// generated from the .proto by protoc-gen-es-lite and marshals each variant
+// as canonical proto bytes tagged with the variant's full type name.
 //
 // Decode returns ErrUnknownEventType when it does not recognize the
 // TypeURL — the signal for a version-skew deployment.

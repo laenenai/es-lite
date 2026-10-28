@@ -2,9 +2,8 @@ package es
 
 // Decider is es-lite's aggregate model — pure functions describing how a
 // stream's state evolves and which events a command produces. Adopted
-// from the parent framework's ADR 0003; es-lite drops the parent's
-// constraint-operations return value (cross-aggregate uniqueness is out
-// of scope), leaving the classic three-function shape.
+// from the parent framework's ADR 0003 and extended with transactional
+// uniqueness constraints (ADR 0008).
 //
 // All functions MUST be pure:
 //

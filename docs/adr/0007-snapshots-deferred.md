@@ -1,7 +1,9 @@
 # ADR 0007: Snapshots (Deferred)
 
-- **Status:** Deferred
+- **Status:** Implemented (snapshot cache; sealing is client-owned per ADR 0025)
 - **Date:** 2026-08-01
+
+> Errata (2026-10-28): snapshots are implemented as `snapshot`/`snapshot/natskv`; sealing and erasure of snapshot state are client-owned (ADR 0025).
 
 ## Context
 

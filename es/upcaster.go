@@ -2,8 +2,9 @@ package es
 
 // Upcaster transforms a decoded event from an older schema version to the
 // current one, at read time. The aggregate runtime (and projection replays)
-// run it after Codec.Decode when a stored event's SchemaVersion is older than
-// the code's current version — see the schema_version option (ADR 0001).
+// run it after Codec.Decode for every event; the upcaster decides from
+// fromVersion whether the event needs upgrading — see the schema_version
+// option (ADR 0001).
 //
 // Like Decider.Evolve, an Upcaster runs during replay, so it must be pure and
 // deterministic: no clock, no I/O, no randomness. Returning the event

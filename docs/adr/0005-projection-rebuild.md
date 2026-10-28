@@ -1,7 +1,9 @@
 # ADR 0005: Projection Rebuild
 
-- **Status:** Accepted (design; primitive deferred)
+- **Status:** Accepted (implemented)
 - **Date:** 2026-08-01
+
+> Errata (2026-10-28): references to crypto-shredding describe the superseded design; see ADR 0025. Replay itself is implemented in `projection`.
 
 ## Context
 

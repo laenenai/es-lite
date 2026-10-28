@@ -43,8 +43,7 @@ type eventDataWire struct {
 type constraintWire struct {
 	Op    uint8  `json:"op"`
 	Scope string `json:"scope"`
-	Value string `json:"value"` // opaque key (client may have HMAC'd it)
-	PII   bool   `json:"pii"`
+	Value string `json:"value"` // opaque key (client may hash/MAC it)
 }
 
 type envelopeWire struct {
@@ -110,8 +109,7 @@ type currentVersionReq struct {
 
 type lookupClaimReq struct {
 	Scope string `json:"scope"`
-	Value string `json:"value"` // opaque key (client may have HMAC'd PII)
-	PII   bool   `json:"pii"`
+	Value string `json:"value"` // opaque key (client may hash/MAC it)
 }
 
 type lookupClaimResp struct {
