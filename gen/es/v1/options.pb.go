@@ -62,10 +62,10 @@ var (
 	// stamps this onto every EncodedEvent as its upcaster dispatch key; it
 	// rides the wire in the envelope and the Es-Schema-Version NATS header.
 	//
-	//	message Incremented {
-	//	  option (es.v1.schema_version) = 2;
-	//	  int64 by_millicents = 1; // was by_cents in v1
-	//	}
+	//   message Incremented {
+	//     option (es.v1.schema_version) = 2;
+	//     int64 by_millicents = 1; // was by_cents in v1
+	//   }
 	//
 	// optional uint32 schema_version = 50001;
 	E_SchemaVersion = &file_es_v1_options_proto_extTypes[1]
