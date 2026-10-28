@@ -115,7 +115,7 @@ tasks:
     desc: buf lint + breaking-change check against main.
     cmds:
       - buf lint
-      - buf breaking --against '.git#branch=main'
+      - buf breaking --against '.git#ref=origin/main'
 
   tidy:
     desc: Tidy go.mod/go.sum.
