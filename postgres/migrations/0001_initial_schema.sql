@@ -75,9 +75,9 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 
 -- unique_claims: cross-stream uniqueness, per-workspace (ADR 0008). value_key
--- is opaque bytes as given by the caller (ADR 0025): the client's codec
--- supplies a keyed MAC for PII scopes so shredding the scope key unlinks it;
--- es-lite stores the bytes verbatim. The PK is the uniqueness constraint; a
+-- is opaque bytes as given by the caller (ADR 0025): for personal data the
+-- caller supplies a keyed MAC it controls; es-lite stores the bytes verbatim
+-- and does not hash or erase them. The PK is the uniqueness constraint; a
 -- colliding Claim rolls back the whole append with es.ErrConstraintViolated.
 -- RLS scopes it like events.
 CREATE TABLE IF NOT EXISTS unique_claims (

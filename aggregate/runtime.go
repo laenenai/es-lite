@@ -35,8 +35,8 @@ type Runtime[S, C, E any] struct {
 	foldVersion uint32
 }
 
-// NewRuntime wires a Runtime against a Store, a Decider, and the event
-// Codec (generated per aggregate; hand-written for now).
+// NewRuntime wires a Runtime against a Store, a Decider, and the generated
+// per-aggregate event Codec.
 func NewRuntime[S, C, E any](store es.Store, decider es.Decider[S, C, E], codec es.Codec[E]) *Runtime[S, C, E] {
 	return &Runtime[S, C, E]{store: store, decider: decider, codec: codec}
 }

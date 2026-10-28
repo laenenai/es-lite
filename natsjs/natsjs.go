@@ -34,7 +34,7 @@ const (
 	HdrEventID        = "Es-Event-Id"
 	HdrTypeURL        = "Es-Type-Url"
 	HdrSchemaVersion  = "Es-Schema-Version"
-	HdrStream         = "Es-Stream"      // canonical "type:id"
+	HdrStream         = "Es-Stream" // canonical "type:id"
 	HdrWorkspace      = "Es-Workspace"
 	HdrVersion        = "Es-Version"
 	HdrGlobalPosition = "Es-Global-Position"

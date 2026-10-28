@@ -8,7 +8,7 @@
 - as a **Go library** you embed (proto-defined aggregates, the Decider model, a
   storage-neutral `Store`), and
 - as a **NATS service** (`es-lited`) that many services share over NATS, holding
-  no keys and storing only ciphertext.
+  no keys and storing only the opaque bytes clients send.
 
 The append-only event log is the source of truth. **History, auditability, and
 time-travel** are non-negotiable requirements — which is why the storage model
@@ -38,65 +38,65 @@ Design decisions live in [`docs/adr`](./docs/adr) (10 ADRs); operations in
 
 ## What it is / responsibilities
 
-`es-lited` is a **workspace-scoped, zero-knowledge eventstore service**. It is
-deliberately narrow: it owns durability, ordering, isolation, and delivery of
-an opaque, encrypted event log — and delegates everything else.
+`es-lited` is a **workspace-scoped, keyless eventstore service**. It owns
+durability, per-stream versioning, workspace isolation (Postgres), and delivery
+of an opaque event log. It delegates encryption, key management, PII handling,
+authentication and business rules.
 
 **es-lited IS responsible for:**
 
 | Responsibility | Mechanism |
 |---|---|
-| Durable, immutable, append-only event log | Postgres/SQLite; no `UPDATE`/`DELETE` of events |
+| Durable, append-only event log | Postgres/SQLite; payload rows are never updated (`published_at` is the only mutable delivery marker) |
 | Optimistic concurrency | `UNIQUE (workspace, stream, version)` → `ErrConflict` |
 | Per-workspace data isolation | Postgres RLS + hash partitioning; workspace from the subject |
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
-| Total ordering + at-least-once delivery | `global_position` + relay/poller + JetStream dedup |
-| Ciphertext at rest & in flight | stores only what the client encrypted; never decrypts |
+| At-least-once delivery | relay/poller + JetStream dedup (see the delivery caveats in ADR 0003/0005) |
+| Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
 | Schema lifecycle | versioned migrations (`es-migrate`) |
 
 **es-lited is NOT responsible for (by design):**
 
 | Not its job | Whose job |
 |---|---|
-| Authenticating callers / verifying tokens | the NATS auth callout (`natsauthd`) + SPIRE/Zitadel |
-| Holding encryption keys / decrypting payloads | **clients** (envelope encryption) + OpenBao (KEKs) |
-| Authorization decisions | the PDP (OpenFGA) at the caller/interceptor |
+| Authenticating callers / verifying tokens | the NATS auth callout/ACLs in your deployment |
+| Holding encryption keys / decrypting payloads | **clients** (client-side envelope encryption, KMS/keystore of your choice) |
+| PII hashing, erasure or crypto-shredding | **clients**; es-lite has no keystore and no `ForgetWorkspace` |
+| Authorization decisions | the PDP at the caller/interceptor |
 | Business rules | the **Decider**, which runs client-side |
 
-> The client encrypts, decides, and holds keys; the broker authenticates and
-> scopes; es-lited durably stores and orders ciphertext. Three concerns, three
-> owners — that separation *is* the security model.
+> The client encrypts, decides, hashes PII and owns erasure; the broker
+> authenticates and scopes; es-lited durably stores and orders opaque bytes.
+> Three concerns, three owners.
 
-## Security features
+## Security model
 
-- **Zero-knowledge server.** `es-lited` and `es-relayd` hold **no keys** and
-  **never decrypt**. Clients encrypt event payloads client-side (per-workspace
-  envelope encryption); the service stores and moves only ciphertext. Compromise
-  the service → you get ciphertext and metadata, never plaintext.
-- **Crypto-shredding erasure (GDPR).** Each workspace's data is sealed under a
-  per-workspace **OpenBao Transit** KEK. `ForgetWorkspace` deletes the KEK — the
-  ciphertext (including in DB backups) becomes permanently unrecoverable.
-  Immutability and erasure coexist: destroy a key, not a row.
-- **Per-workspace isolation, enforced not asserted.** Postgres **Row-Level
-  Security** scopes every access; the workspace comes from the **subject**
-  (`svc.eslite.<region>.<ws>.<method>`) and is **cross-checked fail-closed**
-  against the authenticated workspace (`subject.ws != auth.ws` ⇒ reject; never
-  falls back to a client-supplied value). Defense in depth: broker subject-ACLs
-  (via `natsauthd`) **and** the app cross-check **and** RLS — no single gate is
-  trusted (architecture ADR 0005).
-- **PII-safe uniqueness.** Unique claims on personal data (e.g. email) store an
-  **HMAC under the workspace key**, not plaintext — so uniqueness holds while the
-  workspace lives, and crypto-shredding unlinks it.
-- **Tamper-evident by construction.** Append-only log with full causality/actor
-  metadata (`correlation`, `causation`, `command`, `actor`) and two clocks
-  (occurred-at vs recorded-at); time-travel reconstructs any past state.
+es-lite is **keyless**: it persists and moves whatever opaque bytes clients send.
+It does not encrypt, decrypt, hold keys, hash PII, or erase data by destroying
+keys. Those are client responsibilities (ADR 0025).
+
+- **Client-side encryption.** Seal payloads before `Append` and open them after
+  read. The service, relay and JetStream see only the bytes you give them.
+  "Zero-knowledge" holds only if you actually encrypt client-side.
+- **Erasure is client-owned.** There is no server-side crypto-shredding and no
+  `ForgetWorkspace`. If you need key-destruction erasure, keep keys outside
+  es-lite and account for snapshots, unique-claim values, JetStream retention,
+  read models and database backups when you destroy them.
+- **Uniqueness values are opaque.** `Claim`/`Release` store the exact value you
+  provide. For personal data, pass a keyed hash/MAC you control, never the raw
+  value; `LookupClaim` must receive the same value. There is no PII flag.
+- **Per-workspace isolation (Postgres).** RLS scopes rows and the workspace is
+  read from the NATS subject. That is isolation, not authentication: configure
+  per-workspace NATS ACLs/auth callout and never rely on the subject token alone.
+- **Append-only by API contract.** The library never updates event payloads;
+  `published_at` is the relay's one mutable column. There is no hash chain or
+  signature, so the log is not tamper-evident against a database operator.
+- **Metadata is visible.** Stream IDs, actors, type URLs and claim scopes are not
+  encrypted by the store. Use TLS and broker ACLs on the client↔service hop; the
+  repo does not wire TLS for you.
 - **Multi-region / data residency.** Region is in the subject from day 1; a
-  region is a self-contained cell (Postgres + OpenBao + NATS + read models). No
+  region is a self-contained cell (Postgres + NATS + read models). There is no
   transparent cross-region failover for partitioned state.
-- **Hardened container.** Distroless, non-root (UID 65532), read-only root
-  filesystem, all capabilities dropped, static binary (no shell).
-- **mTLS** on the client↔service hop protects the metadata the server does see
-  (stream ids, actors, type URLs).
 
 ## Architecture
 
@@ -107,11 +107,10 @@ an opaque, encrypted event log — and delegates everything else.
    │ Handle(cmd)                                           │ (JetStream durable)
    ▼                                                       │
  es.Store over NATS  ──req/reply──▶  es-lited ──▶ Postgres (RLS, partitioned,
-   (svc.eslite.<region>.<ws>.*)      (no keys)      append-only, ciphertext)
+   (svc.eslite.<region>.<ws>.*)      (no keys)      append-only, opaque payloads)
                                                           │
                                        es-relayd  ◀───────┘ drain
-                                       (no keys)  ──▶ JetStream (evt.<ws>.…, ciphertext,
-                                                            dedup by global_position)
+                                       (no keys)  ──▶ JetStream (evt.<ws>.…, opaque payloads)
 ```
 
 - **`es.Store` is the whole contract** — the same aggregate runtime/decider/codec
@@ -193,9 +192,10 @@ mesh, `es-lited` also registers as a **NATS Micro** service — `nats micro ls` 
 when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (→ OpenObserve), inert otherwise — see
 [the deploy guide](./docs/deploy/README.md#observability-opentelemetry--openobserve).
 
-Secrets are best injected by an **OpenBao/Vault Agent sidecar** (dynamic
-Postgres creds via the database secrets engine, NATS creds, mTLS via PKI) — the
-pod then holds no static secrets. See [`docs/deploy`](./docs/deploy).
+Secrets are best injected by your platform's secret manager (for example an
+OpenBao/Vault Agent sidecar with dynamic Postgres creds and NATS creds); the pod
+then holds no static secrets. TLS is a deployment responsibility. See
+[`docs/deploy`](./docs/deploy).
 
 ## Deployment (Kubernetes)
 
@@ -203,7 +203,7 @@ Manifests in [`deploy/k8s`](./deploy/k8s): a `Deployment` for `es-lited` (with a
 `es-migrate` **init container** and `AUTO_MIGRATE=false`), a singleton
 `es-relayd`, and a KEDA `ScaledObject` (autoscale the service on **p95 latency**,
 projection consumers on **JetStream lag** — never CPU). Full guide, including the
-OpenBao Agent sidecar, mTLS, sharding, and multi-region cells:
+secret injection, TLS, sharding, and multi-region cells:
 **[`docs/deploy/README.md`](./docs/deploy/README.md)**.
 
 ## Using es-lite as a library
@@ -212,26 +212,52 @@ Aggregates are defined in `.proto`; `task generate` emits sealed sum-types +
 codecs. You hand-write only the `Decider` and its error sentinels.
 
 ```go
+func example(ctx context.Context, nc *nats.Conn, someTimestamp time.Time) error {
 // Embedded (direct Postgres/SQLite):
-store, _ := sqlite.Open(ctx, "file:events.db")           // auto-migrates
-rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
-res, _ := rt.Handle(ctx, sid, &counterv1.Init{Min: 0, Max: 100}, es.Meta{})
+store, err := sqlite.Open(ctx, "file:events.db") // auto-migrates
+if err != nil {
+	return err
+}
+defer store.Close()
 
-// Over NATS, zero-knowledge (client encrypts):
+sid, err := es.NewStreamID("counter", "main")
+if err != nil {
+	return err
+}
+rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
+res, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100}), es.Meta{})
+if err != nil {
+	return err
+}
+_ = res
+
+// Over NATS: the store moves opaque bytes. If you need encryption, wrap this
+// store with your own client-side sealing codec (es-lite holds no keys).
 client := natsstore.NewClient(nc, natsstore.WithClientPrefix("svc.eslite.eu"))
-enc := cryptostore.New(client.Workspace("ws_123"), shredder, "ws_123")
-rt := aggregate.NewRuntime(enc, counter.Decider, counterv1.EventCodec{})  // identical runtime
+remote := client.Workspace("ws_123")
+rt = aggregate.NewRuntime(remote, counter.Decider, counterv1.EventCodec{})
 
 // Time-travel:
-past, _ := rt.LoadAsOfVersion(ctx, sid, 1)
-past, _  = rt.LoadAsOfTime(ctx, sid, someTimestamp)
+past, err := rt.LoadAsOfVersion(ctx, sid, 1)
+if err != nil {
+	return err
+}
+_ = past
+past, err = rt.LoadAsOfTime(ctx, sid, someTimestamp)
+if err != nil {
+	return err
+}
+_ = past
 
-// Bounded-staleness read (from the NATS-KV snapshot cache, zero store hops):
-state, _, fresh, _ := rt.LoadStale(ctx, sid, 5*time.Minute)
+// Bounded-staleness read (snapshot cache; only if you configured WithSnapshots):
+state, _, cacheHit, err := rt.LoadStale(ctx, sid, 5*time.Minute)
+_, _, _, _ = state, cacheHit, err, store
+return nil
+}
 ```
 
-See [`examples/`](./examples) — `counter`, `pipeline` (end-to-end),
-`zeroknowledge`, `snapshots`, `upcast`.
+See [`examples/`](./examples) — `counter`, `pipeline` (end-to-end), `snapshots`,
+`upcast`.
 
 ## Backends
 
@@ -275,8 +301,8 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 
 ## Documentation
 
-- **[ADRs](./docs/adr)** — 10 decision records (event-sourcing, workspaces &
-  crypto-shredding, NATS service, migrations, …). Start at
+- **[ADRs](./docs/adr)** — 12 decision records (event-sourcing, workspaces,
+  client-owned crypto, NATS service, migrations, …). Start at
   [the index](./docs/adr/README.md).
 - **[Deployment guide](./docs/deploy/README.md)** — running `es-lited` in
   production.

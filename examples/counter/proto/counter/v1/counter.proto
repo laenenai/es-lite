@@ -28,10 +28,9 @@ message Increment { int64 by = 1; }
 message Decrement { int64 by = 1; }
 message Close {}
 
-// Commands is the sum-type container. Codegen (future) reads the oneof to
-// emit the sealed `Command` interface + codec; today those are
-// hand-written in counter.go. The container documents the closed variant
-// set regardless.
+// Commands is the sum-type container. protoc-gen-es-lite reads the oneof to
+// emit the sealed `Command` interface + codec; the container documents the
+// closed variant set.
 message Commands {
   option (es.v1.sum_type) = "Command";
 

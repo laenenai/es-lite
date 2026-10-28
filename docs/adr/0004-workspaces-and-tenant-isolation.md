@@ -1,8 +1,10 @@
 # ADR 0004: Workspaces and Tenant Isolation
 
-- **Status:** Accepted (amends ADR 0001 — reinstates crypto-shredding as
-  the workspace erasure mechanism)
+- **Status:** Accepted for workspace isolation.
+- **Superseded in part:** crypto/erasure by ADR 0025.
 - **Date:** 2026-08-01
+
+> Errata (2026-10-28): server-side crypto-shredding and per-workspace key custody are superseded by ADR 0025. Workspace isolation (RLS/partitioning) remains accepted.
 
 ## Context
 

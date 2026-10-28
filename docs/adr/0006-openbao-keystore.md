@@ -1,7 +1,9 @@
 # ADR 0006: OpenBao KeyStore Adapter
 
-- **Status:** Accepted (implemented; validated against OpenBao 2.6.1)
+- **Status:** Superseded by ADR 0025 (server-side keystore removed)
 - **Date:** 2026-08-01
+
+> Errata (2026-10-28): the keystore and crypto-shredding implementation described here was removed in commit `d451cf4`; this ADR is superseded by ADR 0025.
 
 ## Context
 

@@ -57,8 +57,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 -- unique_claims: cross-stream uniqueness (ADR 0008). A Claim inserts a row;
 -- the PRIMARY KEY makes a duplicate fail, rolling back the whole append with
 -- es.ErrConstraintViolated. A Release deletes the owning stream's row.
--- SQLite is single-workspace, so no workspace_id column and values are stored
--- as plaintext (the PII flag applies only to keystore-backed Postgres).
+-- SQLite is single-workspace, so no workspace_id column. Values are stored
+-- exactly as given; callers must pre-hash personal data (ADR 0025).
 CREATE TABLE IF NOT EXISTS unique_claims (
     scope      TEXT NOT NULL,
     value_key  BLOB NOT NULL,

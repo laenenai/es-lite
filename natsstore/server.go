@@ -221,7 +221,7 @@ func (s *Server) handleLookupClaim(ctx context.Context, m MsgContext) ([]byte, e
 	if err := json.Unmarshal(m.Data, &req); err != nil {
 		return json.Marshal(lookupClaimResp{ErrKind: "internal", ErrMsg: err.Error()})
 	}
-	streamID, found, err := s.scope(WorkspaceFrom(ctx)).LookupClaim(ctx, req.Scope, req.Value, req.PII)
+	streamID, found, err := s.scope(WorkspaceFrom(ctx)).LookupClaim(ctx, req.Scope, req.Value)
 	kind, msg := errKind(err)
 	return json.Marshal(lookupClaimResp{ErrKind: kind, ErrMsg: msg, StreamID: streamID, Found: found})
 }

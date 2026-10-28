@@ -17,13 +17,15 @@ than editing history.
 | 0001 | [Event-Sourced Log as Source of Truth](./0001-event-sourced-lite-architecture.md)         | Accepted |
 | 0002 | [Deployment Topology and Delivery](./0002-deployment-topology-and-delivery.md)             | Accepted |
 | 0003 | [NATS/JetStream Delivery and Projections](./0003-nats-jetstream-delivery.md)               | Accepted (implemented) |
-| 0004 | [Workspaces and Tenant Isolation](./0004-workspaces-and-tenant-isolation.md)               | Accepted (amends 0001) |
-| 0005 | [Projection Rebuild](./0005-projection-rebuild.md)                                         | Accepted (design; primitive deferred) |
-| 0006 | [OpenBao KeyStore Adapter](./0006-openbao-keystore.md)                                     | Accepted (implemented) |
-| 0007 | [Snapshots (Deferred)](./0007-snapshots-deferred.md)                                       | Deferred |
-| 0008 | [Uniqueness Constraints](./0008-uniqueness-constraints.md)                                 | Accepted (amends 0003) |
+| 0004 | [Workspaces and Tenant Isolation](./0004-workspaces-and-tenant-isolation.md)               | Accepted for isolation; crypto/erasure superseded by 0025 |
+| 0005 | [Projection Rebuild](./0005-projection-rebuild.md)                                         | Accepted (implemented) |
+| 0006 | [OpenBao KeyStore Adapter](./0006-openbao-keystore.md)                                     | Superseded by 0025 (server-side keystore removed) |
+| 0007 | [Snapshots](./0007-snapshots-deferred.md)                                                   | Implemented (cache; sealing is client-owned per 0025) |
+| 0008 | [Uniqueness Constraints](./0008-uniqueness-constraints.md)                                 | Accepted; PII handling amended by 0025 |
 | 0009 | [NATS Eventstore Service (zero-knowledge client)](./0009-nats-eventstore-service.md)       | Accepted (implemented) |
 | 0010 | [Schema Migrations](./0010-schema-migrations.md)                                           | Accepted |
+| 0025 | [Client-Owned Cryptography and Erasure](./0025-client-owned-crypto.md)                     | Accepted (supersedes 0004/0006 crypto; amends 0008) |
+| 0028 | [In-Repo NATS Middleware and Observability](./0028-in-repo-nats-middleware-and-observability.md) | Accepted |
 
 ## Conventions
 
@@ -40,7 +42,8 @@ than editing history.
 *ideas* the parent proved out — proto-defined aggregates, the Decider
 model, a storage-neutral `Store` — while deliberately **omitting** the
 parent's heavier machinery (durable command-bus workflows, synchronous
-projections, `state_cache`, crypto-shredding, Cedar authz, mandatory
-multi-tenancy, the tamper-evident hash chain). ADR 0001 lists the cuts
-and the reasoning. When a cut later proves necessary, the parent's ADRs
-are the reference for how to add it back.
+projections, `state_cache`, server-side crypto-shredding, Cedar authz,
+mandatory multi-tenancy, the tamper-evident hash chain). ADR 0001 lists
+the cuts and the reasoning. Cryptography and erasure are client-owned
+(ADR 0025). When a cut later proves necessary, the parent's ADRs are the
+reference for how to add it back.

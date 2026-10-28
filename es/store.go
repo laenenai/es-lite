@@ -10,7 +10,7 @@ import (
 // Store is the storage contract every backend implements. It is small
 // and serialization-neutral: it moves Envelopes (opaque Payload +
 // metadata) in and out, and knows nothing about aggregates, proto, or
-// projections. Adapters live under sqlite/ (and, later, postgres/).
+// projections. Adapters live under sqlite/ and postgres/.
 //
 // The event log is append-only and immutable: there is no Update or
 // Delete. History, auditability, and time-travel all rest on that
@@ -46,16 +46,16 @@ type Store interface {
 	CurrentStreamVersion(ctx context.Context, sid StreamID) (uint64, error)
 
 	// LookupClaim returns the stream that currently holds the uniqueness
-	// claim (scope, value) — the reverse of Claim. `value` and `pii` are the
-	// same as passed to Claim; the store keys the value identically, so a PII
-	// claim is looked up by the same keyed HMAC. `found` is false when no
-	// stream holds it (never claimed, or since released).
+	// claim (scope, value) — the reverse of Claim. `value` is the same opaque
+	// string passed to Claim; for personal data the caller must pass the same
+	// keyed hash/MAC both times. `found` is false when no stream holds it
+	// (never claimed, or since released).
 	//
 	// This exposes the uniqueness index as a read: any aggregate that Claims a
 	// value gets reverse lookup (e.g. external-identity → user_id) with
 	// read-your-writes consistency, since the claim commits in the append
 	// transaction — no separate, eventually-consistent projection needed.
-	LookupClaim(ctx context.Context, scope, value string, pii bool) (streamID string, found bool, err error)
+	LookupClaim(ctx context.Context, scope, value string) (streamID string, found bool, err error)
 }
 
 // AppendParams is the input to Store.Append. The audit/causality fields

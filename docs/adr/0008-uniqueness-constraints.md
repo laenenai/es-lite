@@ -1,7 +1,10 @@
 # ADR 0008: Uniqueness Constraints
 
-- **Status:** Accepted (amends ADR 0003 — Decider signature)
+- **Status:** Accepted (amends ADR 0003 — Decider signature).
+- **Amended by:** ADR 0025 (PII flag removed; callers pre-hash).
 - **Date:** 2026-08-02
+
+> Errata (2026-10-28): the `PII` flag and server-side HMAC are removed; callers supply an opaque, pre-hashed value (ADR 0025). The transactional uniqueness design remains accepted.
 
 ## Context
 
