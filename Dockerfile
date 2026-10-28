@@ -1,34 +1,24 @@
 # syntax=docker/dockerfile:1
 #
 # es-lited — the es-lite eventstore as a NATS service (ADR 0009).
-# Multi-stage, static (CGO off; pgx + nats + natskit are pure Go), distroless
-# runtime. The private module github.com/laenenai/natskit is fetched with a
-# BuildKit secret so the token never lands in an image layer:
-#
-#   docker build --secret id=go_modules_token,env=GO_MODULES_TOKEN -t es-lited .
-#
-# (locally: GO_MODULES_TOKEN=$(gh auth token) docker build --secret ... .)
+# Multi-stage, static (CGO off; pgx, nats and modernc/sqlite are pure Go),
+# distroless runtime. There are no private module dependencies.
 
 # --platform=$BUILDPLATFORM: run the builder natively and cross-compile to the
 # target (pure Go, CGO off) — fast multi-arch without QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
-ARG TARGETOS TARGETARCH
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm AS build
+ARG TARGETOS TARGETARCH VERSION=dev
 WORKDIR /src
-ENV GOPRIVATE=github.com/laenenai/* \
-    CGO_ENABLED=0
+ENV CGO_ENABLED=0
 
-# Build cmd/es-lited directly so only ITS dependency graph is fetched (pgx,
-# nats, natskit — not modernc/sqlite, which the server never uses). The
-# BuildKit secret gives git access to the private natskit module.
+# Build the three commands directly so only their dependency graphs are fetched.
 COPY . .
-RUN --mount=type=secret,id=go_modules_token \
-    git config --global url."https://x-access-token:$(cat /run/secrets/go_modules_token)@github.com/".insteadOf "https://github.com/" && \
-    GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/es-lited ./cmd/es-lited && \
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/es-lited ./cmd/es-lited && \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/es-migrate ./cmd/es-migrate && \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/es-relayd ./cmd/es-relayd
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/es-relayd ./cmd/es-relayd
 
 FROM gcr.io/distroless/static-debian12:nonroot
 # es-lited (service) + es-migrate (init container) + es-relayd (relay).

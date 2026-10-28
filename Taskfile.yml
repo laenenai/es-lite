@@ -44,10 +44,10 @@ tasks:
       - PATH="$(go env GOPATH)/bin:$PATH" buf generate
 
   generate:check:
-    desc: Fail if generated code is out of date (CI gate).
+    desc: Fail if generated code is out of date, including untracked files (CI gate).
     deps: [generate]
     cmds:
-      - git diff --exit-code -- gen/ || (echo "generated code is stale; run 'task generate'" && exit 1)
+      - test -z "$(git status --porcelain -- gen/)" || (echo "generated code is stale; run 'task generate'" && git status --porcelain -- gen/ && exit 1)
 
   build:
     desc: Build every package.
@@ -58,6 +58,16 @@ tasks:
     desc: Run the unit test suite (integration tests skip without live services).
     cmds:
       - go test ./...
+
+  test:race:
+    desc: Run the unit suite under the race detector with shuffled order.
+    cmds:
+      - go test -race -count=1 -shuffle=on ./...
+
+  vuln:
+    desc: Run govulncheck against the module (CI gate).
+    cmds:
+      - govulncheck ./...
 
   test:pg:
     desc: Postgres integration tests against a throwaway Docker Postgres.
@@ -75,7 +85,7 @@ tasks:
       - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
       - until nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
       - defer: docker rm -f es-lite-nats
-      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./natsjs/...
+      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./natsjs/... ./leader/... ./natsstore/...
 
   test:pipeline:
     desc: Full-pipeline integration test (Postgres + NATS) end to end.
@@ -102,9 +112,10 @@ tasks:
       - go vet ./...
 
   lint:proto:
-    desc: buf lint + breaking-change check against the checked-in schema.
+    desc: buf lint + breaking-change check against main.
     cmds:
       - buf lint
+      - buf breaking --against '.git#branch=main'
 
   tidy:
     desc: Tidy go.mod/go.sum.
@@ -113,18 +124,17 @@ tasks:
 
   docker:build:
     desc: >
-      Build the es-lited container image. Needs GO_MODULES_TOKEN in the
-      environment (a GitHub PAT/token with read access to the private
-      github.com/laenenai/natskit repo), passed as a BuildKit secret so it
-      never lands in an image layer. Locally: GO_MODULES_TOKEN=$(gh auth token) task docker:build
+      Build the es-lited container image. Override VERSION with a semver tag
+      (default "dev"). Example: VERSION=v0.3.0 task docker:build.
     cmds:
-      - docker build --secret id=go_modules_token,env=GO_MODULES_TOKEN -t "{{.IMAGE | default \"es-lited:dev\"}}" .
+      - docker build --build-arg VERSION="{{.VERSION | default \"dev\"}}" -t "{{.IMAGE | default \"es-lited:dev\"}}" .
 
   docker:push:
     desc: >
-      Build and push the multi-arch es-lited image. Needs GO_MODULES_TOKEN in the
-      environment and a registry login (e.g. `docker login ghcr.io`). Override the
-      tag with IMAGE=..., e.g. IMAGE=ghcr.io/laenenai/es-lited:v0.1.0 task docker:push.
-      CI publishes on release tags (release.yml) — this is for manual/local pushes.
+      Build and push the multi-arch es-lited image. Needs a registry login
+      (e.g. `docker login ghcr.io`). Override the tag with IMAGE=... and
+      VERSION=..., e.g. IMAGE=ghcr.io/laenenai/es-lited:v0.3.0 VERSION=v0.3.0
+      task docker:push. CI publishes on release tags (release.yml) — this is
+      for manual/local pushes.
     cmds:
-      - docker buildx build --secret id=go_modules_token,env=GO_MODULES_TOKEN --platform linux/amd64,linux/arm64 --push -t "{{.IMAGE | default \"ghcr.io/laenenai/es-lited:dev\"}}" .
+      - docker buildx build --build-arg VERSION="{{.VERSION | default \"dev\"}}" --platform linux/amd64,linux/arm64 --push -t "{{.IMAGE | default \"ghcr.io/laenenai/es-lited:dev\"}}" .

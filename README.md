@@ -1,7 +1,7 @@
 # es-lite
 
 [![CI](https://github.com/laenenai/es-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/laenenai/es-lite/actions/workflows/ci.yml)
-![Go 1.26](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)
+![Go 1.27](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)
 
 **A zero-knowledge, event-sourcing eventstore** — usable two ways:
 
@@ -246,20 +246,18 @@ aggregate code.
 
 ## Development
 
-Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.26+, buf, task); run
-`mise install`. es-lite depends on the private `github.com/laenenai/natskit` —
-set `GOPRIVATE=github.com/laenenai/*` and authenticate git (see the
-[architecture getting-started](https://github.com/laenenai/architecture/blob/main/docs/getting-started.md)).
+Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.27.3, buf, task,
+govulncheck); run `mise install`. The module has no private dependencies.
 
 ```sh
 task                 # list tasks
 task generate        # buf lint + codegen (protoc-gen-go + protoc-gen-es-lite)
 task test            # unit tests (integration suites skip without services)
+task test:race       # unit tests under the race detector
+task vuln            # govulncheck
 task test:pg         # \
 task test:nats       #  ┐ docker-gated integration suites (spin up throwaway
-task test:openbao    #  ┘ Postgres / NATS / OpenBao and tear down)
-task test:pipeline   # /
-task test:zeroknowledge
+task test:pipeline   #  ┘ Postgres / NATS and tear down)
 task test:snapshots
 task build vet
 ```
@@ -288,9 +286,9 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 
 ## Status
 
-Broad and integration-tested against real infrastructure (Postgres 17, NATS 2.10
-+ JetStream, OpenBao 2.6.1). Identity is wired through **natskit v0.3.0**
-(`Tenant` + `RequireSubjectWorkspace`), so the authoritative workspace comes
-from the `natsauthd`-scoped subject and the subject cross-check is enforced
-fail-closed. Pre-1.0: the API may still shift. See
-[Status in each ADR](./docs/adr/README.md) for what is implemented vs. designed.
+Integration-tested against real infrastructure (Postgres 17, NATS 2.10 +
+JetStream). The in-repo `natsstore` middleware provides the subject/workspace
+pipeline; broker-side authentication and per-workspace ACLs remain deployment
+prerequisites (see the security review and ADR 0009). Pre-1.0: the API may
+still shift. See [Status in each ADR](./docs/adr/README.md) for what is
+implemented vs. designed.
