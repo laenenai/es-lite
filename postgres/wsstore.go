@@ -36,8 +36,10 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 	if err := p.StreamID.Validate(); err != nil {
 		return zero, err
 	}
-	if len(p.Events) == 0 {
-		return es.AppendResult{FromVersion: p.ExpectedVersion, ToVersion: p.ExpectedVersion}, nil
+	for _, op := range p.Constraints {
+		if err := op.Validate(); err != nil {
+			return zero, err
+		}
 	}
 
 	occurred := p.OccurredAt

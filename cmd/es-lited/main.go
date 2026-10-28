@@ -202,15 +202,23 @@ func runElectedRelay(ctx context.Context, nc *nats.Conn, drainer delivery.Draine
 	key := "relay." + strings.Map(kvKeyRune, prefix)
 	id := instanceID()
 	log.Printf("es-lited: relay enabled, campaigning for leadership (key %s, id %s)", key, id)
-	err = leader.Run(ctx, js, leader.Config{Key: key, ID: id}, func(leaderCtx context.Context) {
-		log.Print("es-lited: became relay leader, draining postgres -> jetstream")
-		if err := relay.Run(leaderCtx); err != nil && leaderCtx.Err() == nil {
-			log.Printf("es-lited: relay: %v", err)
+	for ctx.Err() == nil {
+		err = leader.Run(ctx, js, leader.Config{Key: key, ID: id}, func(leaderCtx context.Context) {
+			log.Print("es-lited: became relay leader, draining postgres -> jetstream")
+			if err := relay.Run(leaderCtx); err != nil && leaderCtx.Err() == nil {
+				log.Printf("es-lited: relay: %v", err)
+			}
+			log.Print("es-lited: relinquished relay leadership")
+		})
+		if err == nil || ctx.Err() != nil {
+			return
 		}
-		log.Print("es-lited: relinquished relay leadership")
-	})
-	if err != nil && ctx.Err() == nil {
-		log.Printf("es-lited: relay election: %v", err)
+		log.Printf("es-lited: relay election: %v; retrying in 5s", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 }
 

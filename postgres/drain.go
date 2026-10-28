@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/laenenai/es-lite/es"
 )
 
@@ -49,36 +47,11 @@ func (s *Store) Drain(ctx context.Context, limit int, publish func(context.Conte
 		claimed   int
 	)
 	for rows.Next() {
-		var (
-			e                                     es.Envelope
-			eventID, streamType, streamID         string
-			correlationID, causationID, commandID string
-			actorType, actorID                    string
-			payload                               []byte
-			wsID                                  string
-		)
-		if err := rows.Scan(
-			&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
-			&e.TypeURL, &e.SchemaVersion, &e.OccurredAt, &e.RecordedAt,
-			&correlationID, &causationID, &commandID,
-			&actorType, &actorID, &payload, &wsID,
-		); err != nil {
+		e, err := scanEnvelope(rows)
+		if err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan: %w", err)
 		}
-		sid, err := es.ParseCanonical(streamID)
-		if err != nil {
-			rows.Close()
-			return 0, err
-		}
-		e.StreamID = sid
-		e.EventID, _ = uuid.Parse(eventID)
-		e.CorrelationID, _ = uuid.Parse(correlationID)
-		e.CausationID, _ = uuid.Parse(causationID)
-		e.CommandID, _ = uuid.Parse(commandID)
-		e.Actor = es.Actor{Type: actorType, ID: actorID}
-		e.Workspace = wsID
-		e.Payload = payload // opaque bytes, relayed unchanged (ADR 0025)
 		claimed++
 		positions = append(positions, e.GlobalPosition)
 		batch = append(batch, e)

@@ -95,7 +95,7 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 	if err != nil {
 		return zero, err // domain rejection — surfaced verbatim to the caller
 	}
-	if len(events) == 0 {
+	if len(events) == 0 && len(constraints) == 0 {
 		// A no-op command: nothing to append. Return current state.
 		return Result[S, E]{State: state, FromVersion: version, ToVersion: version}, nil
 	}
@@ -175,8 +175,16 @@ func (r *Runtime[S, C, E]) Load(ctx context.Context, sid es.StreamID) (state S, 
 }
 
 // LoadAsOfVersion returns the state as it stood after exactly version v
-// (time-travel by version). v=0 returns Initial().
+// (time-travel by version). v=0 returns Initial(); v beyond the stream's
+// current version returns es.ErrVersionOutOfRange.
 func (r *Runtime[S, C, E]) LoadAsOfVersion(ctx context.Context, sid es.StreamID, v uint64) (S, error) {
+	if err := sid.Validate(); err != nil {
+		var zero S
+		return zero, err
+	}
+	if v == 0 {
+		return r.decider.Initial(), nil
+	}
 	state, _, err := r.load(ctx, sid, v, time.Time{})
 	return state, err
 }
@@ -261,6 +269,10 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 		}
 		state = r.decider.Evolve(state, ev)
 		version = env.Version
+	}
+	if upToVersion > 0 && version != upToVersion {
+		return state, version, fmt.Errorf("%w: stream %s has version %d, want %d",
+			es.ErrVersionOutOfRange, sid, version, upToVersion)
 	}
 	return state, version, nil
 }

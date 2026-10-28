@@ -142,3 +142,39 @@ func recvLeader(t *testing.T, ch <-chan string, d time.Duration) string {
 		return ""
 	}
 }
+
+// TestWorkExitReleasesLease: if the elected work returns early, Run must not
+// keep refreshing the lease. Another candidate must be able to take over
+// immediately instead of waiting for the TTL.
+func TestWorkExitReleasesLease(t *testing.T) {
+	js, closeConn := dialJS(t)
+	defer closeConn()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	key := uniqueKey()
+
+	firstReturned := make(chan struct{})
+	go func() {
+		_ = leader.Run(ctx, js, leader.Config{Key: key, ID: "a", TTL: 5 * time.Second}, func(context.Context) {})
+		close(firstReturned)
+	}()
+	select {
+	case <-firstReturned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first candidate did not return after its work exited")
+	}
+
+	acquired := make(chan struct{}, 1)
+	go func() {
+		_ = leader.Run(ctx, js, leader.Config{Key: key, ID: "b", TTL: 5 * time.Second}, func(lctx context.Context) {
+			acquired <- struct{}{}
+			<-lctx.Done()
+		})
+	}()
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second candidate could not acquire the lease after the first work exited")
+	}
+}

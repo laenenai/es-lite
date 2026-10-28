@@ -311,3 +311,31 @@ func rawPayload(t *testing.T, s *postgres.Store, ws, canonicalStream string, ver
 	}
 	return p
 }
+
+func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.Workspace("ws_empty")
+	sid, _ := es.NewStreamID("thing", "main")
+
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+	if _, err := ws.Append(ctx, es.AppendParams{StreamID: sid, ExpectedVersion: 0}); !errors.Is(err, es.ErrConflict) {
+		t.Fatalf("stale empty append error = %v, want ErrConflict", err)
+	}
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 1,
+		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com", false)},
+	}); err != nil {
+		t.Fatalf("claim-only append: %v", err)
+	}
+	if _, found, err := ws.LookupClaim(ctx, "email", "a@b.com", false); err != nil || !found {
+		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
+	}
+}

@@ -1,5 +1,7 @@
 package es
 
+import "fmt"
+
 // ConstraintOpKind distinguishes a uniqueness Claim from a Release.
 type ConstraintOpKind uint8
 
@@ -35,4 +37,15 @@ func Claim(scope, value string, pii bool) ConstraintOp {
 // Release builds a Release op.
 func Release(scope, value string, pii bool) ConstraintOp {
 	return ConstraintOp{Op: ReleaseOp, Scope: scope, Value: value, PII: pii}
+}
+
+// Validate reports whether the op has a known kind and a non-empty scope.
+func (o ConstraintOp) Validate() error {
+	if o.Op != ClaimOp && o.Op != ReleaseOp {
+		return fmt.Errorf("%w: unknown op %d", ErrInvalidConstraint, o.Op)
+	}
+	if o.Scope == "" {
+		return fmt.Errorf("%w: empty scope", ErrInvalidConstraint)
+	}
+	return nil
 }
