@@ -69,13 +69,18 @@ func Run(ctx context.Context, js jetstream.JetStream, cfg Config, onLeader func(
 			leaderCtx, cancel := context.WithCancel(ctx)
 			done := make(chan struct{})
 			go func() { defer close(done); onLeader(leaderCtx) }()
-			hold(ctx, kv, cfg, rev, refresh)
+			holdErr := hold(ctx, kv, cfg, rev, refresh, done)
 			cancel()
 			<-done
+			if holdErr != nil {
+				return holdErr
+			}
 		}
 	}
 	return ctx.Err()
 }
+
+var errWorkExited = errors.New("leader: onLeader returned while still leader")
 
 func acquire(ctx context.Context, kv jetstream.KeyValue, cfg Config) (uint64, bool, error) {
 	rev, err := kv.Create(ctx, cfg.Key, []byte(cfg.ID))
@@ -89,22 +94,35 @@ func acquire(ctx context.Context, kv jetstream.KeyValue, cfg Config) (uint64, bo
 }
 
 // hold refreshes the lease every `refresh` until an Update fails (leadership
-// lost: revision moved, or the key expired and was recreated) or ctx ends.
-func hold(ctx context.Context, kv jetstream.KeyValue, cfg Config, rev uint64, refresh time.Duration) {
+// lost: revision moved, or the key expired and was recreated), ctx ends, or
+// the elected work returns. On shutdown/work-exit it best-effort deletes the
+// key so failover does not wait for the TTL.
+func hold(ctx context.Context, kv jetstream.KeyValue, cfg Config, rev uint64, refresh time.Duration, done <-chan struct{}) error {
 	t := time.NewTicker(refresh)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			release(ctx, kv, cfg.Key)
+			return ctx.Err()
+		case <-done:
+			release(ctx, kv, cfg.Key)
+			return errWorkExited
 		case <-t.C:
 			next, err := kv.Update(ctx, cfg.Key, []byte(cfg.ID), rev)
 			if err != nil {
-				return // lost leadership
+				return nil // lost leadership; campaign again
 			}
 			rev = next
 		}
 	}
+}
+
+// release deletes the leadership key without inheriting a canceled context.
+func release(ctx context.Context, kv jetstream.KeyValue, key string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = kv.Delete(releaseCtx, key)
 }
 
 func sleep(ctx context.Context, d time.Duration) error {

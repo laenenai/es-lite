@@ -149,6 +149,10 @@ func errKind(err error) (kind, msg string) {
 		return "not_found", err.Error()
 	case is(err, es.ErrInvalidStreamID):
 		return "invalid_stream", err.Error()
+	case is(err, es.ErrVersionOutOfRange):
+		return "version_out_of_range", err.Error()
+	case is(err, es.ErrInvalidConstraint):
+		return "invalid_constraint", err.Error()
 	default:
 		return "internal", err.Error()
 	}
@@ -170,6 +174,10 @@ func errFromKind(kind, msg string) error {
 		return wrap(es.ErrStreamNotFound, msg)
 	case "invalid_stream":
 		return wrap(es.ErrInvalidStreamID, msg)
+	case "version_out_of_range":
+		return wrap(es.ErrVersionOutOfRange, msg)
+	case "invalid_constraint":
+		return wrap(es.ErrInvalidConstraint, msg)
 	default:
 		return newErr(msg)
 	}

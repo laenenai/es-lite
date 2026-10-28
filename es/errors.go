@@ -23,6 +23,15 @@ var (
 	// ErrInvalidStreamID reports that a StreamID failed validation.
 	ErrInvalidStreamID = errors.New("es-lite: invalid stream id")
 
+	// ErrVersionOutOfRange reports that a time-travel read asked for a stream
+	// version the stream has not reached. It is distinct from ErrConflict: no
+	// write was attempted.
+	ErrVersionOutOfRange = errors.New("es-lite: stream version out of range")
+
+	// ErrInvalidConstraint reports a malformed ConstraintOp (unknown kind or
+	// empty scope).
+	ErrInvalidConstraint = errors.New("es-lite: invalid constraint")
+
 	// ErrTerminal reports that a command was issued against a stream
 	// whose Decider.IsTerminal returned true. The stream is closed —
 	// no further events may be appended.
