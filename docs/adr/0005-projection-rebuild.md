@@ -133,3 +133,13 @@ path for "replay the last N days", not as the authoritative rebuild.
 Rejected. Two handlers for one projection drift apart; the bug you fixed
 in live delivery reappears in rebuild. Reusing the one `apply` via
 `Replay` keeps them identical by construction.
+
+## Errata (2026-10-30)
+
+ADR 0030 generates the projector that this ADR describes by hand:
+`projection.Runner` holds the marker load/skip/save loop once, `Rebuild`
+is `Replay` from position 0 through the same dispatch `Run` uses, and the
+`(es.v1.projection)` option declares what is consumed. The principles here
+(log as rebuild source, marker as the single idempotency/cutover value,
+one apply path for live and rebuild) are unchanged; the code that embodies
+them is now generated.

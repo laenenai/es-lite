@@ -3,18 +3,21 @@ syntax = "proto3";
 package es.v1;
 
 import "google/protobuf/descriptor.proto";
+import "google/protobuf/duration.proto";
 
 option go_package = "github.com/laenenai/es-lite/gen/es/v1;esv1";
 
 // es-lite's framework options. The parent framework's options.proto carries
 // a dozen options (data classification, subject fields, projection specs);
 // lite carries only what its own runtime and code generator act on. Message
-// options: the sum-type marker and the per-event schema version. Field
-// options: the command-time marker (ADR 0032).
+// options: the sum-type marker, the per-event schema version, the aggregate
+// marker and the projection/reaction specs (ADR 0030). Field options: the
+// command-time marker (ADR 0032).
 //
 // Extension numbers are allocated from es-lite's 5xxxx range and are never
 // renumbered (buf breaking, FILE rule):
-//   50001–50002  message options (schema_version, sum_type)
+//   50001–50003  message options (schema_version, sum_type, aggregate)
+//   50010–50011  message options (projection, reaction; ADR 0030)
 //   50023        field option    (decided_at, ADR 0032)
 extend google.protobuf.MessageOptions {
   // Marks this message as a sum-type container: a message holding exactly
@@ -41,6 +44,107 @@ extend google.protobuf.MessageOptions {
   //     int64 by_millicents = 1; // was by_cents in v1
   //   }
   uint32 schema_version = 50001;
+
+  // Marks the aggregate's State message and names its stream type (ADR
+  // 0030). Exactly one message per proto package carries it; the
+  // generator resolves a consumed event's package to this message to type
+  // projector handlers and to derive NATS subjects.
+  //
+  //   message Counter {
+  //     option (es.v1.aggregate) = { stream_type: "counter" };
+  //   }
+  Aggregate aggregate = 50003;
+
+  // Declares a read model or index on the message that IS the read model
+  // (ADR 0030 §2). protoc-gen-es-lite generates the typed handler
+  // interface, state-loader seams, runner and rebuild for it.
+  ProjectionSpec projection = 50010;
+
+  // Declares one executor reaction on an empty descriptor message (ADR
+  // 0030 §3): events in, commands out. protoc-gen-es-lite generates the
+  // handler interface, typed issuer, runner and the executor loop.
+  ReactionSpec reaction = 50011;
+}
+
+// Aggregate is the (es.v1.aggregate) payload.
+message Aggregate {
+  // The StreamID.Type every stream of this aggregate uses, e.g. "counter";
+  // also the <aggregate> token of evt.<ws>.<aggregate>.<event> subjects.
+  string stream_type = 1;
+}
+
+// FetchMode says how a projector gets content. Payloads on the bus may be
+// sealed, so a projector either works from envelope metadata alone or
+// fetches aggregate state through a loader. Closed.
+enum FetchMode {
+  // Not set; rejected by the generator.
+  FETCH_MODE_UNSPECIFIED = 0;
+  // Works from envelope metadata alone: handlers receive only the
+  // envelope, no decoded event and no state, and no codec is required.
+  FETCH_MODE_METADATA_ONLY = 1;
+  // Fetches aggregate state AS OF THE EVENT'S STREAM VERSION, never
+  // latest, so a rebuild from the log equals the live run. Handlers
+  // receive the decoded event and that state.
+  FETCH_MODE_STATE_AS_OF_EVENT_VERSION = 2;
+}
+
+// RebuildMode says where a projection can be rebuilt from. Closed.
+enum RebuildMode {
+  // Not set.
+  REBUILD_MODE_UNSPECIFIED = 0;
+  // Rebuildable from the event log (projection.Replay); required for
+  // READ_MODEL and INDEX.
+  REBUILD_MODE_FROM_LOG = 1;
+}
+
+// ProjectionKind says what a projection is for. Closed.
+enum ProjectionKind {
+  // Not set.
+  PROJECTION_KIND_UNSPECIFIED = 0;
+  // Serves queries; its message is the read model.
+  PROJECTION_KIND_READ_MODEL = 1;
+  // An executor reaction (declare with (es.v1.reaction) instead).
+  PROJECTION_KIND_REACTION = 2;
+  // An internal index a gate needs.
+  PROJECTION_KIND_INDEX = 3;
+}
+
+// ProjectionSpec declares a read model or index.
+message ProjectionSpec {
+  // Stable name; the checkpoint (marker) key and durable name. Never
+  // reused. Unique across one generation run.
+  string name = 1;
+  // What the projection is for.
+  ProjectionKind kind = 2;
+  // Full event type names it consumes, e.g. "counter.v1.Incremented". Each
+  // must be a variant of an (es.v1.sum_type) = "Event" container whose
+  // package has exactly one (es.v1.aggregate) message.
+  repeated string consumes = 3;
+  // How it gets content.
+  FetchMode fetch = 4;
+  // Where it is rebuilt from; FROM_LOG is required for READ_MODEL/INDEX.
+  RebuildMode rebuild = 5;
+  // Tolerated staleness, for alerting. Opaque to the runtime.
+  google.protobuf.Duration max_lag = 6;
+  // Owning bounded context, e.g. "casework". Opaque to the runtime; used
+  // to group the generated documentation.
+  string owner_context = 7;
+}
+
+// ReactionSpec declares one executor reaction: events in, commands out.
+message ReactionSpec {
+  // Stable name; the checkpoint (marker) key and durable name.
+  string name = 1;
+  // Full event type names it consumes (as ProjectionSpec.consumes).
+  repeated string consumes = 2;
+  // Full command type names it issues, e.g. "counter.v1.Init". Each must
+  // be a variant of an (es.v1.sum_type) = "Command" container. Empty for a
+  // reaction that only observes.
+  repeated string issues = 3;
+  // How it gets content.
+  FetchMode fetch = 4;
+  // Owning bounded context. Opaque to the runtime.
+  string owner_context = 5;
 }
 
 extend google.protobuf.FieldOptions {

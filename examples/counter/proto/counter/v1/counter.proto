@@ -9,8 +9,12 @@ option go_package = "github.com/laenenai/es-lite/gen/counter/v1;counterv1";
 
 // Counter is the aggregate's folded State — the value produced by
 // replaying a stream through Decider.Evolve. es-lite uses the proto
-// State message directly as the Go state type.
+// State message directly as the Go state type. (es.v1.aggregate) names the
+// stream type so projectors consuming counter events can be generated
+// (ADR 0030).
 message Counter {
+  option (es.v1.aggregate) = { stream_type: "counter" };
+
   bool  initialized = 1;
   int64 count       = 2;
   int64 min         = 3;

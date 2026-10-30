@@ -85,7 +85,7 @@ tasks:
       - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
       - until nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
       - defer: docker rm -f es-lite-nats
-      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./natsjs/... ./leader/... ./natsstore/...
+      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./natsjs/... ./leader/... ./natsstore/... ./examples/projection/...
 
   test:pipeline:
     desc: Full-pipeline integration test (Postgres + NATS) end to end.

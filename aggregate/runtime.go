@@ -100,6 +100,11 @@ func (r *Runtime[S, C, E]) WithConflictRetry(n int, backoff func(attempt int) ti
 	return r
 }
 
+// ConflictRetries reports the retry budget set by WithConflictRetry (0 when
+// unset), so a caller such as reaction.RuntimeDispatcher can add its own
+// only when the runtime has none.
+func (r *Runtime[S, C, E]) ConflictRetries() int { return r.retries }
+
 // WithChainVerification makes every load recompute the per-stream hash chain
 // over the envelopes it folds and fail with es.ErrChainBroken on a mismatch
 // (ADR 0029 §3). Returns the runtime for chaining.

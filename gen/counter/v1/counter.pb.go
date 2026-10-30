@@ -25,7 +25,9 @@ const (
 
 // Counter is the aggregate's folded State — the value produced by
 // replaying a stream through Decider.Evolve. es-lite uses the proto
-// State message directly as the Go state type.
+// State message directly as the Go state type. (es.v1.aggregate) names the
+// stream type so projectors consuming counter events can be generated
+// (ADR 0030).
 type Counter struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Initialized   bool                   `protobuf:"varint,1,opt,name=initialized,proto3" json:"initialized,omitempty"`
@@ -718,13 +720,14 @@ var File_counter_v1_counter_proto protoreflect.FileDescriptor
 const file_counter_v1_counter_proto_rawDesc = "" +
 	"\n" +
 	"\x18counter/v1/counter.proto\x12\n" +
-	"counter.v1\x1a\x13es/v1/options.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"}\n" +
+	"counter.v1\x1a\x13es/v1/options.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x8c\x01\n" +
 	"\aCounter\x12 \n" +
 	"\vinitialized\x18\x01 \x01(\bR\vinitialized\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x03R\x05count\x12\x10\n" +
 	"\x03min\x18\x03 \x01(\x03R\x03min\x12\x10\n" +
 	"\x03max\x18\x04 \x01(\x03R\x03max\x12\x16\n" +
-	"\x06closed\x18\x05 \x01(\bR\x06closed\"D\n" +
+	"\x06closed\x18\x05 \x01(\bR\x06closed:\r\x9a\xb5\x18\t\n" +
+	"\acounter\"D\n" +
 	"\x04Init\x12\x10\n" +
 	"\x03min\x18\x01 \x01(\x03R\x03min\x12\x10\n" +
 	"\x03max\x18\x02 \x01(\x03R\x03max\x12\x18\n" +

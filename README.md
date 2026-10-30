@@ -294,8 +294,46 @@ return nil
 }
 ```
 
-See [`examples/`](./examples) — `counter`, `pipeline` (end-to-end), `snapshots`,
-`upcast`.
+**Projections and reactions from options (ADR 0030).** Declare a read model,
+index or executor reaction as a message option and `task generate` emits the
+typed handler interface, state-loader seam, deps, subjects and runner; you
+write only the apply logic:
+
+```proto
+message CounterView {
+  option (es.v1.projection) = {
+    name: "counter.view"  kind: PROJECTION_KIND_READ_MODEL
+    consumes: ["counter.v1.Initialized", "counter.v1.Incremented"]
+    fetch: FETCH_MODE_STATE_AS_OF_EVENT_VERSION  rebuild: REBUILD_MODE_FROM_LOG
+  };
+  ...
+}
+```
+
+```go
+runner := counterviewv1.NewCounterViewRunner(myHandler, counterviewv1.CounterViewDeps{
+	Counter: rt,              // *aggregate.Runtime is the state loader (as-of-version)
+	Marker:  markerStore,     // ADR 0005 last-applied position
+})
+// live: over JetStream (filter subjects derived from `consumes`) ...
+err := runner.Run(ctx, natsjs.NewFeed(js, natsjs.ConsumerConfig{
+	Stream: "ES_EVENTS", Durable: counterviewv1.CounterViewName,
+	FilterSubjects: counterviewv1.CounterViewSubjects("*"), Gaps: natsjs.NewGapDetector(),
+}))
+// ... or straight from the log (tests, single-node SQLite):
+err = runner.Run(ctx, &projection.LogFeed{Source: store})
+// rebuild from position 0 through the same dispatch path:
+pos, err := runner.Rebuild(ctx, store, 500)
+```
+
+Reactions (`(es.v1.reaction)`) get a typed issuer and the executor loop
+(`reaction.Execute`: conflicts retried, a terminal target counts as done).
+The plugin needs `strategy: all` in `buf.gen.yaml` so `consumes` resolves
+across packages; `--es-lite_opt=docs=<path>` renders a catalogue of every
+projection and reaction from the descriptors.
+
+See [`examples/`](./examples) — `counter`, `projection` (generated projector
+and reaction on SQLite), `pipeline` (end-to-end), `snapshots`, `upcast`.
 
 ## Backends
 

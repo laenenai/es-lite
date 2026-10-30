@@ -1,6 +1,6 @@
 # ADR 0030: Projector and Reaction Codegen from ProjectionSpec / ReactionSpec
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented)
 - **Date:** 2026-10-30
 
 ## Context
@@ -236,3 +236,41 @@ runtime contract's shape live in a repo that cannot test the runtime.
 Possible for `METADATA_ONLY`, but the typed handler signature with the
 resolved state type is the deliverable `contracts` asked for; generics cannot
 express "one method per consumed type".
+
+## Implementation notes
+
+- **Feed abstraction.** The runner constructor does not take a
+  `jetstream.JetStream`. `New<Name>Runner(h, deps)` returns a
+  `*projection.Runner` (reactions: `*reaction.Runner`) whose `Run(ctx, feed)`
+  consumes any `projection.Feed`: `natsjs.NewFeed(js, ConsumerConfig)` over a
+  JetStream durable with `FilterSubjects: <Name>Subjects(ws)`, or
+  `projection.LogFeed` over the log itself. The in-memory path is what
+  `examples/projection` tests on SQLite with no NATS; the JetStream path runs
+  under `NATS_URL`. Subjects are emitted as string constants (no `natsjs`
+  import in generated code).
+- **Runner logic lives in `projection.Runner`** (marker load once, skip at or
+  below, dispatch, save, ack; `Apply` for `Replay`; `Rebuild` = `Replay` from 0)
+  and `reaction` (`Dispatcher`, `RuntimeDispatcher`, `Issue`, `Execute`,
+  `MetaFor`, `Runner` without Rebuild). Generated code is the typed glue
+  only. `Deps.Marker == nil` selects an in-memory marker.
+- **Gap detection** is a feed concern (`natsjs.ConsumerConfig.Gaps`), not a
+  runner concern: a `LogFeed` cannot reorder.
+- **Conflict retry in reactions.** `reaction.RuntimeDispatcher` applies
+  `DefaultConflictRetries` (5) with `aggregate.DefaultBackoff` only when the
+  runtime reports `ConflictRetries() == 0`; a runtime with its own budget is
+  used as configured. `Execute` itself does not retry — a conflict that
+  escapes the dispatcher naks the event and the feed redelivers it.
+- **`strategy: all`.** buf runs local plugins once per directory by default,
+  which hides a consumed package's file from the request; `buf.gen.yaml`
+  sets `strategy: all` for `protoc-gen-es-lite` and the resolver's error
+  says so. `contracts` must do the same (migration doc §2).
+- **`kind: PROJECTION_KIND_REACTION` on `(es.v1.projection)` is rejected**;
+  a reaction is declared with `(es.v1.reaction)`, so "no Rebuild for
+  reactions" falls out of the type (`*reaction.Runner`) rather than a flag.
+- **`FETCH_MODE_UNSPECIFIED` is a generation error**, as are a missing
+  `name`/`kind`, duplicate names across the run, duplicate consumed event or
+  issued command Go names within one spec, and empty `consumes`.
+- **Field-number change vs. the `contracts` original:** `rebuild` is 5 and
+  `max_lag` 6 in `es.v1.ProjectionSpec` (`ceiling` is gone). Options are
+  written by name, so the migration is mechanical
+  (`docs/migration/contracts-projection-options.md`).
