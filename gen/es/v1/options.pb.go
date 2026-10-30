@@ -38,6 +38,14 @@ var file_es_v1_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Tag:           "varint,50001,opt,name=schema_version",
 		Filename:      "es/v1/options.proto",
 	},
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50023,
+		Name:          "es.v1.decided_at",
+		Tag:           "varint,50023,opt,name=decided_at",
+		Filename:      "es/v1/options.proto",
+	},
 }
 
 // Extension fields to descriptorpb.MessageOptions.
@@ -71,24 +79,49 @@ var (
 	E_SchemaVersion = &file_es_v1_options_proto_extTypes[1]
 )
 
+// Extension fields to descriptorpb.FieldOptions.
+var (
+	// Marks the google.protobuf.Timestamp field of a command variant that
+	// carries the command's decision time (ADR 0032). protoc-gen-es-lite
+	// emits `DecisionTime() time.Time` on the variant (es.DecidedAt — the
+	// method is not called DecidedAt because protoc-gen-go already emits a
+	// struct field of that name for a field called decided_at), and aggregate.Runtime
+	// sources Envelope.OccurredAt from it: a zero Meta.OccurredAt is filled
+	// from the command, a conflicting non-zero one is rejected with
+	// es.ErrDecidedAtMismatch, and a tagged-but-unset field is rejected with
+	// es.ErrDecidedAtMissing. Generation fails when the field is not a
+	// Timestamp or its message is not a variant of a "Command" sum type.
+	//
+	//   message AddMember {
+	//     google.protobuf.Timestamp decided_at = 4 [(es.v1.decided_at) = true];
+	//   }
+	//
+	// optional bool decided_at = 50023;
+	E_DecidedAt = &file_es_v1_options_proto_extTypes[2]
+)
+
 var File_es_v1_options_proto protoreflect.FileDescriptor
 
 const file_es_v1_options_proto_rawDesc = "" +
 	"\n" +
 	"\x13es/v1/options.proto\x12\x05es.v1\x1a google/protobuf/descriptor.proto:<\n" +
 	"\bsum_type\x12\x1f.google.protobuf.MessageOptions\x18҆\x03 \x01(\tR\asumType:H\n" +
-	"\x0eschema_version\x12\x1f.google.protobuf.MessageOptions\x18ц\x03 \x01(\rR\rschemaVersionB,Z*github.com/laenenai/es-lite/gen/es/v1;esv1b\x06proto3"
+	"\x0eschema_version\x12\x1f.google.protobuf.MessageOptions\x18ц\x03 \x01(\rR\rschemaVersion:>\n" +
+	"\n" +
+	"decided_at\x12\x1d.google.protobuf.FieldOptions\x18\xe7\x86\x03 \x01(\bR\tdecidedAtB,Z*github.com/laenenai/es-lite/gen/es/v1;esv1b\x06proto3"
 
 var file_es_v1_options_proto_goTypes = []any{
 	(*descriptorpb.MessageOptions)(nil), // 0: google.protobuf.MessageOptions
+	(*descriptorpb.FieldOptions)(nil),   // 1: google.protobuf.FieldOptions
 }
 var file_es_v1_options_proto_depIdxs = []int32{
 	0, // 0: es.v1.sum_type:extendee -> google.protobuf.MessageOptions
 	0, // 1: es.v1.schema_version:extendee -> google.protobuf.MessageOptions
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	0, // [0:2] is the sub-list for extension extendee
+	1, // 2: es.v1.decided_at:extendee -> google.protobuf.FieldOptions
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	0, // [0:3] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
 }
 
@@ -104,7 +137,7 @@ func file_es_v1_options_proto_init() {
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_es_v1_options_proto_rawDesc), len(file_es_v1_options_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   0,
-			NumExtensions: 2,
+			NumExtensions: 3,
 			NumServices:   0,
 		},
 		GoTypes:           file_es_v1_options_proto_goTypes,

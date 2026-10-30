@@ -37,6 +37,16 @@ var (
 	// no further events may be appended.
 	ErrTerminal = errors.New("es-lite: stream is terminal")
 
+	// ErrDecidedAtMismatch reports that a command carrying (es.v1.decided_at)
+	// was handled with a Meta.OccurredAt that differs from the command's
+	// value. The caller asserted two domain times; the runtime refuses rather
+	// than picking one (ADR 0032). Nothing was appended.
+	ErrDecidedAtMismatch = errors.New("es-lite: meta.OccurredAt differs from the command's decided_at")
+
+	// ErrDecidedAtMissing reports that a command carrying (es.v1.decided_at)
+	// left the field unset. Nothing was appended (ADR 0032).
+	ErrDecidedAtMissing = errors.New("es-lite: command's decided_at is unset")
+
 	// ErrUnknownEventType is returned by a Codec.Decode when the
 	// envelope's TypeURL is not one the codec recognizes. Usually a
 	// version-skew deployment or a codec wired to the wrong aggregate.

@@ -1,6 +1,6 @@
 # ADR 0032: Bounded Conflict Retry and `OccurredAt` from `decided_at`
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented)
 - **Date:** 2026-10-30
 
 ## Context
@@ -104,3 +104,25 @@ interpreted.
 
 Rejected: it keeps the forgetting failure mode (`Meta` zero → `now`) and
 contradicts convention 7, which names the command as the source.
+
+## Implementation notes
+
+- **Method name.** The generated accessor is `DecisionTime() time.Time`, and
+  `es.DecidedAt` declares that method, not `DecidedAt()`. protoc-gen-go
+  already emits a struct field named `DecidedAt` for a proto field called
+  `decided_at` — the name `contracts` uses on every such command — and Go
+  forbids a field and a method of the same name on one type. The interface
+  keeps the name `es.DecidedAt` so the option, the interface and the ADR
+  still line up.
+- **Unset field.** `timestamppb.(*Timestamp).AsTime()` on a nil pointer
+  returns the Unix epoch, not the zero time. The generated method returns
+  `time.Time{}` for an unset field so `Handle` can tell "missing" from 1970.
+- **Order of checks.** `Handle` applies the `decided_at` rule before any I/O
+  (not "before the `OccurredAt` default" after `Decide`, as the text has it):
+  a mismatch or a missing value never costs a load and never appends. The
+  observable behaviour is the one the ADR specifies.
+- **Retry placement.** Audit defaults (`CommandID`, `CorrelationID`,
+  `OccurredAt`) are filled once before the loop; `handleOnce` is the body
+  the loop repeats. `DefaultBackoff` is exported so callers can compose it.
+- **Plugin checks.** Besides the two the ADR lists, generation also fails
+  when a message tags two fields or tags a repeated/map field.

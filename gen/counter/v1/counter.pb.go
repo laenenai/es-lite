@@ -10,6 +10,7 @@ import (
 	_ "github.com/laenenai/es-lite/gen/es/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -249,8 +250,12 @@ func (x *Decrement) GetBy() int64 {
 	return 0
 }
 
+// Close makes the stream terminal. It carries the decision time (ADR 0032):
+// the runtime sources Envelope.OccurredAt from decided_at, so the envelope
+// and the command agree on when the counter was closed.
 type Close struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	DecidedAt     *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=decided_at,json=decidedAt,proto3" json:"decided_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -283,6 +288,13 @@ func (x *Close) ProtoReflect() protoreflect.Message {
 // Deprecated: Use Close.ProtoReflect.Descriptor instead.
 func (*Close) Descriptor() ([]byte, []int) {
 	return file_counter_v1_counter_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Close) GetDecidedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DecidedAt
+	}
+	return nil
 }
 
 // Commands is the sum-type container. protoc-gen-es-lite reads the oneof to
@@ -706,7 +718,7 @@ var File_counter_v1_counter_proto protoreflect.FileDescriptor
 const file_counter_v1_counter_proto_rawDesc = "" +
 	"\n" +
 	"\x18counter/v1/counter.proto\x12\n" +
-	"counter.v1\x1a\x13es/v1/options.proto\"}\n" +
+	"counter.v1\x1a\x13es/v1/options.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"}\n" +
 	"\aCounter\x12 \n" +
 	"\vinitialized\x18\x01 \x01(\bR\vinitialized\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x03R\x05count\x12\x10\n" +
@@ -720,8 +732,10 @@ const file_counter_v1_counter_proto_rawDesc = "" +
 	"\tIncrement\x12\x0e\n" +
 	"\x02by\x18\x01 \x01(\x03R\x02by\"\x1b\n" +
 	"\tDecrement\x12\x0e\n" +
-	"\x02by\x18\x01 \x01(\x03R\x02by\"\a\n" +
-	"\x05Close\"\xe3\x01\n" +
+	"\x02by\x18\x01 \x01(\x03R\x02by\"H\n" +
+	"\x05Close\x12?\n" +
+	"\n" +
+	"decided_at\x18\x01 \x01(\v2\x1a.google.protobuf.TimestampB\x04\xb8\xb6\x18\x01R\tdecidedAt\"\xe3\x01\n" +
 	"\bCommands\x12&\n" +
 	"\x04init\x18\x01 \x01(\v2\x10.counter.v1.InitH\x00R\x04init\x125\n" +
 	"\tincrement\x18\x02 \x01(\v2\x15.counter.v1.IncrementH\x00R\tincrement\x125\n" +
@@ -758,32 +772,34 @@ func file_counter_v1_counter_proto_rawDescGZIP() []byte {
 
 var file_counter_v1_counter_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_counter_v1_counter_proto_goTypes = []any{
-	(*Counter)(nil),     // 0: counter.v1.Counter
-	(*Init)(nil),        // 1: counter.v1.Init
-	(*Increment)(nil),   // 2: counter.v1.Increment
-	(*Decrement)(nil),   // 3: counter.v1.Decrement
-	(*Close)(nil),       // 4: counter.v1.Close
-	(*Commands)(nil),    // 5: counter.v1.Commands
-	(*Initialized)(nil), // 6: counter.v1.Initialized
-	(*Incremented)(nil), // 7: counter.v1.Incremented
-	(*Decremented)(nil), // 8: counter.v1.Decremented
-	(*Closed)(nil),      // 9: counter.v1.Closed
-	(*Events)(nil),      // 10: counter.v1.Events
+	(*Counter)(nil),               // 0: counter.v1.Counter
+	(*Init)(nil),                  // 1: counter.v1.Init
+	(*Increment)(nil),             // 2: counter.v1.Increment
+	(*Decrement)(nil),             // 3: counter.v1.Decrement
+	(*Close)(nil),                 // 4: counter.v1.Close
+	(*Commands)(nil),              // 5: counter.v1.Commands
+	(*Initialized)(nil),           // 6: counter.v1.Initialized
+	(*Incremented)(nil),           // 7: counter.v1.Incremented
+	(*Decremented)(nil),           // 8: counter.v1.Decremented
+	(*Closed)(nil),                // 9: counter.v1.Closed
+	(*Events)(nil),                // 10: counter.v1.Events
+	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
 }
 var file_counter_v1_counter_proto_depIdxs = []int32{
-	1, // 0: counter.v1.Commands.init:type_name -> counter.v1.Init
-	2, // 1: counter.v1.Commands.increment:type_name -> counter.v1.Increment
-	3, // 2: counter.v1.Commands.decrement:type_name -> counter.v1.Decrement
-	4, // 3: counter.v1.Commands.close:type_name -> counter.v1.Close
-	6, // 4: counter.v1.Events.initialized:type_name -> counter.v1.Initialized
-	7, // 5: counter.v1.Events.incremented:type_name -> counter.v1.Incremented
-	8, // 6: counter.v1.Events.decremented:type_name -> counter.v1.Decremented
-	9, // 7: counter.v1.Events.closed:type_name -> counter.v1.Closed
-	8, // [8:8] is the sub-list for method output_type
-	8, // [8:8] is the sub-list for method input_type
-	8, // [8:8] is the sub-list for extension type_name
-	8, // [8:8] is the sub-list for extension extendee
-	0, // [0:8] is the sub-list for field type_name
+	11, // 0: counter.v1.Close.decided_at:type_name -> google.protobuf.Timestamp
+	1,  // 1: counter.v1.Commands.init:type_name -> counter.v1.Init
+	2,  // 2: counter.v1.Commands.increment:type_name -> counter.v1.Increment
+	3,  // 3: counter.v1.Commands.decrement:type_name -> counter.v1.Decrement
+	4,  // 4: counter.v1.Commands.close:type_name -> counter.v1.Close
+	6,  // 5: counter.v1.Events.initialized:type_name -> counter.v1.Initialized
+	7,  // 6: counter.v1.Events.incremented:type_name -> counter.v1.Incremented
+	8,  // 7: counter.v1.Events.decremented:type_name -> counter.v1.Decremented
+	9,  // 8: counter.v1.Events.closed:type_name -> counter.v1.Closed
+	9,  // [9:9] is the sub-list for method output_type
+	9,  // [9:9] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_counter_v1_counter_proto_init() }

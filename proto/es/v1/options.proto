@@ -6,10 +6,16 @@ import "google/protobuf/descriptor.proto";
 
 option go_package = "github.com/laenenai/es-lite/gen/es/v1;esv1";
 
-// es-lite's framework options. Kept deliberately minimal — the parent
-// framework's options.proto carries a dozen options (data classification,
-// subject fields, projection specs); lite has two: the sum-type marker and
-// the per-event schema version.
+// es-lite's framework options. The parent framework's options.proto carries
+// a dozen options (data classification, subject fields, projection specs);
+// lite carries only what its own runtime and code generator act on. Message
+// options: the sum-type marker and the per-event schema version. Field
+// options: the command-time marker (ADR 0032).
+//
+// Extension numbers are allocated from es-lite's 5xxxx range and are never
+// renumbered (buf breaking, FILE rule):
+//   50001–50002  message options (schema_version, sum_type)
+//   50023        field option    (decided_at, ADR 0032)
 extend google.protobuf.MessageOptions {
   // Marks this message as a sum-type container: a message holding exactly
   // one `oneof` whose variants form a sealed Go interface. The value is
@@ -35,4 +41,22 @@ extend google.protobuf.MessageOptions {
   //     int64 by_millicents = 1; // was by_cents in v1
   //   }
   uint32 schema_version = 50001;
+}
+
+extend google.protobuf.FieldOptions {
+  // Marks the google.protobuf.Timestamp field of a command variant that
+  // carries the command's decision time (ADR 0032). protoc-gen-es-lite
+  // emits `DecisionTime() time.Time` on the variant (es.DecidedAt — the
+  // method is not called DecidedAt because protoc-gen-go already emits a
+  // struct field of that name for a field called decided_at), and aggregate.Runtime
+  // sources Envelope.OccurredAt from it: a zero Meta.OccurredAt is filled
+  // from the command, a conflicting non-zero one is rejected with
+  // es.ErrDecidedAtMismatch, and a tagged-but-unset field is rejected with
+  // es.ErrDecidedAtMissing. Generation fails when the field is not a
+  // Timestamp or its message is not a variant of a "Command" sum type.
+  //
+  //   message AddMember {
+  //     google.protobuf.Timestamp decided_at = 4 [(es.v1.decided_at) = true];
+  //   }
+  bool decided_at = 50023;
 }
