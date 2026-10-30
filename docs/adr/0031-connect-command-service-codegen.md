@@ -1,6 +1,6 @@
 # ADR 0031: Connect Command Service Codegen
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented)
 - **Date:** 2026-10-30
 
 ## Context
@@ -195,3 +195,49 @@ field assignment reflective.
 Rejected: convention 29 puts tooling concerns in options; a field named
 `acting_principal` that is *not* meant to be overwritten would be silently
 clobbered under a naming rule.
+
+## Implementation notes
+
+- **Output package.** The handler is generated into a sibling package
+  `<pkg>es` (e.g. `countersvcv1es`), next to connect-go's `<pkg>connect`,
+  not "next to" the messages in `<pkg>` as §1 says: `<pkg>connect` imports
+  `<pkg>` for the message types, so a handler in `<pkg>` that implements the
+  connect interface is an import cycle. The wiring the ADR sketches
+  (`spacev1es.NewSpaceCommandServiceHandler(deps)`) already assumed this.
+- **Client-asserted version.** `aggregate.Runtime` gains `HandleAt(ctx, sid,
+  cmd, meta, expected)`: with a non-zero `expected` it returns
+  `*es.ConflictError{Expected, Current}` when the loaded version differs,
+  before deciding, and that conflict is never retried by `WithConflictRetry`
+  (the caller's assertion is stale; only the caller can refresh it).
+  `Handle` is `HandleAt(…, 0)`. The generated method passes the
+  `(es.v1.expected_version)` field (or 0), so the client's optimistic
+  concurrency is actually enforced — §2 step 6 alone (`Handle`) would have
+  silently used the loaded version. `VersionConflict.expected_version` is
+  the command's value, or `ConflictError.Expected`, else 0: the runtime does
+  not expose "the version Handle loaded" on a write-race conflict.
+- **Identity.** The generated `<Svc>Identity` interface is
+  `Principal(ctx) (*P, es.Actor, error)` when any RPC command carries
+  `(es.v1.acting_principal)` (one principal type per service, enforced), else
+  `Actor(ctx) (es.Actor, error)`. A `*connect.Error` from it passes through;
+  any other error is `unauthenticated`.
+- **Errors.** `cmdsvc.MapError` also maps `es.ErrDecidedAtMissing` /
+  `ErrDecidedAtMismatch` (ADR 0032) and `es.ErrInvalidStreamID` to
+  `invalid_argument`, and `context` errors to `canceled` /
+  `deadline_exceeded`; a `*connect.Error` anywhere in the chain passes
+  through. `cmdsvc.VersionConflictDetail(err)` is the client-side extractor.
+- **Validation.** `cmdsvc.DefaultValidator` wraps `buf.build/go/protovalidate`
+  (the module's current import path; `github.com/bufbuild/protovalidate-go`
+  is retired). Violations ride as the `buf.validate.Violations` error detail.
+  The fixture keeps `buf.validate` rules on the *request* messages in the
+  `cmdsvc/example/proto` module so the core module and its `gen/` never
+  import the validate types.
+- **Nested module.** `cmdsvc/go.mod` requires `connectrpc.com/connect`,
+  `buf.build/go/protovalidate` and the parent module via
+  `replace github.com/laenenai/es-lite => ../`; it floats
+  `google.golang.org/protobuf` to 1.36.12 (protovalidate's floor) while the
+  core stays on 1.36.11. `task build|vet|test|test:race|vuln|tidy` cover both
+  modules; `task tools` installs `protoc-gen-connect-go` at the version the
+  nested module pins; `task generate` runs buf per workspace module so the
+  fixture lands in `cmdsvc/example/gen`.
+- **`VersionConflict`** lives in `proto/es/v1/cmdsvc.proto` (the BSR module
+  of ADR 0033), as decided; `contracts` can alias or drop its own.

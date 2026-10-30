@@ -1,6 +1,9 @@
 package es
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Typed errors. Framework operations return one of these, bare or
 // wrapped via fmt.Errorf("...: %w", err). Consumers match with errors.Is.
@@ -64,3 +67,20 @@ var (
 	// version-skew deployment or a codec wired to the wrong aggregate.
 	ErrUnknownEventType = errors.New("es-lite: unknown event type url")
 )
+
+// ConflictError is the structured form of ErrConflict a caller-supplied
+// expected version produces (aggregate.Runtime.HandleAt, ADR 0031): it
+// carries the versions a VersionConflict detail reports. errors.Is(err,
+// ErrConflict) still matches.
+type ConflictError struct {
+	StreamID StreamID
+	Expected uint64 // what the caller asserted
+	Current  uint64 // what the stream was at when checked
+}
+
+func (e *ConflictError) Error() string {
+	return fmt.Sprintf("%v: stream %s at v%d, expected v%d", ErrConflict, e.StreamID, e.Current, e.Expected)
+}
+
+// Unwrap makes errors.Is(err, ErrConflict) true.
+func (e *ConflictError) Unwrap() error { return ErrConflict }

@@ -9,7 +9,13 @@
 //     seams, deps struct, subjects and runner constructor (projection.go;
 //     ADR 0030 §2);
 //   - for (es.v1.reaction): the same plus a typed issuer and the executor
-//     wiring (reaction.go; ADR 0030 §3).
+//     wiring (reaction.go; ADR 0030 §3);
+//   - for (es.v1.command_service): a Connect handler implementing the
+//     protoc-gen-connect-go interface, with validation, principal injection,
+//     edge authorisation and error mapping (service.go; ADR 0031). This one
+//     goes into a sibling package, <pkg>es, next to connect-go's <pkg>connect:
+//     the connect package imports the message package, so the handler cannot
+//     live in the message package without an import cycle.
 //
 // Cross-package lookups (a consumed event -> its package's Event container
 // -> the package's (es.v1.aggregate) State) are in resolve.go. With the
@@ -95,8 +101,15 @@ func generateFile(gen *protogen.Plugin, f *protogen.File, r *resolver) ([]catalo
 	if err != nil {
 		return nil, err
 	}
+	svcs, err := collectServices(f, r)
+	if err != nil {
+		return nil, err
+	}
+	if len(svcs) > 0 {
+		writeServiceFile(gen, f, svcs)
+	}
 	if len(sums)+len(projs)+len(reacts) == 0 {
-		return nil, nil // nothing to generate for this file
+		return nil, nil // nothing to generate into the message package
 	}
 
 	g := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_es.pb.go", f.GoImportPath)

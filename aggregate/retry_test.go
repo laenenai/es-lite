@@ -223,3 +223,26 @@ func TestDecidedAtMissing(t *testing.T) {
 		t.Fatalf("version after missing = %d (err %v), want 1", v, err)
 	}
 }
+
+func TestHandleAtEnforcesCallerVersionWithoutRetry(t *testing.T) {
+	ctx := context.Background()
+	rt, sid := initCounter(t) // at v1
+	rt.WithConflictRetry(5, func(int) time.Duration { return time.Hour })
+
+	start := time.Now()
+	_, err := rt.HandleAt(ctx, sid, counterv1.Command(&counterv1.Increment{By: 1}), es.Meta{}, 7)
+	var ce *es.ConflictError
+	if !errors.Is(err, es.ErrConflict) || !errors.As(err, &ce) || ce.Expected != 7 || ce.Current != 1 {
+		t.Fatalf("error = %v, want ConflictError{7,1}", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("a stale caller version must not be retried")
+	}
+	if _, v, _ := rt.Load(ctx, sid); v != 1 {
+		t.Fatalf("version after stale HandleAt = %d, want 1", v)
+	}
+	// The right version goes through.
+	if res, err := rt.HandleAt(ctx, sid, counterv1.Command(&counterv1.Increment{By: 1}), es.Meta{}, 1); err != nil || res.ToVersion != 2 {
+		t.Fatalf("HandleAt(1): %+v %v", res.ToVersion, err)
+	}
+}

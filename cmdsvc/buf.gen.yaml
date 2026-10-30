@@ -1,0 +1,16 @@
+# Generation for the ADR 0031 fixture: the service messages, the Connect
+# interface and the es-lite handler all land in the cmdsvc nested module
+# (cmdsvc/example/gen), so the core module never imports connect-go. Run via
+# `task generate` (buf generate cmdsvc/example/proto --template cmdsvc/buf.gen.yaml).
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: cmdsvc/example/gen
+    opt: paths=source_relative
+  - local: protoc-gen-connect-go
+    out: cmdsvc/example/gen
+    opt: paths=source_relative
+  - local: protoc-gen-es-lite
+    out: cmdsvc/example/gen
+    opt: paths=source_relative
+    strategy: all

@@ -18,7 +18,9 @@ option go_package = "github.com/laenenai/es-lite/gen/es/v1;esv1";
 // renumbered (buf breaking, FILE rule):
 //   50001–50003  message options (schema_version, sum_type, aggregate)
 //   50010–50011  message options (projection, reaction; ADR 0030)
-//   50023        field option    (decided_at, ADR 0032)
+//   50020        service option  (command_service, ADR 0031)
+//   50021–50024  field options   (stream_id, acting_principal, decided_at,
+//                                 expected_version; ADR 0031/0032)
 extend google.protobuf.MessageOptions {
   // Marks this message as a sum-type container: a message holding exactly
   // one `oneof` whose variants form a sealed Go interface. The value is
@@ -147,7 +149,35 @@ message ReactionSpec {
   string owner_context = 5;
 }
 
+// CommandService is the (es.v1.command_service) payload (ADR 0031).
+message CommandService {
+  // Full name of the aggregate's State message (the one carrying
+  // (es.v1.aggregate)), e.g. "counter.v1.Counter". Every RPC of the service
+  // takes one command of that aggregate and returns its state.
+  string aggregate = 1;
+}
+
+extend google.protobuf.ServiceOptions {
+  // Marks a Connect service as a command service for one aggregate (ADR
+  // 0031). protoc-gen-es-lite generates a handler implementing the
+  // protoc-gen-connect-go interface: validate -> stream id -> acting
+  // principal from the identity source -> edge authorisation -> Handle ->
+  // WriteResult + state, with es errors mapped to Connect codes and a
+  // VersionConflict detail on es.ErrConflict.
+  CommandService command_service = 50020;
+}
+
 extend google.protobuf.FieldOptions {
+  // Marks the string field of a command-service request that holds the
+  // stream's ID slug (ADR 0031). Exactly one per request message.
+  bool stream_id = 50021;
+
+  // Marks the command field the generated handler OVERWRITES with the
+  // authenticated identity's principal, discarding whatever the client sent
+  // (ADR 0031, contracts §3.5). A message-typed field; the generated
+  // identity source is typed with its Go type.
+  bool acting_principal = 50022;
+
   // Marks the google.protobuf.Timestamp field of a command variant that
   // carries the command's decision time (ADR 0032). protoc-gen-es-lite
   // emits `DecisionTime() time.Time` on the variant (es.DecidedAt — the
@@ -163,4 +193,10 @@ extend google.protobuf.FieldOptions {
   //     google.protobuf.Timestamp decided_at = 4 [(es.v1.decided_at) = true];
   //   }
   bool decided_at = 50023;
+
+  // Marks the optional uint64 command field carrying the version the client
+  // believes current (ADR 0031). When non-zero the handler refuses the
+  // command with a VersionConflict detail if the stream has moved on, and
+  // reports it as VersionConflict.expected_version.
+  bool expected_version = 50024;
 }

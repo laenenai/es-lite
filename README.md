@@ -332,8 +332,35 @@ The plugin needs `strategy: all` in `buf.gen.yaml` so `consumes` resolves
 across packages; `--es-lite_opt=docs=<path>` renders a catalogue of every
 projection and reaction from the descriptors.
 
+**Command services over Connect (ADR 0031).** Write the service `.proto` by
+hand, mark it `(es.v1.command_service) = { aggregate: "counter.v1.Counter" }`,
+tag the request's stream-id field `(es.v1.stream_id)` and, on the commands,
+`(es.v1.acting_principal)` / `(es.v1.expected_version)` / `(es.v1.decided_at)`
+where they apply; `protoc-gen-connect-go` emits the interface and
+`protoc-gen-es-lite` emits the handler into a sibling `<pkg>es` package:
+
+```go
+handler := countersvcv1es.NewCounterCommandServiceHandler(countersvcv1es.CounterCommandServiceDeps{
+	Runtime:   rt,
+	Authorize: myAuthorizer,   // one typed Authorize<RPC> per RPC — a missing rule is a compile error
+	Identity:  myIdentity,     // Principal(ctx): assigned to the command, never taken from the client
+	Errors:    myErrorMapper,  // optional: domain sentinels -> Connect codes
+})
+mux.Handle(countersvcv1connect.NewCounterCommandServiceHandler(handler))
+```
+
+Each RPC runs validate (protovalidate) → stream id → principal injection →
+authorise → `Runtime.HandleAt` → `WriteResult{stream_id, version,
+global_position}` + state; `es.ErrConflict` becomes `failed_precondition`
+with an `es.v1.VersionConflict` detail carrying the current version and
+state. The runtime for this lives in the nested module
+`github.com/laenenai/es-lite/cmdsvc`, so the core module never imports
+connect-go.
+
 See [`examples/`](./examples) — `counter`, `projection` (generated projector
-and reaction on SQLite), `pipeline` (end-to-end), `snapshots`, `upcast`.
+and reaction on SQLite), `pipeline` (end-to-end), `snapshots`, `upcast` — and
+[`cmdsvc/example`](./cmdsvc/example) (generated Connect command service,
+tested in-process with connect-go).
 
 ## Backends
 
@@ -350,6 +377,8 @@ aggregate code.
 
 Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.27.3, buf, task,
 govulncheck); run `mise install`. The module has no private dependencies.
+`cmdsvc/` is a nested Go module (connect-go + protovalidate stay out of the
+core graph); every `task` target covers both.
 
 ```sh
 task                 # list tasks
@@ -377,9 +406,11 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 
 ## Documentation
 
-- **[ADRs](./docs/adr)** — 12 decision records (event-sourcing, workspaces,
-  client-owned crypto, NATS service, migrations, …). Start at
-  [the index](./docs/adr/README.md).
+- **[ADRs](./docs/adr)** — 17 decision records (event-sourcing, workspaces,
+  client-owned crypto, NATS service, migrations, hash chain, codegen, …).
+  Start at [the index](./docs/adr/README.md).
+- **[Migration notes](./docs/migration)** — what downstream repositories
+  change when an ADR moves a contract (currently: projection options).
 - **[Deployment guide](./docs/deploy/README.md)** — running `es-lited` in
   production.
 - **[Backlog](./docs/backlog)** — tracked follow-ups.

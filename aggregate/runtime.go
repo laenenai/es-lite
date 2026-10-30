@@ -155,6 +155,16 @@ type Result[S, E any] struct {
 // from it, a differing non-zero one is rejected with es.ErrDecidedAtMismatch,
 // and an unset decided_at is rejected with es.ErrDecidedAtMissing.
 func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta) (Result[S, E], error) {
+	return r.HandleAt(ctx, sid, cmd, meta, 0)
+}
+
+// HandleAt is Handle with a caller-asserted stream version (ADR 0031): when
+// expected is non-zero and the stream's current version differs, it returns
+// an *es.ConflictError carrying both versions without deciding or
+// appending. Unlike a write race, that conflict is never retried by
+// WithConflictRetry — the caller's assertion is stale, and only the caller
+// can refresh it. expected == 0 means "no assertion" (plain Handle).
+func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64) (Result[S, E], error) {
 	var zero Result[S, E]
 
 	// Domain time from the command (ADR 0032). Checked before any I/O so a
@@ -187,8 +197,9 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 	}
 
 	for attempt := 0; ; attempt++ {
-		res, err := r.handleOnce(ctx, sid, cmd, meta)
-		if err == nil || !errors.Is(err, es.ErrConflict) || attempt >= r.retries {
+		res, err := r.handleOnce(ctx, sid, cmd, meta, expected)
+		var stale *es.ConflictError
+		if err == nil || !errors.Is(err, es.ErrConflict) || errors.As(err, &stale) || attempt >= r.retries {
 			if err != nil && attempt > 0 {
 				return zero, fmt.Errorf("aggregate: conflict retry exhausted after %d attempts: %w", attempt+1, err)
 			}
@@ -218,12 +229,15 @@ func (r *Runtime[S, C, E]) sleep(ctx context.Context, d time.Duration) error {
 // handleOnce is a single load → IsTerminal → Decide → Append pass. Decide is
 // pure and load re-reads the stream, so re-running it after a conflict is
 // safe by construction.
-func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta) (Result[S, E], error) {
+func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64) (Result[S, E], error) {
 	var zero Result[S, E]
 
 	state, version, err := r.load(ctx, sid, 0, time.Time{})
 	if err != nil {
 		return zero, err
+	}
+	if expected != 0 && version != expected {
+		return zero, &es.ConflictError{StreamID: sid, Expected: expected, Current: version}
 	}
 
 	if r.decider.IsTerminal != nil && r.decider.IsTerminal(state) {

@@ -29,7 +29,21 @@ message Init {
   int64 max     = 2;
   int64 initial = 3;
 }
-message Increment { int64 by = 1; }
+// Principal is who acts on the counter. A command service (ADR 0031) fills
+// it from the authenticated identity, never from the client.
+message Principal {
+  string subject = 1;
+}
+
+// Increment is the fixture for ADR 0031: an acting principal the generated
+// handler overwrites, and an optional expected_version for optimistic
+// concurrency from the client. (Validation rules live on the service's
+// request messages, so this module stays free of buf.validate.)
+message Increment {
+  int64     by               = 1;
+  Principal actor            = 2 [(es.v1.acting_principal) = true];
+  uint64    expected_version = 3 [(es.v1.expected_version) = true];
+}
 message Decrement { int64 by = 1; }
 // Close makes the stream terminal. It carries the decision time (ADR 0032):
 // the runtime sources Envelope.OccurredAt from decided_at, so the envelope

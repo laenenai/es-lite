@@ -372,3 +372,136 @@ func TestDocsCatalogue(t *testing.T) {
 		t.Fatal("catalogue file not generated")
 	}
 }
+
+// ---- ADR 0031: command service generation --------------------------------
+
+func serviceOpts(aggregate string) *descriptorpb.ServiceOptions {
+	o := &descriptorpb.ServiceOptions{}
+	proto.SetExtension(o, esv1.E_CommandService, &esv1.CommandService{Aggregate: aggregate})
+	return o
+}
+
+func streamIDOpts() *descriptorpb.FieldOptions {
+	o := &descriptorpb.FieldOptions{}
+	proto.SetExtension(o, esv1.E_StreamId, true)
+	return o
+}
+
+func msgField(name string, num int32, typeName string) *descriptorpb.FieldDescriptorProto {
+	return &descriptorpb.FieldDescriptorProto{
+		Name: proto.String(name), Number: proto.Int32(num), JsonName: proto.String(name),
+		Label:    descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		Type:     descriptorpb.FieldDescriptorProto_TYPE_MESSAGE.Enum(),
+		TypeName: proto.String(typeName),
+	}
+}
+
+func uint64Field(name string, num int32) *descriptorpb.FieldDescriptorProto {
+	return &descriptorpb.FieldDescriptorProto{
+		Name: proto.String(name), Number: proto.Int32(num), JsonName: proto.String(name),
+		Label: descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL.Enum(),
+		Type:  descriptorpb.FieldDescriptorProto_TYPE_UINT64.Enum(),
+	}
+}
+
+// serviceFile is the domain file plus a one-RPC command service; mutate
+// lets a test break one part of it.
+func serviceFile(mutate func(req, resp *descriptorpb.DescriptorProto, svc *descriptorpb.ServiceDescriptorProto)) *descriptorpb.FileDescriptorProto {
+	f := domainFile(true)
+	req := msg("DoRequest", stringField("id", 1, streamIDOpts()), msgField("command", 2, ".t.v1.Do"))
+	resp := msg("DoResponse",
+		msgField("result", 1, ".t.v1.WriteResult"),
+		msgField("state", 2, ".t.v1.State"))
+	wr := msg("WriteResult", stringField("stream_id", 1, nil), uint64Field("version", 2), uint64Field("global_position", 3))
+	svc := &descriptorpb.ServiceDescriptorProto{
+		Name:    proto.String("ThingCommandService"),
+		Options: serviceOpts("t.v1.State"),
+		Method: []*descriptorpb.MethodDescriptorProto{{
+			Name: proto.String("Do"), InputType: proto.String(".t.v1.DoRequest"), OutputType: proto.String(".t.v1.DoResponse"),
+		}},
+	}
+	if mutate != nil {
+		mutate(req, resp, svc)
+	}
+	f.MessageType = append(f.MessageType, req, resp, wr)
+	f.Service = []*descriptorpb.ServiceDescriptorProto{svc}
+	return f
+}
+
+func TestServiceGeneratesHandlerInSiblingPackage(t *testing.T) {
+	f := serviceFile(nil)
+	specNames = map[string]string{}
+	gen := fixture(t, f)
+	if err := run(gen, ""); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var svcFile string
+	for _, out := range gen.Response().File {
+		if strings.HasSuffix(out.GetName(), "tv1es/t_es.pb.go") {
+			svcFile = out.GetContent()
+		}
+	}
+	if svcFile == "" {
+		t.Fatalf("service handler not generated into the tv1es package; files: %v", names(gen))
+	}
+	for _, want := range []string{
+		"package tv1es",
+		"type ThingCommandServiceAuthorizer interface",
+		"AuthorizeDo(ctx context.Context, sid es.StreamID, cmd *",
+		"Actor(ctx context.Context) (es.Actor, error)", // no acting_principal field: actor-only identity
+		"func NewThingCommandServiceHandler(d ThingCommandServiceDeps) tv1connect.ThingCommandServiceHandler",
+		`es.NewStreamID("thing", req.Msg.GetId())`,
+		"h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)",
+		"cmdsvc.SetWriteResult(resp.Result, sid, res.ToVersion, cmdsvc.LastGlobalPosition(res.Envelopes))",
+	} {
+		if !strings.Contains(svcFile, want) {
+			t.Fatalf("generated service lacks %q:\n%s", want, svcFile)
+		}
+	}
+}
+
+func names(gen *protogen.Plugin) []string {
+	var out []string
+	for _, f := range gen.Response().File {
+		out = append(out, f.GetName())
+	}
+	return out
+}
+
+func TestServiceErrors(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(req, resp *descriptorpb.DescriptorProto, svc *descriptorpb.ServiceDescriptorProto)
+		want   string
+	}{
+		"unknown aggregate": {func(_, _ *descriptorpb.DescriptorProto, svc *descriptorpb.ServiceDescriptorProto) {
+			svc.Options = serviceOpts("t.v1.Nope")
+		}, "is not a message carrying (es.v1.aggregate)"},
+		"no stream id": {func(req, _ *descriptorpb.DescriptorProto, _ *descriptorpb.ServiceDescriptorProto) {
+			req.Field[0].Options = nil
+		}, "exactly one string field tagged (es.v1.stream_id)"},
+		"no command": {func(req, _ *descriptorpb.DescriptorProto, _ *descriptorpb.ServiceDescriptorProto) {
+			req.Field = req.Field[:1]
+		}, "exactly one field whose type is a variant"},
+		"two commands": {func(req, _ *descriptorpb.DescriptorProto, _ *descriptorpb.ServiceDescriptorProto) {
+			req.Field = append(req.Field, msgField("again", 3, ".t.v1.Do"))
+		}, "two command fields"},
+		"no result": {func(_, resp *descriptorpb.DescriptorProto, _ *descriptorpb.ServiceDescriptorProto) {
+			resp.Field = resp.Field[1:]
+		}, "field named `result`"},
+		"no state": {func(_, resp *descriptorpb.DescriptorProto, _ *descriptorpb.ServiceDescriptorProto) {
+			resp.Field = resp.Field[:1]
+		}, "exactly one field of type t.v1.State"},
+		"streaming": {func(_, _ *descriptorpb.DescriptorProto, svc *descriptorpb.ServiceDescriptorProto) {
+			svc.Method[0].ServerStreaming = proto.Bool(true)
+		}, "must be unary"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			specNames = map[string]string{}
+			err := run(fixture(t, serviceFile(c.mutate)), "")
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %v, want %q", err, c.want)
+			}
+		})
+	}
+}

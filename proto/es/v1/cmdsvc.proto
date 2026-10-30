@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package es.v1;
+
+import "google/protobuf/any.proto";
+
+option go_package = "github.com/laenenai/es-lite/gen/es/v1;esv1";
+
+// VersionConflict is the error detail a generated command service attaches
+// to a Connect failed_precondition error when a command lost an optimistic
+// concurrency check (ADR 0031; contracts §9.11). It carries what the caller
+// needs to retry from fresh state without a second round trip.
+message VersionConflict {
+  // The version the command carried ((es.v1.expected_version)), or the
+  // version the handler had loaded when the append failed; 0 if unknown.
+  uint64 expected_version = 1;
+  // The stream's version now.
+  uint64 current_version = 2;
+  // The stream's state now, filtered as the service's Filter dictates.
+  google.protobuf.Any current_state = 3;
+}

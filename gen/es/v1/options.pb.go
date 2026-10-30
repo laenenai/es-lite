@@ -423,6 +423,54 @@ func (x *ReactionSpec) GetOwnerContext() string {
 	return ""
 }
 
+// CommandService is the (es.v1.command_service) payload (ADR 0031).
+type CommandService struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Full name of the aggregate's State message (the one carrying
+	// (es.v1.aggregate)), e.g. "counter.v1.Counter". Every RPC of the service
+	// takes one command of that aggregate and returns its state.
+	Aggregate     string `protobuf:"bytes,1,opt,name=aggregate,proto3" json:"aggregate,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommandService) Reset() {
+	*x = CommandService{}
+	mi := &file_es_v1_options_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommandService) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommandService) ProtoMessage() {}
+
+func (x *CommandService) ProtoReflect() protoreflect.Message {
+	mi := &file_es_v1_options_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommandService.ProtoReflect.Descriptor instead.
+func (*CommandService) Descriptor() ([]byte, []int) {
+	return file_es_v1_options_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *CommandService) GetAggregate() string {
+	if x != nil {
+		return x.Aggregate
+	}
+	return ""
+}
+
 var file_es_v1_options_proto_extTypes = []protoimpl.ExtensionInfo{
 	{
 		ExtendedType:  (*descriptorpb.MessageOptions)(nil),
@@ -465,11 +513,43 @@ var file_es_v1_options_proto_extTypes = []protoimpl.ExtensionInfo{
 		Filename:      "es/v1/options.proto",
 	},
 	{
+		ExtendedType:  (*descriptorpb.ServiceOptions)(nil),
+		ExtensionType: (*CommandService)(nil),
+		Field:         50020,
+		Name:          "es.v1.command_service",
+		Tag:           "bytes,50020,opt,name=command_service",
+		Filename:      "es/v1/options.proto",
+	},
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50021,
+		Name:          "es.v1.stream_id",
+		Tag:           "varint,50021,opt,name=stream_id",
+		Filename:      "es/v1/options.proto",
+	},
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50022,
+		Name:          "es.v1.acting_principal",
+		Tag:           "varint,50022,opt,name=acting_principal",
+		Filename:      "es/v1/options.proto",
+	},
+	{
 		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
 		ExtensionType: (*bool)(nil),
 		Field:         50023,
 		Name:          "es.v1.decided_at",
 		Tag:           "varint,50023,opt,name=decided_at",
+		Filename:      "es/v1/options.proto",
+	},
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*bool)(nil),
+		Field:         50024,
+		Name:          "es.v1.expected_version",
+		Tag:           "varint,50024,opt,name=expected_version",
 		Filename:      "es/v1/options.proto",
 	},
 }
@@ -528,8 +608,33 @@ var (
 	E_Reaction = &file_es_v1_options_proto_extTypes[4]
 )
 
+// Extension fields to descriptorpb.ServiceOptions.
+var (
+	// Marks a Connect service as a command service for one aggregate (ADR
+	// 0031). protoc-gen-es-lite generates a handler implementing the
+	// protoc-gen-connect-go interface: validate -> stream id -> acting
+	// principal from the identity source -> edge authorisation -> Handle ->
+	// WriteResult + state, with es errors mapped to Connect codes and a
+	// VersionConflict detail on es.ErrConflict.
+	//
+	// optional es.v1.CommandService command_service = 50020;
+	E_CommandService = &file_es_v1_options_proto_extTypes[5]
+)
+
 // Extension fields to descriptorpb.FieldOptions.
 var (
+	// Marks the string field of a command-service request that holds the
+	// stream's ID slug (ADR 0031). Exactly one per request message.
+	//
+	// optional bool stream_id = 50021;
+	E_StreamId = &file_es_v1_options_proto_extTypes[6]
+	// Marks the command field the generated handler OVERWRITES with the
+	// authenticated identity's principal, discarding whatever the client sent
+	// (ADR 0031, contracts §3.5). A message-typed field; the generated
+	// identity source is typed with its Go type.
+	//
+	// optional bool acting_principal = 50022;
+	E_ActingPrincipal = &file_es_v1_options_proto_extTypes[7]
 	// Marks the google.protobuf.Timestamp field of a command variant that
 	// carries the command's decision time (ADR 0032). protoc-gen-es-lite
 	// emits `DecisionTime() time.Time` on the variant (es.DecidedAt — the
@@ -546,7 +651,14 @@ var (
 	//   }
 	//
 	// optional bool decided_at = 50023;
-	E_DecidedAt = &file_es_v1_options_proto_extTypes[5]
+	E_DecidedAt = &file_es_v1_options_proto_extTypes[8]
+	// Marks the optional uint64 command field carrying the version the client
+	// believes current (ADR 0031). When non-zero the handler refuses the
+	// command with a VersionConflict detail if the stream has moved on, and
+	// reports it as VersionConflict.expected_version.
+	//
+	// optional bool expected_version = 50024;
+	E_ExpectedVersion = &file_es_v1_options_proto_extTypes[9]
 )
 
 var File_es_v1_options_proto protoreflect.FileDescriptor
@@ -570,7 +682,9 @@ const file_es_v1_options_proto_rawDesc = "" +
 	"\bconsumes\x18\x02 \x03(\tR\bconsumes\x12\x16\n" +
 	"\x06issues\x18\x03 \x03(\tR\x06issues\x12&\n" +
 	"\x05fetch\x18\x04 \x01(\x0e2\x10.es.v1.FetchModeR\x05fetch\x12#\n" +
-	"\rowner_context\x18\x05 \x01(\tR\fownerContext*o\n" +
+	"\rowner_context\x18\x05 \x01(\tR\fownerContext\".\n" +
+	"\x0eCommandService\x12\x1c\n" +
+	"\taggregate\x18\x01 \x01(\tR\taggregate*o\n" +
 	"\tFetchMode\x12\x1a\n" +
 	"\x16FETCH_MODE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18FETCH_MODE_METADATA_ONLY\x10\x01\x12(\n" +
@@ -589,9 +703,13 @@ const file_es_v1_options_proto_rawDesc = "" +
 	"\n" +
 	"projection\x12\x1f.google.protobuf.MessageOptions\x18چ\x03 \x01(\v2\x15.es.v1.ProjectionSpecR\n" +
 	"projection:R\n" +
-	"\breaction\x12\x1f.google.protobuf.MessageOptions\x18ۆ\x03 \x01(\v2\x13.es.v1.ReactionSpecR\breaction:>\n" +
+	"\breaction\x12\x1f.google.protobuf.MessageOptions\x18ۆ\x03 \x01(\v2\x13.es.v1.ReactionSpecR\breaction:a\n" +
+	"\x0fcommand_service\x12\x1f.google.protobuf.ServiceOptions\x18\xe4\x86\x03 \x01(\v2\x15.es.v1.CommandServiceR\x0ecommandService:<\n" +
+	"\tstream_id\x12\x1d.google.protobuf.FieldOptions\x18\xe5\x86\x03 \x01(\bR\bstreamId:J\n" +
+	"\x10acting_principal\x12\x1d.google.protobuf.FieldOptions\x18\xe6\x86\x03 \x01(\bR\x0factingPrincipal:>\n" +
 	"\n" +
-	"decided_at\x12\x1d.google.protobuf.FieldOptions\x18\xe7\x86\x03 \x01(\bR\tdecidedAtB,Z*github.com/laenenai/es-lite/gen/es/v1;esv1b\x06proto3"
+	"decided_at\x12\x1d.google.protobuf.FieldOptions\x18\xe7\x86\x03 \x01(\bR\tdecidedAt:J\n" +
+	"\x10expected_version\x12\x1d.google.protobuf.FieldOptions\x18\xe8\x86\x03 \x01(\bR\x0fexpectedVersionB,Z*github.com/laenenai/es-lite/gen/es/v1;esv1b\x06proto3"
 
 var (
 	file_es_v1_options_proto_rawDescOnce sync.Once
@@ -606,7 +724,7 @@ func file_es_v1_options_proto_rawDescGZIP() []byte {
 }
 
 var file_es_v1_options_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_es_v1_options_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_es_v1_options_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
 var file_es_v1_options_proto_goTypes = []any{
 	(FetchMode)(0),                      // 0: es.v1.FetchMode
 	(RebuildMode)(0),                    // 1: es.v1.RebuildMode
@@ -614,29 +732,36 @@ var file_es_v1_options_proto_goTypes = []any{
 	(*Aggregate)(nil),                   // 3: es.v1.Aggregate
 	(*ProjectionSpec)(nil),              // 4: es.v1.ProjectionSpec
 	(*ReactionSpec)(nil),                // 5: es.v1.ReactionSpec
-	(*durationpb.Duration)(nil),         // 6: google.protobuf.Duration
-	(*descriptorpb.MessageOptions)(nil), // 7: google.protobuf.MessageOptions
-	(*descriptorpb.FieldOptions)(nil),   // 8: google.protobuf.FieldOptions
+	(*CommandService)(nil),              // 6: es.v1.CommandService
+	(*durationpb.Duration)(nil),         // 7: google.protobuf.Duration
+	(*descriptorpb.MessageOptions)(nil), // 8: google.protobuf.MessageOptions
+	(*descriptorpb.ServiceOptions)(nil), // 9: google.protobuf.ServiceOptions
+	(*descriptorpb.FieldOptions)(nil),   // 10: google.protobuf.FieldOptions
 }
 var file_es_v1_options_proto_depIdxs = []int32{
 	2,  // 0: es.v1.ProjectionSpec.kind:type_name -> es.v1.ProjectionKind
 	0,  // 1: es.v1.ProjectionSpec.fetch:type_name -> es.v1.FetchMode
 	1,  // 2: es.v1.ProjectionSpec.rebuild:type_name -> es.v1.RebuildMode
-	6,  // 3: es.v1.ProjectionSpec.max_lag:type_name -> google.protobuf.Duration
+	7,  // 3: es.v1.ProjectionSpec.max_lag:type_name -> google.protobuf.Duration
 	0,  // 4: es.v1.ReactionSpec.fetch:type_name -> es.v1.FetchMode
-	7,  // 5: es.v1.sum_type:extendee -> google.protobuf.MessageOptions
-	7,  // 6: es.v1.schema_version:extendee -> google.protobuf.MessageOptions
-	7,  // 7: es.v1.aggregate:extendee -> google.protobuf.MessageOptions
-	7,  // 8: es.v1.projection:extendee -> google.protobuf.MessageOptions
-	7,  // 9: es.v1.reaction:extendee -> google.protobuf.MessageOptions
-	8,  // 10: es.v1.decided_at:extendee -> google.protobuf.FieldOptions
-	3,  // 11: es.v1.aggregate:type_name -> es.v1.Aggregate
-	4,  // 12: es.v1.projection:type_name -> es.v1.ProjectionSpec
-	5,  // 13: es.v1.reaction:type_name -> es.v1.ReactionSpec
-	14, // [14:14] is the sub-list for method output_type
-	14, // [14:14] is the sub-list for method input_type
-	11, // [11:14] is the sub-list for extension type_name
-	5,  // [5:11] is the sub-list for extension extendee
+	8,  // 5: es.v1.sum_type:extendee -> google.protobuf.MessageOptions
+	8,  // 6: es.v1.schema_version:extendee -> google.protobuf.MessageOptions
+	8,  // 7: es.v1.aggregate:extendee -> google.protobuf.MessageOptions
+	8,  // 8: es.v1.projection:extendee -> google.protobuf.MessageOptions
+	8,  // 9: es.v1.reaction:extendee -> google.protobuf.MessageOptions
+	9,  // 10: es.v1.command_service:extendee -> google.protobuf.ServiceOptions
+	10, // 11: es.v1.stream_id:extendee -> google.protobuf.FieldOptions
+	10, // 12: es.v1.acting_principal:extendee -> google.protobuf.FieldOptions
+	10, // 13: es.v1.decided_at:extendee -> google.protobuf.FieldOptions
+	10, // 14: es.v1.expected_version:extendee -> google.protobuf.FieldOptions
+	3,  // 15: es.v1.aggregate:type_name -> es.v1.Aggregate
+	4,  // 16: es.v1.projection:type_name -> es.v1.ProjectionSpec
+	5,  // 17: es.v1.reaction:type_name -> es.v1.ReactionSpec
+	6,  // 18: es.v1.command_service:type_name -> es.v1.CommandService
+	19, // [19:19] is the sub-list for method output_type
+	19, // [19:19] is the sub-list for method input_type
+	15, // [15:19] is the sub-list for extension type_name
+	5,  // [5:15] is the sub-list for extension extendee
 	0,  // [0:5] is the sub-list for field type_name
 }
 
@@ -651,8 +776,8 @@ func file_es_v1_options_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_es_v1_options_proto_rawDesc), len(file_es_v1_options_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   3,
-			NumExtensions: 6,
+			NumMessages:   4,
+			NumExtensions: 10,
 			NumServices:   0,
 		},
 		GoTypes:           file_es_v1_options_proto_goTypes,

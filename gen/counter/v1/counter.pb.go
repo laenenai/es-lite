@@ -164,16 +164,68 @@ func (x *Init) GetInitial() int64 {
 	return 0
 }
 
-type Increment struct {
+// Principal is who acts on the counter. A command service (ADR 0031) fills
+// it from the authenticated identity, never from the client.
+type Principal struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	By            int64                  `protobuf:"varint,1,opt,name=by,proto3" json:"by,omitempty"`
+	Subject       string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
+func (x *Principal) Reset() {
+	*x = Principal{}
+	mi := &file_counter_v1_counter_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Principal) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Principal) ProtoMessage() {}
+
+func (x *Principal) ProtoReflect() protoreflect.Message {
+	mi := &file_counter_v1_counter_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Principal.ProtoReflect.Descriptor instead.
+func (*Principal) Descriptor() ([]byte, []int) {
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Principal) GetSubject() string {
+	if x != nil {
+		return x.Subject
+	}
+	return ""
+}
+
+// Increment is the fixture for ADR 0031: an acting principal the generated
+// handler overwrites, and an optional expected_version for optimistic
+// concurrency from the client. (Validation rules live on the service's
+// request messages, so this module stays free of buf.validate.)
+type Increment struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	By              int64                  `protobuf:"varint,1,opt,name=by,proto3" json:"by,omitempty"`
+	Actor           *Principal             `protobuf:"bytes,2,opt,name=actor,proto3" json:"actor,omitempty"`
+	ExpectedVersion uint64                 `protobuf:"varint,3,opt,name=expected_version,json=expectedVersion,proto3" json:"expected_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
 func (x *Increment) Reset() {
 	*x = Increment{}
-	mi := &file_counter_v1_counter_proto_msgTypes[2]
+	mi := &file_counter_v1_counter_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -185,7 +237,7 @@ func (x *Increment) String() string {
 func (*Increment) ProtoMessage() {}
 
 func (x *Increment) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[2]
+	mi := &file_counter_v1_counter_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -198,12 +250,26 @@ func (x *Increment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Increment.ProtoReflect.Descriptor instead.
 func (*Increment) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{2}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Increment) GetBy() int64 {
 	if x != nil {
 		return x.By
+	}
+	return 0
+}
+
+func (x *Increment) GetActor() *Principal {
+	if x != nil {
+		return x.Actor
+	}
+	return nil
+}
+
+func (x *Increment) GetExpectedVersion() uint64 {
+	if x != nil {
+		return x.ExpectedVersion
 	}
 	return 0
 }
@@ -217,7 +283,7 @@ type Decrement struct {
 
 func (x *Decrement) Reset() {
 	*x = Decrement{}
-	mi := &file_counter_v1_counter_proto_msgTypes[3]
+	mi := &file_counter_v1_counter_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -229,7 +295,7 @@ func (x *Decrement) String() string {
 func (*Decrement) ProtoMessage() {}
 
 func (x *Decrement) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[3]
+	mi := &file_counter_v1_counter_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -242,7 +308,7 @@ func (x *Decrement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Decrement.ProtoReflect.Descriptor instead.
 func (*Decrement) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{3}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Decrement) GetBy() int64 {
@@ -264,7 +330,7 @@ type Close struct {
 
 func (x *Close) Reset() {
 	*x = Close{}
-	mi := &file_counter_v1_counter_proto_msgTypes[4]
+	mi := &file_counter_v1_counter_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -276,7 +342,7 @@ func (x *Close) String() string {
 func (*Close) ProtoMessage() {}
 
 func (x *Close) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[4]
+	mi := &file_counter_v1_counter_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -289,7 +355,7 @@ func (x *Close) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Close.ProtoReflect.Descriptor instead.
 func (*Close) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{4}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Close) GetDecidedAt() *timestamppb.Timestamp {
@@ -317,7 +383,7 @@ type Commands struct {
 
 func (x *Commands) Reset() {
 	*x = Commands{}
-	mi := &file_counter_v1_counter_proto_msgTypes[5]
+	mi := &file_counter_v1_counter_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -329,7 +395,7 @@ func (x *Commands) String() string {
 func (*Commands) ProtoMessage() {}
 
 func (x *Commands) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[5]
+	mi := &file_counter_v1_counter_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -342,7 +408,7 @@ func (x *Commands) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Commands.ProtoReflect.Descriptor instead.
 func (*Commands) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{5}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *Commands) GetVariant() isCommands_Variant {
@@ -427,7 +493,7 @@ type Initialized struct {
 
 func (x *Initialized) Reset() {
 	*x = Initialized{}
-	mi := &file_counter_v1_counter_proto_msgTypes[6]
+	mi := &file_counter_v1_counter_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -439,7 +505,7 @@ func (x *Initialized) String() string {
 func (*Initialized) ProtoMessage() {}
 
 func (x *Initialized) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[6]
+	mi := &file_counter_v1_counter_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -452,7 +518,7 @@ func (x *Initialized) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Initialized.ProtoReflect.Descriptor instead.
 func (*Initialized) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{6}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Initialized) GetMin() int64 {
@@ -486,7 +552,7 @@ type Incremented struct {
 
 func (x *Incremented) Reset() {
 	*x = Incremented{}
-	mi := &file_counter_v1_counter_proto_msgTypes[7]
+	mi := &file_counter_v1_counter_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -498,7 +564,7 @@ func (x *Incremented) String() string {
 func (*Incremented) ProtoMessage() {}
 
 func (x *Incremented) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[7]
+	mi := &file_counter_v1_counter_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -511,7 +577,7 @@ func (x *Incremented) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Incremented.ProtoReflect.Descriptor instead.
 func (*Incremented) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{7}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *Incremented) GetBy() int64 {
@@ -530,7 +596,7 @@ type Decremented struct {
 
 func (x *Decremented) Reset() {
 	*x = Decremented{}
-	mi := &file_counter_v1_counter_proto_msgTypes[8]
+	mi := &file_counter_v1_counter_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -542,7 +608,7 @@ func (x *Decremented) String() string {
 func (*Decremented) ProtoMessage() {}
 
 func (x *Decremented) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[8]
+	mi := &file_counter_v1_counter_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -555,7 +621,7 @@ func (x *Decremented) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Decremented.ProtoReflect.Descriptor instead.
 func (*Decremented) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{8}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Decremented) GetBy() int64 {
@@ -573,7 +639,7 @@ type Closed struct {
 
 func (x *Closed) Reset() {
 	*x = Closed{}
-	mi := &file_counter_v1_counter_proto_msgTypes[9]
+	mi := &file_counter_v1_counter_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -585,7 +651,7 @@ func (x *Closed) String() string {
 func (*Closed) ProtoMessage() {}
 
 func (x *Closed) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[9]
+	mi := &file_counter_v1_counter_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -598,7 +664,7 @@ func (x *Closed) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Closed.ProtoReflect.Descriptor instead.
 func (*Closed) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{9}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{10}
 }
 
 type Events struct {
@@ -616,7 +682,7 @@ type Events struct {
 
 func (x *Events) Reset() {
 	*x = Events{}
-	mi := &file_counter_v1_counter_proto_msgTypes[10]
+	mi := &file_counter_v1_counter_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -628,7 +694,7 @@ func (x *Events) String() string {
 func (*Events) ProtoMessage() {}
 
 func (x *Events) ProtoReflect() protoreflect.Message {
-	mi := &file_counter_v1_counter_proto_msgTypes[10]
+	mi := &file_counter_v1_counter_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -641,7 +707,7 @@ func (x *Events) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Events.ProtoReflect.Descriptor instead.
 func (*Events) Descriptor() ([]byte, []int) {
-	return file_counter_v1_counter_proto_rawDescGZIP(), []int{10}
+	return file_counter_v1_counter_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Events) GetVariant() isEvents_Variant {
@@ -731,9 +797,13 @@ const file_counter_v1_counter_proto_rawDesc = "" +
 	"\x04Init\x12\x10\n" +
 	"\x03min\x18\x01 \x01(\x03R\x03min\x12\x10\n" +
 	"\x03max\x18\x02 \x01(\x03R\x03max\x12\x18\n" +
-	"\ainitial\x18\x03 \x01(\x03R\ainitial\"\x1b\n" +
+	"\ainitial\x18\x03 \x01(\x03R\ainitial\"%\n" +
+	"\tPrincipal\x12\x18\n" +
+	"\asubject\x18\x01 \x01(\tR\asubject\"\x7f\n" +
 	"\tIncrement\x12\x0e\n" +
-	"\x02by\x18\x01 \x01(\x03R\x02by\"\x1b\n" +
+	"\x02by\x18\x01 \x01(\x03R\x02by\x121\n" +
+	"\x05actor\x18\x02 \x01(\v2\x15.counter.v1.PrincipalB\x04\xb0\xb6\x18\x01R\x05actor\x12/\n" +
+	"\x10expected_version\x18\x03 \x01(\x04B\x04\xc0\xb6\x18\x01R\x0fexpectedVersion\"\x1b\n" +
 	"\tDecrement\x12\x0e\n" +
 	"\x02by\x18\x01 \x01(\x03R\x02by\"H\n" +
 	"\x05Close\x12?\n" +
@@ -773,36 +843,38 @@ func file_counter_v1_counter_proto_rawDescGZIP() []byte {
 	return file_counter_v1_counter_proto_rawDescData
 }
 
-var file_counter_v1_counter_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_counter_v1_counter_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_counter_v1_counter_proto_goTypes = []any{
 	(*Counter)(nil),               // 0: counter.v1.Counter
 	(*Init)(nil),                  // 1: counter.v1.Init
-	(*Increment)(nil),             // 2: counter.v1.Increment
-	(*Decrement)(nil),             // 3: counter.v1.Decrement
-	(*Close)(nil),                 // 4: counter.v1.Close
-	(*Commands)(nil),              // 5: counter.v1.Commands
-	(*Initialized)(nil),           // 6: counter.v1.Initialized
-	(*Incremented)(nil),           // 7: counter.v1.Incremented
-	(*Decremented)(nil),           // 8: counter.v1.Decremented
-	(*Closed)(nil),                // 9: counter.v1.Closed
-	(*Events)(nil),                // 10: counter.v1.Events
-	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
+	(*Principal)(nil),             // 2: counter.v1.Principal
+	(*Increment)(nil),             // 3: counter.v1.Increment
+	(*Decrement)(nil),             // 4: counter.v1.Decrement
+	(*Close)(nil),                 // 5: counter.v1.Close
+	(*Commands)(nil),              // 6: counter.v1.Commands
+	(*Initialized)(nil),           // 7: counter.v1.Initialized
+	(*Incremented)(nil),           // 8: counter.v1.Incremented
+	(*Decremented)(nil),           // 9: counter.v1.Decremented
+	(*Closed)(nil),                // 10: counter.v1.Closed
+	(*Events)(nil),                // 11: counter.v1.Events
+	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
 }
 var file_counter_v1_counter_proto_depIdxs = []int32{
-	11, // 0: counter.v1.Close.decided_at:type_name -> google.protobuf.Timestamp
-	1,  // 1: counter.v1.Commands.init:type_name -> counter.v1.Init
-	2,  // 2: counter.v1.Commands.increment:type_name -> counter.v1.Increment
-	3,  // 3: counter.v1.Commands.decrement:type_name -> counter.v1.Decrement
-	4,  // 4: counter.v1.Commands.close:type_name -> counter.v1.Close
-	6,  // 5: counter.v1.Events.initialized:type_name -> counter.v1.Initialized
-	7,  // 6: counter.v1.Events.incremented:type_name -> counter.v1.Incremented
-	8,  // 7: counter.v1.Events.decremented:type_name -> counter.v1.Decremented
-	9,  // 8: counter.v1.Events.closed:type_name -> counter.v1.Closed
-	9,  // [9:9] is the sub-list for method output_type
-	9,  // [9:9] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	2,  // 0: counter.v1.Increment.actor:type_name -> counter.v1.Principal
+	12, // 1: counter.v1.Close.decided_at:type_name -> google.protobuf.Timestamp
+	1,  // 2: counter.v1.Commands.init:type_name -> counter.v1.Init
+	3,  // 3: counter.v1.Commands.increment:type_name -> counter.v1.Increment
+	4,  // 4: counter.v1.Commands.decrement:type_name -> counter.v1.Decrement
+	5,  // 5: counter.v1.Commands.close:type_name -> counter.v1.Close
+	7,  // 6: counter.v1.Events.initialized:type_name -> counter.v1.Initialized
+	8,  // 7: counter.v1.Events.incremented:type_name -> counter.v1.Incremented
+	9,  // 8: counter.v1.Events.decremented:type_name -> counter.v1.Decremented
+	10, // 9: counter.v1.Events.closed:type_name -> counter.v1.Closed
+	10, // [10:10] is the sub-list for method output_type
+	10, // [10:10] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_counter_v1_counter_proto_init() }
@@ -810,13 +882,13 @@ func file_counter_v1_counter_proto_init() {
 	if File_counter_v1_counter_proto != nil {
 		return
 	}
-	file_counter_v1_counter_proto_msgTypes[5].OneofWrappers = []any{
+	file_counter_v1_counter_proto_msgTypes[6].OneofWrappers = []any{
 		(*Commands_Init)(nil),
 		(*Commands_Increment)(nil),
 		(*Commands_Decrement)(nil),
 		(*Commands_Close)(nil),
 	}
-	file_counter_v1_counter_proto_msgTypes[10].OneofWrappers = []any{
+	file_counter_v1_counter_proto_msgTypes[11].OneofWrappers = []any{
 		(*Events_Initialized)(nil),
 		(*Events_Incremented)(nil),
 		(*Events_Decremented)(nil),
@@ -828,7 +900,7 @@ func file_counter_v1_counter_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_counter_v1_counter_proto_rawDesc), len(file_counter_v1_counter_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

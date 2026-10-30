@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+// The hand-written command service for the counter aggregate — the ADR 0031
+// fixture. protoc-gen-go and protoc-gen-connect-go emit the messages and the
+// Connect interface as usual; protoc-gen-es-lite emits the handler that
+// implements it (counter_service_es.pb.go).
+package countersvc.v1;
+
+import "buf/validate/validate.proto";
+import "counter/v1/counter.proto";
+import "es/v1/options.proto";
+
+option go_package = "github.com/laenenai/es-lite/cmdsvc/example/gen/countersvc/v1;countersvcv1";
+
+// CounterCommandService serves the counter's commands over Connect.
+service CounterCommandService {
+  option (es.v1.command_service) = { aggregate: "counter.v1.Counter" };
+
+  rpc Init(InitRequest) returns (InitResponse);
+  rpc Increment(IncrementRequest) returns (IncrementResponse);
+  rpc Close(CloseRequest) returns (CloseResponse);
+}
+
+// WriteResult is what every command response carries (contracts
+// convention 31): where the write landed.
+message WriteResult {
+  string stream_id       = 1;
+  uint64 version         = 2;
+  uint64 global_position = 3;
+}
+
+message InitRequest {
+  string          counter_id = 1 [(es.v1.stream_id) = true];
+  counter.v1.Init command    = 2;
+}
+message InitResponse {
+  WriteResult        result = 1;
+  counter.v1.Counter state  = 2;
+}
+
+message IncrementRequest {
+  // max_len is deliberately tighter than es.StreamID's own slug rule, so a
+  // protovalidate rejection is distinguishable from a stream-id rejection.
+  string counter_id = 1 [
+    (es.v1.stream_id) = true,
+    (buf.validate.field).string.max_len = 16
+  ];
+  counter.v1.Increment command = 2 [(buf.validate.field).required = true];
+}
+message IncrementResponse {
+  WriteResult        result = 1;
+  counter.v1.Counter state  = 2;
+}
+
+message CloseRequest {
+  string           counter_id = 1 [(es.v1.stream_id) = true];
+  counter.v1.Close command    = 2;
+}
+message CloseResponse {
+  WriteResult        result = 1;
+  counter.v1.Counter state  = 2;
+}
