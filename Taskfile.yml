@@ -126,10 +126,15 @@ tasks:
       - cd cmdsvc && go vet ./...
 
   lint:proto:
-    desc: buf lint + breaking-change check against main.
+    desc: buf lint + breaking-change check against main, per module.
     cmds:
       - buf lint
-      - buf breaking --against '.git#ref=origin/main'
+      # Compare each module against its own path on main. A workspace-wide
+      # `--against` cannot match modules once `proto` carries a BSR name
+      # (ADR 0033): it reported the unchanged counter fixture as deleted.
+      # cmdsvc/example/proto is new on this branch and has no baseline yet.
+      - buf breaking proto --against '.git#ref=origin/main,subdir=proto'
+      - buf breaking examples/counter/proto --against '.git#ref=origin/main,subdir=examples/counter/proto'
 
   buf:push:
     desc: >
