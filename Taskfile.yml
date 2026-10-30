@@ -119,6 +119,17 @@ tasks:
       - buf lint
       - buf breaking --against '.git#ref=origin/main'
 
+  buf:push:
+    desc: >
+      Push the es/v1 options module to the BSR as buf.build/laenenai/es-lite
+      (ADR 0033). Needs a BUF_TOKEN with write access (`buf registry login`).
+      LABEL defaults to the current git ref name; CI pushes `main` on every
+      main build and the tag name on release. Lint + breaking gate the push.
+    cmds:
+      - buf lint proto
+      - buf breaking proto --against '.git#ref=origin/main,subdir=proto'
+      - buf push proto --label "{{.LABEL | default "$(git rev-parse --abbrev-ref HEAD)"}}"
+
   tidy:
     desc: Tidy go.mod/go.sum.
     cmds:

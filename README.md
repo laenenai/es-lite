@@ -227,6 +227,28 @@ secret injection, TLS, sharding, and multi-region cells:
 Aggregates are defined in `.proto`; `task generate` emits sealed sum-types +
 codecs. You hand-write only the `Decider` and its error sentinels.
 
+**Proto options from the BSR.** The framework options your `.proto` files
+import (`es/v1/options.proto`: `sum_type`, `schema_version`, `decided_at`, …)
+are published as the Buf module `buf.build/laenenai/es-lite` (ADR 0033).
+Depend on it instead of vendoring the file:
+
+```yaml
+# buf.yaml (consumer)
+version: v2
+modules:
+  - path: proto
+deps:
+  - buf.build/laenenai/es-lite          # pin a label: buf.build/laenenai/es-lite:v0.3.0
+```
+
+then `buf dep update`, keep `import "es/v1/options.proto";` unchanged, and
+run `protoc-gen-es-lite` from this Go module (`go install
+github.com/laenenai/es-lite/cmd/protoc-gen-es-lite@<tag>`). The Go types for
+the options stay in `github.com/laenenai/es-lite/gen/es/v1` — do not generate
+them from the BSR module (in buf v2 dependencies are not generated unless
+`include_imports` is set; with `managed` mode add a `disable` override for
+`buf.build/laenenai/es-lite`).
+
 ```go
 func example(ctx context.Context, nc *nats.Conn, someTimestamp time.Time) error {
 // Embedded (direct Postgres/SQLite):

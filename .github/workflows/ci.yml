@@ -21,6 +21,25 @@ jobs:
       - run: task test:race
       - run: task vuln
 
+  # Publish the es/v1 options module to the BSR under the `main` label so
+  # consumers can pin a commit before a release tag exists (ADR 0033).
+  # Skipped on PRs and forks (no BUF_TOKEN there).
+  bsr:
+    name: buf push (main)
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v2
+      - uses: bufbuild/buf-action@v1
+        with:
+          token: ${{ secrets.BUF_TOKEN }}
+          setup_only: true
+      - run: task buf:push LABEL=main
+
   integration:
     name: integration (postgres · nats · pipeline · snapshots)
     runs-on: ubuntu-latest

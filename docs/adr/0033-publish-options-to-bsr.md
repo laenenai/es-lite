@@ -1,6 +1,6 @@
 # ADR 0033: Publish `es/v1/options.proto` as a Buf Module
 
-- **Status:** Proposed
+- **Status:** Accepted (configured; first push pending the `BUF_TOKEN` secret)
 - **Date:** 2026-10-30
 
 ## Context
@@ -79,3 +79,16 @@ descriptor build.
 ### Move the options into `contracts` and have es-lite depend on it
 
 Rejected for the dependency-direction reasons in ADR 0030.
+
+## Implementation notes
+
+- `buf.yaml` names the `proto` module `buf.build/laenenai/es-lite`; the
+  counter fixture module stays unnamed.
+- The push is a Taskfile task, `task buf:push [LABEL=…]`, gated by `buf lint`
+  and `buf breaking` against `origin/main`'s `proto` subdirectory. `ci.yml`
+  runs it with `LABEL=main` on pushes to `main`; `release.yml` runs it with the
+  tag name after the image job. Both use `bufbuild/buf-action` with
+  `setup_only` and the `BUF_TOKEN` repository secret.
+- No push has been made from this branch: the BSR repository and the
+  `BUF_TOKEN` secret must be created by the owner first. Until then
+  `contracts` keeps its vendored copy; the migration steps in §4 are unchanged.
