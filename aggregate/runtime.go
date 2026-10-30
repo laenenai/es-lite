@@ -41,6 +41,11 @@ type Runtime[S, C, E any] struct {
 	// the pause before it.
 	retries int
 	backoff func(attempt int) time.Duration
+
+	// verifyChain makes load recompute the hash chain of every envelope it
+	// folds (ADR 0029 §3). Off by default: it doubles hashing on the read
+	// path, and a gate can verify once per fetch instead.
+	verifyChain bool
 }
 
 // NewRuntime wires a Runtime against a Store, a Decider, and the generated
@@ -92,6 +97,14 @@ func (r *Runtime[S, C, E]) WithConflictRetry(n int, backoff func(attempt int) ti
 	}
 	r.retries = n
 	r.backoff = backoff
+	return r
+}
+
+// WithChainVerification makes every load recompute the per-stream hash chain
+// over the envelopes it folds and fail with es.ErrChainBroken on a mismatch
+// (ADR 0029 §3). Returns the runtime for chaining.
+func (r *Runtime[S, C, E]) WithChainVerification() *Runtime[S, C, E] {
+	r.verifyChain = true
 	return r
 }
 
@@ -359,8 +372,17 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 		return state, 0, err
 	}
 
+	var checker *es.ChainChecker
+	if r.verifyChain {
+		checker = es.NewChainChecker(sid)
+	}
 	version := from
 	for _, env := range envs {
+		if checker != nil {
+			if err := checker.Next(env); err != nil {
+				return state, 0, err
+			}
+		}
 		ev, err := r.codec.Decode(es.EncodedEvent{
 			TypeURL:       env.TypeURL,
 			SchemaVersion: env.SchemaVersion,

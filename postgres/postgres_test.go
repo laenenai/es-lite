@@ -32,7 +32,7 @@ func openStore(t *testing.T) *postgres.Store {
 	}
 	// Isolate each test: tests run sequentially, so a truncate is safe and
 	// keeps the shared partitioned tables clean.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)

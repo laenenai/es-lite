@@ -12,9 +12,10 @@ import (
 // neutral").
 //
 // The field set is deliberately smaller than the parent framework's:
-// no tenant, no crypto key-refs, no tamper-evidence hash chain. What
-// remains is identity, ordering, schema, the two timestamps, and the
-// audit/causality metadata that make the log a genuine audit trail.
+// no tenant and no crypto key-refs. What remains is identity, ordering,
+// schema, the two timestamps, the audit/causality metadata that make the
+// log a genuine audit trail, and — since ADR 0029 — the per-stream hash
+// chain that makes it tamper-evident.
 type Envelope struct {
 	// Identity & ordering
 	EventID        uuid.UUID // UUIDv7 — globally unique, time-ordered
@@ -44,4 +45,14 @@ type Envelope struct {
 
 	// Payload — canonical serialized event bytes (proto by convention).
 	Payload []byte
+
+	// Tamper evidence (ADR 0029): a per-stream SHA-256 chain the store
+	// computes inside the append transaction. PrevHash is the Hash of
+	// version-1 (ZeroHash for version 1; UnchainedHeadHash for the first
+	// chained event of a stream that predates the chain) and Hash is
+	// EnvelopeHash of this envelope. Both are nil on rows written before
+	// migration 0002. Store-assigned, like GlobalPosition and RecordedAt;
+	// never supplied by the caller.
+	PrevHash []byte
+	Hash     []byte
 }

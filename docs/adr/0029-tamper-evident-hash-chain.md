@@ -1,6 +1,6 @@
 # ADR 0029: Tamper-Evident Event Log (Per-Stream Hash Chain)
 
-- **Status:** Proposed (reverses the "tamper-evident hash chain" cut in ADR 0001)
+- **Status:** Accepted (implemented; reverses the "tamper-evident hash chain" cut in ADR 0001)
 - **Date:** 2026-10-30
 
 ## Context
@@ -237,3 +237,35 @@ Server-side computation in the transaction is the only placement where
 Rejected: it splits the canonical encoding across Go and two SQL dialects
 (SHA-256 over µs timestamps and UUID bytes is awkward in SQLite), and the
 verifier must be in Go anyway. One encoding, one implementation.
+
+## Implementation notes
+
+- **Canonical encoding** is `es.CanonicalEnvelope`; `es/hash_test.go` pins
+  golden vectors produced by an independent (Python) reimplementation of §2.
+  A nil `PrevHash` encodes as 32 zero bytes; a zero timestamp encodes as 0.
+  The anchor root (§4) has its own separator, `es-lite.anchor.v1`, and a
+  leading stream count; unchained heads contribute `UnchainedHeadHash`.
+- **Verifier shape.** `es.VerifyStream` is a thin pager over
+  `es.ChainChecker`, an incremental checker the runtime reuses for
+  `WithChainVerification` (a snapshot-seeded load starts mid-stream, so the
+  checker accepts the first envelope's `prev_hash` as given and verifies
+  linkage from there). `es.VerifyStreamWith` adds `VerifyOptions{ChainedSince,
+  Strict, Page}`; the "NULL hash after the migration instant" rule of §5
+  needs `schema_migrations.applied_at`, which only the adapters know, so they
+  expose `ChainedSince(ctx)` and `es-verify` passes it through.
+- **Anchors** are behind `es.Anchorer` (`Anchor`, `ListAnchors`,
+  `CheckAnchor`, `ListStreams`), implemented by `sqlite.Store` and
+  `postgres.Store` (the latter under `app.bypass_rls`; the `anchors` table's
+  RLS policy admits only that setting). `es-lited` takes anchors on
+  `ANCHOR_INTERVAL` under its own leader key (`anchor.<prefix>`), reusing the
+  relay's election wiring.
+- **Postgres `Append`** now sets `Envelope.Workspace` on the returned
+  envelopes (it did not before) — the hash covers the workspace, and a
+  verifier reads it back from the row. Both adapters truncate timestamps to
+  microseconds on write and `scanEnvelope` re-truncates on read, so the
+  returned and the re-read envelope hash identically.
+- **Gap detection** lives in `natsjs.GapDetector` (`ConsumerConfig.Gaps`);
+  `Consume` naks on `ErrGap` so the missing message is redelivered first. A
+  redelivery (`version <= last`) is accepted, not flagged.
+- **`es-verify`** is its own command (`cmd/es-verify`), the image's fourth
+  entrypoint; exit 0 intact, 1 broken/mismatch, 2 usage or connection error.

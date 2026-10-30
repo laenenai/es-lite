@@ -15,7 +15,7 @@ time-travel** are non-negotiable requirements — which is why the storage model
 is event sourcing, not "state + outbox": only an immutable log answers *"what
 did aggregate X look like on 3 March, and why?"* from the database alone.
 
-Design decisions live in [`docs/adr`](./docs/adr) (10 ADRs); operations in
+Design decisions live in [`docs/adr`](./docs/adr); operations in
 [`docs/deploy`](./docs/deploy).
 
 ---
@@ -53,6 +53,7 @@ authentication and business rules.
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
 | At-least-once delivery | relay/poller + JetStream dedup (see the delivery caveats in ADR 0003/0005) |
 | Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
+| Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes, computed in the append transaction; keyless verification (`es-verify`) and exportable anchors (ADR 0029) |
 | Schema lifecycle | versioned migrations (`es-migrate`) |
 
 **es-lited is NOT responsible for (by design):**
@@ -88,9 +89,19 @@ keys. Those are client responsibilities (ADR 0025).
 - **Per-workspace isolation (Postgres).** RLS scopes rows and the workspace is
   read from the NATS subject. That is isolation, not authentication: configure
   per-workspace NATS ACLs/auth callout and never rely on the subject token alone.
-- **Append-only by API contract.** The library never updates event payloads;
-  `published_at` is the relay's one mutable column. There is no hash chain or
-  signature, so the log is not tamper-evident against a database operator.
+- **Append-only by API contract, tamper-evident by hash chain.** The library
+  never updates event payloads; `published_at` is the relay's one mutable
+  column. Since ADR 0029 every row carries `prev_hash`/`hash`: a per-stream
+  SHA-256 chain over the *sealed* bytes, computed inside the append
+  transaction, so an auditor with no keys can detect an altered, reordered or
+  missing row (`es.VerifyStream`, `es-verify stream|all`). A chain alone cannot
+  detect a truncated tail or an operator who rewrites every hash after an
+  edit; periodic **anchors** (`es-verify anchor`, or `ANCHOR_INTERVAL` on
+  `es-lited`) fix every stream head under one root that you export somewhere
+  the database operator cannot rewrite (a signed commit, a transparency log).
+  es-lite does not sign anchors — signing is the operator's layer. The chain
+  starts at the first append after migration 0002; rows written before it are
+  never back-filled and stay unattested (`ChainedFrom` in the report).
 - **Metadata is visible.** Stream IDs, actors, type URLs and claim scopes are not
   encrypted by the store. Use TLS and broker ACLs on the client↔service hop; the
   repo does not wire TLS for you.
@@ -122,13 +133,14 @@ keys. Those are client responsibilities (ADR 0025).
 
 ## Running the container
 
-The image `ghcr.io/laenenai/es-lited` ships **three** static entrypoints:
+The image `ghcr.io/laenenai/es-lited` ships **four** static entrypoints:
 
 | Entrypoint | Role | Scale |
 |---|---|---|
 | `/es-lited` (default) | the eventstore service (`es.Store` over NATS) | N replicas |
 | `/es-migrate` | apply schema migrations once, then exit | init container / job |
 | `/es-relayd` | drain the log → JetStream (delivery relay) | **singleton** |
+| `/es-verify` | audit the hash chain; take / check anchors (ADR 0029) | job / cron |
 
 The image is private — authenticate to GHCR first (`docker login ghcr.io`).
 
@@ -183,8 +195,12 @@ mesh, `es-lited` also registers as a **NATS Micro** service — `nats micro ls` 
 | `NATS_SUBJECT_PREFIX` | `svc.eslite.local` | `<prefix>.<ws>.<method>`; region per cell |
 | `AUTO_MIGRATE` | `true` | `false` in prod → replicas skip DDL (see `es-migrate`) |
 | `HEALTH_ADDR` | `:8080` | kubelet `/healthz` address |
+| `ANCHOR_INTERVAL` | — | e.g. `1h`: take a hash-chain anchor at that interval under leader election and log it as JSON (Postgres only) |
 
 **`es-migrate`:** `BACKEND`, `PG_DSN`, `SQLITE_DSN` (as above).
+**`es-verify`:** same env; `es-verify stream <ws> <type:id>`, `es-verify all
+[--strict]`, `es-verify anchor [--upto N] | --check <anchor.json> | list`.
+Exit status is the audit result.
 **`es-relayd`:** `PG_DSN`, `NATS_URL`, `ES_STREAM` (default `ES_EVENTS`),
 `ES_BATCH` (default 200), `HEALTH_ADDR`.
 

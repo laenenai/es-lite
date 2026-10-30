@@ -96,6 +96,8 @@ tasks:
       - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1 && nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
       - defer: docker rm -f es-lite-pg es-lite-nats
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/pipeline/...
+      # Chain audit smoke (ADR 0029): every stream the pipeline wrote verifies.
+      - BACKEND=postgres PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go run ./cmd/es-verify all --strict
 
   test:snapshots:
     desc: Snapshot-cache integration test (NATS KV).

@@ -42,10 +42,13 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		}
 	}
 
+	// Timestamps are truncated to microseconds — timestamptz precision and
+	// what the hash chain attests (ADR 0029 §2).
 	occurred := p.OccurredAt
 	if occurred.IsZero() {
-		occurred = time.Now().UTC()
+		occurred = time.Now()
 	}
+	occurred = es.TruncateMicros(occurred)
 	canonical := p.StreamID.Canonical()
 
 	tx, err := w.store.pool.Begin(ctx)
@@ -57,17 +60,25 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		return zero, fmt.Errorf("set workspace: %w", err)
 	}
 
-	var current uint64
-	if err := tx.QueryRow(ctx,
-		`SELECT COALESCE(MAX(version), 0) FROM events WHERE workspace_id = $1 AND stream_id = $2`,
-		w.ws, canonical,
-	).Scan(&current); err != nil {
-		return zero, fmt.Errorf("read current version: %w", err)
+	// Optimistic-concurrency guard and chain head in one read (ADR 0029 §1).
+	current, prev, err := w.readHead(ctx, tx, p.StreamID)
+	if err != nil {
+		return zero, err
 	}
 	if current != p.ExpectedVersion {
 		return zero, fmt.Errorf("%w: stream %s at v%d, expected v%d",
 			es.ErrConflict, p.StreamID, current, p.ExpectedVersion)
 	}
+
+	// Commit clock, sampled AFTER the version check inside the transaction
+	// (clock_timestamp, not now() = transaction start): the loser of a
+	// version race never commits, so recorded_at is monotonic per stream
+	// and an as-of-time read cannot skip a version (ADR 0029 §2, ES-03).
+	var recorded time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&recorded); err != nil {
+		return zero, fmt.Errorf("read commit clock: %w", err)
+	}
+	recorded = es.TruncateMicros(recorded)
 
 	envs := make([]es.Envelope, len(p.Events))
 	for i, ev := range p.Events {
@@ -76,44 +87,50 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		if eventID == uuid.Nil {
 			eventID = newV7()
 		}
+		env := es.Envelope{
+			EventID:       eventID,
+			StreamID:      p.StreamID,
+			Workspace:     w.ws,
+			Version:       version,
+			TypeURL:       ev.TypeURL,
+			SchemaVersion: ev.SchemaVersion,
+			OccurredAt:    occurred,
+			RecordedAt:    recorded,
+			CorrelationID: p.CorrelationID,
+			CausationID:   p.CausationID,
+			CommandID:     p.CommandID,
+			Actor:         p.Actor,
+			Payload:       ev.Payload,                      // opaque bytes, echoed back unchanged
+			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
+		}
+		hash := es.EnvelopeHash(env)
+		env.Hash = hash[:]
+		prev = hash // within one batch, event i chains to event i-1 in memory
 
 		var gp uint64
-		var recorded time.Time
 		err := tx.QueryRow(ctx,
 			`INSERT INTO events (
 				workspace_id, event_id, stream_type, stream_id, version,
-				type_url, schema_version, occurred_at,
+				type_url, schema_version, occurred_at, recorded_at,
 				correlation_id, causation_id, command_id,
-				actor_type, actor_id, actor_principal, payload
-			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8, $9,$10,$11, $12,$13,$14,$15)
-			RETURNING global_position, recorded_at`,
+				actor_type, actor_id, actor_principal, payload,
+				prev_hash, hash
+			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15,$16, $17,$18)
+			RETURNING global_position`,
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
-			ev.TypeURL, ev.SchemaVersion, occurred,
+			ev.TypeURL, ev.SchemaVersion, occurred, recorded,
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
-		).Scan(&gp, &recorded)
+			env.PrevHash, env.Hash,
+		).Scan(&gp)
 		if err != nil {
 			if isUniqueViolation(err) {
 				return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
 			}
 			return zero, fmt.Errorf("insert v%d: %w", version, err)
 		}
-
-		envs[i] = es.Envelope{
-			EventID:        eventID,
-			StreamID:       p.StreamID,
-			Version:        version,
-			GlobalPosition: gp,
-			TypeURL:        ev.TypeURL,
-			SchemaVersion:  ev.SchemaVersion,
-			OccurredAt:     occurred,
-			RecordedAt:     recorded,
-			CorrelationID:  p.CorrelationID,
-			CausationID:    p.CausationID,
-			CommandID:      p.CommandID,
-			Actor:          p.Actor,
-			Payload:        ev.Payload, // opaque bytes, echoed back unchanged
-		}
+		env.GlobalPosition = gp
+		envs[i] = env
 	}
 
 	if err := w.applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
@@ -128,6 +145,33 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// readHead returns the stream's current version and the prev_hash the next
+// event must chain to: ZeroHash for an empty stream, the head's hash when it
+// is chained, and UnchainedHeadHash when the head predates migration 0002
+// (ADR 0029 §5).
+func (w *wsStore) readHead(ctx context.Context, tx pgx.Tx, sid es.StreamID) (uint64, [es.HashSize]byte, error) {
+	var (
+		current uint64
+		head    []byte
+		prev    [es.HashSize]byte
+	)
+	err := tx.QueryRow(ctx,
+		`SELECT version, hash FROM events WHERE workspace_id = $1 AND stream_id = $2 ORDER BY version DESC LIMIT 1`,
+		w.ws, sid.Canonical(),
+	).Scan(&current, &head)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, es.ZeroHash, nil
+	case err != nil:
+		return 0, prev, fmt.Errorf("read stream head: %w", err)
+	case len(head) == es.HashSize:
+		copy(prev[:], head)
+		return current, prev, nil
+	default:
+		return current, es.UnchainedHeadHash(sid, current), nil
+	}
 }
 
 // applyClaims applies uniqueness ops in the append transaction (ADR 0008):

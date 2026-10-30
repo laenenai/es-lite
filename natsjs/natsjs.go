@@ -15,6 +15,7 @@
 package natsjs
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
@@ -45,23 +46,39 @@ const (
 	HdrCommandID      = "Es-Command-Id"
 	HdrActorType      = "Es-Actor-Type"
 	HdrActorID        = "Es-Actor-Id"
+
+	// Hash chain (ADR 0029 §6), hex-encoded; absent on rows written before
+	// migration 0002. A consumer keeping the last Es-Hash per stream can
+	// detect a relay gap or reorder when an incoming Es-Prev-Hash does not
+	// match it — see GapDetector.
+	HdrPrevHash = "Es-Prev-Hash"
+	HdrHash     = "Es-Hash"
 )
 
 // SubjectFunc derives a NATS subject from an event. The default follows the
 // nats-contracts lifecycle-event taxonomy: evt.<workspace>.<aggregate>.<event>.
 type SubjectFunc func(e es.Envelope) string
 
-// DefaultSubject builds evt.<workspace>.<aggregate>.<event>, lower-casing the
-// event type and substituting "default" for an empty workspace (single-
-// workspace backends). Tokens are sanitized to valid NATS subject characters.
+// DefaultSubject builds evt.<workspace>.<aggregate>.<event> for an envelope
+// — SubjectFor over its workspace, stream type and type URL.
 func DefaultSubject(e es.Envelope) string {
-	ws := subjectToken(e.Workspace)
+	return SubjectFor(e.Workspace, e.StreamID.Type, e.TypeURL)
+}
+
+// SubjectFor builds evt.<workspace>.<streamType>.<event>, lower-casing the
+// last segment of typeURL and substituting "default" for an empty workspace
+// (single-workspace backends). Tokens are sanitized to valid NATS subject
+// characters, except that workspace may be the wildcard "*" so a projector
+// can filter one aggregate's event across every workspace (ADR 0030 §2).
+func SubjectFor(workspace, streamType, typeURL string) string {
+	ws := workspace
+	if ws != "*" {
+		ws = subjectToken(ws)
+	}
 	if ws == "" {
 		ws = "default"
 	}
-	aggregate := subjectToken(e.StreamID.Type)
-	event := subjectToken(strings.ToLower(shortType(e.TypeURL)))
-	return "evt." + ws + "." + aggregate + "." + event
+	return "evt." + ws + "." + subjectToken(streamType) + "." + subjectToken(strings.ToLower(shortType(typeURL)))
 }
 
 // shortType returns the last dot-separated segment of a proto type URL,
@@ -109,6 +126,10 @@ func toMsg(subject string, e es.Envelope) *nats.Msg {
 	h.Set(HdrCommandID, e.CommandID.String())
 	h.Set(HdrActorType, e.Actor.Type)
 	h.Set(HdrActorID, e.Actor.ID)
+	if len(e.Hash) > 0 {
+		h.Set(HdrPrevHash, hex.EncodeToString(e.PrevHash))
+		h.Set(HdrHash, hex.EncodeToString(e.Hash))
+	}
 	return &nats.Msg{Subject: subject, Header: h, Data: e.Payload}
 }
 
@@ -142,6 +163,14 @@ func DecodeEnvelope(header nats.Header, data []byte) (es.Envelope, error) {
 	}
 	if t, err := time.Parse(tsLayout, header.Get(HdrRecordedAt)); err == nil {
 		e.RecordedAt = t
+	}
+	if v := header.Get(HdrHash); v != "" {
+		if b, err := hex.DecodeString(v); err == nil {
+			e.Hash = b
+		}
+		if b, err := hex.DecodeString(header.Get(HdrPrevHash)); err == nil {
+			e.PrevHash = b
+		}
 	}
 	e.Payload = data
 	return e, nil

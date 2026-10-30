@@ -138,3 +138,19 @@ func TestInvalidConstraintRejected(t *testing.T) {
 		t.Fatalf("invalid constraint error = %v, want ErrInvalidConstraint", err)
 	}
 }
+
+func TestWithChainVerificationPassesOnIntactStream(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	sid, _ := es.NewStreamID("counter", "main")
+	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{}).WithChainVerification()
+	if _, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 5}), es.Meta{}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Increment{By: 10}), es.Meta{}); err != nil {
+		t.Fatalf("increment: %v", err)
+	}
+	if st, v, err := rt.Load(ctx, sid); err != nil || v != 2 || st.GetCount() != 15 {
+		t.Fatalf("verified load: count=%d v=%d err=%v", st.GetCount(), v, err)
+	}
+}

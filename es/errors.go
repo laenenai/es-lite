@@ -47,6 +47,18 @@ var (
 	// left the field unset. Nothing was appended (ADR 0032).
 	ErrDecidedAtMissing = errors.New("es-lite: command's decided_at is unset")
 
+	// ErrChainBroken reports that a stream's hash chain (ADR 0029) failed
+	// verification: a recomputed hash differs from the stored one, a
+	// prev_hash does not link to its predecessor, versions are not
+	// contiguous, or a chained stream has an unhashed row. The ChainReport
+	// that accompanies it names the first broken version.
+	ErrChainBroken = errors.New("es-lite: hash chain broken")
+
+	// ErrAnchorMismatch reports that a recomputed anchor root differs from
+	// the exported one (ADR 0029 §4): history up to the anchor's position
+	// has been altered or truncated since the anchor was taken.
+	ErrAnchorMismatch = errors.New("es-lite: anchor root mismatch")
+
 	// ErrUnknownEventType is returned by a Codec.Decode when the
 	// envelope's TypeURL is not one the codec recognizes. Usually a
 	// version-skew deployment or a codec wired to the wrong aggregate.

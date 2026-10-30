@@ -167,11 +167,13 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		}
 	}
 
+	// Timestamps are truncated to microseconds — the precision the hash chain
+	// attests and every backend returns (ADR 0029 §2).
 	occurred := p.OccurredAt
 	if occurred.IsZero() {
-		occurred = time.Now().UTC()
+		occurred = time.Now()
 	}
-	recorded := time.Now().UTC()
+	occurred = es.TruncateMicros(occurred)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -179,21 +181,24 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	}
 	defer tx.Rollback()
 
-	// Optimistic-concurrency guard. With a single connection this check
-	// and the inserts are effectively serialized; the UNIQUE(stream_id,
-	// version) constraint is the backstop if that ever changes.
-	var current uint64
-	err = tx.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(version), 0) FROM events WHERE stream_id = ?`,
-		p.StreamID.Canonical(),
-	).Scan(&current)
+	// Optimistic-concurrency guard and chain head in one read (ADR 0029 §1).
+	// With a single connection this check and the inserts are effectively
+	// serialized; the UNIQUE(stream_id, version) constraint is the backstop
+	// if that ever changes.
+	current, prev, err := readHead(ctx, tx, p.StreamID)
 	if err != nil {
-		return zero, fmt.Errorf("read current version: %w", err)
+		return zero, err
 	}
 	if current != p.ExpectedVersion {
 		return zero, fmt.Errorf("%w: stream %s at v%d, expected v%d",
 			es.ErrConflict, p.StreamID, current, p.ExpectedVersion)
 	}
+
+	// Commit clock, sampled AFTER the version check inside the transaction:
+	// the loser of a version race never commits, so recorded_at is monotonic
+	// per stream and an as-of-time read cannot skip a version (ADR 0029 §2,
+	// review finding ES-03).
+	recorded := es.TruncateMicros(time.Now())
 
 	canonical := p.StreamID.Canonical()
 	envs := make([]es.Envelope, len(p.Events))
@@ -203,17 +208,38 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		if eventID == uuid.Nil {
 			eventID = newV7()
 		}
+		env := es.Envelope{
+			EventID:       eventID,
+			StreamID:      p.StreamID,
+			Version:       version,
+			TypeURL:       ev.TypeURL,
+			SchemaVersion: ev.SchemaVersion,
+			OccurredAt:    occurred,
+			RecordedAt:    recorded,
+			CorrelationID: p.CorrelationID,
+			CausationID:   p.CausationID,
+			CommandID:     p.CommandID,
+			Actor:         p.Actor,
+			Payload:       ev.Payload,
+			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
+		}
+		hash := es.EnvelopeHash(env)
+		env.Hash = hash[:]
+		prev = hash // within one batch, event i chains to event i-1 in memory
+
 		res, err := tx.ExecContext(ctx,
 			`INSERT INTO events (
 				event_id, stream_type, stream_id, version,
 				type_url, schema_version, occurred_at, recorded_at,
 				correlation_id, causation_id, command_id,
-				actor_type, actor_id, actor_principal, payload
-			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?)`,
+				actor_type, actor_id, actor_principal, payload,
+				prev_hash, hash
+			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?)`,
 			eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, formatTS(occurred), formatTS(recorded),
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
+			env.PrevHash, env.Hash,
 		)
 		if err != nil {
 			if isConstraintViolation(err) {
@@ -226,21 +252,8 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		if err != nil {
 			return zero, fmt.Errorf("last insert id: %w", err)
 		}
-		envs[i] = es.Envelope{
-			EventID:        eventID,
-			StreamID:       p.StreamID,
-			Version:        version,
-			GlobalPosition: uint64(gp),
-			TypeURL:        ev.TypeURL,
-			SchemaVersion:  ev.SchemaVersion,
-			OccurredAt:     occurred,
-			RecordedAt:     recorded,
-			CorrelationID:  p.CorrelationID,
-			CausationID:    p.CausationID,
-			CommandID:      p.CommandID,
-			Actor:          p.Actor,
-			Payload:        ev.Payload,
-		}
+		env.GlobalPosition = uint64(gp)
+		envs[i] = env
 	}
 
 	if err := applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
@@ -255,6 +268,33 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// readHead returns the stream's current version and the prev_hash the next
+// event must chain to: ZeroHash for an empty stream, the head's hash when it
+// is chained, and UnchainedHeadHash when the head predates migration 0002
+// (ADR 0029 §5).
+func readHead(ctx context.Context, tx *sql.Tx, sid es.StreamID) (uint64, [es.HashSize]byte, error) {
+	var (
+		current uint64
+		head    []byte
+		prev    [es.HashSize]byte
+	)
+	err := tx.QueryRowContext(ctx,
+		`SELECT version, hash FROM events WHERE stream_id = ? ORDER BY version DESC LIMIT 1`,
+		sid.Canonical(),
+	).Scan(&current, &head)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, es.ZeroHash, nil
+	case err != nil:
+		return 0, prev, fmt.Errorf("read stream head: %w", err)
+	case len(head) == es.HashSize:
+		copy(prev[:], head)
+		return current, prev, nil
+	default:
+		return current, es.UnchainedHeadHash(sid, current), nil
+	}
 }
 
 // applyClaims applies uniqueness ops in the append transaction: releases
@@ -367,7 +407,7 @@ const envelopeCols = `
 	global_position, event_id, stream_type, stream_id, version,
 	type_url, schema_version, occurred_at, recorded_at,
 	correlation_id, causation_id, command_id,
-	actor_type, actor_id, payload`
+	actor_type, actor_id, payload, prev_hash, hash`
 
 func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -389,7 +429,7 @@ func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es
 			&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
 			&e.TypeURL, &e.SchemaVersion, &occurredAt, &recordedAt,
 			&correlationID, &causationID, &commandID,
-			&actorType, &actorID, &e.Payload,
+			&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
 		); err != nil {
 			return nil, err
 		}

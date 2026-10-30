@@ -171,3 +171,33 @@ KV are isolated with their own quotas. Export the `svc.eslite.*` service and
 the `evt.*` projection stream to client accounts. Derive the **workspace from
 the caller's JWT** (an identity middleware), never from a client-supplied
 field (ADR 0009).
+
+## Tamper evidence: verifying the chain and exporting anchors (ADR 0029)
+
+Every event row carries a per-stream SHA-256 chain computed in the append
+transaction. The chain needs no keys to verify, but it is only *evident*
+against a database operator if its heads are regularly fixed **outside** the
+database. Runbook:
+
+1. **Verify.** `es-verify all` (same env as `es-migrate`) recomputes every
+   stream's chain and exits non-zero on the first break; `es-verify all
+   --strict` additionally requires every row to be chained (only a store that
+   was empty at migration 0002 can satisfy it — `contracts`' case). Run it from
+   a job after restores and on a schedule.
+2. **Anchor.** `es-verify anchor` prints one JSON line
+   (`anchor_id`, `created_at`, `upto_global_position`, `stream_count`,
+   `root_hash`). Alternatively set `ANCHOR_INTERVAL=1h` on `es-lited`
+   (Postgres only): the elected leader takes an anchor on that cadence and
+   logs it as `es-lited: anchor {...}`.
+3. **Export.** Ship that line somewhere the database operator cannot rewrite:
+   a signed git commit in an ops repository, a transparency log, a
+   timestamping authority, or at minimum a different trust domain's log sink.
+   es-lite does not sign anchors (it is keyless, ADR 0025); the export is
+   where signing belongs.
+4. **Check.** `es-verify anchor --check anchor.json` recomputes the root at the
+   anchored `global_position` and exits non-zero on mismatch — this is what
+   catches a truncated tail or a rewritten-and-rehashed history, which the
+   chain alone cannot.
+
+`anchors` rows are store-wide and readable only with `app.bypass_rls`
+(admin / the `es-verify` binary), never by a workspace session.
