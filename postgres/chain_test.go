@@ -148,12 +148,23 @@ func TestAnchorsPostgres(t *testing.T) {
 	if err != nil || len(list) != 1 || list[0].ID != a.ID {
 		t.Fatalf("list = %+v err=%v", list, err)
 	}
-	// Anchors are admin-only: a workspace-scoped session sees none.
+	// Anchors are admin-only: a workspace-scoped session sees none. Row-level
+	// security never applies to a superuser (not even with FORCE), so the
+	// negative check is only meaningful under a regular role — CI connects
+	// as `postgres` and gets the positive checks above only.
 	tx, err := s.Pool().Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
+	var super bool
+	if err := tx.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`).Scan(&super); err != nil {
+		t.Fatal(err)
+	}
+	if super {
+		t.Log("connected as a superuser: RLS is bypassed by Postgres, skipping the anchors-invisible check")
+		return
+	}
 	if _, err := tx.Exec(ctx, `SELECT set_config('app.workspace_id', 'ws_a', true)`); err != nil {
 		t.Fatal(err)
 	}

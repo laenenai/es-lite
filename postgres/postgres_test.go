@@ -269,8 +269,9 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 1 {
-		t.Fatalf("applied version = %d, want 1", v)
+	// Every embedded migration is applied on Open; 0002 (hash chain) made it two.
+	if v != 2 {
+		t.Fatalf("applied version = %d, want 2", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.
