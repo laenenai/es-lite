@@ -26,6 +26,15 @@ than editing history.
 | 0010 | [Schema Migrations](./0010-schema-migrations.md)                                           | Accepted |
 | 0025 | [Client-Owned Cryptography and Erasure](./0025-client-owned-crypto.md)                     | Accepted (supersedes 0004/0006 crypto; amends 0008) |
 | 0028 | [In-Repo NATS Middleware and Observability](./0028-in-repo-nats-middleware-and-observability.md) | Accepted |
+| 0029 | [Tamper-Evident Event Log (Per-Stream Hash Chain)](./0029-tamper-evident-hash-chain.md) | Proposed (reverses the 0001 cut) |
+| 0030 | [Projector and Reaction Codegen from ProjectionSpec / ReactionSpec](./0030-projection-and-reaction-codegen.md) | Proposed |
+| 0031 | [Connect Command Service Codegen](./0031-connect-command-service-codegen.md)                | Proposed |
+| 0032 | [Bounded Conflict Retry and `OccurredAt` from `decided_at`](./0032-conflict-retry-and-decided-at.md) | Proposed |
+| 0033 | [Publish `es/v1/options.proto` as a Buf Module](./0033-publish-options-to-bsr.md)          | Proposed |
+
+ADRs 0029–0033 are the es-lite side of the `contracts` integration; the
+ordered implementation plan is in
+[`docs/proposals/2026-10-30-contracts-integration-plan.md`](../proposals/2026-10-30-contracts-integration-plan.md).
 
 ## Conventions
 
