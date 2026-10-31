@@ -425,3 +425,7 @@ pipeline; broker-side authentication and per-workspace ACLs remain deployment
 prerequisites (see the security review and ADR 0009). Pre-1.0: the API may
 still shift. See [Status in each ADR](./docs/adr/README.md) for what is
 implemented vs. designed.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).
