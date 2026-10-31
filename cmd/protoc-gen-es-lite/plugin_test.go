@@ -505,3 +505,15 @@ func TestServiceErrors(t *testing.T) {
 		})
 	}
 }
+
+// An aggregate named Case (a real one: casework) yields the Go keyword
+// `case` as an unexported identifier; the generator must escape it.
+func TestLowerFirstEscapesGoKeywords(t *testing.T) {
+	for in, want := range map[string]string{
+		"Case": "case_", "Type": "type_", "Range": "range_", "Counter": "counter", "Event": "event", "": "",
+	} {
+		if got := lowerFirst(in); got != want {
+			t.Errorf("lowerFirst(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

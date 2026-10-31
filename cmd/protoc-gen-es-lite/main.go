@@ -136,13 +136,29 @@ func generateFile(gen *protogen.Plugin, f *protogen.File, r *resolver) ([]catalo
 
 // lowerFirst lowercases the first rune, turning an exported name into an
 // unexported one (e.g. "Event" -> "eventSchemaVersion", "Counter" -> "counter").
+// A result that is a Go keyword gets a trailing underscore ("Case" ->
+// "case_"), since aggregates are named by the domain, not by Go.
 func lowerFirst(s string) string {
 	if s == "" {
 		return s
 	}
 	r := []rune(s)
 	r[0] = unicode.ToLower(r[0])
-	return string(r)
+	out := string(r)
+	if goKeywords[out] {
+		return out + "_"
+	}
+	return out
+}
+
+// goKeywords are the identifiers Go reserves; generated unexported names
+// must never collide with them.
+var goKeywords = map[string]bool{
+	"break": true, "case": true, "chan": true, "const": true, "continue": true,
+	"default": true, "defer": true, "else": true, "fallthrough": true, "for": true,
+	"func": true, "go": true, "goto": true, "if": true, "import": true,
+	"interface": true, "map": true, "package": true, "range": true, "return": true,
+	"select": true, "struct": true, "switch": true, "type": true, "var": true,
 }
 
 // commandVariants collects, across every file in the request (imports
