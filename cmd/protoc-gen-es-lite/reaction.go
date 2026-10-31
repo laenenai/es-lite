@@ -11,6 +11,7 @@ import (
 
 // issued is one `issues` entry, resolved.
 type issued struct {
+	method  string // issuer method name: <Command>, or <StreamType><Command> when issues span aggregates
 	typeURL string
 	msg     *protogen.Message
 	agg     *aggregateInfo
@@ -44,18 +45,28 @@ func collectReactions(f *protogen.File, r *resolver) ([]reactSpec, error) {
 		if rc.consumes, err = resolveConsumes(where, spec.GetName(), spec.GetConsumes(), spec.GetFetch(), r, rc.aggs); err != nil {
 			return nil, err
 		}
-		seen := map[string]string{}
 		for _, c := range spec.GetIssues() {
 			cm, agg, err := r.variant(where, c, commandSumType)
 			if err != nil {
 				return nil, err
 			}
-			if prev, ok := seen[cm.GoIdent.GoName]; ok {
-				return nil, fmt.Errorf("%s: %q and %q would both generate issuer method %s; issued command names must be unique", where, prev, c, cm.GoIdent.GoName)
-			}
-			seen[cm.GoIdent.GoName] = c
 			rc.routers.add(agg)
 			rc.issues = append(rc.issues, issued{typeURL: c, msg: cm, agg: agg})
+		}
+		// Issuer method names follow the handler rule: qualified by stream
+		// type only when the issued commands span aggregates.
+		qualify := rc.routers.len() > 1
+		seen := map[string]string{}
+		for i := range rc.issues {
+			name := rc.issues[i].msg.GoIdent.GoName
+			if qualify {
+				name = exportSnake(rc.issues[i].agg.streamType) + name
+			}
+			if prev, ok := seen[name]; ok {
+				return nil, fmt.Errorf("%s: %q and %q would both generate issuer method %s; issued command names must be unique within an aggregate", where, prev, rc.issues[i].typeURL, name)
+			}
+			seen[name] = rc.issues[i].typeURL
+			rc.issues[i].method = name
 		}
 		out = append(out, rc)
 	}
@@ -105,8 +116,8 @@ func writeReaction(g *protogen.GeneratedFile, rc reactSpec) {
 	g.P()
 	for _, i := range rc.issues {
 		field := lowerFirst(depName(i.agg))
-		g.P("// ", i.msg.GoIdent.GoName, " issues a ", i.typeURL, " to sid.")
-		g.P("func (i *", issuerName, ") ", i.msg.GoIdent.GoName, "(sid ", streamID, ", cmd *", g.QualifiedGoIdent(i.msg.GoIdent), ") {")
+		g.P("// ", i.method, " issues a ", i.typeURL, " to sid.")
+		g.P("func (i *", issuerName, ") ", i.method, "(sid ", streamID, ", cmd *", g.QualifiedGoIdent(i.msg.GoIdent), ") {")
 		g.P("	i.", field, " = append(i.", field, ", ", issue, "[", g.QualifiedGoIdent(i.agg.ifaceIdent()), "]{StreamID: sid, Command: cmd})")
 		g.P("}")
 		g.P()

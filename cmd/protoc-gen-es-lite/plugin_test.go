@@ -505,3 +505,71 @@ func TestServiceErrors(t *testing.T) {
 		})
 	}
 }
+
+// An aggregate named Case (a real one: casework) yields the Go keyword
+// `case` as an unexported identifier; the generator must escape it.
+func TestLowerFirstEscapesGoKeywords(t *testing.T) {
+	for in, want := range map[string]string{
+		"Case": "case_", "Type": "type_", "Range": "range_", "Counter": "counter", "Event": "event", "": "",
+	} {
+		if got := lowerFirst(in); got != want {
+			t.Errorf("lowerFirst(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// secondDomainFile is a second aggregate package, u.v1 (stream type
+// "other"), whose event and command carry the same names as t.v1's.
+func secondDomainFile() *descriptorpb.FileDescriptorProto {
+	f := fileProto("u/v1/u.proto", "u.v1")
+	state := msg("Other")
+	state.Options = aggregateOpts("other")
+	events := container("Events", "Event", "Happened")
+	commands := container("Commands", "Command", "Do")
+	for _, c := range []*descriptorpb.DescriptorProto{events, commands} {
+		for _, fld := range c.Field {
+			fld.TypeName = proto.String(strings.Replace(fld.GetTypeName(), ".t.v1.", ".u.v1.", 1))
+		}
+	}
+	f.MessageType = []*descriptorpb.DescriptorProto{state, msg("Happened"), msg("Do"), events, commands}
+	return f
+}
+
+// A spec consuming the same event name from two aggregates qualifies every
+// handler method by stream type; a single-aggregate spec does not. Issuer
+// methods follow the same rule for issued commands.
+func TestHandlerNamesQualifiedAcrossAggregates(t *testing.T) {
+	f := domainFile(true)
+	f.Dependency = append(f.Dependency, "u/v1/u.proto")
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
+		Name: "t.react", Consumes: []string{"t.v1.Happened", "u.v1.Happened"}, Issues: []string{"t.v1.Do", "u.v1.Do"},
+		Fetch: esv1.FetchMode_FETCH_MODE_METADATA_ONLY,
+	})})
+	content, err := runWith(t, f, secondDomainFile())
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{
+		"OnThingHappened(ctx context.Context, env es.Envelope, issue *ReactIssuer) error",
+		"OnOtherHappened(ctx context.Context, env es.Envelope, issue *ReactIssuer) error",
+		"func (i *ReactIssuer) ThingDo(sid es.StreamID, cmd *Do)",
+		"func (i *ReactIssuer) OtherDo(sid es.StreamID, cmd *",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated code lacks %q:\n%s", want, content)
+		}
+	}
+	// Single-aggregate specs keep the short names.
+	g := domainFile(true)
+	g.MessageType = append(g.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
+		Name: "t.react1", Consumes: []string{"t.v1.Happened"}, Issues: []string{"t.v1.Do"},
+		Fetch: esv1.FetchMode_FETCH_MODE_METADATA_ONLY,
+	})})
+	content, err = runWith(t, g)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if !strings.Contains(content, "OnHappened(ctx") || !strings.Contains(content, "func (i *ReactIssuer) Do(sid") {
+		t.Fatalf("single-aggregate spec must keep short names:\n%s", content)
+	}
+}
