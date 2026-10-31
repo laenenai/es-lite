@@ -3,6 +3,11 @@ plugins:
   - local: protoc-gen-go
     out: gen
     opt: paths=source_relative
+  # strategy: all — one invocation over every file, so a projection's
+  # `consumes` entries resolve across packages (ADR 0030 §2). buf's default
+  # for local plugins is one invocation per directory, which would hide
+  # counter/v1 from counterview/v1.
   - local: protoc-gen-es-lite
     out: gen
     opt: paths=source_relative
+    strategy: all

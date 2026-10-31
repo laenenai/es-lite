@@ -17,6 +17,10 @@
 //	ES_BATCH            relay drain batch size (default 200)
 //	ES_ENSURE_STREAM    false assumes an ops-provisioned stream (default true
 //	                    auto-creates it, R1 / infinite retention)
+//	ANCHOR_INTERVAL     a Go duration (e.g. 1h): take a hash-chain anchor
+//	                    (ADR 0029 §4) at that interval under the same NATS
+//	                    KV leader election as the relay (Postgres only) and
+//	                    log it as JSON for off-box export; default off
 //
 // BACKEND=sqlite is single-workspace (SQLite has no workspace_id/RLS) — for
 // single-tenant or edge deployments. Multi-workspace uses Postgres.
@@ -24,6 +28,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -78,7 +83,7 @@ func main() {
 	if backend == "" {
 		backend = "postgres"
 	}
-	scope, drainer, closeStore, err := openBackend(ctx, backend)
+	scope, drainer, anchorer, closeStore, err := openBackend(ctx, backend)
 	if err != nil {
 		log.Fatalf("es-lited: open %s backend: %v", backend, err)
 	}
@@ -139,6 +144,21 @@ func main() {
 			log.Printf("es-lited: RELAY=true ignored: backend %s has no gap-safe drainer", backend)
 		} else {
 			go runElectedRelay(ctx, nc, drainer, prefix)
+		}
+	}
+	// ANCHOR_INTERVAL=<duration> takes periodic hash-chain anchors (ADR 0029
+	// §4) under leader election, exactly as the relay runs. The anchor row is
+	// logged as JSON: the operator ships that line somewhere the database
+	// operator cannot rewrite.
+	if v := os.Getenv("ANCHOR_INTERVAL"); v != "" {
+		interval, err := time.ParseDuration(v)
+		switch {
+		case err != nil || interval <= 0:
+			log.Printf("es-lited: ANCHOR_INTERVAL=%q ignored: not a positive duration", v)
+		case anchorer == nil:
+			log.Printf("es-lited: ANCHOR_INTERVAL ignored: backend %s has no store-wide anchorer", backend)
+		default:
+			go runElectedAnchors(ctx, nc, anchorer, prefix, interval)
 		}
 	}
 
@@ -222,6 +242,48 @@ func runElectedRelay(ctx context.Context, nc *nats.Conn, drainer delivery.Draine
 	}
 }
 
+// runElectedAnchors campaigns for the anchor lease and, while leader, takes an
+// anchor every interval and logs it. Blocks until ctx is cancelled.
+func runElectedAnchors(ctx context.Context, nc *nats.Conn, anchorer es.Anchorer, prefix string, interval time.Duration) {
+	js, err := jetstream.New(nc)
+	if err != nil {
+		log.Printf("es-lited: anchors: jetstream: %v", err)
+		return
+	}
+	key := "anchor." + strings.Map(kvKeyRune, prefix)
+	id := instanceID()
+	log.Printf("es-lited: anchors every %s, campaigning for leadership (key %s, id %s)", interval, key, id)
+	for ctx.Err() == nil {
+		err = leader.Run(ctx, js, leader.Config{Key: key, ID: id}, func(leaderCtx context.Context) {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-leaderCtx.Done():
+					return
+				case <-ticker.C:
+					a, err := anchorer.Anchor(leaderCtx, 0)
+					if err != nil {
+						log.Printf("es-lited: anchor: %v", err)
+						continue
+					}
+					out, _ := json.Marshal(a)
+					log.Printf("es-lited: anchor %s", out)
+				}
+			}
+		})
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		log.Printf("es-lited: anchor election: %v; retrying in 5s", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
 // instanceID is a best-effort unique id for this process (host-pid).
 func instanceID() string {
 	host, err := os.Hostname()
@@ -248,7 +310,7 @@ func kvKeyRune(r rune) rune {
 // Scoper plus a close function. Postgres is multi-workspace (RLS +
 // partitioning); SQLite is single-workspace (the Scoper ignores the workspace
 // argument), for single-tenant / edge deployments.
-func openBackend(ctx context.Context, backend string) (natsstore.Scoper, delivery.Drainer, func(), error) {
+func openBackend(ctx context.Context, backend string) (natsstore.Scoper, delivery.Drainer, es.Anchorer, func(), error) {
 	// AUTO_MIGRATE=false: assume the schema is already migrated (a separate
 	// es-migrate init container ran it) — so replicas never touch DDL on boot
 	// (ADR 0010). Default true keeps dev/single-node zero-config.
@@ -258,7 +320,7 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, deliver
 	case "postgres":
 		dsn := os.Getenv("PG_DSN")
 		if dsn == "" {
-			return nil, nil, nil, fmt.Errorf("PG_DSN is required for BACKEND=postgres")
+			return nil, nil, nil, nil, fmt.Errorf("PG_DSN is required for BACKEND=postgres")
 		}
 		var opts []postgres.Option
 		if !autoMigrate {
@@ -266,11 +328,12 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, deliver
 		}
 		store, err := postgres.Open(ctx, dsn, opts...)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		// Postgres drains gap-safe (FOR UPDATE SKIP LOCKED), so it can back the
-		// in-process relay under leader election (RELAY=true).
-		return store.Workspace, store, func() { store.Close() }, nil
+		// in-process relay under leader election (RELAY=true), and anchors
+		// store-wide under app.bypass_rls (ANCHOR_INTERVAL).
+		return store.Workspace, store, store, func() { store.Close() }, nil
 
 	case "sqlite":
 		dsn := os.Getenv("SQLITE_DSN")
@@ -283,13 +346,14 @@ func openBackend(ctx context.Context, backend string) (natsstore.Scoper, deliver
 		}
 		store, err := sqlite.Open(ctx, dsn, opts...)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		// Single-workspace: ignore the workspace argument. No Drainer — SQLite is
-		// single-node; use the in-process Poller, not the relay.
-		return func(string) es.Store { return store }, nil, func() { store.Close() }, nil
+		// single-node; use the in-process Poller, not the relay. Anchors are
+		// a job's concern there (es-verify anchor), not a leader's.
+		return func(string) es.Store { return store }, nil, nil, func() { store.Close() }, nil
 
 	default:
-		return nil, nil, nil, fmt.Errorf("unknown BACKEND %q (want postgres|sqlite)", backend)
+		return nil, nil, nil, nil, fmt.Errorf("unknown BACKEND %q (want postgres|sqlite)", backend)
 	}
 }

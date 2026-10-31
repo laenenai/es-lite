@@ -1,7 +1,19 @@
 version: v2
 modules:
+  # The framework options (es/v1/options.proto): published to the Buf Schema
+  # Registry as buf.build/laenenai/es-lite so consumers depend on it instead
+  # of vendoring (ADR 0033). go_package stays github.com/laenenai/es-lite/gen/es/v1.
   - path: proto
+    name: buf.build/laenenai/es-lite
+  # The counter example is a private fixture; it is never pushed.
   - path: examples/counter/proto
+  # The command-service fixture (ADR 0031); generated into the cmdsvc nested
+  # module by cmdsvc/buf.gen.yaml, never pushed.
+  - path: cmdsvc/example/proto
+deps:
+  # Validation rules on the counter fixture; cmdsvc validates with
+  # protovalidate-go by default (ADR 0031).
+  - buf.build/bufbuild/protovalidate
 lint:
   use:
     - STANDARD

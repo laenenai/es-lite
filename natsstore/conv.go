@@ -67,6 +67,8 @@ func toEnvelopeWire(e es.Envelope) envelopeWire {
 		ActorType:      e.Actor.Type,
 		ActorID:        e.Actor.ID,
 		Payload:        e.Payload,
+		PrevHash:       e.PrevHash,
+		Hash:           e.Hash,
 	}
 }
 
@@ -86,6 +88,8 @@ func fromEnvelopeWire(w envelopeWire) (es.Envelope, error) {
 		RecordedAt:     parseTS(w.RecordedAt),
 		Actor:          es.Actor{Type: w.ActorType, ID: w.ActorID},
 		Payload:        w.Payload,
+		PrevHash:       w.PrevHash,
+		Hash:           w.Hash,
 	}
 	e.EventID, _ = uuid.Parse(w.EventID)
 	e.CorrelationID, _ = uuid.Parse(w.CorrelationID)

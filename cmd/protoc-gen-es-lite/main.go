@@ -1,8 +1,26 @@
-// protoc-gen-es-lite is es-lite's code generator. For every message
-// annotated with (es.v1.sum_type), it emits — into that message's own Go
-// package — a sealed interface over the oneof's variants, a marker method
-// on each variant, and an es.Codec implementation. This is the file the
-// hand-written counter_es.go previously stood in for.
+// protoc-gen-es-lite is es-lite's code generator. Into each annotated
+// message's own Go package it emits:
+//
+//   - for (es.v1.sum_type): a sealed interface over the oneof's variants, a
+//     marker method on each variant, an es.Codec implementation, and
+//     DecisionTime() on Command variants tagged (es.v1.decided_at)
+//     (sumtype.go; ADR 0032);
+//   - for (es.v1.projection): the typed handler interface, state-loader
+//     seams, deps struct, subjects and runner constructor (projection.go;
+//     ADR 0030 §2);
+//   - for (es.v1.reaction): the same plus a typed issuer and the executor
+//     wiring (reaction.go; ADR 0030 §3);
+//   - for (es.v1.command_service): a Connect handler implementing the
+//     protoc-gen-connect-go interface, with validation, principal injection,
+//     edge authorisation and error mapping (service.go; ADR 0031). This one
+//     goes into a sibling package, <pkg>es, next to connect-go's <pkg>connect:
+//     the connect package imports the message package, so the handler cannot
+//     live in the message package without an import cycle.
+//
+// Cross-package lookups (a consumed event -> its package's Event container
+// -> the package's (es.v1.aggregate) State) are in resolve.go. With the
+// plugin parameter docs=<path> it also renders a markdown catalogue of every
+// projection and reaction (docs.go).
 //
 // It is a standard protoc/buf plugin: it reads a CodeGeneratorRequest on
 // stdin and writes a CodeGeneratorResponse on stdout. Wire it via
@@ -10,14 +28,11 @@
 package main
 
 import (
-	"fmt"
+	"flag"
 	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/pluginpb"
-
-	esv1 "github.com/laenenai/es-lite/gen/es/v1"
 )
 
 // Import paths referenced by generated code.
@@ -25,64 +40,76 @@ const (
 	protoPkgPath = protogen.GoImportPath("google.golang.org/protobuf/proto")
 	esPkgPath    = protogen.GoImportPath("github.com/laenenai/es-lite/es")
 	fmtPkgPath   = protogen.GoImportPath("fmt")
+	timePkgPath  = protogen.GoImportPath("time")
 )
 
+// timestampFullName is the only field type (es.v1.decided_at) may annotate.
+const timestampFullName = "google.protobuf.Timestamp"
+
+// commandSumType is the sum-type name whose variants may carry
+// (es.v1.decided_at): commands, never events or value types (ADR 0032).
+const commandSumType = "Command"
+
 func main() {
-	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
-		// The generated code uses proto3; advertise support so buf does
-		// not warn on optional fields.
-		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
-		for _, f := range gen.Files {
-			if !f.Generate {
-				continue
-			}
-			if err := generateFile(gen, f); err != nil {
-				return err
-			}
-		}
-		return nil
+	var docs string
+	fs := flag.NewFlagSet("protoc-gen-es-lite", flag.ContinueOnError)
+	fs.StringVar(&docs, "docs", "", "path (relative to the output dir) of a markdown catalogue of projections and reactions")
+	protogen.Options{ParamFunc: fs.Set}.Run(func(gen *protogen.Plugin) error {
+		return run(gen, docs)
 	})
 }
 
-// sumType is one annotated container: its generated interface name, the
-// variant messages of its oneof, and any non-default schema versions
-// (keyed by full proto type name) declared via (es.v1.schema_version).
-type sumType struct {
-	iface      string
-	variants   []*protogen.Message
-	nonDefault map[string]uint32
-}
-
-func generateFile(gen *protogen.Plugin, f *protogen.File) error {
-	var sums []sumType
-	for _, m := range f.Messages {
-		name, err := sumTypeName(m)
+// run is the plugin body, separated from main so tests can drive it with a
+// hand-built CodeGeneratorRequest. docs is the optional catalogue path.
+func run(gen *protogen.Plugin, docs string) error {
+	// The generated code uses proto3; advertise support so buf does
+	// not warn on optional fields.
+	gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
+	r, err := newResolver(gen)
+	if err != nil {
+		return err
+	}
+	var catalogue []catalogueEntry
+	for _, f := range gen.Files {
+		if !f.Generate {
+			continue
+		}
+		entries, err := generateFile(gen, f, r)
 		if err != nil {
 			return err
 		}
-		if name == "" {
-			continue
-		}
-		if len(m.Oneofs) != 1 {
-			return fmt.Errorf("%s: (es.v1.sum_type) requires exactly one oneof, found %d", m.Desc.FullName(), len(m.Oneofs))
-		}
-		st := sumType{iface: name}
-		for _, field := range m.Oneofs[0].Fields {
-			if field.Message == nil {
-				return fmt.Errorf("%s: sum-type variant %q must be a message", m.Desc.FullName(), field.Desc.Name())
-			}
-			st.variants = append(st.variants, field.Message)
-			if v := schemaVersionOf(field.Message); v != 1 {
-				if st.nonDefault == nil {
-					st.nonDefault = map[string]uint32{}
-				}
-				st.nonDefault[string(field.Message.Desc.FullName())] = v
-			}
-		}
-		sums = append(sums, st)
+		catalogue = append(catalogue, entries...)
 	}
-	if len(sums) == 0 {
-		return nil // nothing to generate for this file
+	if docs != "" {
+		writeCatalogue(gen, docs, catalogue)
+	}
+	return nil
+}
+
+// generateFile emits <proto>_es.pb.go for f when it carries any annotated
+// message, and returns the catalogue entries of its projections/reactions.
+func generateFile(gen *protogen.Plugin, f *protogen.File, r *resolver) ([]catalogueEntry, error) {
+	sums, err := collectSumTypes(f, r.commands)
+	if err != nil {
+		return nil, err
+	}
+	projs, err := collectProjections(f, r)
+	if err != nil {
+		return nil, err
+	}
+	reacts, err := collectReactions(f, r)
+	if err != nil {
+		return nil, err
+	}
+	svcs, err := collectServices(f, r)
+	if err != nil {
+		return nil, err
+	}
+	if len(svcs) > 0 {
+		writeServiceFile(gen, f, svcs)
+	}
+	if len(sums)+len(projs)+len(reacts) == 0 {
+		return nil, nil // nothing to generate into the message package
 	}
 
 	g := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_es.pb.go", f.GoImportPath)
@@ -92,135 +119,23 @@ func generateFile(gen *protogen.Plugin, f *protogen.File) error {
 	g.P()
 	g.P("package ", f.GoPackageName)
 	g.P()
-
 	for _, st := range sums {
 		writeSumType(g, st)
 	}
-	return nil
+	var entries []catalogueEntry
+	for _, p := range projs {
+		writeProjection(g, p)
+		entries = append(entries, p.catalogue())
+	}
+	for _, rc := range reacts {
+		writeReaction(g, rc)
+		entries = append(entries, rc.catalogue())
+	}
+	return entries, nil
 }
 
-func writeSumType(g *protogen.GeneratedFile, st sumType) {
-	proto := g.QualifiedGoIdent(protoPkgPath.Ident("Message"))
-	marshal := g.QualifiedGoIdent(protoPkgPath.Ident("Marshal"))
-	unmarshal := g.QualifiedGoIdent(protoPkgPath.Ident("Unmarshal"))
-	encodedEvent := g.QualifiedGoIdent(esPkgPath.Ident("EncodedEvent"))
-	codec := g.QualifiedGoIdent(esPkgPath.Ident("Codec"))
-	unknownErr := g.QualifiedGoIdent(esPkgPath.Ident("ErrUnknownEventType"))
-	errorf := g.QualifiedGoIdent(fmtPkgPath.Ident("Errorf"))
-
-	iface := st.iface
-	marker := "is" + iface
-
-	// Sealed interface + marker methods.
-	g.P("// ", iface, " is the sealed sum type over the annotated oneof's variants.")
-	g.P("type ", iface, " interface{ ", marker, "() }")
-	g.P()
-	for _, v := range st.variants {
-		g.P("func (*", g.QualifiedGoIdent(v.GoIdent), ") ", marker, "() {}")
-	}
-	g.P()
-
-	// Codec.
-	codecType := iface + "Codec"
-	g.P("// ", codecType, " marshals each ", iface, " variant as canonical proto")
-	g.P("// bytes tagged with its full proto type name.")
-	g.P("type ", codecType, " struct{}")
-	g.P()
-	g.P("var _ ", codec, "[", iface, "] = ", codecType, "{}")
-	g.P()
-
-	// Encode.
-	schemaFn := lowerFirst(iface) + "SchemaVersion"
-	g.P("func (", codecType, ") Encode(v ", iface, ") (", encodedEvent, ", error) {")
-	g.P("	m, ok := v.(", proto, ")")
-	g.P("	if !ok {")
-	g.P("		return ", encodedEvent, "{}, ", errorf, "(\"", iface, "Codec: %T is not a proto.Message\", v)")
-	g.P("	}")
-	g.P("	b, err := ", marshal, "(m)")
-	g.P("	if err != nil {")
-	g.P("		return ", encodedEvent, "{}, err")
-	g.P("	}")
-	g.P("	typeURL := string(m.ProtoReflect().Descriptor().FullName())")
-	if len(st.nonDefault) == 0 {
-		g.P("	return ", encodedEvent, "{TypeURL: typeURL, SchemaVersion: 1, Payload: b}, nil")
-	} else {
-		g.P("	return ", encodedEvent, "{TypeURL: typeURL, SchemaVersion: ", schemaFn, "(typeURL), Payload: b}, nil")
-	}
-	g.P("}")
-	g.P()
-
-	// Per-variant schema version lookup (only when some variant overrides
-	// the default of 1). Cases are emitted in variant declaration order for
-	// deterministic output.
-	if len(st.nonDefault) > 0 {
-		g.P("func ", schemaFn, "(typeURL string) uint32 {")
-		g.P("	switch typeURL {")
-		for _, v := range st.variants {
-			name := string(v.Desc.FullName())
-			if ver, ok := st.nonDefault[name]; ok {
-				g.P("	case ", fmt.Sprintf("%q", name), ":")
-				g.P("		return ", ver)
-			}
-		}
-		g.P("	default:")
-		g.P("		return 1")
-		g.P("	}")
-		g.P("}")
-		g.P()
-	}
-
-	// Decode.
-	g.P("func (", codecType, ") Decode(enc ", encodedEvent, ") (", iface, ", error) {")
-	g.P("	var msg ", proto)
-	g.P("	switch enc.TypeURL {")
-	for _, v := range st.variants {
-		g.P("	case ", fmt.Sprintf("%q", string(v.Desc.FullName())), ":")
-		g.P("		msg = &", g.QualifiedGoIdent(v.GoIdent), "{}")
-	}
-	g.P("	default:")
-	g.P("		return nil, ", errorf, "(\"%w: %q\", ", unknownErr, ", enc.TypeURL)")
-	g.P("	}")
-	g.P("	if err := ", unmarshal, "(enc.Payload, msg); err != nil {")
-	g.P("		return nil, err")
-	g.P("	}")
-	g.P("	return msg.(", iface, "), nil")
-	g.P("}")
-	g.P()
-}
-
-// sumTypeName returns the (es.v1.sum_type) value on a message, or "" if
-// unset.
-func sumTypeName(m *protogen.Message) (string, error) {
-	opts := m.Desc.Options()
-	if opts == nil {
-		return "", nil
-	}
-	if !proto.HasExtension(opts, esv1.E_SumType) {
-		return "", nil
-	}
-	name, ok := proto.GetExtension(opts, esv1.E_SumType).(string)
-	if !ok {
-		return "", fmt.Errorf("%s: (es.v1.sum_type) is not a string", m.Desc.FullName())
-	}
-	return name, nil
-}
-
-// schemaVersionOf returns the (es.v1.schema_version) on a variant message,
-// defaulting to 1 when unset or zero.
-func schemaVersionOf(m *protogen.Message) uint32 {
-	opts := m.Desc.Options()
-	if opts == nil || !proto.HasExtension(opts, esv1.E_SchemaVersion) {
-		return 1
-	}
-	v, ok := proto.GetExtension(opts, esv1.E_SchemaVersion).(uint32)
-	if !ok || v == 0 {
-		return 1
-	}
-	return v
-}
-
-// lowerFirst lowercases the first rune, turning an exported interface name
-// into an unexported helper name (e.g. "Event" -> "eventSchemaVersion").
+// lowerFirst lowercases the first rune, turning an exported name into an
+// unexported one (e.g. "Event" -> "eventSchemaVersion", "Counter" -> "counter").
 func lowerFirst(s string) string {
 	if s == "" {
 		return s
@@ -228,4 +143,29 @@ func lowerFirst(s string) string {
 	r := []rune(s)
 	r[0] = unicode.ToLower(r[0])
 	return string(r)
+}
+
+// commandVariants collects, across every file in the request (imports
+// included, so a container may live in another file of the package), the
+// variants of each (es.v1.sum_type) = "Command" container. It is the set a
+// (es.v1.decided_at) field may appear in.
+func commandVariants(gen *protogen.Plugin) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, f := range gen.Files {
+		for _, m := range f.Messages {
+			name, err := sumTypeName(m)
+			if err != nil {
+				return nil, err
+			}
+			if name != commandSumType || len(m.Oneofs) != 1 {
+				continue
+			}
+			for _, field := range m.Oneofs[0].Fields {
+				if field.Message != nil {
+					out[string(field.Message.Desc.FullName())] = true
+				}
+			}
+		}
+	}
+	return out, nil
 }

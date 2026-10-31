@@ -13,6 +13,7 @@ import (
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
 	"github.com/laenenai/es-lite/sqlite"
 	"github.com/laenenai/es-lite/upcast"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func newRuntime(t *testing.T) (*aggregate.Runtime[*counterv1.Counter, counterv1.Command, counterv1.Event], *sqlite.Store) {
@@ -180,7 +181,7 @@ func TestTerminalStream(t *testing.T) {
 	if _, err := rt.Handle(ctx, stream, counterv1.Command(&counterv1.Init{Min: 0, Max: 10, Initial: 1}), es.Meta{}); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if _, err := rt.Handle(ctx, stream, counterv1.Command(&counterv1.Close{}), es.Meta{}); err != nil {
+	if _, err := rt.Handle(ctx, stream, counterv1.Command(&counterv1.Close{DecidedAt: timestamppb.Now()}), es.Meta{}); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	if _, err := rt.Handle(ctx, stream, counterv1.Command(&counterv1.Increment{By: 1}), es.Meta{}); !errors.Is(err, es.ErrTerminal) {
@@ -241,7 +242,7 @@ func TestDeliveryPoller(t *testing.T) {
 		&counterv1.Init{Min: 0, Max: 100, Initial: 0},
 		&counterv1.Increment{By: 7},
 		&counterv1.Decrement{By: 2},
-		&counterv1.Close{},
+		&counterv1.Close{DecidedAt: timestamppb.Now()},
 	} {
 		if _, err := rt.Handle(ctx, stream, cmd, es.Meta{}); err != nil {
 			t.Fatalf("handle %T: %v", cmd, err)

@@ -15,7 +15,7 @@ time-travel** are non-negotiable requirements — which is why the storage model
 is event sourcing, not "state + outbox": only an immutable log answers *"what
 did aggregate X look like on 3 March, and why?"* from the database alone.
 
-Design decisions live in [`docs/adr`](./docs/adr) (10 ADRs); operations in
+Design decisions live in [`docs/adr`](./docs/adr); operations in
 [`docs/deploy`](./docs/deploy).
 
 ---
@@ -53,6 +53,7 @@ authentication and business rules.
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
 | At-least-once delivery | relay/poller + JetStream dedup (see the delivery caveats in ADR 0003/0005) |
 | Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
+| Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes, computed in the append transaction; keyless verification (`es-verify`) and exportable anchors (ADR 0029) |
 | Schema lifecycle | versioned migrations (`es-migrate`) |
 
 **es-lited is NOT responsible for (by design):**
@@ -88,9 +89,19 @@ keys. Those are client responsibilities (ADR 0025).
 - **Per-workspace isolation (Postgres).** RLS scopes rows and the workspace is
   read from the NATS subject. That is isolation, not authentication: configure
   per-workspace NATS ACLs/auth callout and never rely on the subject token alone.
-- **Append-only by API contract.** The library never updates event payloads;
-  `published_at` is the relay's one mutable column. There is no hash chain or
-  signature, so the log is not tamper-evident against a database operator.
+- **Append-only by API contract, tamper-evident by hash chain.** The library
+  never updates event payloads; `published_at` is the relay's one mutable
+  column. Since ADR 0029 every row carries `prev_hash`/`hash`: a per-stream
+  SHA-256 chain over the *sealed* bytes, computed inside the append
+  transaction, so an auditor with no keys can detect an altered, reordered or
+  missing row (`es.VerifyStream`, `es-verify stream|all`). A chain alone cannot
+  detect a truncated tail or an operator who rewrites every hash after an
+  edit; periodic **anchors** (`es-verify anchor`, or `ANCHOR_INTERVAL` on
+  `es-lited`) fix every stream head under one root that you export somewhere
+  the database operator cannot rewrite (a signed commit, a transparency log).
+  es-lite does not sign anchors — signing is the operator's layer. The chain
+  starts at the first append after migration 0002; rows written before it are
+  never back-filled and stay unattested (`ChainedFrom` in the report).
 - **Metadata is visible.** Stream IDs, actors, type URLs and claim scopes are not
   encrypted by the store. Use TLS and broker ACLs on the client↔service hop; the
   repo does not wire TLS for you.
@@ -122,13 +133,14 @@ keys. Those are client responsibilities (ADR 0025).
 
 ## Running the container
 
-The image `ghcr.io/laenenai/es-lited` ships **three** static entrypoints:
+The image `ghcr.io/laenenai/es-lited` ships **four** static entrypoints:
 
 | Entrypoint | Role | Scale |
 |---|---|---|
 | `/es-lited` (default) | the eventstore service (`es.Store` over NATS) | N replicas |
 | `/es-migrate` | apply schema migrations once, then exit | init container / job |
 | `/es-relayd` | drain the log → JetStream (delivery relay) | **singleton** |
+| `/es-verify` | audit the hash chain; take / check anchors (ADR 0029) | job / cron |
 
 The image is private — authenticate to GHCR first (`docker login ghcr.io`).
 
@@ -183,8 +195,12 @@ mesh, `es-lited` also registers as a **NATS Micro** service — `nats micro ls` 
 | `NATS_SUBJECT_PREFIX` | `svc.eslite.local` | `<prefix>.<ws>.<method>`; region per cell |
 | `AUTO_MIGRATE` | `true` | `false` in prod → replicas skip DDL (see `es-migrate`) |
 | `HEALTH_ADDR` | `:8080` | kubelet `/healthz` address |
+| `ANCHOR_INTERVAL` | — | e.g. `1h`: take a hash-chain anchor at that interval under leader election and log it as JSON (Postgres only) |
 
 **`es-migrate`:** `BACKEND`, `PG_DSN`, `SQLITE_DSN` (as above).
+**`es-verify`:** same env; `es-verify stream <ws> <type:id>`, `es-verify all
+[--strict]`, `es-verify anchor [--upto N] | --check <anchor.json> | list`.
+Exit status is the audit result.
 **`es-relayd`:** `PG_DSN`, `NATS_URL`, `ES_STREAM` (default `ES_EVENTS`),
 `ES_BATCH` (default 200), `HEALTH_ADDR`.
 
@@ -210,6 +226,28 @@ secret injection, TLS, sharding, and multi-region cells:
 
 Aggregates are defined in `.proto`; `task generate` emits sealed sum-types +
 codecs. You hand-write only the `Decider` and its error sentinels.
+
+**Proto options from the BSR.** The framework options your `.proto` files
+import (`es/v1/options.proto`: `sum_type`, `schema_version`, `decided_at`, …)
+are published as the Buf module `buf.build/laenenai/es-lite` (ADR 0033).
+Depend on it instead of vendoring the file:
+
+```yaml
+# buf.yaml (consumer)
+version: v2
+modules:
+  - path: proto
+deps:
+  - buf.build/laenenai/es-lite          # pin a label: buf.build/laenenai/es-lite:v0.3.0
+```
+
+then `buf dep update`, keep `import "es/v1/options.proto";` unchanged, and
+run `protoc-gen-es-lite` from this Go module (`go install
+github.com/laenenai/es-lite/cmd/protoc-gen-es-lite@<tag>`). The Go types for
+the options stay in `github.com/laenenai/es-lite/gen/es/v1` — do not generate
+them from the BSR module (in buf v2 dependencies are not generated unless
+`include_imports` is set; with `managed` mode add a `disable` override for
+`buf.build/laenenai/es-lite`).
 
 ```go
 func example(ctx context.Context, nc *nats.Conn, someTimestamp time.Time) error {
@@ -256,8 +294,73 @@ return nil
 }
 ```
 
-See [`examples/`](./examples) — `counter`, `pipeline` (end-to-end), `snapshots`,
-`upcast`.
+**Projections and reactions from options (ADR 0030).** Declare a read model,
+index or executor reaction as a message option and `task generate` emits the
+typed handler interface, state-loader seam, deps, subjects and runner; you
+write only the apply logic:
+
+```proto
+message CounterView {
+  option (es.v1.projection) = {
+    name: "counter.view"  kind: PROJECTION_KIND_READ_MODEL
+    consumes: ["counter.v1.Initialized", "counter.v1.Incremented"]
+    fetch: FETCH_MODE_STATE_AS_OF_EVENT_VERSION  rebuild: REBUILD_MODE_FROM_LOG
+  };
+  ...
+}
+```
+
+```go
+runner := counterviewv1.NewCounterViewRunner(myHandler, counterviewv1.CounterViewDeps{
+	Counter: rt,              // *aggregate.Runtime is the state loader (as-of-version)
+	Marker:  markerStore,     // ADR 0005 last-applied position
+})
+// live: over JetStream (filter subjects derived from `consumes`) ...
+err := runner.Run(ctx, natsjs.NewFeed(js, natsjs.ConsumerConfig{
+	Stream: "ES_EVENTS", Durable: counterviewv1.CounterViewName,
+	FilterSubjects: counterviewv1.CounterViewSubjects("*"), Gaps: natsjs.NewGapDetector(),
+}))
+// ... or straight from the log (tests, single-node SQLite):
+err = runner.Run(ctx, &projection.LogFeed{Source: store})
+// rebuild from position 0 through the same dispatch path:
+pos, err := runner.Rebuild(ctx, store, 500)
+```
+
+Reactions (`(es.v1.reaction)`) get a typed issuer and the executor loop
+(`reaction.Execute`: conflicts retried, a terminal target counts as done).
+The plugin needs `strategy: all` in `buf.gen.yaml` so `consumes` resolves
+across packages; `--es-lite_opt=docs=<path>` renders a catalogue of every
+projection and reaction from the descriptors.
+
+**Command services over Connect (ADR 0031).** Write the service `.proto` by
+hand, mark it `(es.v1.command_service) = { aggregate: "counter.v1.Counter" }`,
+tag the request's stream-id field `(es.v1.stream_id)` and, on the commands,
+`(es.v1.acting_principal)` / `(es.v1.expected_version)` / `(es.v1.decided_at)`
+where they apply; `protoc-gen-connect-go` emits the interface and
+`protoc-gen-es-lite` emits the handler into a sibling `<pkg>es` package:
+
+```go
+handler := countersvcv1es.NewCounterCommandServiceHandler(countersvcv1es.CounterCommandServiceDeps{
+	Runtime:   rt,
+	Authorize: myAuthorizer,   // one typed Authorize<RPC> per RPC — a missing rule is a compile error
+	Identity:  myIdentity,     // Principal(ctx): assigned to the command, never taken from the client
+	Errors:    myErrorMapper,  // optional: domain sentinels -> Connect codes
+})
+mux.Handle(countersvcv1connect.NewCounterCommandServiceHandler(handler))
+```
+
+Each RPC runs validate (protovalidate) → stream id → principal injection →
+authorise → `Runtime.HandleAt` → `WriteResult{stream_id, version,
+global_position}` + state; `es.ErrConflict` becomes `failed_precondition`
+with an `es.v1.VersionConflict` detail carrying the current version and
+state. The runtime for this lives in the nested module
+`github.com/laenenai/es-lite/cmdsvc`, so the core module never imports
+connect-go.
+
+See [`examples/`](./examples) — `counter`, `projection` (generated projector
+and reaction on SQLite), `pipeline` (end-to-end), `snapshots`, `upcast` — and
+[`cmdsvc/example`](./cmdsvc/example) (generated Connect command service,
+tested in-process with connect-go).
 
 ## Backends
 
@@ -274,6 +377,8 @@ aggregate code.
 
 Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.27.3, buf, task,
 govulncheck); run `mise install`. The module has no private dependencies.
+`cmdsvc/` is a nested Go module (connect-go + protovalidate stay out of the
+core graph); every `task` target covers both.
 
 ```sh
 task                 # list tasks
@@ -301,9 +406,11 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 
 ## Documentation
 
-- **[ADRs](./docs/adr)** — 12 decision records (event-sourcing, workspaces,
-  client-owned crypto, NATS service, migrations, …). Start at
-  [the index](./docs/adr/README.md).
+- **[ADRs](./docs/adr)** — 17 decision records (event-sourcing, workspaces,
+  client-owned crypto, NATS service, migrations, hash chain, codegen, …).
+  Start at [the index](./docs/adr/README.md).
+- **[Migration notes](./docs/migration)** — what downstream repositories
+  change when an ADR moves a contract (currently: projection options).
 - **[Deployment guide](./docs/deploy/README.md)** — running `es-lited` in
   production.
 - **[Backlog](./docs/backlog)** — tracked follow-ups.

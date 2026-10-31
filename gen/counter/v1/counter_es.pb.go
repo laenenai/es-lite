@@ -8,6 +8,7 @@ import (
 	fmt "fmt"
 	es "github.com/laenenai/es-lite/es"
 	proto "google.golang.org/protobuf/proto"
+	time "time"
 )
 
 // Command is the sealed sum type over the annotated oneof's variants.
@@ -17,6 +18,17 @@ func (*Init) isCommand()      {}
 func (*Increment) isCommand() {}
 func (*Decrement) isCommand() {}
 func (*Close) isCommand()     {}
+
+// DecisionTime returns the command's decision time from its (es.v1.decided_at)
+// field, or the zero time when the field is unset.
+func (x *Close) DecisionTime() time.Time {
+	if ts := x.GetDecidedAt(); ts != nil {
+		return ts.AsTime()
+	}
+	return time.Time{}
+}
+
+var _ es.DecidedAt = (*Close)(nil)
 
 // CommandCodec marshals each Command variant as canonical proto
 // bytes tagged with its full proto type name.

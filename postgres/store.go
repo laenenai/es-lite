@@ -220,7 +220,7 @@ const envelopeCols = `
 	global_position, event_id, stream_type, stream_id, version,
 	type_url, schema_version, occurred_at, recorded_at,
 	correlation_id, causation_id, command_id,
-	actor_type, actor_id, payload, workspace_id`
+	actor_type, actor_id, payload, workspace_id, prev_hash, hash`
 
 // scanEnvelope reads one row (in envelopeCols order). The payload is opaque —
 // stored and returned as-is (ADR 0025); es-lite performs no decryption.
@@ -237,10 +237,13 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
 		&e.TypeURL, &e.SchemaVersion, &e.OccurredAt, &e.RecordedAt,
 		&correlationID, &causationID, &commandID,
-		&actorType, &actorID, &payload, &workspaceID,
+		&actorType, &actorID, &payload, &workspaceID, &e.PrevHash, &e.Hash,
 	); err != nil {
 		return es.Envelope{}, err
 	}
+	// pgx returns timestamptz in the session zone; the chain hashes UTC µs.
+	e.OccurredAt = es.TruncateMicros(e.OccurredAt)
+	e.RecordedAt = es.TruncateMicros(e.RecordedAt)
 	sid, err := es.ParseCanonical(streamID)
 	if err != nil {
 		return es.Envelope{}, fmt.Errorf("parse stream_id %q: %w", streamID, err)

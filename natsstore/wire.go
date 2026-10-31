@@ -63,6 +63,8 @@ type envelopeWire struct {
 	ActorType      string `json:"actor_type"`
 	ActorID        string `json:"actor_id"`
 	Payload        []byte `json:"payload"`
+	PrevHash       []byte `json:"prev_hash,omitempty"` // ADR 0029; base64
+	Hash           []byte `json:"hash,omitempty"`
 }
 
 // Request structs carry NO workspace field: the workspace is the subject's

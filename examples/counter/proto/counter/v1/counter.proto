@@ -3,13 +3,18 @@ syntax = "proto3";
 package counter.v1;
 
 import "es/v1/options.proto";
+import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/laenenai/es-lite/gen/counter/v1;counterv1";
 
 // Counter is the aggregate's folded State — the value produced by
 // replaying a stream through Decider.Evolve. es-lite uses the proto
-// State message directly as the Go state type.
+// State message directly as the Go state type. (es.v1.aggregate) names the
+// stream type so projectors consuming counter events can be generated
+// (ADR 0030).
 message Counter {
+  option (es.v1.aggregate) = { stream_type: "counter" };
+
   bool  initialized = 1;
   int64 count       = 2;
   int64 min         = 3;
@@ -24,9 +29,28 @@ message Init {
   int64 max     = 2;
   int64 initial = 3;
 }
-message Increment { int64 by = 1; }
+// Principal is who acts on the counter. A command service (ADR 0031) fills
+// it from the authenticated identity, never from the client.
+message Principal {
+  string subject = 1;
+}
+
+// Increment is the fixture for ADR 0031: an acting principal the generated
+// handler overwrites, and an optional expected_version for optimistic
+// concurrency from the client. (Validation rules live on the service's
+// request messages, so this module stays free of buf.validate.)
+message Increment {
+  int64     by               = 1;
+  Principal actor            = 2 [(es.v1.acting_principal) = true];
+  uint64    expected_version = 3 [(es.v1.expected_version) = true];
+}
 message Decrement { int64 by = 1; }
-message Close {}
+// Close makes the stream terminal. It carries the decision time (ADR 0032):
+// the runtime sources Envelope.OccurredAt from decided_at, so the envelope
+// and the command agree on when the counter was closed.
+message Close {
+  google.protobuf.Timestamp decided_at = 1 [(es.v1.decided_at) = true];
+}
 
 // Commands is the sum-type container. protoc-gen-es-lite reads the oneof to
 // emit the sealed `Command` interface + codec; the container documents the

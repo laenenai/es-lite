@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+// Projection and reaction fixtures for protoc-gen-es-lite (ADR 0030). They
+// live in their own package so the generator's cross-package resolution of
+// `consumes`/`issues` entries (counter.v1 -> its (es.v1.aggregate) State) is
+// exercised, exactly as a contracts read model consumes a domain package.
+package counterview.v1;
+
+import "es/v1/options.proto";
+
+option go_package = "github.com/laenenai/es-lite/gen/counterview/v1;counterviewv1";
+
+// CounterView is a read model: the latest value of every counter and
+// whether it is closed. It fetches state as of the event's version, so a
+// rebuild from the log equals the live run.
+message CounterView {
+  option (es.v1.projection) = {
+    name: "counter.view"
+    kind: PROJECTION_KIND_READ_MODEL
+    consumes: [
+      "counter.v1.Initialized",
+      "counter.v1.Incremented",
+      "counter.v1.Decremented",
+      "counter.v1.Closed"
+    ]
+    fetch: FETCH_MODE_STATE_AS_OF_EVENT_VERSION
+    rebuild: REBUILD_MODE_FROM_LOG
+    owner_context: "counter"
+  };
+
+  string counter_id = 1;
+  int64  count      = 2;
+  bool   closed     = 3;
+  uint64 version    = 4;
+}
+
+// CounterActivity is a metadata-only index: how many events each counter
+// has produced. No codec and no state are needed.
+message CounterActivity {
+  option (es.v1.projection) = {
+    name: "counter.activity"
+    kind: PROJECTION_KIND_INDEX
+    consumes: [
+      "counter.v1.Incremented",
+      "counter.v1.Decremented"
+    ]
+    fetch: FETCH_MODE_METADATA_ONLY
+    rebuild: REBUILD_MODE_FROM_LOG
+    owner_context: "counter"
+  };
+
+  string counter_id = 1;
+  uint64 events     = 2;
+}
+
+// ResetOnClosed is a reaction descriptor: when a counter closes, open its
+// successor with the same bounds. Issues counter.v1.Init.
+message ResetOnClosed {
+  option (es.v1.reaction) = {
+    name: "counter.reset_on_closed"
+    consumes: ["counter.v1.Closed"]
+    issues: ["counter.v1.Init"]
+    fetch: FETCH_MODE_STATE_AS_OF_EVENT_VERSION
+    owner_context: "counter"
+  };
+}

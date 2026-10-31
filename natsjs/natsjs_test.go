@@ -127,3 +127,73 @@ func TestPublishDedupAndConsume(t *testing.T) {
 		}
 	}
 }
+
+// TestGapDetectionOnConsume publishes v1 and v3 of one stream, expects the
+// consumer with a GapDetector to nak v3 (never handing it to the handler),
+// then publishes v2 and expects v2 and v3 to arrive in order.
+func TestGapDetectionOnConsume(t *testing.T) {
+	url := os.Getenv("NATS_URL")
+	if url == "" {
+		t.Skip("set NATS_URL to run the NATS/JetStream integration test")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	nc, err := natsjs.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	streamName, ws := "ES_GAP_"+suffix, "wsgap"+suffix
+	if _, err := natsjs.EnsureStream(ctx, js, natsjs.StreamConfig{Name: streamName, Subjects: []string{"evt." + ws + ".>"}}); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := es.NewStreamID("counter", "main")
+	evs := make([]es.Envelope, 3)
+	prev := es.ZeroHash[:]
+	for i := range evs {
+		e := es.Envelope{EventID: uuid.New(), StreamID: sid, Workspace: ws, Version: uint64(i + 1), GlobalPosition: uint64(i + 1),
+			TypeURL: "counter.v1.Incremented", SchemaVersion: 1, OccurredAt: time.Now(), RecordedAt: time.Now(),
+			Payload: []byte{byte(i)}, PrevHash: prev}
+		h := es.EnvelopeHash(e)
+		e.Hash = h[:]
+		prev = e.Hash
+		evs[i] = e
+	}
+	pub := natsjs.NewPublisher(js, nil)
+	if err := pub.Handle(ctx, []es.Envelope{evs[0], evs[2]}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(chan uint64, 8)
+	go func() {
+		_ = natsjs.Consume(ctx, js, natsjs.ConsumerConfig{Stream: streamName, Durable: "gap", Gaps: natsjs.NewGapDetector()},
+			func(_ context.Context, e es.Envelope) error { got <- e.Version; return nil })
+	}()
+	expect := func(v uint64) {
+		t.Helper()
+		select {
+		case g := <-got:
+			if g != v {
+				t.Fatalf("got v%d, want v%d", g, v)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for v%d", v)
+		}
+	}
+	expect(1)
+	select {
+	case g := <-got:
+		t.Fatalf("v%d delivered across the gap", g)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := pub.Publish(ctx, evs[1]); err != nil {
+		t.Fatal(err)
+	}
+	expect(2)
+	expect(3)
+}
