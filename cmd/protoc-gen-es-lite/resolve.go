@@ -134,6 +134,9 @@ func newAggregateSet() *aggregateSet {
 	return &aggregateSet{byPkg: map[protoreflect.FullName]*aggregateInfo{}}
 }
 
+// len reports how many distinct aggregates the set holds.
+func (s *aggregateSet) len() int { return len(s.byPkg) }
+
 func (s *aggregateSet) add(a *aggregateInfo) { s.byPkg[a.pkg] = a }
 
 // sorted returns the aggregates in package order for deterministic output.

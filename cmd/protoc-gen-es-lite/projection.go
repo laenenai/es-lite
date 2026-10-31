@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"strings"
+	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/proto"
@@ -17,6 +19,7 @@ const (
 
 // consumed is one `consumes` entry, resolved.
 type consumed struct {
+	method  string // handler method name: On<Event>, or On<StreamType><Event> when the spec spans aggregates
 	typeURL string
 	msg     *protogen.Message
 	agg     *aggregateInfo
@@ -80,20 +83,54 @@ func resolveConsumes(where, name string, consumes []string, fetch esv1.FetchMode
 		return nil, fmt.Errorf("%s: consumes must list at least one event type", where)
 	}
 	var out []consumed
-	seen := map[string]string{}
 	for _, c := range consumes {
 		m, agg, err := r.variant(where, c, eventSumType)
 		if err != nil {
 			return nil, err
 		}
-		if prev, ok := seen[m.GoIdent.GoName]; ok {
-			return nil, fmt.Errorf("%s: %q and %q would both generate On%s; consumed event names must be unique", where, prev, c, m.GoIdent.GoName)
-		}
-		seen[m.GoIdent.GoName] = c
 		aggs.add(agg)
 		out = append(out, consumed{typeURL: c, msg: m, agg: agg})
 	}
+	// Handler method names: On<Event> when every consumed event comes from
+	// one aggregate; On<StreamType><Event> for every method when the spec
+	// spans aggregates, since different aggregates legitimately share event
+	// names (DerogationGranted on a case and on a review). The rule applies
+	// to the whole spec so names stay predictable; adding a second aggregate
+	// to a spec is a deliberate change to that spec.
+	qualify := aggs.len() > 1
+	seen := map[string]string{}
+	for i := range out {
+		name := "On" + out[i].msg.GoIdent.GoName
+		if qualify {
+			name = "On" + exportSnake(out[i].agg.streamType) + out[i].msg.GoIdent.GoName
+		}
+		if prev, ok := seen[name]; ok {
+			return nil, fmt.Errorf("%s: %q and %q would both generate %s; consumed event names must be unique within an aggregate", where, prev, out[i].typeURL, name)
+		}
+		seen[name] = out[i].typeURL
+		out[i].method = name
+	}
 	return out, nil
+}
+
+// exportSnake turns a stream type ("unit_review") into an exported Go name
+// fragment ("UnitReview").
+func exportSnake(s string) string {
+	var b strings.Builder
+	up := true
+	for _, r := range s {
+		if r == '_' || r == '-' {
+			up = true
+			continue
+		}
+		if up {
+			b.WriteRune(unicode.ToUpper(r))
+			up = false
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func (p projSpec) fetchesState() bool {
@@ -199,7 +236,7 @@ func writeHandlerIface(g *protogen.GeneratedFile, base string, consumes []consum
 		if issuer != "" {
 			params += ", issue *" + issuer
 		}
-		g.P("	On", c.msg.GoIdent.GoName, "(", params, ") error")
+		g.P("	", c.method, "(", params, ") error")
 	}
 	g.P("}")
 	g.P()
@@ -302,9 +339,9 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 			args += ", issue"
 		}
 		if issuer == nil {
-			g.P("			return h.On", c.msg.GoIdent.GoName, "(", args, ")")
+			g.P("			return h.", c.method, "(", args, ")")
 		} else {
-			g.P("			if err := h.On", c.msg.GoIdent.GoName, "(", args, "); err != nil {")
+			g.P("			if err := h.", c.method, "(", args, "); err != nil {")
 			g.P("				return err")
 			g.P("			}")
 		}
