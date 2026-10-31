@@ -354,18 +354,36 @@ func TestDocsCatalogue(t *testing.T) {
 	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(goodSpec())})
 	specNames = map[string]string{}
 	gen := fixture(t, f)
-	// fixture() lacks the domain file's dependencies only when extra files
-	// are needed; here everything is in one file.
 	if err := run(gen, "PROJECTIONS.md"); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
+	if gen.SupportedFeatures&uint64(pluginpb.CodeGeneratorResponse_FEATURE_SUPPORTS_EDITIONS) == 0 {
+		t.Fatal("plugin must declare editions support")
+	}
 	var found bool
 	for _, out := range gen.Response().File {
-		if out.GetName() == "PROJECTIONS.md" {
-			found = true
-			if !strings.Contains(out.GetContent(), "| `t.view` | PROJECTION_KIND_READ_MODEL | `t.v1.Happened` |") {
-				t.Fatalf("catalogue content:\n%s", out.GetContent())
+		if out.GetName() != "PROJECTIONS.md" {
+			continue
+		}
+		found = true
+		content := out.GetContent()
+		// Readable, not one wide table: grouped by owner context and kind,
+		// one heading per descriptor, short event names grouped by package,
+		// humanised fetch/rebuild.
+		for _, want := range []string{
+			"## " + goodSpec().GetOwnerContext() + "\n",
+			"### Read models\n",
+			"#### `t.view` (`t.v1.View`)\n",
+			"- consumes: t → `Happened`",
+			"- fetch: state as of the event's version",
+			"- rebuild: from the log",
+		} {
+			if !strings.Contains(content, want) {
+				t.Fatalf("catalogue lacks %q:\n%s", want, content)
 			}
+		}
+		if strings.Contains(content, "FETCH_MODE_") || strings.Contains(content, "| Owner |") {
+			t.Fatalf("catalogue still carries raw enum names or the wide table:\n%s", content)
 		}
 	}
 	if !found {

@@ -81,6 +81,7 @@ func (rc reactSpec) catalogue() catalogueEntry {
 	e := catalogueEntry{
 		kind: "REACTION", name: rc.spec.GetName(), owner: rc.spec.GetOwnerContext(),
 		fetch: rc.spec.GetFetch().String(), message: string(rc.msg.Desc.FullName()),
+		comment: firstParagraph(rc.msg.Comments.Leading),
 	}
 	for _, c := range rc.consumes {
 		e.consumes = append(e.consumes, c.typeURL)

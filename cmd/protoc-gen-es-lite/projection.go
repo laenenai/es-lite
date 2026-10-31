@@ -141,6 +141,7 @@ func (p projSpec) catalogue() catalogueEntry {
 	e := catalogueEntry{
 		kind: p.spec.GetKind().String(), name: p.spec.GetName(), owner: p.spec.GetOwnerContext(),
 		fetch: p.spec.GetFetch().String(), rebuild: p.spec.GetRebuild().String(), message: string(p.msg.Desc.FullName()),
+		comment: firstParagraph(p.msg.Comments.Leading),
 	}
 	for _, c := range p.consumes {
 		e.consumes = append(e.consumes, c.typeURL)
