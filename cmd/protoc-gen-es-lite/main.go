@@ -32,6 +32,7 @@ import (
 	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
@@ -63,8 +64,13 @@ func main() {
 // hand-built CodeGeneratorRequest. docs is the optional catalogue path.
 func run(gen *protogen.Plugin, docs string) error {
 	// The generated code uses proto3; advertise support so buf does
-	// not warn on optional fields.
-	gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
+	// not warn on optional fields. Editions files are accepted too: the
+	// generator reads descriptors and options only, and protobuf-go
+	// handles the edition semantics.
+	gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL) |
+		uint64(pluginpb.CodeGeneratorResponse_FEATURE_SUPPORTS_EDITIONS)
+	gen.SupportedEditionsMinimum = descriptorpb.Edition_EDITION_PROTO2
+	gen.SupportedEditionsMaximum = descriptorpb.Edition_EDITION_2023
 	r, err := newResolver(gen)
 	if err != nil {
 		return err
