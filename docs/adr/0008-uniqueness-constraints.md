@@ -41,6 +41,11 @@ latter and says why.
 The parent framework made the same call. Uniqueness is modelled as data
 the store understands, not as a transaction it lends out.
 
+ADR 0035 later added `AppendTx`/`ReadStreamTx` for callers that already own a
+transaction. That keeps this decision: the caller receives no commit/rollback
+handle, es-lite still applies its invariants, and `es.Store` stays
+transaction-neutral.
+
 ### Uniqueness is a first-class constraint applied in the append transaction
 
 A `unique_claims` table with a `UNIQUE` index is the serialization point.
