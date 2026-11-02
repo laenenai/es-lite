@@ -45,9 +45,10 @@ message Increment {
   uint64    expected_version = 3 [(es.v1.expected_version) = true];
 }
 message Decrement { int64 by = 1; }
-// Close makes the stream terminal. It carries the decision time (ADR 0032):
-// the runtime sources Envelope.OccurredAt from decided_at, so the envelope
-// and the command agree on when the counter was closed.
+// Close makes the stream terminal. It carries the client's decision time as
+// intent (ADR 0034); the runtime validates its skew, stamps Envelope.OccurredAt
+// from the server clock, and normalizes decided_at to server time before
+// Decide runs.
 message Close {
   google.protobuf.Timestamp decided_at = 1 [(es.v1.decided_at) = true];
 }

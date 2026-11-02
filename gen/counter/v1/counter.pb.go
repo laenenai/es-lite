@@ -318,9 +318,10 @@ func (x *Decrement) GetBy() int64 {
 	return 0
 }
 
-// Close makes the stream terminal. It carries the decision time (ADR 0032):
-// the runtime sources Envelope.OccurredAt from decided_at, so the envelope
-// and the command agree on when the counter was closed.
+// Close makes the stream terminal. It carries the client's decision time as
+// intent (ADR 0034); the runtime validates its skew, stamps Envelope.OccurredAt
+// from the server clock, and normalizes decided_at to server time before
+// Decide runs.
 type Close struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	DecidedAt     *timestamppb.Timestamp `protobuf:"bytes,1,opt,name=decided_at,json=decidedAt,proto3" json:"decided_at,omitempty"`

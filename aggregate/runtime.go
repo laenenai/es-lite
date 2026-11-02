@@ -148,12 +148,14 @@ type Result[S, E any] struct {
 // the resulting events. On an optimistic-concurrency clash it returns
 // es.ErrConflict — the caller reloads and retries, unless WithConflictRetry
 // is set, in which case Handle retries a bounded number of times itself.
-// The command's audit metadata is taken from meta; missing
-// CommandID/OccurredAt are filled in here (the runtime, unlike the Decider,
-// may touch the clock and generate IDs). A command implementing es.DecidedAt
-// supplies OccurredAt itself (ADR 0032): a zero meta.OccurredAt is filled
-// from it, a differing non-zero one is rejected with es.ErrDecidedAtMismatch,
-// and an unset decided_at is rejected with es.ErrDecidedAtMissing.
+//
+// The runtime, unlike the Decider, may touch the clock and generate IDs.
+// Meta.OccurredAt is ALWAYS stamped from the server clock; a caller-supplied
+// value is ignored (ADR 0034). A command implementing es.DecidedAt supplies
+// intent only: an unset decided_at is rejected with es.ErrDecidedAtMissing,
+// one further than es.MaxDecisionSkew from server time is rejected with
+// *es.DecidedAtSkewError, and an in-window value is replaced by server time
+// before Decide runs so expiry windows validate against the server clock.
 func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta) (Result[S, E], error) {
 	return r.HandleAt(ctx, sid, cmd, meta, 0)
 }
@@ -167,34 +169,39 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64) (Result[S, E], error) {
 	var zero Result[S, E]
 
-	// Domain time from the command (ADR 0032). Checked before any I/O so a
-	// disagreement never costs a load and never appends.
+	// One server-clock reading is the authority for both checks and the
+	// envelope (ADR 0034), taken before any I/O so a rejection never costs a
+	// load and never appends. The client's decided_at is intent only.
+	now := time.Now().UTC()
 	if d, ok := any(cmd).(es.DecidedAt); ok {
 		decided := d.DecisionTime()
-		switch {
-		case decided.IsZero():
+		if decided.IsZero() {
 			return zero, fmt.Errorf("%w: %T", es.ErrDecidedAtMissing, cmd)
-		case meta.OccurredAt.IsZero():
-			meta.OccurredAt = decided
-		case !meta.OccurredAt.Equal(decided):
-			return zero, fmt.Errorf("%w: meta %s, command %s",
-				es.ErrDecidedAtMismatch, meta.OccurredAt.UTC().Format(time.RFC3339Nano), decided.UTC().Format(time.RFC3339Nano))
 		}
+		skew := now.Sub(decided)
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > es.MaxDecisionSkew {
+			return zero, &es.DecidedAtSkewError{DecidedAt: decided, ServerTime: now, MaxSkew: es.MaxDecisionSkew}
+		}
+		// The command is normalized to the server reading before Decide, so a
+		// decider that reads cmd.DecisionTime() for an expiry window is
+		// validating against server time, never the client value.
+		es.StampDecisionTime(cmd, now)
 	}
 
 	// Fill audit defaults once, outside the retry loop, so every attempt
 	// carries the same command id and domain time. CorrelationID defaults
 	// to the command id so a single command still forms a one-event
-	// correlation group.
+	// correlation group. OccurredAt is never taken from meta or the command.
 	if meta.CommandID == uuid.Nil {
 		meta.CommandID = newV7()
 	}
 	if meta.CorrelationID == uuid.Nil {
 		meta.CorrelationID = meta.CommandID
 	}
-	if meta.OccurredAt.IsZero() {
-		meta.OccurredAt = time.Now().UTC()
-	}
+	meta.OccurredAt = now
 
 	for attempt := 0; ; attempt++ {
 		res, err := r.handleOnce(ctx, sid, cmd, meta, expected)

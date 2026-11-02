@@ -3,6 +3,7 @@ package es
 import (
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Typed errors. Framework operations return one of these, bare or
@@ -40,11 +41,16 @@ var (
 	// no further events may be appended.
 	ErrTerminal = errors.New("es-lite: stream is terminal")
 
-	// ErrDecidedAtMismatch reports that a command carrying (es.v1.decided_at)
-	// was handled with a Meta.OccurredAt that differs from the command's
-	// value. The caller asserted two domain times; the runtime refuses rather
-	// than picking one (ADR 0032). Nothing was appended.
+	// ErrDecidedAtMismatch is retained for callers compiled against ADR 0032.
+	// The runtime no longer returns it: Meta.OccurredAt is always stamped from
+	// the server clock and the client value is checked against that clock
+	// (ADR 0034). Use ErrDecidedAtSkew for the trust-boundary rejection.
 	ErrDecidedAtMismatch = errors.New("es-lite: meta.OccurredAt differs from the command's decided_at")
+
+	// ErrDecidedAtSkew reports that a command carrying (es.v1.decided_at)
+	// supplied a decision time further than MaxDecisionSkew from the server
+	// clock. Nothing was appended (ADR 0034).
+	ErrDecidedAtSkew = errors.New("es-lite: command's decided_at is outside the allowed server-time skew")
 
 	// ErrDecidedAtMissing reports that a command carrying (es.v1.decided_at)
 	// left the field unset. Nothing was appended (ADR 0032).
@@ -67,6 +73,23 @@ var (
 	// version-skew deployment or a codec wired to the wrong aggregate.
 	ErrUnknownEventType = errors.New("es-lite: unknown event type url")
 )
+
+// DecidedAtSkewError is the structured form of ErrDecidedAtSkew: it carries
+// both clocks and the accepted window so a caller can report the rejection.
+type DecidedAtSkewError struct {
+	DecidedAt  time.Time
+	ServerTime time.Time
+	MaxSkew    time.Duration
+}
+
+func (e *DecidedAtSkewError) Error() string {
+	return fmt.Sprintf("%v: command %s, server %s, max %s",
+		ErrDecidedAtSkew, e.DecidedAt.UTC().Format(time.RFC3339Nano),
+		e.ServerTime.UTC().Format(time.RFC3339Nano), e.MaxSkew)
+}
+
+// Unwrap makes errors.Is(err, ErrDecidedAtSkew) true.
+func (e *DecidedAtSkewError) Unwrap() error { return ErrDecidedAtSkew }
 
 // ConflictError is the structured form of ErrConflict a caller-supplied
 // expected version produces (aggregate.Runtime.HandleAt, ADR 0031): it

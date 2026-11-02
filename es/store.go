@@ -83,7 +83,7 @@ type AppendParams struct {
 	CorrelationID uuid.UUID
 	CausationID   uuid.UUID
 	Actor         Actor
-	OccurredAt    time.Time // domain time; adapter uses now if zero
+	OccurredAt    time.Time // domain time; adapter uses now if zero (Runtime always sets it, ADR 0034)
 }
 
 // EventData is one event to append: its encoded form plus an optional

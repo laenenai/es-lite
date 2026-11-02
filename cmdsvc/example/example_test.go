@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -259,6 +260,16 @@ func TestCommandServiceValidationAndErrors(t *testing.T) {
 	_, err = h.client.Close(ctx, connect.NewRequest(&countersvcv1.CloseRequest{CounterId: "main", Command: &counterv1.Close{}}))
 	if !errors.As(err, &ce) || ce.Code() != connect.CodeInvalidArgument {
 		t.Fatalf("missing decided_at error = %v, want invalid_argument", err)
+	}
+	// decided_at outside the server-time skew: invalid_argument, nothing appended.
+	backdated := timestamppb.New(time.Now().Add(-es.MaxDecisionSkew - time.Minute))
+	_, err = h.client.Close(ctx, connect.NewRequest(&countersvcv1.CloseRequest{CounterId: "main", Command: &counterv1.Close{DecidedAt: backdated}}))
+	if !errors.As(err, &ce) || ce.Code() != connect.CodeInvalidArgument {
+		t.Fatalf("skewed decided_at error = %v, want invalid_argument", err)
+	}
+	sid, _ := es.NewStreamID("counter", "main")
+	if _, v, _ := h.rt.Load(ctx, sid); v != 1 {
+		t.Fatalf("version after skewed close = %d, want 1 (nothing appended)", v)
 	}
 	// Terminal stream: failed_precondition.
 	if _, err := h.client.Close(ctx, connect.NewRequest(&countersvcv1.CloseRequest{CounterId: "main", Command: &counterv1.Close{DecidedAt: timestamppb.Now()}})); err != nil {

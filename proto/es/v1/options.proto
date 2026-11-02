@@ -179,15 +179,20 @@ extend google.protobuf.FieldOptions {
   bool acting_principal = 50022;
 
   // Marks the google.protobuf.Timestamp field of a command variant that
-  // carries the command's decision time (ADR 0032). protoc-gen-es-lite
+  // carries the command's decision time (ADR 0034). protoc-gen-es-lite
   // emits `DecisionTime() time.Time` on the variant (es.DecidedAt — the
   // method is not called DecidedAt because protoc-gen-go already emits a
-  // struct field of that name for a field called decided_at), and aggregate.Runtime
-  // sources Envelope.OccurredAt from it: a zero Meta.OccurredAt is filled
-  // from the command, a conflicting non-zero one is rejected with
-  // es.ErrDecidedAtMismatch, and a tagged-but-unset field is rejected with
-  // es.ErrDecidedAtMissing. Generation fails when the field is not a
-  // Timestamp or its message is not a variant of a "Command" sum type.
+  // struct field of that name for a field called decided_at).
+  //
+  // The client value is intent, not authority. aggregate.Runtime always
+  // stamps Envelope.OccurredAt from the server clock (Meta.OccurredAt is
+  // ignored), rejects a tagged-but-unset field with es.ErrDecidedAtMissing,
+  // rejects a value further than es.MaxDecisionSkew (five minutes) from
+  // server time with *es.DecidedAtSkewError, and replaces the command's
+  // decided_at with server time before Decide runs so a decider checking an
+  // expiry window validates against the server clock. Generation fails when
+  // the field is not a Timestamp or its message is not a variant of a
+  // "Command" sum type.
   //
   //   message AddMember {
   //     google.protobuf.Timestamp decided_at = 4 [(es.v1.decided_at) = true];
