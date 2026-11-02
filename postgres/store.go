@@ -196,8 +196,19 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // Workspace returns an es.Store scoped to one workspace: every operation runs
 // in a transaction that sets the RLS variable. Payloads are stored and
 // returned as opaque bytes (ADR 0025) — crypto is the caller's codec.
+//
+// Use WorkspaceStore instead when the operation must join a transaction the
+// caller owns; the returned *Workspace also exposes AppendTx/ReadStreamTx.
 func (s *Store) Workspace(workspaceID string) es.Store {
-	return &wsStore{store: s, ws: workspaceID}
+	return s.WorkspaceStore(workspaceID)
+}
+
+// WorkspaceStore returns the workspace-scoped handle as its concrete type.
+// It implements es.Store and additionally exposes AppendTx and ReadStreamTx,
+// which run inside a caller-supplied transaction (a tenancy.TenantTx, for
+// example) without opening, committing or rolling back one of their own.
+func (s *Store) WorkspaceStore(workspaceID string) *Workspace {
+	return &Workspace{store: s, ws: workspaceID}
 }
 
 func isUniqueViolation(err error) bool {

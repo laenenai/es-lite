@@ -23,7 +23,9 @@ tasks:
     cmds:
       - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
       # protoc-gen-connect-go at the version the cmdsvc nested module pins.
-      - cd cmdsvc && go install connectrpc.com/connect/cmd/protoc-gen-connect-go
+      # An unversioned install now resolves the latest connect/v2 and makes
+      # generate:check drift, so ask cmdsvc's module graph for the exact pin.
+      - cd cmdsvc && go install "connectrpc.com/connect/cmd/protoc-gen-connect-go@$(go list -m connectrpc.com/connect | awk '{print $2}')"
       - go build -o "$(go env GOPATH)/bin/protoc-gen-es-lite" ./cmd/protoc-gen-es-lite
 
   generate:

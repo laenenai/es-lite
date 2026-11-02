@@ -8,39 +8,105 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/laenenai/es-lite/es"
 )
 
-// wsStore is an es.Store scoped to one workspace. Every operation runs in a
-// transaction that sets app.workspace_id (RLS) and, for partition pruning,
-// filters by workspace_id explicitly. Payloads are stored and returned as
-// opaque bytes (ADR 0025) — es-lite performs no encryption.
-type wsStore struct {
+// DBTX is the narrow database handle the transaction-aware methods need:
+// statement execution only, with no Commit, Rollback, Begin or pool. It is
+// the shape sqlc uses for pgx/v5 and the shape tenancy.TenantTx exposes, so a
+// tenant-scoped transaction satisfies it without es-lite importing tenancy.
+// *pgxpool.Pool and pgx.Tx also satisfy it.
+type DBTX interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// Workspace is an es.Store scoped to one workspace. Every operation sets
+// app.workspace_id (RLS) and, for partition pruning, filters by workspace_id
+// explicitly. Payloads are stored and returned as opaque bytes (ADR 0025) —
+// es-lite performs no encryption.
+//
+// Append/ReadStream open and own their transaction. AppendTx/ReadStreamTx
+// join a transaction the caller already owns; see WorkspaceStore. Create one
+// with Store.WorkspaceStore; the zero value is not usable.
+type Workspace struct {
 	store *Store
 	ws    string
 }
 
-var _ es.Store = (*wsStore)(nil)
+var _ es.Store = (*Workspace)(nil)
 
 // setWorkspace binds the RLS variable for the current transaction.
-func setWorkspace(ctx context.Context, tx pgx.Tx, ws string) error {
+// is_local=true scopes it to that transaction, so a caller's tenant context
+// (app.tenant_id) is untouched and the setting cannot leak past commit.
+func setWorkspace(ctx context.Context, db DBTX, ws string) error {
 	// set_config(name, value, is_local=true) — parameterized, unlike SET.
-	_, err := tx.Exec(ctx, `SELECT set_config('app.workspace_id', $1, true)`, ws)
+	_, err := db.Exec(ctx, `SELECT set_config('app.workspace_id', $1, true)`, ws)
 	return err
 }
 
-// Append implements es.Store.
-func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResult, error) {
+// Append implements es.Store. It opens and owns a transaction.
+func (w *Workspace) Append(ctx context.Context, p es.AppendParams) (es.AppendResult, error) {
 	var zero es.AppendResult
-	if err := p.StreamID.Validate(); err != nil {
+	if err := validateAppend(p); err != nil {
 		return zero, err
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return zero, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return zero, fmt.Errorf("set workspace: %w", err)
+	}
+	res, err := w.append(ctx, tx, p)
+	if err != nil {
+		return zero, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return zero, fmt.Errorf("commit: %w", err)
+	}
+	return res, nil
+}
+
+// AppendTx appends inside a transaction the caller already owns. It never
+// commits or rolls back that transaction. It sets app.workspace_id on db
+// (is_local=true) so the workspace RLS policy applies for the rest of the
+// transaction; the caller's tenant context is left untouched.
+//
+// db must be an active transaction, not a pool: the local setting lasts only
+// until the transaction ends, and every statement in one append must share
+// it. tenancy.TenantTx satisfies db directly, without a pool or Commit.
+func (w *Workspace) AppendTx(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
+	var zero es.AppendResult
+	if err := validateAppend(p); err != nil {
+		return zero, err
+	}
+	if err := setWorkspace(ctx, db, w.ws); err != nil {
+		return zero, fmt.Errorf("set workspace: %w", err)
+	}
+	return w.append(ctx, db, p)
+}
+
+func validateAppend(p es.AppendParams) error {
+	if err := p.StreamID.Validate(); err != nil {
+		return err
 	}
 	for _, op := range p.Constraints {
 		if err := op.Validate(); err != nil {
-			return zero, err
+			return err
 		}
 	}
+	return nil
+}
+
+// append is the shared append body. The caller has validated p, set the
+// workspace RLS context and owns the transaction boundary.
+func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
+	var zero es.AppendResult
 
 	// Timestamps are truncated to microseconds — timestamptz precision and
 	// what the hash chain attests (ADR 0029 §2).
@@ -51,17 +117,8 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 	occurred = es.TruncateMicros(occurred)
 	canonical := p.StreamID.Canonical()
 
-	tx, err := w.store.pool.Begin(ctx)
-	if err != nil {
-		return zero, fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if err := setWorkspace(ctx, tx, w.ws); err != nil {
-		return zero, fmt.Errorf("set workspace: %w", err)
-	}
-
 	// Optimistic-concurrency guard and chain head in one read (ADR 0029 §1).
-	current, prev, err := w.readHead(ctx, tx, p.StreamID)
+	current, prev, err := w.readHead(ctx, db, p.StreamID)
 	if err != nil {
 		return zero, err
 	}
@@ -75,7 +132,7 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 	// version race never commits, so recorded_at is monotonic per stream
 	// and an as-of-time read cannot skip a version (ADR 0029 §2, ES-03).
 	var recorded time.Time
-	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&recorded); err != nil {
+	if err := db.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&recorded); err != nil {
 		return zero, fmt.Errorf("read commit clock: %w", err)
 	}
 	recorded = es.TruncateMicros(recorded)
@@ -108,7 +165,7 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		prev = hash // within one batch, event i chains to event i-1 in memory
 
 		var gp uint64
-		err := tx.QueryRow(ctx,
+		err := db.QueryRow(ctx,
 			`INSERT INTO events (
 				workspace_id, event_id, stream_type, stream_id, version,
 				type_url, schema_version, occurred_at, recorded_at,
@@ -133,13 +190,10 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 		envs[i] = env
 	}
 
-	if err := w.applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
+	if err := w.applyClaims(ctx, db, canonical, p.Constraints); err != nil {
 		return zero, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return zero, fmt.Errorf("commit: %w", err)
-	}
 	return es.AppendResult{
 		FromVersion: p.ExpectedVersion,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
@@ -151,7 +205,7 @@ func (w *wsStore) Append(ctx context.Context, p es.AppendParams) (es.AppendResul
 // event must chain to: ZeroHash for an empty stream, the head's hash when it
 // is chained, and UnchainedHeadHash when the head predates migration 0002
 // (ADR 0029 §5).
-func (w *wsStore) readHead(ctx context.Context, tx pgx.Tx, sid es.StreamID) (uint64, [es.HashSize]byte, error) {
+func (w *Workspace) readHead(ctx context.Context, tx DBTX, sid es.StreamID) (uint64, [es.HashSize]byte, error) {
 	var (
 		current uint64
 		head    []byte
@@ -179,7 +233,7 @@ func (w *wsStore) readHead(ctx context.Context, tx pgx.Tx, sid es.StreamID) (uin
 // The value_key is stored opaquely (ADR 0025): for personal data the caller
 // supplies a keyed MAC as the value; es-lite stores whatever bytes it is given.
 // A colliding claim returns es.ErrConstraintViolated, rolling back the append.
-func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, ops []es.ConstraintOp) error {
+func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
 			continue
@@ -208,10 +262,37 @@ func (w *wsStore) applyClaims(ctx context.Context, tx pgx.Tx, streamID string, o
 	return nil
 }
 
-func (w *wsStore) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
+// ReadStream implements es.Store. It opens and owns a transaction.
+func (w *Workspace) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err
 	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return nil, err
+	}
+	return w.readStream(ctx, tx, sid, fromVersion, toVersion)
+}
+
+// ReadStreamTx reads inside a transaction the caller already owns. It never
+// commits or rolls back that transaction, and it sets app.workspace_id on db
+// (is_local=true) exactly as AppendTx does. db must be an active transaction;
+// tenancy.TenantTx satisfies it directly.
+func (w *Workspace) ReadStreamTx(ctx context.Context, db DBTX, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
+	if err := sid.Validate(); err != nil {
+		return nil, err
+	}
+	if err := setWorkspace(ctx, db, w.ws); err != nil {
+		return nil, err
+	}
+	return w.readStream(ctx, db, sid, fromVersion, toVersion)
+}
+
+func (w *Workspace) readStream(ctx context.Context, db DBTX, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	q := `SELECT ` + envelopeCols + ` FROM events
 	      WHERE workspace_id = $1 AND stream_id = $2 AND version > $3`
 	args := []any{w.ws, sid.Canonical(), fromVersion}
@@ -220,10 +301,10 @@ func (w *wsStore) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, 
 		args = append(args, toVersion)
 	}
 	q += ` ORDER BY version ASC`
-	return w.query(ctx, q, args...)
+	return queryDB(ctx, db, q, args...)
 }
 
-func (w *wsStore) ReadStreamAsOf(ctx context.Context, sid es.StreamID, asOf time.Time) ([]es.Envelope, error) {
+func (w *Workspace) ReadStreamAsOf(ctx context.Context, sid es.StreamID, asOf time.Time) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err
 	}
@@ -236,7 +317,7 @@ func (w *wsStore) ReadStreamAsOf(ctx context.Context, sid es.StreamID, asOf time
 // ReadAll here is workspace-scoped: this workspace's events in global order
 // (useful for per-workspace projections/rebuild). Cross-workspace delivery
 // uses Store.Drain.
-func (w *wsStore) ReadAll(ctx context.Context, fromPosition uint64, limit int) ([]es.Envelope, error) {
+func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int) ([]es.Envelope, error) {
 	if limit <= 0 {
 		limit = 100
 	}
@@ -246,7 +327,7 @@ func (w *wsStore) ReadAll(ctx context.Context, fromPosition uint64, limit int) (
 	return w.query(ctx, q, w.ws, fromPosition, limit)
 }
 
-func (w *wsStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint64, error) {
+func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint64, error) {
 	if err := sid.Validate(); err != nil {
 		return 0, err
 	}
@@ -270,7 +351,7 @@ func (w *wsStore) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (ui
 // (scope, value). The value is keyed exactly as applyClaims stores it — opaque
 // bytes as given (ADR 0025) — so writes and lookups agree. A personal-data
 // lookup must pass the same caller-computed MAC the write used.
-func (w *wsStore) LookupClaim(ctx context.Context, scope, value string) (string, bool, error) {
+func (w *Workspace) LookupClaim(ctx context.Context, scope, value string) (string, bool, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
 		return "", false, err
@@ -295,7 +376,7 @@ func (w *wsStore) LookupClaim(ctx context.Context, scope, value string) (string,
 
 // query runs a workspace-scoped read: a transaction with the RLS variable set.
 // Payloads are returned opaquely (ADR 0025) — es-lite performs no decryption.
-func (w *wsStore) query(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
+func (w *Workspace) query(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -304,7 +385,13 @@ func (w *wsStore) query(ctx context.Context, q string, args ...any) ([]es.Envelo
 	if err := setWorkspace(ctx, tx, w.ws); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, q, args...)
+	return queryDB(ctx, tx, q, args...)
+}
+
+// queryDB runs a workspace-scoped read through db. The caller has set the RLS
+// variable and owns the transaction (or passes a transaction-shaped handle).
+func queryDB(ctx context.Context, db DBTX, q string, args ...any) ([]es.Envelope, error) {
+	rows, err := db.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -294,6 +294,21 @@ return nil
 }
 ```
 
+**Caller-owned transactions (ADR 0035).** When an append must share a
+transaction with another write — for example an audit record in a
+`tenancy.TenantTx` — use `WorkspaceStore` and the `*Tx` methods. es-lite sets
+`app.workspace_id` on the caller's transaction and never commits or rolls it
+back; the caller still owns the boundary:
+
+```go
+ws := pgStore.WorkspaceStore("ws_123")
+_, err := ws.AppendTx(ctx, tx, es.AppendParams{ /* ... */ })
+```
+
+`tx` only needs `Exec`, `Query` and `QueryRow` (`postgres.DBTX`), so a
+tenant-scoped handle works without exposing a pool. `Append`/`ReadStream`
+keep their existing signatures and still open their own transaction.
+
 **Projections and reactions from options (ADR 0030).** Declare a read model,
 index or executor reaction as a message option and `task generate` emits the
 typed handler interface, state-loader seam, deps, subjects and runner; you
