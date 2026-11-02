@@ -5,6 +5,9 @@
 /protoc-gen-es-lite
 /es-lited
 
+# Exported proto distributions (`task buf:export`).
+/dist/
+
 # Local SQLite databases created by examples / manual runs.
 *.db
 *.db-wal

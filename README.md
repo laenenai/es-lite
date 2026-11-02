@@ -227,27 +227,36 @@ secret injection, TLS, sharding, and multi-region cells:
 Aggregates are defined in `.proto`; `task generate` emits sealed sum-types +
 codecs. You hand-write only the `Decider` and its error sentinels.
 
-**Proto options from the BSR.** The framework options your `.proto` files
-import (`es/v1/options.proto`: `sum_type`, `schema_version`, `decided_at`, …)
-are published as the Buf module `buf.build/laenenai/es-lite` (ADR 0033).
-Depend on it instead of vendoring the file:
+**Proto options.** The framework options your `.proto` files import
+(`es/v1/options.proto`: `sum_type`, `schema_version`, `decided_at`, …) are
+distributed as the Buf module `buf.build/laenenai/es-lite` (ADR 0033). While
+BSR publishing is blocked on the `BUF_TOKEN` secret, each release also ships
+`es-lite-proto-<tag>.tar.gz`. Extract it and add the directory as a local
+module:
 
 ```yaml
 # buf.yaml (consumer)
 version: v2
 modules:
   - path: proto
-deps:
-  - buf.build/laenenai/es-lite          # pin a label: buf.build/laenenai/es-lite:v0.3.0
+  - path: third_party/es-lite-proto
 ```
 
-then `buf dep update`, keep `import "es/v1/options.proto";` unchanged, and
-run `protoc-gen-es-lite` from this Go module (`go install
+Or produce the export yourself from a checkout:
+
+```bash
+VERSION=dev task buf:export
+# dist/es-lite-proto-dev.tar.gz
+```
+
+Keep `import "es/v1/options.proto";` unchanged, and run `protoc-gen-es-lite`
+from this Go module (`go install
 github.com/laenenai/es-lite/cmd/protoc-gen-es-lite@<tag>`). The Go types for
 the options stay in `github.com/laenenai/es-lite/gen/es/v1` — do not generate
-them from the BSR module (in buf v2 dependencies are not generated unless
+them from the exported module (in buf v2 dependencies are not generated unless
 `include_imports` is set; with `managed` mode add a `disable` override for
-`buf.build/laenenai/es-lite`).
+`buf.build/laenenai/es-lite`). Once the BSR secret is configured, switch to
+`deps: [buf.build/laenenai/es-lite]` and `buf dep update`.
 
 ```go
 func example(ctx context.Context, nc *nats.Conn, someTimestamp time.Time) error {
