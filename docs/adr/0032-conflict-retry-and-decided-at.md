@@ -1,6 +1,6 @@
 # ADR 0032: Bounded Conflict Retry and `OccurredAt` from `decided_at`
 
-- **Status:** Accepted (implemented)
+- **Status:** Accepted (implemented); §2 superseded by ADR 0034
 - **Date:** 2026-10-30
 
 ## Context

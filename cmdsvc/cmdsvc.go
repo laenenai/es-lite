@@ -63,7 +63,8 @@ type Reload func(ctx context.Context) (version uint64, state proto.Message, err 
 // MetaFrom builds the command's audit metadata from the request headers and
 // the authenticated actor: Correlation-Id (a UUID) and Idempotency-Key (a
 // UUID, or any string hashed to a UUIDv5 so retries share a CommandID).
-// OccurredAt is left zero so ADR 0032's decided_at rule fills it.
+// OccurredAt is left zero because the runtime always stamps it from the
+// server clock (ADR 0034).
 func MetaFrom(h http.Header, actor es.Actor) es.Meta {
 	m := es.Meta{Actor: actor}
 	if v := h.Get(HdrCorrelationID); v != "" {
@@ -126,6 +127,7 @@ func passOr(code connect.Code, err error) *connect.Error {
 //	es.ErrConstraintViolated  already_exists
 //	es.ErrInvalidStreamID,
 //	es.ErrDecidedAtMissing,
+//	es.ErrDecidedAtSkew,
 //	es.ErrDecidedAtMismatch   invalid_argument
 //	anything else             mapper(err) if it returns non-nil, else failed_precondition
 //
@@ -162,7 +164,8 @@ func MapError(ctx context.Context, err error, mapper ErrorMapper, reload Reload,
 		return connect.NewError(connect.CodeFailedPrecondition, err)
 	case errors.Is(err, es.ErrConstraintViolated):
 		return connect.NewError(connect.CodeAlreadyExists, err)
-	case errors.Is(err, es.ErrInvalidStreamID), errors.Is(err, es.ErrDecidedAtMissing), errors.Is(err, es.ErrDecidedAtMismatch):
+	case errors.Is(err, es.ErrInvalidStreamID), errors.Is(err, es.ErrDecidedAtMissing),
+		errors.Is(err, es.ErrDecidedAtSkew), errors.Is(err, es.ErrDecidedAtMismatch):
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, err)

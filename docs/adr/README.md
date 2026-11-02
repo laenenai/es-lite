@@ -29,8 +29,9 @@ than editing history.
 | 0029 | [Tamper-Evident Event Log (Per-Stream Hash Chain)](./0029-tamper-evident-hash-chain.md) | Accepted (implemented; reverses the 0001 cut) |
 | 0030 | [Projector and Reaction Codegen from ProjectionSpec / ReactionSpec](./0030-projection-and-reaction-codegen.md) | Accepted (implemented) |
 | 0031 | [Connect Command Service Codegen](./0031-connect-command-service-codegen.md)                | Accepted (implemented) |
-| 0032 | [Bounded Conflict Retry and `OccurredAt` from `decided_at`](./0032-conflict-retry-and-decided-at.md) | Accepted (implemented) |
+| 0032 | [Bounded Conflict Retry and `OccurredAt` from `decided_at`](./0032-conflict-retry-and-decided-at.md) | Conflict retry accepted; §2 superseded by 0034 |
 | 0033 | [Publish `es/v1/options.proto` as a Buf Module](./0033-publish-options-to-bsr.md)          | Accepted (configured; push pending BUF_TOKEN) |
+| 0034 | [The Server Stamps Decision Time; `decided_at` Is Only Intent](./0034-server-stamped-decided-at.md) | Accepted (implemented; supersedes 0032 §2) |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in

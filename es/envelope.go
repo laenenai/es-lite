@@ -34,7 +34,7 @@ type Envelope struct {
 	SchemaVersion uint32 // event schema version (default 1); enables future upcasting
 
 	// Time — two distinct clocks, both load-bearing for time-travel.
-	OccurredAt time.Time // domain time, supplied by the command
+	OccurredAt time.Time // domain time stamped by the runtime from the server clock
 	RecordedAt time.Time // DB commit time, set by the adapter; the as-of-time basis
 
 	// Causality & audit

@@ -11,7 +11,6 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
 	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // racingStore wraps a Store and, before delegating each of the first
@@ -167,48 +166,6 @@ func initCounter(t *testing.T) (*aggregate.Runtime[*counterv1.Counter, counterv1
 		t.Fatalf("init: %v", err)
 	}
 	return rt, sid
-}
-
-func TestDecidedAtSourcesOccurredAt(t *testing.T) {
-	ctx := context.Background()
-	rt, sid := initCounter(t)
-	decided := time.Date(2026, 3, 3, 10, 0, 0, 123456000, time.UTC) // µs precision survives every backend
-
-	res, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Close{DecidedAt: timestamppb.New(decided)}), es.Meta{})
-	if err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	if len(res.Envelopes) != 1 || !res.Envelopes[0].OccurredAt.Equal(decided) {
-		t.Fatalf("OccurredAt = %v, want decided_at %v", res.Envelopes[0].OccurredAt, decided)
-	}
-}
-
-func TestDecidedAtAgreesWithMeta(t *testing.T) {
-	ctx := context.Background()
-	rt, sid := initCounter(t)
-	decided := time.Date(2026, 3, 3, 10, 0, 0, 0, time.UTC)
-
-	// Setting both to the same instant is fine.
-	if _, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Close{DecidedAt: timestamppb.New(decided)}),
-		es.Meta{OccurredAt: decided.In(time.FixedZone("x", 3600))}); err != nil {
-		t.Fatalf("close with agreeing meta: %v", err)
-	}
-}
-
-func TestDecidedAtMismatch(t *testing.T) {
-	ctx := context.Background()
-	rt, sid := initCounter(t)
-	decided := time.Date(2026, 3, 3, 10, 0, 0, 0, time.UTC)
-
-	_, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Close{DecidedAt: timestamppb.New(decided)}),
-		es.Meta{OccurredAt: decided.Add(time.Second)})
-	if !errors.Is(err, es.ErrDecidedAtMismatch) {
-		t.Fatalf("error = %v, want ErrDecidedAtMismatch", err)
-	}
-	// Nothing was appended.
-	if _, v, err := rt.Load(ctx, sid); err != nil || v != 1 {
-		t.Fatalf("version after mismatch = %d (err %v), want 1", v, err)
-	}
 }
 
 func TestDecidedAtMissing(t *testing.T) {
