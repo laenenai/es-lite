@@ -1,7 +1,8 @@
 # ADR 0033: Publish `es/v1/options.proto` as a Buf Module
 
-- **Status:** Accepted (configured; first push pending the `BUF_TOKEN` secret)
+- **Status:** Accepted (BSR push deferred; `buf export` fallback active)
 - **Date:** 2026-10-30
+- **Updated:** 2026-11-02
 
 ## Context
 
@@ -19,6 +20,20 @@ between the two repos more likely, not less.
 
 `buf.yaml` already declares the `proto` directory as a module (and
 `examples/counter/proto` as a second one, which must stay private).
+
+## Fallback until the BSR secret exists
+
+BSR push is blocked on the `BUF_TOKEN` repository secret. Until it is
+configured:
+
+1. `task buf:export VERSION=<tag>` writes
+   `dist/es-lite-proto-<tag>.tar.gz` containing `es/v1/options.proto` and the
+   licence.
+2. `ci.yml` uploads the `main` export as a workflow artifact.
+3. `release.yml` attaches the tag export to the GitHub release.
+4. Consumers extract the tarball and add `es-lite-proto` as a local module.
+   This is a temporary distribution path, not a replacement for the BSR
+   module.
 
 ## Decision
 
@@ -85,10 +100,11 @@ Rejected for the dependency-direction reasons in ADR 0030.
 - `buf.yaml` names the `proto` module `buf.build/laenenai/es-lite`; the
   counter fixture module stays unnamed.
 - The push is a Taskfile task, `task buf:push [LABEL=…]`, gated by `buf lint`
-  and `buf breaking` against `origin/main`'s `proto` subdirectory. `ci.yml`
-  runs it with `LABEL=main` on pushes to `main`; `release.yml` runs it with the
-  tag name after the image job. Both use `bufbuild/buf-action` with
-  `setup_only` and the `BUF_TOKEN` repository secret.
+  and `buf breaking` against `origin/main`'s `proto` subdirectory. It remains
+  available for when the BSR repository and `BUF_TOKEN` secret exist.
+- The active fallback is `task buf:export [VERSION=…]`: `ci.yml` uploads the
+  `main` export as an artifact and `release.yml` attaches the tag export to
+  the GitHub release. No BSR credentials are required.
 - No push has been made from this branch: the BSR repository and the
   `BUF_TOKEN` secret must be created by the owner first. Until then
   `contracts` keeps its vendored copy; the migration steps in §4 are unchanged.

@@ -52,18 +52,20 @@ jobs:
           provenance: mode=max
           sbom: true
 
-  # Push the es/v1 options module to the BSR labelled with the release tag
-  # (ADR 0033): consumers pin `buf.build/laenenai/es-lite:<tag>`.
-  bsr:
+  # Publish the es/v1 options module as a release asset while BSR publishing is
+  # blocked on BUF_TOKEN (ADR 0033). Consumers extract it and add the directory
+  # as a local buf module.
+  proto:
+    name: proto export
     runs-on: ubuntu-latest
-    needs: image
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: jdx/mise-action@v2
-      - uses: bufbuild/buf-action@v1
+      - run: task buf:export VERSION=${{ github.ref_name }}
+      - uses: softprops/action-gh-release@v2
         with:
-          token: ${{ secrets.BUF_TOKEN }}
-          setup_only: true
-      - run: task buf:push LABEL=${{ github.ref_name }}
+          files: dist/es-lite-proto-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true

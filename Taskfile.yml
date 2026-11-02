@@ -138,6 +138,18 @@ tasks:
       - buf breaking proto --against '.git#ref=origin/main,subdir=proto'
       - buf breaking examples/counter/proto --against '.git#ref=origin/main,subdir=examples/counter/proto'
 
+  buf:export:
+    desc: >
+      Export the es/v1 options module as dist/es-lite-proto-<VERSION>.tar.gz.
+      Used until BSR publishing is configured (ADR 0033); release.yml attaches
+      the tag export to the GitHub release. VERSION defaults to "dev".
+    cmds:
+      - rm -rf dist/es-lite-proto
+      - mkdir -p dist/es-lite-proto
+      - buf export proto -o dist/es-lite-proto
+      - cp LICENSE dist/es-lite-proto/LICENSE
+      - tar -C dist -czf "dist/es-lite-proto-{{.VERSION | default `dev`}}.tar.gz" es-lite-proto
+
   buf:push:
     desc: >
       Push the es/v1 options module to the BSR as buf.build/laenenai/es-lite
