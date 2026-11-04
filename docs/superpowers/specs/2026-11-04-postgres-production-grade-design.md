@@ -1,6 +1,6 @@
 # Postgres Production-Grade Feed — Design
 
-- **Date:** 2026-11-04 (rev 2 — builder-check corrections folded in)
+- **Date:** 2026-11-04 (rev 3 — Task 1 spike falsified the settled ceiling; horizon fence chosen)
 - **Status:** proposed (awaiting approval)
 - **Owner:** es-lite
 - **Implements:** the Postgres-relevant actions of `docs/review/20261104_feed_review.md` (Gate 0 in full; Gate 1 items R2, R4, R5, R7, R8 including the consumer adapter, R11; Gate 2 test/CI items)
@@ -47,7 +47,8 @@ This design makes the Postgres feed path trustworthy: no silent loss, no silent 
 |---|---|---|
 | **A1. Read-side per-row `xmin` filter** — pages return only rows whose insert transaction provably finished | **rejected during design review** | Provably lossy under ADR 0035: it filters in *xid space* while the cursor advances in *position space*, and the two orders diverge when a transaction's first write precedes its append (old xid, late position). The reader can deliver `gp=101` and permanently skip an in-flight `gp=100`. Found by the builder check; not fixable by tweaking the predicate. |
 | **A2. Pre-reserved commit watermark** — positions reserved in a committed registration transaction before insert | **rejected** | Broken for caller-owned transactions: the registration cannot commit before the caller's transaction that wraps the append. Also +1 commit/fsync per append call and advisory-lock liveness machinery for the non-ADR-0035 path. |
-| **A3. Settled-ceiling reads (two-phase, position-space)** — each page bounds delivery by the sequence value recorded one round earlier, delivered only once the snapshot horizon has passed that round's xmax | **chosen** (§5.1) | Pure read-side; no system columns, no xid arithmetic, no write-path change; correct for any interleaving including ADR 0035 (proof in §5.1.3); degrades to delay, never loss; fast path adds zero latency when nothing is in flight. |
+| **A3. Settled-ceiling reads (two-phase, position-space)** — each page bounds delivery by the sequence value recorded one round earlier, delivered only once the snapshot horizon has passed that round's xmax | **falsified by the Task 1 spike** | PG's snapshot xmax is the *commit* horizon and skips in-flight xids ≥ it, so a lone in-flight append looks "idle" to every snapshot; the fast-path condition fires at the exact straddle gap (observed `789:789` with tx2 provably in flight) and loses the gap event. Kept as the record of what was tried; see §5.1.6. |
+| **A3′. Horizon-fence reads** — the reader records the sequence value `L`, draws its own transaction id `R` immediately after reading `L`, and delivers below `L` only once every snapshot reports `xmin ≥ R`; appends draw their xid in their existing first statement (`readHead`), so the xid provably precedes the position draw | **chosen** (§5.1, rev 3) | Read-side only; no extra round trips or commits on either path (the append adds one column to an existing query); `xid8` comparison is wrap-safe; correct for any interleaving including ADR 0035 (proof in §5.1.3, validated against the spike's own recorded snapshots); degrades to delay, never loss. |
 | B. Per-workspace contiguous positions (counter row, `FOR UPDATE`) | fallback only (§5.1.5) | Correct and ADR-0035-compatible, but serializes all appends per workspace on a hot row — a real write-path cost, violating an anti-goal unless forced. |
 | C. Gap detection on existing positions | rejected | The sequence is shared across workspaces; gaps within a workspace are legitimate and indistinguishable from in-flight inserts. |
 | D. `track_commit_timestamp` | rejected | Off by default, unavailable on most managed Postgres. |
@@ -56,31 +57,40 @@ This design makes the Postgres feed path trustworthy: no silent loss, no silent 
 
 ## 5. Decided design
 
-### 5.1 Commit-safe reads (the P0): the settled ceiling
+### 5.1 Commit-safe reads (the P0): the horizon fence
 
-**5.1.1 Mechanism.** Every feed-facing Postgres read bounds delivery by a *settled ceiling*: a position `L` captured in a previous round, delivered only once every transaction that existed at capture time has finished.
+> **Revision 3 (2026-11-04).** The Task 1 spike falsified the original settled-ceiling mechanism (§4 row A3; record in §5.1.6). This section now specifies the replacement chosen by the human: the horizon fence. Its losslessness argument (§5.1.3) is validated against the spike's own recorded observations.
 
-Per `ReadAllBounded` call, in the adapter's existing single READ COMMITTED transaction:
+**5.1.1 Mechanism.** Every feed-facing Postgres read is bounded by a *fence*: a recorded sequence value `L` paired with a transaction id `R` drawn by the reader immediately after reading `L`. Rows at positions ≤ `L` are delivered only once no transaction that existed when `R` was drawn is still in flight — observed as `pg_snapshot_xmin(pg_current_snapshot()) >= R`.
 
-1. Read the round's metadata in one statement: `snap = pg_current_snapshot()`, `L = last_value` of the `global_position` sequence. (`pg_snapshot_xmin(snap)`, `pg_snapshot_xmax(snap)` are read from `snap`; `L` is read nontransactionally — a stale or cache-inflated value is conservatively safe: stale lowers the ceiling, inflation only adds empty positions above real rows.)
-2. **Fast path — nothing in flight at this snapshot** (`pg_snapshot_xmin(snap) >= pg_snapshot_xmax(snap)`, i.e. no transaction holds an xid below xmax): every row at position ≤ L was inserted by a finished transaction. Deliver rows in `(from, L]` per the type filter and byte budget, then store `(ceiling, ceilingXmax) = (L, pg_snapshot_xmax(snap))` for the next round.
-3. **Slow path — something in flight.** If a stored ceiling exists and `pg_snapshot_xmin(snap) >= ceilingXmax`, the captured round's transactions have all finished: deliver rows in `(from, ceiling]`, then roll the ceiling forward to `(L, pg_snapshot_xmax(snap))`.
-4. Otherwise (transactions from the captured round still unfinished): refresh the ceiling to `(L, pg_snapshot_xmax(snap))`, return an empty page (`truncated=false`), and let the feed's existing wait cycle retry. The core loop needs no change.
+Per `ReadAllBounded` call:
 
-`Head` and `MatchingHead` (§5.8) use the same ceiling: the settled head is `MAX(global_position)` over rows `<= ceiling` (plus the type filter for `MatchingHead`), computed inside a round whose horizon check has passed. `RawHead` is the plain unfiltered max, for stall detection only.
+1. **Idle check (statement 1, no fence):** read `L = last_value` of `events_global_position_seq`. If `L <= from` there is nothing new — return an empty page without drawing anything (idle streams burn no transaction ids).
+2. **Fence establishment (statement 2, short tx, then rollback):** draw `R = pg_current_xact_id()` and roll the tx back (the abort settles `R` immediately — Task 1b verifies).
+3. **Fence check (statement 3):** `SELECT pg_snapshot_xmin(pg_current_snapshot()) >= R`. True → deliver rows in `(from, L]` (the existing query plus `AND global_position <= L`). False → store `(boundL, fenceR)` on the `Workspace` and return an empty page (`truncated=false`); the feed's existing wait cycle retries.
+4. **Fenced delivery on a later call:** with stored state, run the fence check first; when it clears, deliver `≤ boundL` and drop the state. Every delivered page re-establishes a fresh fence on the next call.
 
-**5.1.2 Where the state lives.** `(ceiling, ceilingXmax)` is two integers on the adapter's per-scope `Log` instance — the `*Workspace` that `Logs.Open` returns once per stream (`feed/server.go:279`). Guarded by a mutex, since `Status` may touch the same instance concurrently. No schema, no new tables, no cross-process state: each stream establishes its own ceiling, one round later than ideal and correct.
+`Head` and `MatchingHead` (§5.8) use the same fence. `RawHead` is the plain unfiltered max, for stall detection only.
 
-**5.1.3 Why it is lossless (the argument the tests must encode).** A row at position ≤ `ceiling` that will ever be visible was inserted by a transaction that already held an xid when the ceiling was captured — that is, an xid < `ceilingXmax` (positions are drawn monotonically from the sequence, so a transaction that starts after the capture can only draw positions > `L`). Once `pg_snapshot_xmin(snap) >= ceilingXmax`, every xid below `ceilingXmax` is committed or aborted: each such row is either already visible in this snapshot or never will be. Therefore the delivered range `(from, ceiling]` is complete — nothing inside it can appear later. Aborted transactions simply leave permanent holes above `from`, which the type filter already treats as ordinary cross-workspace gaps. This argument is reproduced as a comment on the implementation and pinned by a property-style test (§5.10.1).
+**5.1.2 Where the state lives.** `(boundL, fenceR)` is two integers on the adapter's per-scope `Log` instance — the `*Workspace` that `Logs.Open` returns once per stream (`feed/server.go:279`). Guarded by a mutex, since `Status` may touch the same instance concurrently. No schema, no new tables, no cross-process state.
 
-**5.1.4 Spike (throwaway, before Task 1 code).** On the `task test:pg` Docker (`postgres:17`):
+**5.1.3 Why it is lossless (the argument the tests must encode).** Two facts make the fence airtight:
 
-1. `pg_current_snapshot()` is per-statement under READ COMMITTED (fresh statement, fresh snapshot) and behaves as specified when read in the same transaction as the row query.
-2. Sequence `last_value` reads reflect drawn values; confirm the behavior with per-backend sequence cache (cache inflation must not break the fast-path condition).
-3. The fast-path condition holds on an idle database and fails with one open append transaction.
-4. A two-append proof-of-concept implementing the interleaving of §5.10.1's inversion test — this doubles as the red chaos test before the real implementation lands.
+- **P1 — the append draws its xid before its position.** The append's existing first statement (`readHead`) additionally selects `pg_current_xact_id()`, so the transaction id is assigned before any `nextval` position draw. Hence every event row's insert-xid was assigned before its position was drawn.
+- **P2 — positions are monotonic.** Any row at a position ≤ `L` drew that position before the reader read `L`, and therefore (by P1) has an insert-xid assigned before `R` was drawn, i.e. an xid `< R`.
 
-**5.1.5 Fallback gate.** If the spike falsifies the snapshot/sequence assumptions, the design switches to approach B (per-workspace counter positions) — a write-path cost and an ADR amendment, which goes back to the human, not the builder.
+While any xid `< R` is still in flight, `pg_snapshot_xmin` stays below `R` — the spike verified both halves: an in-flight xid *below* the commit horizon appears in the snapshot's in-flight list and lowers `xmin`; an in-flight xid *at or above* the horizon pins the horizon itself, which is `xmin`'s floor when nothing older runs. So `xmin ≥ R` implies every xid `< R` is committed or aborted. Combined with P2: when the fence clears, every row at a position ≤ `L` is either already visible or was aborted — nothing inside the delivered range can appear later. Aborted appends leave permanent holes above `from`, which the type filter already treats as ordinary cross-workspace gaps. The argument is reproduced as a comment on the implementation and pinned by the ordering tests (§5.10.1).
+
+**5.1.4 Re-spike (Task 1b, throwaway).** The fence's own load-bearing assumptions, verified on the `task test:pg` Docker (`postgres:17`):
+
+1. **Abort advances the horizon:** draw `R` in a tx, roll it back; a fresh statement from another connection observes `pg_snapshot_xmin(...) >= R`. (If false, the fallback shape keeps the `R` tx open until delivery.)
+2. **The fence engages on the straddle:** replay the Task 1 straddle (§5.1.6); at the gap step (tx1 committed, tx2 in flight) the reader's freshly drawn `R` yields `xmin < R`; after tx2 commits, `xmin >= R` and delivery ≤ L yields `[1, 2, 3]`.
+3. **The readHead fold assigns the xid:** in an open append tx, `pg_stat_activity.backend_xid` is NULL before `readHead` runs and non-NULL after it. (If false, the append draws its xid with one extra statement before `readHead`.)
+4. **The lone in-flight append:** a single uncommitted `AppendTx` — the fence waits, then clears on commit.
+
+**5.1.5 Fallback gate.** Assumption (1) failing is handled by the open-tx shape (§5.1.4); (3) failing is handled by the extra-statement shape — both are self-contained repairs recorded in the ADR. Anything else falsified goes back to the human.
+
+**5.1.6 Spike record (Task 1, 2026-11-04, throwaway).** Observed on `PostgreSQL 17.11`: snapshot `xmax` is `latestCompletedXid+1` (the commit horizon); in-flight xids ≥ the horizon are skipped from the snapshot's in-flight list entirely (`procarray.c`), so a lone in-flight append looks idle (`xmin == xmax`). At the straddle gap step the spike recorded `789:789` while tx2 was provably in flight — the original fast-path condition fires there and would lose the gap event. Committing a higher xid surfaces lower in-flight xids (`772:774:772`); committing a lower xid does not pass a higher in-flight one (`776:776:`). Sequence `last_value ≥` every drawn position held at every measurement point, cross-connection and mid-transaction. Full report preserved at `.superpowers/sdd/2026-11-04-postgres-production-grade/task-1-report.md`.
 
 ### 5.2 Indexes
 
@@ -251,7 +261,7 @@ Three changes make this envelope honest rather than accidental:
 | Phase | Contents | Exit criterion | Est. |
 |---|---|---|---|
 | **0. Spike** | §5.1.4 on PG 17 | findings recorded; fallback decided if falsified | 1 d |
-| **1. Gate 0** | Failing chaos + inversion tests → §5.1 settled ceiling + §5.2 indexes → §5.3 append cap | `task test:feedgate` green once, recorded; EXPLAIN gate green; append benchmark shows no write-path change | 4–6 d |
+| **1. Gate 0** | Failing chaos + inversion tests → §5.1 horizon fence + §5.2 indexes → §5.3 append cap | `task test:feedgate` green once, recorded; EXPLAIN gate green; append benchmark shows no write-path change | 4–6 d |
 | **2. Protocol** | §5.4 fencing + port reshaping, §5.5 fingerprint, §5.3 Skip/dead letters | Stale-ack, drift, skip-while-held tests green | 3–4 d |
 | **3. Adapters & ops** | §5.6 adapters + `eventfeed` + conformance, §5.7 RLS role, §5.8 observer, §5.12 jitter/wait floor/pool guidance, §5.10 CI, §5.11 docs | Postgres adapters pass `feedtest`; stall observable; ADR merged | 6–7 d |
 
