@@ -28,9 +28,8 @@ type RelayConfig struct {
 }
 
 // Relay drives a Drainer continuously, publishing claimed batches through a
-// Handler (typically the NATS Publisher.Handle). It is the Postgres-side
-// counterpart to Poller: run one per subscriber, as a singleton or
-// leader-elected (ADR 0002/0003).
+// Handler. It is the Postgres-side counterpart to Poller: run one per
+// subscriber, as a singleton or behind a database lease (ADR 0002).
 type Relay struct {
 	drainer Drainer
 	publish Handler

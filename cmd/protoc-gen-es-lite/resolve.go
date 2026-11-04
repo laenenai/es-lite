@@ -152,8 +152,8 @@ func (s *aggregateSet) sorted() []*aggregateInfo {
 // depName is the Deps field prefix for an aggregate: its State Go name.
 func depName(a *aggregateInfo) string { return a.state.GoIdent.GoName }
 
-// subjectToken mirrors natsjs.subjectToken so generated subjects need no
-// natsjs import: anything outside [A-Za-z0-9_-] becomes '_'.
+// subjectToken normalizes a generated subject token: anything outside
+// [A-Za-z0-9_-] becomes '_'.
 func subjectToken(s string) string {
 	var b strings.Builder
 	for _, r := range s {

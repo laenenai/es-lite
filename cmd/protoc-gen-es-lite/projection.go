@@ -195,7 +195,7 @@ func writeSpecHeader(g *protogen.GeneratedFile, base, kind, name string, consume
 	g.P()
 	g.P("// ", base, "Subjects returns the evt.<workspace>.<aggregate>.<event> filter subject")
 	g.P("// of every consumed event type; workspace may be \"*\" for all workspaces")
-	g.P("// (natsjs.ConsumerConfig.FilterSubjects).")
+	g.P("// (a broker consumer filter, for example).")
 	g.P("func ", base, "Subjects(workspace string) []string {")
 	g.P("	if workspace == \"\" {")
 	g.P("		workspace = \"default\"")

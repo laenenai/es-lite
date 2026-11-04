@@ -1,8 +1,7 @@
-// Command es-migrate applies es-lite's schema migrations once and exits — for
-// a Kubernetes init container, a deploy step, or a leader (ADR 0010). It uses
-// the same backend env as es-lited: BACKEND (postgres|sqlite), PG_DSN,
-// SQLITE_DSN. Idempotent and safe to run concurrently (Postgres serializes on
-// an advisory lock).
+// Command es-migrate applies es-lite's schema migrations once and exits — as a
+// deployment step or job (ADR 0010). It reads BACKEND (postgres|sqlite),
+// PG_DSN and SQLITE_DSN. Idempotent and safe to run concurrently (Postgres
+// serializes on an advisory lock).
 package main
 
 import (

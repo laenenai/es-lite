@@ -39,7 +39,7 @@ extend google.protobuf.MessageOptions {
   // changes in a way proto's wire compatibility cannot detect (units shift,
   // enum semantics change, a field is reinterpreted). The generated codec
   // stamps this onto every EncodedEvent as its upcaster dispatch key; it
-  // rides the wire in the envelope and the Es-Schema-Version NATS header.
+  // rides the wire in the envelope's schema_version field.
   //
   //   message Incremented {
   //     option (es.v1.schema_version) = 2;
@@ -50,7 +50,7 @@ extend google.protobuf.MessageOptions {
   // Marks the aggregate's State message and names its stream type (ADR
   // 0030). Exactly one message per proto package carries it; the
   // generator resolves a consumed event's package to this message to type
-  // projector handlers and to derive NATS subjects.
+  // projector handlers and resolve the aggregate's stream type.
   //
   //   message Counter {
   //     option (es.v1.aggregate) = { stream_type: "counter" };

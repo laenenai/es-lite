@@ -30,9 +30,8 @@ func (f FeedFunc) Feed(ctx context.Context, handle func(ctx context.Context, e e
 // LogFeed is a Feed over the event log itself: it pages Source.ReadAll from
 // From (exclusive) in global order and polls every Poll for more. A handler
 // error is retried on the same envelope after Poll, so delivery is
-// at-least-once in order — the same contract as a JetStream nak, without
-// the broker. From is normally the runner's marker; LogFeed itself keeps no
-// checkpoint.
+// at-least-once in order. From is normally the runner's marker; LogFeed itself
+// keeps no checkpoint.
 type LogFeed struct {
 	Source Source
 	From   uint64
@@ -103,7 +102,7 @@ type Runner struct {
 	Dispatch func(ctx context.Context, e es.Envelope) error
 	// Filter reports whether the envelope is one of the consumed types; a
 	// non-consumed envelope is acknowledged without dispatch (a LogFeed
-	// delivers everything, a JetStream feed only the filter subjects).
+	// delivers everything; a filtered feed delivers only matching types).
 	// Generated; nil means "dispatch everything".
 	Filter func(e es.Envelope) bool
 

@@ -1,9 +1,10 @@
-# Built binaries. Anchor to repo root so the SOURCE dirs (cmd/es-lited,
-# cmd/protoc-gen-es-lite) are NOT ignored — only the compiled outputs that a
-# bare `go build ./cmd/...` drops in the working directory.
+# Built binaries. Anchor to repo root so the SOURCE dirs under cmd/ are NOT
+# ignored — only the compiled outputs that a bare `go build ./cmd/...` drops in
+# the working directory.
 /bin/
 /protoc-gen-es-lite
-/es-lited
+/es-migrate
+/es-verify
 
 # Exported proto distributions (`task buf:export`).
 /dist/

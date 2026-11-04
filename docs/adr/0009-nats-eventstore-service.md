@@ -1,6 +1,6 @@
 # ADR 0009: NATS Eventstore Service with a Zero-Knowledge Client
 
-- **Status:** Accepted (implemented)
+- **Status:** Superseded by ADR-0036
 - **Date:** 2026-08-02
 
 > Errata (2026-10-28): key management, HMAC details and OpenBao references are superseded by ADR 0025; the service is keyless and stores opaque bytes. The NATS service/client design is implemented.

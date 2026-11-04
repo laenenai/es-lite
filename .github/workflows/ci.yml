@@ -41,7 +41,7 @@ jobs:
           if-no-files-found: error
 
   integration:
-    name: integration (postgres · nats · pipeline · snapshots)
+    name: integration (postgres)
     runs-on: ubuntu-latest
     needs: check
     steps:
@@ -49,9 +49,6 @@ jobs:
         with:
           fetch-depth: 0
       - uses: jdx/mise-action@v2
-      # Each target spins up its own throwaway container (Docker is preinstalled
-      # on the runner) and tears it down via `defer`.
+      # The target spins up a throwaway container (Docker is preinstalled on the
+      # runner) and tears it down via `defer`.
       - run: task test:pg
-      - run: task test:nats
-      - run: task test:pipeline
-      - run: task test:snapshots

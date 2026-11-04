@@ -8,9 +8,7 @@
 //
 // The tests run the generated runners over projection.LogFeed (the log
 // itself) with the embedded aggregate.Runtime as the state loader, so a
-// projector is exercised end to end on SQLite with no NATS. The JetStream
-// path (natsjs.NewFeed with the generated filter subjects) is covered under
-// NATS_URL.
+// projector is exercised end to end on SQLite with no external service.
 package projection
 
 import (

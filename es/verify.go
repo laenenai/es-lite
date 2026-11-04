@@ -54,9 +54,9 @@ type VerifyOptions struct {
 // VerifyStream recomputes the hash chain of one stream from what store
 // returns — version contiguity, prev_hash linkage and every hash — and
 // reports the result. It is a free function over any Store, so it verifies
-// through the NATS client exactly as it does against Postgres or SQLite:
-// the client holds the sealed payload bytes and recomputes from them. No
-// keys are needed.
+// a remote store exactly as it does against Postgres or SQLite: the caller
+// holds the sealed payload bytes and recomputes from them. No keys are
+// needed.
 //
 // A store/read error is returned as-is. A broken chain returns the populated
 // report and an error wrapping ErrChainBroken; an intact chain returns a nil

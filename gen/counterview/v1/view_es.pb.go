@@ -18,7 +18,7 @@ const CounterViewName = "counter.view"
 
 // CounterViewSubjects returns the evt.<workspace>.<aggregate>.<event> filter subject
 // of every consumed event type; workspace may be "*" for all workspaces
-// (natsjs.ConsumerConfig.FilterSubjects).
+// (a broker consumer filter, for example).
 func CounterViewSubjects(workspace string) []string {
 	if workspace == "" {
 		workspace = "default"
@@ -170,7 +170,7 @@ const CounterActivityName = "counter.activity"
 
 // CounterActivitySubjects returns the evt.<workspace>.<aggregate>.<event> filter subject
 // of every consumed event type; workspace may be "*" for all workspaces
-// (natsjs.ConsumerConfig.FilterSubjects).
+// (a broker consumer filter, for example).
 func CounterActivitySubjects(workspace string) []string {
 	if workspace == "" {
 		workspace = "default"
@@ -247,7 +247,7 @@ const ResetOnClosedName = "counter.reset_on_closed"
 
 // ResetOnClosedSubjects returns the evt.<workspace>.<aggregate>.<event> filter subject
 // of every consumed event type; workspace may be "*" for all workspaces
-// (natsjs.ConsumerConfig.FilterSubjects).
+// (a broker consumer filter, for example).
 func ResetOnClosedSubjects(workspace string) []string {
 	if workspace == "" {
 		workspace = "default"

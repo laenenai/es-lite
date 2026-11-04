@@ -16,16 +16,16 @@ than editing history.
 | ---- | ----------------------------------------------------------------------------------------- | -------- |
 | 0001 | [Event-Sourced Log as Source of Truth](./0001-event-sourced-lite-architecture.md)         | Accepted |
 | 0002 | [Deployment Topology and Delivery](./0002-deployment-topology-and-delivery.md)             | Accepted |
-| 0003 | [NATS/JetStream Delivery and Projections](./0003-nats-jetstream-delivery.md)               | Accepted (implemented) |
+| 0003 | [NATS/JetStream Delivery and Projections](./0003-nats-jetstream-delivery.md)               | Superseded by ADR-0036 |
 | 0004 | [Workspaces and Tenant Isolation](./0004-workspaces-and-tenant-isolation.md)               | Accepted for isolation; crypto/erasure superseded by 0025 |
 | 0005 | [Projection Rebuild](./0005-projection-rebuild.md)                                         | Accepted (implemented) |
 | 0006 | [OpenBao KeyStore Adapter](./0006-openbao-keystore.md)                                     | Superseded by 0025 (server-side keystore removed) |
 | 0007 | [Snapshots](./0007-snapshots-deferred.md)                                                   | Implemented (cache; sealing is client-owned per 0025) |
 | 0008 | [Uniqueness Constraints](./0008-uniqueness-constraints.md)                                 | Accepted; PII handling amended by 0025 |
-| 0009 | [NATS Eventstore Service (zero-knowledge client)](./0009-nats-eventstore-service.md)       | Accepted (implemented) |
+| 0009 | [NATS Eventstore Service (zero-knowledge client)](./0009-nats-eventstore-service.md)       | Superseded by ADR-0036 |
 | 0010 | [Schema Migrations](./0010-schema-migrations.md)                                           | Accepted |
 | 0025 | [Client-Owned Cryptography and Erasure](./0025-client-owned-crypto.md)                     | Accepted (supersedes 0004/0006 crypto; amends 0008) |
-| 0028 | [In-Repo NATS Middleware and Observability](./0028-in-repo-nats-middleware-and-observability.md) | Accepted |
+| 0028 | [In-Repo NATS Middleware and Observability](./0028-in-repo-nats-middleware-and-observability.md) | Superseded by ADR-0036 |
 | 0029 | [Tamper-Evident Event Log (Per-Stream Hash Chain)](./0029-tamper-evident-hash-chain.md) | Accepted (implemented; reverses the 0001 cut) |
 | 0030 | [Projector and Reaction Codegen from ProjectionSpec / ReactionSpec](./0030-projection-and-reaction-codegen.md) | Accepted (implemented) |
 | 0031 | [Connect Command Service Codegen](./0031-connect-command-service-codegen.md)                | Accepted (implemented) |
@@ -33,6 +33,7 @@ than editing history.
 | 0033 | [Publish `es/v1/options.proto` as a Buf Module](./0033-publish-options-to-bsr.md)          | Accepted (configured; push pending BUF_TOKEN) |
 | 0034 | [The Server Stamps Decision Time; `decided_at` Is Only Intent](./0034-server-stamped-decided-at.md) | Accepted (implemented; supersedes 0032 §2) |
 | 0035 | [Caller-Owned Transactions for Atomic Appends](./0035-caller-owned-transactions.md) | Accepted (implemented; additive to 0008) |
+| 0036 | [No Broker in es-lite; Postgres and SQLite Only](./0036-postgres-only-no-broker.md) | Proposed (supersedes 0003/0009/0028) |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in

@@ -22,7 +22,7 @@ type Apply func(ctx context.Context, batch []es.Envelope) error
 
 // Replay pages src.ReadAll from `from` (exclusive) in global order, applying
 // each batch, and returns the last global_position applied. This is the
-// authoritative rebuild source — the DB log, not JetStream retention
+// authoritative rebuild source — the DB log, not an external retention window
 // (ADR 0005). Apply must be idempotent; pair it with a Marker so a rebuild
 // can cut over to live delivery at exactly the returned position.
 func Replay(ctx context.Context, src Source, from uint64, batch int, apply Apply) (uint64, error) {

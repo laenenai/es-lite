@@ -1,6 +1,6 @@
 # ADR 0028: In-Repo NATS Middleware and Observability
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0036
 - **Date:** 2026-10-28
 
 ## Context

@@ -1,6 +1,6 @@
 # ADR 0003: NATS/JetStream Delivery and Projections
 
-- **Status:** Accepted (implemented)
+- **Status:** Superseded by ADR-0036
 - **Date:** 2026-08-01
 
 ## Context

@@ -91,36 +91,6 @@ tasks:
       - defer: docker rm -f es-lite-pg
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -count=1 ./postgres/...
 
-  test:nats:
-    desc: NATS/JetStream integration test against a throwaway Docker NATS.
-    cmds:
-      - docker rm -f es-lite-nats 2>/dev/null || true
-      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
-      - until nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
-      - defer: docker rm -f es-lite-nats
-      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./natsjs/... ./leader/... ./natsstore/... ./examples/projection/...
-
-  test:pipeline:
-    desc: Full-pipeline integration test (Postgres + NATS) end to end.
-    cmds:
-      - docker rm -f es-lite-pg es-lite-nats 2>/dev/null || true
-      - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
-      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
-      - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1 && nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
-      - defer: docker rm -f es-lite-pg es-lite-nats
-      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/pipeline/...
-      # Chain audit smoke (ADR 0029): every stream the pipeline wrote verifies.
-      - BACKEND=postgres PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go run ./cmd/es-verify all --strict
-
-  test:snapshots:
-    desc: Snapshot-cache integration test (NATS KV).
-    cmds:
-      - docker rm -f es-lite-nats 2>/dev/null || true
-      - docker run -d --rm --name es-lite-nats -p 4222:4222 nats:2.10 -js
-      - until nc -z 127.0.0.1 4222 2>/dev/null; do sleep 1; done
-      - defer: docker rm -f es-lite-nats
-      - NATS_URL=nats://127.0.0.1:4222 go test -count=1 ./examples/snapshots/...
-
   vet:
     desc: go vet across the module and the cmdsvc nested module.
     cmds:
@@ -167,19 +137,3 @@ tasks:
       - go mod tidy
       - cd cmdsvc && go mod tidy
 
-  docker:build:
-    desc: >
-      Build the es-lited container image. Override VERSION with a semver tag
-      (default "dev"). Example: VERSION=v0.3.0 task docker:build.
-    cmds:
-      - docker build --build-arg VERSION="{{.VERSION | default \"dev\"}}" -t "{{.IMAGE | default \"es-lited:dev\"}}" .
-
-  docker:push:
-    desc: >
-      Build and push the multi-arch es-lited image. Needs a registry login
-      (e.g. `docker login ghcr.io`). Override the tag with IMAGE=... and
-      VERSION=..., e.g. IMAGE=ghcr.io/laenenai/es-lited:v0.3.0 VERSION=v0.3.0
-      task docker:push. CI publishes on release tags (release.yml) — this is
-      for manual/local pushes.
-    cmds:
-      - docker buildx build --build-arg VERSION="{{.VERSION | default \"dev\"}}" --platform linux/amd64,linux/arm64 --push -t "{{.IMAGE | default \"ghcr.io/laenenai/es-lited:dev\"}}" .

@@ -24,9 +24,9 @@ type Envelope struct {
 	GlobalPosition uint64 // monotonic across all streams; the delivery cursor
 
 	// Workspace is the source workspace, carried for delivery routing and
-	// NATS subject construction (ADR 0003/0004). It is NOT part of stream
-	// identity (StreamID stays Type:ID) — it is provenance the storage
-	// adapter fills in. Empty for single-workspace backends (SQLite).
+	// per-workspace scoping (ADR 0004). It is NOT part of stream identity
+	// (StreamID stays Type:ID) — it is provenance the storage adapter fills
+	// in. Empty for single-workspace backends (SQLite).
 	Workspace string
 
 	// Type & schema
