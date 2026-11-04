@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/postgres"
@@ -42,6 +43,94 @@ func TestWorkspaceHead(t *testing.T) {
 	}
 	if head != want {
 		t.Fatalf("Head = %d, want %d (the third event's global_position)", head, want)
+	}
+}
+
+// TestHeadIsSettledWhileAppendInFlight pins Head's settle guarantee (spec
+// §5.1): while an append is still in flight, Head never reports a position
+// at or above it — a checkpoint or resume at the raw max would ack the
+// cursor past the in-flight event and lose it when it commits. The shape is
+// the out-of-order commit: tx1 draws the lower position and stays open while
+// tx2 commits the higher one, so the raw max is above an in-flight position.
+// RawHead sees the committed event immediately (the stall-detection view,
+// §5.8); the settled Head stays at or below the in-flight position until the
+// fence clears, then converges to the full settled max.
+func TestHeadIsSettledWhileAppendInFlight(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_head_settled")
+	const (
+		typeA = "feedtest.v1.E1" // tx1, lower position, held in flight
+		typeB = "feedtest.v1.E2" // tx2, higher position, committed
+	)
+
+	// tx1 draws the lower position and stays open: an append in flight.
+	tx1, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	gpA := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "head-settled-a"), 0, typeA)
+
+	// tx2 draws the higher position and commits: gpB is committed and
+	// visible while the lower gpA is still in flight.
+	tx2, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+	gpB := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "head-settled-b"), 0, typeB)
+	if gpA >= gpB {
+		t.Fatalf("insert order: tx1 gp=%d, tx2 gp=%d, want tx1 lower", gpA, gpB)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit tx2: %v", err)
+	}
+
+	// The raw head sees the committed gpB immediately — no fence, no
+	// wait: committed backlog above an in-flight predecessor, exactly
+	// what stall detection probes for.
+	raw, err := ws.RawHead(ctx)
+	if err != nil {
+		t.Fatalf("RawHead: %v", err)
+	}
+	if raw != gpB {
+		t.Fatalf("RawHead = %d, want %d (the committed event, immediately visible)", raw, gpB)
+	}
+
+	// The settled Head must not ack past the in-flight gpA: while tx1 is
+	// open it reports at most gpA — never the raw max. Two polls cover
+	// both round shapes: the fence-establishing poll and the stored-fence
+	// poll.
+	for i := 0; i < 2; i++ {
+		head, err := ws.Head(ctx)
+		if err != nil {
+			t.Fatalf("Head poll %d: %v", i, err)
+		}
+		if head > gpA {
+			t.Fatalf("Head poll %d = %d while gp=%d is in flight, want <= %d: a checkpoint at the raw max would ack past it",
+				i, head, gpA, gpA)
+		}
+	}
+
+	// Once tx1 settles, the fence clears and Head converges to the full
+	// settled max.
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit tx1: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		head, err := ws.Head(ctx)
+		if err != nil {
+			t.Fatalf("Head after commit: %v", err)
+		}
+		if head == gpB {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Head = %d past the deadline, want %d (the settled max once the fence clears)", head, gpB)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 

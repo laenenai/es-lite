@@ -582,12 +582,61 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 	return v, err
 }
 
-// Head returns the workspace's current log head: the highest
-// global_position in the workspace, or 0 when it has no events. It is the
-// position a live feed resumes from and the checkpoint a reset rewinds to.
-// It is deliberately not on es.Store: it exists for feed plumbing, not for
-// the append/read contract.
+// Head returns the workspace's settled log head: the highest
+// global_position whose append is known to have settled — never a position
+// at or above one still in flight. It is the position a live feed resumes
+// from and the checkpoint a reset rewinds to: a value a caller may ack to
+// without skipping an event that commits later. It is deliberately not on
+// es.Store: it exists for feed plumbing, not for the append/read contract.
+//
+// Head is eventually consistent. It shares this Workspace's horizon fence
+// with ReadAllBounded (spec §5.1) — the same (boundL, fenceR) round — so
+// while that fence is blocked by an in-flight append, Head reports a value
+// below the raw max: 0 until a fence clears, then whatever has settled up
+// to the clearing round's L. It converges to the full settled max once the
+// blocking transaction commits or aborts. Callers that need the immediate
+// committed maximum — for stall detection — use RawHead.
 func (w *Workspace) Head(ctx context.Context) (uint64, error) {
+	// One fence round (spec §5.1.1), from 0: Head reads the whole log, so
+	// any drawn position is new and the idle shortcut never fires — every
+	// call either checks the stored fence or draws a fresh one. A zero
+	// bound means no settled range yet — an append is in flight below the
+	// fence — and Head reports 0 rather than a position it would have to
+	// take back.
+	bound, err := w.fenceBound(ctx, 0)
+	if err != nil {
+		return 0, err
+	}
+	if bound == 0 {
+		return 0, nil
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events
+		  WHERE workspace_id = $1 AND global_position <= $2`,
+		w.ws, bound,
+	).Scan(&head)
+	return head, err
+}
+
+// RawHead returns the workspace's raw log head: the highest
+// global_position among the workspace's committed events, read immediately
+// with no fence and no bounding. It can jump past positions whose appends
+// are still in flight — the raw max is not a settle point — so it is not a
+// resume position: a feed that acked to RawHead would skip an in-flight
+// event when it commits. It exists for stall detection only (spec §5.8):
+// RawHead above the feed's position is committed backlog the settled reads
+// have not delivered, the signal to report OnStall; probe it rate-limited.
+// Deliberately not on es.Store.
+func (w *Workspace) RawHead(ctx context.Context) (uint64, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
