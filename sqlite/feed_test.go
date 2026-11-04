@@ -3,7 +3,9 @@ package sqlite_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -284,6 +286,122 @@ func TestReadAllBoundedFirstOversizedEventIsIncluded(t *testing.T) {
 	}
 	if !truncated {
 		t.Fatal("oversized first event did not report truncated")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency guard: the single-connection invariant
+// ---------------------------------------------------------------------------
+
+// TestConcurrentAppendsKeepPositionsGapFree is the SQLite safety guard (spec
+// §5.10.1.4): the backend's gap-free, commit-ordered delivery rests entirely
+// on Open's SetMaxOpenConns(1) serializing every writer against the single
+// connection. Eight goroutines appending single events to distinct streams
+// must produce exactly positions 1..400 — contiguous, no gaps — and an
+// interleaved ReadAll reader must observe every page as a contiguous run
+// starting at its cursor: never gp N+1 before gp N. If the single-connection
+// invariant ever loosens, commit order and position order diverge and this
+// test catches it.
+func TestConcurrentAppendsKeepPositionsGapFree(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s := openFeedStore(t)
+
+	const (
+		writers  = 8
+		perWrite = 50
+		total    = writers * perWrite
+	)
+	const typ = "thing.v1.Happened"
+
+	// One stream per writer, built on the test goroutine: t.Fatalf must
+	// not run on a writer goroutine.
+	streams := make([]es.StreamID, writers)
+	for g := range streams {
+		streams[g] = mustStreamID(t, "thing", fmt.Sprintf("gapfree-%d", g))
+	}
+
+	var (
+		mu       sync.Mutex
+		writePos = make([]uint64, 0, total)
+		writeErr error
+	)
+	var wg sync.WaitGroup
+	for g := range writers {
+		wg.Add(1)
+		go func(sid es.StreamID) {
+			defer wg.Done()
+			for i := 0; i < perWrite; i++ {
+				res, err := s.Append(ctx, es.AppendParams{
+					StreamID:        sid,
+					ExpectedVersion: uint64(i),
+					Events: []es.EventData{{
+						TypeURL:       typ,
+						SchemaVersion: 1,
+						Payload:       []byte("x"),
+					}},
+				})
+				if err != nil {
+					mu.Lock()
+					if writeErr == nil {
+						writeErr = fmt.Errorf("append %s v%d: %w", sid.Canonical(), i+1, err)
+					}
+					mu.Unlock()
+					return
+				}
+				mu.Lock()
+				writePos = append(writePos, res.Envelopes[0].GlobalPosition)
+				mu.Unlock()
+			}
+		}(streams[g])
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	// Interleaved reader (the test goroutine): every observed page must be
+	// a contiguous run starting at cursor+1 — observing gp N+1 before gp N
+	// is exactly what the single-connection invariant must rule out.
+	writersDone := false
+	cursor := uint64(0)
+	for cursor < total {
+		page, err := s.ReadAll(ctx, cursor, 25)
+		if err != nil {
+			t.Fatalf("read all from %d: %v", cursor, err)
+		}
+		for i, e := range page {
+			if want := cursor + uint64(i) + 1; e.GlobalPosition != want {
+				t.Fatalf("reader observed gp %d at offset %d past cursor %d, want %d (gp N+1 before gp N)",
+					e.GlobalPosition, i, cursor, want)
+			}
+		}
+		if len(page) > 0 {
+			cursor = page[len(page)-1].GlobalPosition
+		} else if writersDone {
+			break // every append has returned; nothing more can appear
+		}
+		select {
+		case <-done:
+			writersDone = true
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if writeErr != nil {
+		t.Fatalf("concurrent append: %v", writeErr)
+	}
+	if len(writePos) != total {
+		t.Fatalf("%d of %d appends completed", len(writePos), total)
+	}
+	slices.Sort(writePos)
+	for i, pos := range writePos {
+		if pos != uint64(i+1) {
+			t.Fatalf("appended positions are not exactly 1..%d: got %d at sorted index %d", total, pos, i)
+		}
+	}
+	if cursor != total {
+		t.Fatalf("reader reached %d of %d positions", cursor, total)
 	}
 }
 
