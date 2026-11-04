@@ -161,6 +161,16 @@ func (p projSpec) catalogue() catalogueEntry {
 func writeProjection(g *protogen.GeneratedFile, p projSpec) {
 	base := p.base
 	writeSpecHeader(g, base, "projection", p.spec.GetName(), p.consumes, p.aggs)
+
+	projDefinition := g.QualifiedGoIdent(projectionPkgPath.Ident("Definition"))
+	g.P("// ", base, "Definition returns the projection's catalogue entry: the stable")
+	g.P("// name and the consumed event types, read from the same generated")
+	g.P("// identifiers the handlers use so registration cannot drift.")
+	g.P("func ", base, "Definition() ", projDefinition, " {")
+	g.P("	return ", projDefinition, "{Name: ", base, "Name, Consumes: ", base, "Consumes()}")
+	g.P("}")
+	g.P()
+
 	writeHandlerIface(g, base, p.consumes, p.fetchesState(), "")
 	writeDeps(g, base, p.aggs, p.fetchesState(), nil)
 

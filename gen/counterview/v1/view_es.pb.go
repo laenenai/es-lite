@@ -55,6 +55,13 @@ func counterViewConsumes(env es.Envelope) bool {
 	return false
 }
 
+// CounterViewDefinition returns the projection's catalogue entry: the stable
+// name and the consumed event types, read from the same generated
+// identifiers the handlers use so registration cannot drift.
+func CounterViewDefinition() projection.Definition {
+	return projection.Definition{Name: CounterViewName, Consumes: CounterViewConsumes()}
+}
+
 // CounterViewHandler is the application-written part: one method per consumed
 // event, typed by the event's Go type. Delivery is at-least-once; the
 // runner skips positions at or below the marker, so a method sees each
@@ -192,6 +199,13 @@ func counterActivityConsumes(env es.Envelope) bool {
 		return true
 	}
 	return false
+}
+
+// CounterActivityDefinition returns the projection's catalogue entry: the stable
+// name and the consumed event types, read from the same generated
+// identifiers the handlers use so registration cannot drift.
+func CounterActivityDefinition() projection.Definition {
+	return projection.Definition{Name: CounterActivityName, Consumes: CounterActivityConsumes()}
 }
 
 // CounterActivityHandler is the application-written part: one method per consumed

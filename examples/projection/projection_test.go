@@ -113,6 +113,12 @@ func TestProjectorLiveOverLogFeed(t *testing.T) {
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("consumes = %v, want %v (the spec's order)", got, want)
 	}
+	// The generated Definition is the catalogue entry: same name and consumes
+	// list, read from the same identifiers, so registration cannot drift.
+	def := counterviewv1.CounterViewDefinition()
+	if def.Name != counterviewv1.CounterViewName || !reflect.DeepEqual(def.Consumes, counterviewv1.CounterViewConsumes()) {
+		t.Fatalf("definition = %+v, want name %q and consumes %v", def, counterviewv1.CounterViewName, counterviewv1.CounterViewConsumes())
+	}
 }
 
 // TestRebuildEqualsLive: a fresh read model rebuilt from position 0 equals

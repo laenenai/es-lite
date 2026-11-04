@@ -273,6 +273,8 @@ func TestProjectionGeneratesHandlerAndRunner(t *testing.T) {
 	for _, want := range []string{
 		`const ViewName = "t.view"`,
 		`"evt." + workspace + ".thing.happened"`,
+		"func ViewDefinition() projection.Definition",
+		"return projection.Definition{Name: ViewName, Consumes: ViewConsumes()}",
 		"OnHappened(ctx context.Context, env es.Envelope, ev *Happened, state *State) error",
 		"type ViewStateLoader interface",
 		"func NewViewRunner(h ViewHandler, deps ViewDeps) *projection.Runner",
