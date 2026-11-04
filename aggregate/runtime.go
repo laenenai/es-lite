@@ -156,8 +156,46 @@ type Result[S, E any] struct {
 // one further than es.MaxDecisionSkew from server time is rejected with
 // *es.DecidedAtSkewError, and an in-window value is replaced by server time
 // before Decide runs so expiry windows validate against the server clock.
-func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta) (Result[S, E], error) {
-	return r.HandleAt(ctx, sid, cmd, meta, 0)
+// AppendFunc performs the append for one Handle call.
+//
+// It exists so a caller can own the transaction: an audited store, an outbox
+// or an event store with extra invariants appends inside its own transaction
+// and needs the events to commit atomically with its own records.
+//
+// The function may be called more than once for one command when conflict
+// retry is enabled; it must therefore be idempotent with respect to a retried
+// attempt, exactly as Store.Append is.
+type AppendFunc func(ctx context.Context, p es.AppendParams) (es.AppendResult, error)
+
+// HandleOption configures a single Handle or HandleAt call.
+type HandleOption func(*handleOptions)
+
+type handleOptions struct {
+	append AppendFunc
+}
+
+// WithAppend replaces the store append for one call. A nil function is
+// ignored, so the option is always safe to pass.
+func WithAppend(fn AppendFunc) HandleOption {
+	return func(o *handleOptions) {
+		if fn != nil {
+			o.append = fn
+		}
+	}
+}
+
+func newHandleOptions(opts []HandleOption) handleOptions {
+	var o handleOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o
+}
+
+func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, opts ...HandleOption) (Result[S, E], error) {
+	return r.HandleAt(ctx, sid, cmd, meta, 0, opts...)
 }
 
 // HandleAt is Handle with a caller-asserted stream version (ADR 0031): when
@@ -166,7 +204,7 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 // appending. Unlike a write race, that conflict is never retried by
 // WithConflictRetry — the caller's assertion is stale, and only the caller
 // can refresh it. expected == 0 means "no assertion" (plain Handle).
-func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64) (Result[S, E], error) {
+func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, opts ...HandleOption) (Result[S, E], error) {
 	var zero Result[S, E]
 
 	// One server-clock reading is the authority for both checks and the
@@ -203,8 +241,10 @@ func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C,
 	}
 	meta.OccurredAt = now
 
+	ho := newHandleOptions(opts)
+
 	for attempt := 0; ; attempt++ {
-		res, err := r.handleOnce(ctx, sid, cmd, meta, expected)
+		res, err := r.handleOnce(ctx, sid, cmd, meta, expected, ho)
 		var stale *es.ConflictError
 		if err == nil || !errors.Is(err, es.ErrConflict) || errors.As(err, &stale) || attempt >= r.retries {
 			if err != nil && attempt > 0 {
@@ -236,7 +276,7 @@ func (r *Runtime[S, C, E]) sleep(ctx context.Context, d time.Duration) error {
 // handleOnce is a single load → IsTerminal → Decide → Append pass. Decide is
 // pure and load re-reads the stream, so re-running it after a conflict is
 // safe by construction.
-func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64) (Result[S, E], error) {
+func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, ho handleOptions) (Result[S, E], error) {
 	var zero Result[S, E]
 
 	state, version, err := r.load(ctx, sid, 0, time.Time{})
@@ -273,7 +313,12 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 		}
 	}
 
-	res, err := r.store.Append(ctx, es.AppendParams{
+	appendFn := r.store.Append
+	if ho.append != nil {
+		appendFn = ho.append
+	}
+
+	res, err := appendFn(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: version,
 		Events:          encoded,
