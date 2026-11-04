@@ -13,3 +13,66 @@ a stream or the whole store.
 
 For the decisions behind the library boundary, see
 [`docs/adr`](../adr).
+
+## Index build order (migration 0003)
+
+Migrations run in one transaction (ADR 0010), so they cannot use
+`CREATE INDEX CONCURRENTLY`. A plain index build on a partitioned table with
+≥10M rows blocks appends for the whole build — and with auto-migrate on
+`Open`, the first upgraded replica would take that lock at boot. So for
+databases of that size, build both feed indexes without blocking appends
+**before** upgrading to a version that includes `0003_feed_indexes.sql`.
+
+Postgres cannot `CREATE INDEX CONCURRENTLY` on a partitioned parent at all
+(all versions through 18), so the build is per partition: build the index on
+each partition with `CONCURRENTLY`, then create the parent index with `ONLY`
+and attach the partition indexes — the last two steps are metadata-only and
+instant. Run this through `psql` (`\gexec` runs one statement per row;
+`CREATE INDEX CONCURRENTLY` cannot run inside a transaction block):
+
+```sql
+-- 1. Build both indexes on every events partition, without blocking appends.
+SELECT format('CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I %s',
+              p.relname || regexp_replace(i.name, '^events', ''), p.relname, i.cols)
+FROM (VALUES ('events_ws_pos_idx',      '(workspace_id, global_position)'),
+             ('events_ws_type_pos_idx', '(workspace_id, type_url, global_position)'))
+         AS i (name, cols)
+CROSS JOIN (SELECT c.relname FROM pg_inherits g
+            JOIN pg_class c ON c.oid = g.inhrelid
+            WHERE g.inhparent = 'events'::regclass) AS p
+\gexec
+
+-- 2. Create the parent indexes (metadata only, instant; marked invalid
+--    until every partition index is attached in step 3).
+CREATE INDEX IF NOT EXISTS events_ws_pos_idx
+    ON ONLY events (workspace_id, global_position);
+CREATE INDEX IF NOT EXISTS events_ws_type_pos_idx
+    ON ONLY events (workspace_id, type_url, global_position);
+
+-- 3. Attach the partition indexes (metadata only, instant). Once all are
+--    attached, the parent indexes become valid on their own.
+SELECT format('ALTER INDEX %I ATTACH PARTITION %I',
+              i.name, p.relname || regexp_replace(i.name, '^events', ''))
+FROM (VALUES ('events_ws_pos_idx',      '(workspace_id, global_position)'),
+             ('events_ws_type_pos_idx', '(workspace_id, type_url, global_position)'))
+         AS i (name, cols)
+CROSS JOIN (SELECT c.relname FROM pg_inherits g
+            JOIN pg_class c ON c.oid = g.inhrelid
+            WHERE g.inhparent = 'events'::regclass) AS p
+\gexec
+```
+
+A `CONCURRENTLY` build that fails or is cancelled leaves an `INVALID` index
+behind; drop it (`DROP INDEX CONCURRENTLY <index name>;`) and re-run step 1.
+Before upgrading, confirm both parent indexes are valid:
+
+```sql
+SELECT c.relname, i.indisvalid FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relname IN ('events_ws_pos_idx', 'events_ws_type_pos_idx');
+```
+
+Once this runbook step is done, migration 0003 is a **no-op**: its
+`CREATE INDEX IF NOT EXISTS` statements find the parent indexes already in
+place. Databases that skip the manual step pay a blocking build inside the
+migration — acceptable only for small databases.
