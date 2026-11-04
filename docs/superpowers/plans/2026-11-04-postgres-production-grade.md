@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- No write-path regression: appends take no new locks, no commits, and no extra round trips; the append's existing first statement (`readHead`) additionally draws the transaction id via one extra column, `pg_current_xact_id()` (spec §3 anti-goal, §5.1 fact P1).
+- No write-path regression: appends take no new locks and no extra commits; the append issues one bare read-only `SELECT pg_current_xact_id()` statement before `readHead` — one extra round trip per append, the accepted price of commit-safe reads (spec §3 anti-goal, §5.1 fact P1; Task 1b falsified the zero-cost `readHead` fold on empty streams: no row means the target list never evaluates).
 - Payloads are opaque (ADR 0025): never logged, never copied; errors carry positions, type URLs and sizes only.
 - Migrations are append-only and transactional (ADR 0010) — no `CREATE INDEX CONCURRENTLY` inside migrations; heavy indexes are built runbook-first. Numbering by landing order: **postgres 0003** (indexes), **0004** (feed tables), **0005** (RLS role policies); **sqlite 0004** (definition hash column + dead letters, lands with Task 11 and 12 together).
 - New Postgres feed tables get RLS policies with **no bypass arm** (spec §5.6).
@@ -80,7 +80,7 @@ The failure modes the spec's §8 says must not be reintroduced, and the test tha
 ### Task 2: Red ordering tests + the horizon fence in `ReadAllBounded`
 
 **Files:**
-- Modify: `postgres/wsstore.go` (Workspace state, `ReadAllBounded`)
+- Modify: `postgres/wsstore.go` (Workspace state, `ReadAllBounded`, and the append path's bare xid-draw statement)
 - Test: `postgres/feed_test.go` (new, PG_DSN-gated); `sqlite/feed_test.go` (one new test)
 
 **Interfaces:**
@@ -101,7 +101,7 @@ The failure modes the spec's §8 says must not be reintroduced, and the test tha
   - `fenceCleared(ctx, r)` — `SELECT pg_snapshot_xmin(pg_current_snapshot()) >= $1`.
   - In `ReadAllBounded`, before the existing page tx: under `mu` — stored state exists → run `fenceCleared(fenceR)`: cleared → bound = `boundL`, drop the state; blocked → return `nil, false, nil` (empty page). No stored state → `L := readLastPosition`; if `L <= from` → empty page, no fence drawn (idle streams burn no xids); else `R := drawFence` and check: cleared → bound = `L`; blocked → store `(boundL=L, fenceR=R)`, return empty.
   - The page query gains `AND global_position <= $5` (the bound); when `bound <= from`, return an empty page without querying rows. Budget/type/truncated logic unchanged.
-  - Fold `pg_current_xact_id()` into `readHead`'s SELECT (one extra column — P1: the xid is assigned before the position draw; zero extra round trips).
+  - In `Workspace.append`, issue one bare read-only `SELECT pg_current_xact_id()` statement as the transaction's first statement, before `readHead` (P1: the xid is assigned before the position draw, unconditionally — including a stream's first append; one extra round trip per append, cost recorded at the Task 7 benchmark gate). The xid is stable for the whole transaction (Task 1b verified).
 - [ ] **Step 6: Run** `task test:pg` — expected: the three tests PASS, full PG suite green.
 - [ ] **Step 7: Add the SQLite regression guard** (spec §5.10.1.4): `TestConcurrentAppendsKeepPositionsGapFree` in `sqlite/feed_test.go` — 8 goroutines × 50 single-event appends to distinct streams; assert positions are exactly `1..400` (contiguous) and an interleaved `ReadAll` reader never observes gp N+1 before gp N. (Guards the `SetMaxOpenConns(1)` invariant the whole SQLite safety argument rests on.)
 - [ ] **Step 8: Run** `GOWORK=off go test -race ./...` — expected: green (PG skipped).
@@ -182,7 +182,7 @@ The failure modes the spec's §8 says must not be reintroduced, and the test tha
 - [ ] **Step 2: Write** `TestFeedGateNoLoss` (spec §5.10.2): 8 appenders × ≥12.5k events each (batches of 20), every batch `Begin → AppendTx → sleep rand(0–500ms) → Commit` (decoupled insert/commit); 3 `feed.Server` consumers with disjoint type filters, `LeaseTTL=100ms`; kill windows per consumer: cancel mid-page after send/before checkpoint, and full store close/reopen. Oracle: **set equality** — each consumer's delivered-position set equals the appended positions filtered by its type set (duplicates allowed, deduplicated for comparison; invention or omission both fail). Hash-chain oracle: per stream, delivered envelopes are version-contiguous and `PrevHash` links (use the existing `es` chain helpers).
 - [ ] **Step 3: Write** `TestFeedGatePageQueryPlan`: seed ≥1M rows via direct batched inserts (512-byte payloads); `EXPLAIN (FORMAT JSON)` the exact page query; assert `events_ws_type_pos_idx` appears and no `Seq Scan` on events partitions.
 - [ ] **Step 4: Write** `TestFeedGateHundredIdleSubscribers` (Review Focus 7): pool `MaxConns=50`; 100 subscriptions (separate instances); after a quiet start, append one matching event; all 100 deliver within 1s; pool stats healthy. Task 18 adds jitter-spread assertions here.
-- [ ] **Step 5: Write** `BenchmarkWorkspaceAppend` (batch of 20) and record the baseline numbers in the PR — the write-path-unchanged evidence (Task 2's mechanism must not move it).
+- [ ] **Step 5: Write** `BenchmarkWorkspaceAppend` (batch of 20) and record the baseline numbers in the PR — the write-path evidence. The only append-path change is the extra bare xid-draw statement (Task 1b), so record its measured cost explicitly for the Gate 0 exit review.
 - [ ] **Step 6: Run** `task test:feedgate` — expected: green. Record the output in the PR (this run is Phase 1's exit evidence).
 - [ ] **Step 7: Wire the nightly CI job** (cron) running `task test:feedgate`.
 - [ ] **Step 8: Commit** — `test(postgres): feedgate chaos, plan and fleet scenarios`
