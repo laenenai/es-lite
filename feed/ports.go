@@ -42,6 +42,7 @@ type Lease struct {
 // Implementations may enforce monotonic Save (the platform's Postgres store
 // uses GREATEST); the core never assumes a rewind.
 type CheckpointStore interface {
+	// Load returns the stored position, or (0, nil) when no checkpoint exists.
 	Load(ctx context.Context, scope, projection, instance string) (uint64, error)
 	Save(ctx context.Context, scope, projection, instance string, position uint64) error
 	Reset(ctx context.Context, scope, projection, instance string, position uint64) error

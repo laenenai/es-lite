@@ -111,7 +111,10 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.RenewEvery >= cfg.LeaseTTL {
 		cfg.RenewEvery = cfg.LeaseTTL / 3
 		if cfg.RenewEvery <= 0 {
-			cfg.RenewEvery = time.Millisecond
+			cfg.RenewEvery = cfg.LeaseTTL / 2
+		}
+		if cfg.RenewEvery <= 0 {
+			return nil, fmt.Errorf("feed: Config.LeaseTTL %v is too small to renew safely", cfg.LeaseTTL)
 		}
 	}
 	return &Server{cfg: cfg, prefix: newPrefix()}, nil
@@ -156,7 +159,16 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 
 	acquired, err := s.cfg.Leases.Acquire(ctx, key, owner, req.Consumer, s.cfg.LeaseTTL)
 	if err != nil {
-		return fmt.Errorf("feed: acquire lease %q: %w", key, err)
+		aerr := fmt.Errorf("feed: acquire lease %q: %w", key, err)
+		// A store may report an error after it took the lease (a failed
+		// post-commit step, for example). (true, err) means we own it, so
+		// release it rather than leaking the key.
+		if acquired {
+			if rerr := s.releaseLease(ctx, key, owner); rerr != nil {
+				aerr = errors.Join(aerr, fmt.Errorf("feed: release lease %q after acquire error: %w", key, rerr))
+			}
+		}
+		return aerr
 	}
 	if !acquired {
 		lease, held, herr := s.cfg.Leases.Holder(ctx, key)
@@ -184,28 +196,48 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	defer func() {
 		cancel()
 		renewals.Wait()
-		releaseCtx, releaseCancel := context.WithTimeout(context.WithoutCancel(ctx), leaseReleaseTimeout)
-		defer releaseCancel()
-		if rerr := s.cfg.Leases.Release(releaseCtx, key, owner); rerr != nil {
+		if rerr := s.releaseLease(ctx, key, owner); rerr != nil {
 			err = errors.Join(err, fmt.Errorf("feed: release lease %q: %w", key, rerr))
 		}
 	}()
 
-	err = s.stream(runCtx, req, sink, s.batchSize(req.BatchSize))
+	streamErr := s.stream(runCtx, req, sink, s.batchSize(req.BatchSize))
 
-	// A renewal failure cancels runCtx; its cause is more useful than the
-	// resulting context.Canceled. A caller cancellation wins over both.
+	// Collect the independent causes instead of letting one silently replace
+	// another. A stream error caused by our own cancellation is derived, not a
+	// diagnosis, and is dropped; a real send/read error that races a lease loss
+	// is joined so both remain visible.
+	var leaseErr error
 	select {
-	case lerr := <-lost:
-		if ctx.Err() == nil {
-			err = lerr
-		}
+	case leaseErr = <-lost:
 	default:
 	}
-	if cerr := ctx.Err(); cerr != nil {
-		return cerr
+	var causes []error
+	if leaseErr != nil {
+		causes = append(causes, leaseErr)
 	}
-	return err
+	if callerErr := ctx.Err(); callerErr != nil {
+		causes = append(causes, callerErr)
+	}
+	if len(causes) > 0 {
+		if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
+			causes = append(causes, streamErr)
+		}
+		if len(causes) == 1 {
+			return causes[0]
+		}
+		return errors.Join(causes...)
+	}
+	return streamErr
+}
+
+// releaseLease releases key for owner on a context detached from the stream's
+// cancellation, bounded by leaseReleaseTimeout, so a cancelled stream still
+// frees its key and values (tenant scope, tracing) survive.
+func (s *Server) releaseLease(ctx context.Context, key, owner string) error {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseReleaseTimeout)
+	defer cancel()
+	return s.cfg.Leases.Release(releaseCtx, key, owner)
 }
 
 // renew extends the lease every RenewEvery until ctx ends. On the first failed
@@ -286,8 +318,10 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 			pos = env.GlobalPosition
 		}
 		// A budget-truncated page, or a full page, means more matching events
-		// are already there: continue without waiting.
-		if truncated || len(envs) >= batch {
+		// are already there: continue without waiting. Guard on a non-empty
+		// page: an adapter that reports truncated with zero rows must not make
+		// the loop spin — wait like any other empty page.
+		if len(envs) > 0 && (truncated || len(envs) >= batch) {
 			continue
 		}
 		if err := s.wait(ctx); err != nil {

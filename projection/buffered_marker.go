@@ -87,8 +87,15 @@ func (m *BufferedMarker) Load(ctx context.Context, projection string) (uint64, e
 func (m *BufferedMarker) Save(ctx context.Context, projection string, position uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.pending[projection] < position {
+	prev, pending := m.pending[projection]
+	switch {
+	case position > prev:
 		m.pending[projection] = position
+	case position == 0 && !pending:
+		// Zero is the marker's zero value and there is no pending write, so
+		// this Save has nothing to persist. Counting it would drift count and
+		// firstDirty and make a later real Save flush early.
+		return nil
 	}
 	now := m.opts.Now()
 	if m.firstDirty.IsZero() {
@@ -116,6 +123,10 @@ func (m *BufferedMarker) Flush(ctx context.Context) error {
 // persisted, so a failed flush keeps firing the retry triggers.
 func (m *BufferedMarker) flush(ctx context.Context) error {
 	if len(m.pending) == 0 {
+		// Nothing to persist is a completed flush: clear the triggers so an
+		// empty flush cannot leave count/firstDirty armed forever.
+		m.count = 0
+		m.firstDirty = time.Time{}
 		return nil
 	}
 	var err error

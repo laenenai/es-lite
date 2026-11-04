@@ -31,8 +31,9 @@ type ReconnectingFeed struct {
 	// must be non-nil: a (nil, nil) return is a programming error, and
 	// Feed fails fast on it rather than retrying.
 	Open func(context.Context) (Feed, error)
-	// Min is the first backoff; it doubles up to Max. Zero values mean
-	// 250ms and 30s.
+	// The first backoff, doubled up to Max. Zero values mean 250ms and 30s.
+	// Min greater than Max is clamped to Max so a misconfiguration cannot
+	// sleep past the documented ceiling.
 	Min, Max time.Duration
 	// Jitter spreads a computed backoff d. Nil means uniform in [0, d).
 	Jitter func(time.Duration) time.Duration
@@ -47,6 +48,9 @@ func (f *ReconnectingFeed) Feed(ctx context.Context, handle func(ctx context.Con
 	}
 	if max <= 0 {
 		max = 30 * time.Second
+	}
+	if min > max {
+		min = max
 	}
 	delay := min
 	for {

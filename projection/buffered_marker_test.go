@@ -105,3 +105,109 @@ func TestBufferedMarkerKeepsTheHighestPendingPosition(t *testing.T) {
 		t.Fatalf("saved position = %d, want 9", inner.saved[0].pos)
 	}
 }
+
+func TestBufferedMarkerEmptyFlushIsANoOp(t *testing.T) {
+	ctx := context.Background()
+	inner := &recordingMarker{}
+	m := projection.NewBufferedMarker(inner, projection.BufferedMarkerOptions{MaxCount: 2, MaxInterval: time.Hour})
+	if err := m.Flush(ctx); err != nil {
+		t.Fatalf("Flush on empty = %v, want nil", err)
+	}
+	if len(inner.saved) != 0 {
+		t.Fatalf("empty Flush saved %+v, want nothing", inner.saved)
+	}
+	// An empty flush must also leave the count disarmed: one real Save below
+	// MaxCount is still deferred.
+	_ = m.Save(ctx, "p", 1)
+	if len(inner.saved) != 0 {
+		t.Fatalf("Save after empty Flush flushed early: %+v", inner.saved)
+	}
+}
+
+// Save(0) with no pending checkpoint has nothing to persist. It must not
+// advance count or firstDirty; otherwise a real position saved later flushes
+// immediately (old bug: zero saves armed the triggers forever).
+func TestBufferedMarkerZeroPositionSavesDoNotArmFlushTriggers(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(0, 0)
+	inner := &recordingMarker{}
+	m := projection.NewBufferedMarker(inner, projection.BufferedMarkerOptions{
+		MaxCount: 1000, MaxInterval: time.Second,
+		Now: func() time.Time { return now },
+	})
+	_ = m.Save(ctx, "p", 0)
+	_ = m.Save(ctx, "p", 0)
+	now = now.Add(2 * time.Second) // past MaxInterval from the zero saves
+	_ = m.Save(ctx, "p", 1)
+	if len(inner.saved) != 0 {
+		t.Fatalf("Save(1) flushed immediately after Save(0)s: %+v", inner.saved)
+	}
+	if err := m.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if len(inner.saved) != 1 || inner.saved[0].pos != 1 {
+		t.Fatalf("saved = %+v, want one save at 1", inner.saved)
+	}
+}
+
+// partialMarker fails Save on one chosen call. It records successful saves only.
+type partialMarker struct {
+	calls    int
+	failCall int // 1-based call that fails; 0 never fails
+	err      error
+	saved    []struct {
+		key string
+		pos uint64
+	}
+}
+
+func (p *partialMarker) Load(context.Context, string) (uint64, error) { return 0, nil }
+
+func (p *partialMarker) Save(_ context.Context, key string, pos uint64) error {
+	p.calls++
+	if p.failCall != 0 && p.calls == p.failCall {
+		return p.err
+	}
+	p.saved = append(p.saved, struct {
+		key string
+		pos uint64
+	}{key, pos})
+	return nil
+}
+
+// A partial flush persists the keys before the failure and leaves the failed
+// key (and anything unattempted) pending for the retry.
+func TestBufferedMarkerPartialFlushFailureKeepsTheFailedKeyPending(t *testing.T) {
+	ctx := context.Background()
+	flushErr := errors.New("db down")
+	inner := &partialMarker{failCall: 2, err: flushErr}
+	m := projection.NewBufferedMarker(inner, projection.BufferedMarkerOptions{MaxCount: 1000, MaxInterval: time.Hour})
+	_ = m.Save(ctx, "a", 1)
+	_ = m.Save(ctx, "b", 2)
+
+	if err := m.Flush(ctx); !errors.Is(err, flushErr) {
+		t.Fatalf("Flush = %v, want the inner error", err)
+	}
+	if len(inner.saved) != 1 {
+		t.Fatalf("saved = %+v, want exactly one key before the failure", inner.saved)
+	}
+	succeeded := inner.saved[0].key
+
+	inner.failCall = 0 // recovery
+	if err := m.Flush(ctx); err != nil {
+		t.Fatalf("Flush after recovery = %v", err)
+	}
+	if len(inner.saved) != 2 {
+		t.Fatalf("saved = %+v, want two keys after the retry", inner.saved)
+	}
+	if inner.saved[1].key == succeeded {
+		t.Fatalf("saved = %+v: succeeded key %q was written twice", inner.saved, succeeded)
+	}
+	seen := map[string]bool{}
+	for _, s := range inner.saved {
+		seen[s.key] = true
+	}
+	if !seen["a"] || !seen["b"] {
+		t.Fatalf("saved = %+v, want both keys", inner.saved)
+	}
+}

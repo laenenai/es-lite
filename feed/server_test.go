@@ -88,6 +88,13 @@ type memLeases struct {
 	failAfter int
 	renewErr  error
 	acquired  []time.Duration // TTLs Acquire saw, newest last
+
+	// acquireErr/acquireTrueOnErr simulate a store that took the lease but
+	// still returned an error; releaseErr simulates a failed release.
+	acquireErr       error
+	acquireTrueOnErr bool
+	releaseErr       error
+	releases         int
 }
 
 type memLease struct {
@@ -103,6 +110,14 @@ func (m *memLeases) Acquire(_ context.Context, key, owner, consumer string, ttl 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.acquired = append(m.acquired, ttl)
+	if m.acquireErr != nil {
+		if m.acquireTrueOnErr {
+			// The lease was taken as a side effect even though the call
+			// reported an error.
+			m.rows[key] = memLease{owner: owner, consumer: consumer, expiresAt: time.Now().Add(ttl)}
+		}
+		return m.acquireTrueOnErr, m.acquireErr
+	}
 	if row, held := m.rows[key]; held && time.Now().Before(row.expiresAt) && row.owner != owner {
 		return false, nil
 	}
@@ -129,10 +144,11 @@ func (m *memLeases) Renew(_ context.Context, key, owner string, ttl time.Duratio
 func (m *memLeases) Release(_ context.Context, key, owner string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.releases++
 	if row, held := m.rows[key]; held && row.owner == owner {
 		delete(m.rows, key)
 	}
-	return nil
+	return m.releaseErr
 }
 
 func (m *memLeases) Holder(_ context.Context, key string) (feed.Lease, bool, error) {
@@ -151,6 +167,22 @@ func (m *memLeases) renewCount() int {
 	return m.renewals
 }
 
+func (m *memLeases) releaseCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.releases
+}
+
+// failRenewalsFromNow makes the next renewal fail and returns the renewal
+// count to wait for. Callers use it after the stream is known to be running,
+// so the failure does not race startup.
+func (m *memLeases) failRenewalsFromNow() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failAfter = m.renewals
+	return m.renewals + 1
+}
+
 // memLogs is a Logs over in-memory per-scope event slices. It records every
 // ReadAllBounded call so tests can pin the exact arguments the loop used.
 type memLogs struct {
@@ -161,6 +193,9 @@ type memLogs struct {
 	openErr error
 	calls   []readCall
 	opens   int
+	// emptyTruncated makes every page report truncated with zero rows, the
+	// pathological adapter the loop must not spin on.
+	emptyTruncated bool
 }
 
 type readCall struct {
@@ -237,6 +272,9 @@ func (l *memLog) ReadAllBounded(ctx context.Context, from uint64, limit, maxByte
 		scope: l.scope, from: from, limit: limit, maxBytes: maxBytes,
 		types: append([]string(nil), types...),
 	})
+	if l.parent.emptyTruncated {
+		return nil, true, nil
+	}
 	want := map[string]bool{}
 	for _, t := range types {
 		want[t] = true
@@ -319,6 +357,27 @@ func (s *memSink) waitFor(t *testing.T, n int) []es.Envelope {
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
+}
+
+// blockingSendSink blocks in Send until the test releases it, then returns a
+// real send error. It lets a lease loss and a stream error race deterministically.
+type blockingSendSink struct {
+	sendErr error
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingSendSink) Send(ctx context.Context, _ es.Envelope) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		// The renewer may cancel first; wait for the test to let Send finish
+		// so the real error, not a derived cancellation, reaches Subscribe.
+		<-s.release
+	}
+	return s.sendErr
 }
 
 // blockingWaiter blocks until the stream is cancelled; it never busy-polls.
@@ -423,6 +482,28 @@ func waitCalls(t *testing.T, logs *memLogs, n int) []readCall {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %d log reads, got %d", n, len(calls))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitWaits(t *testing.T, w *blockingWaiter, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for w.count() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d waits, got %d", n, w.count())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitRenewals(t *testing.T, leases *memLeases, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for leases.renewCount() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d renewals, got %d", n, leases.renewCount())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -726,6 +807,28 @@ func TestSubscribeContinuesImmediatelyAfterTruncation(t *testing.T) {
 	_ = await(t, done)
 }
 
+// An adapter that reports truncated with zero rows is misbehaving. The loop
+// must wait (not spin) and must not call the log in a tight loop.
+func TestSubscribeWaitsOnAZeroRowTruncatedPage(t *testing.T) {
+	logs := newMemLogs()
+	logs.emptyTruncated = true
+	waiter := &blockingWaiter{}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+		Waiter: waiter,
+	})
+	cancel, done := start(t, srv, testRequest("live"), newMemSink())
+
+	waitWaits(t, waiter, 1)
+	if calls := len(logs.callsSnapshot()); calls != 1 {
+		t.Fatalf("log reads = %d before the first wait, want 1 (no spin)", calls)
+	}
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
 func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
 	checkpoints := newMemCheckpoints(at)
@@ -784,6 +887,26 @@ func TestStatusWithoutACheckpoint(t *testing.T) {
 	}
 }
 
+// A checkpoint ahead of the head (a log restored to an earlier point) is
+// reported as negative lag, not clamped away: the operator needs to see the
+// inconsistency.
+func TestStatusReportsNegativeLagWhenCheckpointIsAhead(t *testing.T) {
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", 9)
+	logs := newMemLogs()
+	logs.setHead(4)
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: logs,
+	})
+	got, err := srv.Status(context.Background(), "tenant", "counter.view", "live")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if got.Position != 9 || got.Head != 4 || got.Lag != -5 {
+		t.Fatalf("Status = %+v, want position 9 head 4 lag -5", got)
+	}
+}
+
 func TestSubscribeCancellationReleasesTheLease(t *testing.T) {
 	leases := newMemLeases()
 	srv := newServer(t, feed.Config{
@@ -825,6 +948,79 @@ func TestSubscribeAbortsWhenRenewFails(t *testing.T) {
 	}
 	if !errors.Is(err, leases.renewErr) {
 		t.Fatalf("error = %v, want the renew cause", err)
+	}
+	if strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("error = %v, want only the lease loss (the cancellation is derived)", err)
+	}
+	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
+}
+
+// A real stream error that races a lease loss must keep both diagnoses: the
+// lease loss is terminal, but the send failure explains why the stream was in
+// trouble and must not be silently replaced.
+func TestSubscribeJoinsAStreamErrorRacingLeaseLoss(t *testing.T) {
+	leases := newMemLeases()
+	sendErr := errors.New("client write failed")
+	sink := &blockingSendSink{
+		sendErr: sendErr,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases,
+		Logs:       newMemLogs(ev(1, "counter.v1.Incremented", "one")),
+		LeaseTTL:   50 * time.Millisecond,
+		RenewEvery: 5 * time.Millisecond,
+	})
+	_, done := start(t, srv, testRequest("live"), sink)
+
+	select {
+	case <-sink.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Send was not called")
+	}
+	// Fail the next renewal only after the stream is inside Send, so the send
+	// failure and the lease loss are genuinely concurrent.
+	target := leases.failRenewalsFromNow()
+	waitRenewals(t, leases, target)
+	close(sink.release)
+
+	err := await(t, done)
+	if !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("error = %v, want ErrLeaseLost", err)
+	}
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("error = %v, want the racing send error preserved", err)
+	}
+	var lost *feed.LeaseLostError
+	if !errors.As(err, &lost) {
+		t.Fatalf("error = %v (%T), want *LeaseLostError", err, err)
+	}
+}
+
+// A store may report an error after it took the lease. (true, err) means the
+// key was acquired, so Subscribe must release it before returning.
+func TestSubscribeReleasesALeaseAcquiredWithAnError(t *testing.T) {
+	leases := newMemLeases()
+	acquireErr := errors.New("acquire commit uncertain")
+	releaseErr := errors.New("release store down")
+	leases.acquireErr = acquireErr
+	leases.acquireTrueOnErr = true
+	leases.releaseErr = releaseErr
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+	})
+	req := testRequest("live")
+
+	err := srv.Subscribe(context.Background(), req, newMemSink())
+	if !errors.Is(err, acquireErr) {
+		t.Fatalf("error = %v, want the acquire error", err)
+	}
+	if !errors.Is(err, releaseErr) {
+		t.Fatalf("error = %v, want the release error joined", err)
+	}
+	if releases := leases.releaseCount(); releases != 1 {
+		t.Fatalf("releases = %d, want exactly 1", releases)
 	}
 	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
 }
