@@ -1,6 +1,6 @@
 # ADR 0036: No Broker in es-lite; Postgres and SQLite Only
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-04
 - **Supersedes:** ADR 0003, ADR 0009, ADR 0028
 - **Related:** ADR 0001 (log as source of truth), ADR 0002 (delivery topology), ADR 0005 (projection rebuild), ADR 0007 (snapshots)

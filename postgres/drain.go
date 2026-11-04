@@ -13,7 +13,7 @@ import (
 // out of assignment order — it claims unpublished rows with FOR UPDATE SKIP
 // LOCKED, publishes them, and marks them published, all in one transaction.
 // Publishing before commit makes it at-least-once: a crash after publish but
-// before commit re-delivers the batch (dedup on the consumer side, ADR 0003).
+// before commit re-delivers the batch (dedup on the consumer side, ADR 0036).
 //
 // It reads across all workspaces (RLS bypassed). Payloads are relayed opaquely
 // (ADR 0025) — es-lite performs no decryption. Returns the number of rows

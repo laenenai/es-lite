@@ -42,7 +42,7 @@ transport, authentication, encryption and business rules.
 
 | Responsibility | Mechanism |
 |---|---|
-| Durable, append-only event log | Postgres or SQLite; payload rows are never updated (`published_at` is the only mutable delivery marker) |
+| Durable, append-only event log | Postgres or SQLite; payload rows are never updated (Postgres adds `published_at` as the only mutable delivery marker; SQLite tails in-process) |
 | Optimistic concurrency | `UNIQUE (workspace, stream, version)` → `ErrConflict` |
 | Per-workspace data isolation (Postgres) | RLS + hash partitioning; the caller supplies the workspace |
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
@@ -157,7 +157,7 @@ past, err := rt.LoadAsOfVersion(ctx, sid, 1)
 past, err = rt.LoadAsOfTime(ctx, sid, someTimestamp)
 
 // Bounded-staleness read when a snapshot cache is configured:
-state, version, cacheHit, err := rt.LoadStale(ctx, sid, 5*time.Minute)
+state, version, fresh, err := rt.LoadStale(ctx, sid, 5*time.Minute)
 ```
 
 **Snapshots.** `snapshot.Cache` is a pure, re-derivable optimization: the
@@ -241,8 +241,8 @@ are client responsibilities (ADR 0025).
   authenticate callers and derive the workspace from trusted identity, never
   from an unverified client field.
 - **Append-only by API contract, tamper-evident by hash chain.** The library
-  never updates event payloads; `published_at` is the delivery path's one
-  mutable column. Since ADR 0029 every row carries `prev_hash`/`hash`: a
+  never updates event payloads; on Postgres, `published_at` is the delivery
+  path's one mutable column (SQLite tails in-process and has none). Since ADR 0029 every row carries `prev_hash`/`hash`: a
   per-stream SHA-256 chain over the *sealed* bytes, computed inside the append
   transaction, so an auditor with no keys can detect an altered, reordered or
   missing row (`es.VerifyStream`, `es-verify stream|all`). A chain alone cannot
@@ -283,8 +283,9 @@ runner := counterviewv1.NewCounterViewRunner(myHandler, counterviewv1.CounterVie
 // Live, in-process: tail the log directly (tests, single-node SQLite).
 err := runner.Run(ctx, &projection.LogFeed{Source: store, From: 0})
 
-// Live, through the platform's event-feed service: feed.Server streams to a
-// caller-supplied Sink, resuming from a durable checkpoint under a lease.
+// Live, through the feed core: feed.Server streams to a caller-supplied Sink,
+// resuming from a durable checkpoint under a lease. The platform supplies the
+// checkpoint, lease and log ports; this module ships the Subscribe loop.
 
 // Rebuild from position 0 through the same dispatch path:
 pos, err := runner.Rebuild(ctx, store, 500)
@@ -373,8 +374,8 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 
 ## Status
 
-Pre-1.0: the API may still shift. Postgres integration tests run against real
-Postgres (plus SQLite unit tests); no external service is required. See
+Pre-1.0: the API may still shift. Unit tests need no external service; the
+Postgres integration suite runs against a real Postgres database. See
 [Status in each ADR](./docs/adr/README.md) for what is implemented vs.
 designed.
 

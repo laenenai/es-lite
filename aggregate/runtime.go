@@ -388,7 +388,7 @@ func (r *Runtime[S, C, E]) LoadAsOfTime(ctx context.Context, sid es.StreamID, t 
 	return state, err
 }
 
-// LoadStale is a bounded-staleness read (ADR 0009): if a snapshot exists,
+// LoadStale is a bounded-staleness read (ADR 0007): if a snapshot exists,
 // matches the fold version, and is within maxAge, it returns the cached state
 // directly WITHOUT reading the log — zero store round-trips. Otherwise it falls
 // back to a strong Load (snapshot + tail fold). The bool reports whether the

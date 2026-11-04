@@ -33,7 +33,7 @@ than editing history.
 | 0033 | [Publish `es/v1/options.proto` as a Buf Module](./0033-publish-options-to-bsr.md)          | Accepted (configured; push pending BUF_TOKEN) |
 | 0034 | [The Server Stamps Decision Time; `decided_at` Is Only Intent](./0034-server-stamped-decided-at.md) | Accepted (implemented; supersedes 0032 §2) |
 | 0035 | [Caller-Owned Transactions for Atomic Appends](./0035-caller-owned-transactions.md) | Accepted (implemented; additive to 0008) |
-| 0036 | [No Broker in es-lite; Postgres and SQLite Only](./0036-postgres-only-no-broker.md) | Proposed (supersedes 0003/0009/0028) |
+| 0036 | [No Broker in es-lite; Postgres and SQLite Only](./0036-postgres-only-no-broker.md) | Accepted (implemented); supersedes 0003/0009/0028 |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in
