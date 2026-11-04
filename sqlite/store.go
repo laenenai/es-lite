@@ -1,10 +1,17 @@
-// Package sqlite is the SQLite backend for es-lite. It implements
-// es.Store plus the delivery.Checkpoints contract.
+// Package sqlite is the SQLite backend for es-lite. It implements es.Store,
+// the delivery.Checkpoints contract, and the feed log, checkpoint and lease
+// ports (feed.Log/Logs, feed.CheckpointStore, feed.LeaseStore).
 //
 // SQLite is the first backend precisely because its single-writer model
 // makes the delivery cursor gap-free for free (docs/adr/0001 §5). The
 // store keeps a single database connection so writes are serialized and
 // global_position is assigned in commit order.
+//
+// One database is one workspace. The feed ports accept a scope for parity
+// with multi-tenant backends, but SQLite has no row-level security and no
+// workspace column: it cannot enforce tenant isolation, and callers must not
+// rely on it doing so. Named-tenant callers get a working feed over the
+// single log this database holds.
 package sqlite
 
 import (
@@ -418,43 +425,54 @@ func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es
 
 	var out []es.Envelope
 	for rows.Next() {
-		var (
-			e                                     es.Envelope
-			eventID, streamType, streamID         string
-			occurredAt, recordedAt                string
-			correlationID, causationID, commandID string
-			actorType, actorID                    string
-		)
-		if err := rows.Scan(
-			&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
-			&e.TypeURL, &e.SchemaVersion, &occurredAt, &recordedAt,
-			&correlationID, &causationID, &commandID,
-			&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
-		); err != nil {
+		e, err := scanEnvelope(rows)
+		if err != nil {
 			return nil, err
 		}
-		if e.EventID, err = uuid.Parse(eventID); err != nil {
-			return nil, fmt.Errorf("parse event_id %q: %w", eventID, err)
-		}
-		if e.StreamID, err = es.ParseCanonical(streamID); err != nil {
-			return nil, fmt.Errorf("parse stream_id %q: %w", streamID, err)
-		}
-		if e.OccurredAt, err = parseTS(occurredAt); err != nil {
-			return nil, fmt.Errorf("parse occurred_at %q: %w", occurredAt, err)
-		}
-		if e.RecordedAt, err = parseTS(recordedAt); err != nil {
-			return nil, fmt.Errorf("parse recorded_at %q: %w", recordedAt, err)
-		}
-		e.CorrelationID, _ = uuid.Parse(correlationID)
-		e.CausationID, _ = uuid.Parse(causationID)
-		e.CommandID, _ = uuid.Parse(commandID)
-		e.Actor = es.Actor{Type: actorType, ID: actorID}
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// scanEnvelope scans one row selected with envelopeCols. It is the single
+// column list/scan pairing shared by every read, including the feed page.
+func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
+	var (
+		e                                     es.Envelope
+		eventID, streamType, streamID         string
+		occurredAt, recordedAt                string
+		correlationID, causationID, commandID string
+		actorType, actorID                    string
+	)
+	if err := rows.Scan(
+		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
+		&e.TypeURL, &e.SchemaVersion, &occurredAt, &recordedAt,
+		&correlationID, &causationID, &commandID,
+		&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
+	); err != nil {
+		return es.Envelope{}, err
+	}
+	var err error
+	if e.EventID, err = uuid.Parse(eventID); err != nil {
+		return es.Envelope{}, fmt.Errorf("parse event_id %q: %w", eventID, err)
+	}
+	if e.StreamID, err = es.ParseCanonical(streamID); err != nil {
+		return es.Envelope{}, fmt.Errorf("parse stream_id %q: %w", streamID, err)
+	}
+	if e.OccurredAt, err = parseTS(occurredAt); err != nil {
+		return es.Envelope{}, fmt.Errorf("parse occurred_at %q: %w", occurredAt, err)
+	}
+	if e.RecordedAt, err = parseTS(recordedAt); err != nil {
+		return es.Envelope{}, fmt.Errorf("parse recorded_at %q: %w", recordedAt, err)
+	}
+	e.CorrelationID, _ = uuid.Parse(correlationID)
+	e.CausationID, _ = uuid.Parse(causationID)
+	e.CommandID, _ = uuid.Parse(commandID)
+	e.Actor = es.Actor{Type: actorType, ID: actorID}
+	return e, nil
 }
 
 // LoadCheckpoint returns the last processed global_position for a

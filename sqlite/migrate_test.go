@@ -19,8 +19,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 2 {
-		t.Fatalf("applied version = %d, want 2 (0001 schema + 0002 hash chain)", v)
+	if v != 3 {
+		t.Fatalf("applied version = %d, want 3 (0001 schema + 0002 hash chain + 0003 feed)", v)
 	}
 	// Re-running is a no-op, not an error.
 	if err := s.Migrate(ctx); err != nil {

@@ -15,8 +15,8 @@ import (
 // rows under schema 0001, applies 0002, appends, and checks the ADR 0029 §5
 // behaviour: old rows stay unhashed, the first new row chains to
 // UnchainedHeadHash(sid, head), VerifyStream reports ChainedFrom, and the
-// migration version is 2. It is an internal test so it can apply one
-// migration at a time.
+// migration version is 3 (0002 and 0003 applied together). It is an
+// internal test so it can apply one migration at a time.
 func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", withPragmas("file:"+t.Name()+"?mode=memory&cache=shared"))
@@ -61,8 +61,8 @@ func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	var version int
-	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 2 {
-		t.Fatalf("schema version = %d err=%v, want 2", version, err)
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 3 {
+		t.Fatalf("schema version = %d err=%v, want 3", version, err)
 	}
 	since, err := s.ChainedSince(ctx)
 	if err != nil || since.IsZero() {
