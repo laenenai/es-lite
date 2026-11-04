@@ -13,9 +13,8 @@ import (
 // Feed is a live source of envelopes (ADR 0030 §2). Feed delivers each
 // envelope to handle, in per-stream order, until ctx ends; a nil return
 // means "applied, acknowledge" and an error means "not applied — redeliver
-// later". natsjs.NewFeed implements it over a JetStream durable consumer;
-// LogFeed implements it by tailing the log directly, which is how a
-// projector is tested (and run on single-node SQLite) with no NATS.
+// later". eventfeed implements it over the event feed; LogFeed implements
+// it by tailing the log directly.
 type Feed interface {
 	Feed(ctx context.Context, handle func(ctx context.Context, e es.Envelope) error) error
 }

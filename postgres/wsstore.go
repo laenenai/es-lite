@@ -347,6 +347,28 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 	return v, err
 }
 
+// Head returns the workspace's current log head: the highest
+// global_position in the workspace, or 0 when it has no events. It is the
+// position a live feed resumes from and the checkpoint a reset rewinds to.
+// It is deliberately not on es.Store: it exists for feed plumbing, not for
+// the append/read contract.
+func (w *Workspace) Head(ctx context.Context) (uint64, error) {
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events WHERE workspace_id = $1`,
+		w.ws,
+	).Scan(&head)
+	return head, err
+}
+
 // LookupClaim reads the uniqueness index (unique_claims) for the stream holding
 // (scope, value). The value is keyed exactly as applyClaims stores it — opaque
 // bytes as given (ADR 0025) — so writes and lookups agree. A personal-data
