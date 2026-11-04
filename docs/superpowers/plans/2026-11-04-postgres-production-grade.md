@@ -393,13 +393,14 @@ type Observer interface {
 }
 ```
 
-`Config.Observer Observer` + `feed.NoopObserver`; `feed.Log` gains `MatchingHead(ctx context.Context, types []string) (uint64, error)` (fence-bounded on Postgres); `func (s *Server) Status(ctx context.Context, req Request) (Status, error)` replaces the type-blind `Status` (old signature removed; the duplicate checkpoint read dies with it). `Status.Lag` becomes `matchingHead − position`.
+`Config.Observer Observer` + `feed.NoopObserver`; `feed.Log` gains `RawHead(ctx context.Context) (uint64, error)` (already implemented on `*Workspace` in Task 3) and `MatchingHead(ctx context.Context, types []string) (uint64, error)` (fence-bounded on Postgres); `func (s *Server) Status(ctx context.Context, req Request) (Status, error)` replaces the type-blind `Status` (old signature removed; the duplicate checkpoint read dies with it). `Status.Lag` becomes `matchingHead − position`.
 
 - [ ] **Step 1: Failing test** `TestObserverReportsStall`: an in-flight append holds the fence; two consecutive empty pages → exactly one `OnStall` (rate limit: ≥1 probe per stream per few seconds) with `raw > settled`; after commit, no further stalls.
 - [ ] **Step 2: Failing test** `TestStatusLagIsFilterAware`: matching head 100, all-type head 500, checkpoint 100 → `Lag == 0` (the old code reported 400).
-- [ ] **Step 3: Implement**: `Observer`/`NoopObserver`; wire `OnPage`, `OnCheckpoint` (fenced acks), `OnLeaseLost` (renewal failure), `OnPoison` (oversized first row, both server check and adapter path), `OnStall` (rate-limited `RawHead` probe in the empty-page branch); `MatchingHead` on both backends; `Status(ctx, req)`.
-- [ ] **Step 4: Run** `GOWORK=off go test -race ./...` and `task test:pg` — green.
-- [ ] **Step 5: Commit** — `feat(feed): observer, matching head, filter-aware lag`
+- [ ] **Step 3: Failing test** `TestSubscribeResumeClampIsFenceAware` (carried ruling from Task 3's review — Important finding): a fake `Log` whose `Head()` returns 0 (fence-blocked) while `RawHead()` returns ≥ the checkpoint; `Subscribe` resuming at checkpoint 5000 must NOT clamp `pos` to 0 and must NOT read any page below 5000; once the fake's `Head` unblocks, delivery resumes from 5000. The clamp (feed/server.go, `pos > head`) is for restored/empty logs only.
+- [ ] **Step 4: Implement**: `Observer`/`NoopObserver`; wire `OnPage`, `OnCheckpoint` (fenced acks), `OnLeaseLost` (renewal failure), `OnPoison` (oversized first row, both server check and adapter path), `OnStall` (rate-limited `RawHead` probe in the empty-page branch); `MatchingHead` on both backends; `Status(ctx, req)`; and the fence-aware clamp: in `stream()`, when `pos > head`, consult `RawHead` — `raw >= pos` means the fence is transiently blocked, so do not clamp, wait and re-head; only clamp when `raw < pos` (restored or empty log).
+- [ ] **Step 5: Run** `GOWORK=off go test -race ./...` and `task test:pg` — green.
+- [ ] **Step 6: Commit** — `feat(feed): observer, matching head, filter-aware lag, fence-aware resume clamp`
 
 ### Task 17: `eventfeed` consumer adapter
 
