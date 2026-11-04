@@ -17,5 +17,9 @@
 # OS cruft.
 .DS_Store
 
+# Implementation worktrees (isolated SDD execution) and its scratch space.
+/.worktrees/
+/.superpowers/
+
 # NOTE: gen/ is intentionally NOT ignored — generated code is checked in,
 # and `task generate:check` gates it in CI.
