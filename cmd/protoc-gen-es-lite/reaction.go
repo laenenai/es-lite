@@ -92,8 +92,8 @@ func (rc reactSpec) catalogue() catalogueEntry {
 	return e
 }
 
-// writeReaction emits, for base "ResetOnClosed": the Name/Subjects/filter
-// header, the Handler (with a trailing *ResetOnClosedIssuer parameter), the
+// writeReaction emits, for base "ResetOnClosed": the Name/Subjects/Consumes/
+// filter header, the Handler (with a trailing *ResetOnClosedIssuer parameter), the
 // Issuer with one method per issued command, loader seams, Deps (loaders,
 // codecs, one reaction.Dispatcher per issuing aggregate, Actor, Marker) and
 // NewResetOnClosedRunner returning a *reaction.Runner (no Rebuild).

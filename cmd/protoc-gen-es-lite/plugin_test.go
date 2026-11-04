@@ -1,6 +1,9 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"testing"
 
@@ -210,8 +213,13 @@ func domainFile(withAggregate bool) *descriptorpb.FileDescriptorProto {
 	return f
 }
 
+// readModel puts the projection alone in its own file (t/v1/view.proto),
+// with the domain package only imported: a projection that is alone in its
+// file is the shape that caught the metadata-only fmt import (Task 17),
+// because nothing else in the file can mask an unused import.
 func readModel(spec *esv1.ProjectionSpec) *descriptorpb.FileDescriptorProto {
-	f := fileProto("t/v1/t.proto", "t.v1")
+	f := fileProto("t/v1/view.proto", "t.v1")
+	f.Dependency = append(f.Dependency, "t/v1/t.proto")
 	f.MessageType = []*descriptorpb.DescriptorProto{{Name: proto.String("View"), Options: projectionOpts(spec)}}
 	return f
 }
@@ -273,6 +281,7 @@ func TestProjectionGeneratesHandlerAndRunner(t *testing.T) {
 			t.Fatalf("generated code lacks %q:\n%s", want, content)
 		}
 	}
+	assertAllImportsUsed(t, content)
 }
 
 func TestProjectionErrors(t *testing.T) {
@@ -318,6 +327,94 @@ func TestDuplicateSpecNameRejected(t *testing.T) {
 	}
 }
 
+// A metadata-only projection alone in its file must not register fmt: the
+// dispatch has no state-decoding branch, so an unconditional errorf leaves
+// the import unused and the generated file does not compile downstream.
+func TestProjectionMetadataOnlyHasNoUnusedImports(t *testing.T) {
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_METADATA_ONLY
+	content, err := runWith(t, readModel(spec), domainFile(true))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{
+		"OnHappened(ctx context.Context, env es.Envelope) error",
+		"func NewViewRunner(h ViewHandler, deps ViewDeps) *projection.Runner",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated code lacks %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "\"fmt\"") {
+		t.Fatalf("metadata-only projection must not import fmt:\n%s", content)
+	}
+	assertAllImportsUsed(t, content)
+}
+
+// The exported Consumes list preserves the proto option's order, not any
+// sorted order — a catalogue seeds and drift-checks its filter from it.
+func TestSpecExportsConsumesInOptionOrder(t *testing.T) {
+	f := domainFile(true)
+	f.Dependency = append(f.Dependency, "u/v1/u.proto")
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(&esv1.ProjectionSpec{
+		Name: "t.view", Kind: esv1.ProjectionKind_PROJECTION_KIND_READ_MODEL,
+		// u before t: not alphabetical, so only option order explains it.
+		Consumes: []string{"u.v1.Happened", "t.v1.Happened"},
+		Fetch:    esv1.FetchMode_FETCH_MODE_METADATA_ONLY,
+		Rebuild:  esv1.RebuildMode_REBUILD_MODE_FROM_LOG,
+	})})
+	content, err := runWith(t, f, secondDomainFile())
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	rest := strings.SplitN(content, "func ViewConsumes() []string", 2)
+	if len(rest) != 2 {
+		t.Fatalf("generated code lacks ViewConsumes:\n%s", content)
+	}
+	i := strings.Index(rest[1], `"u.v1.Happened"`)
+	j := strings.Index(rest[1], `"t.v1.Happened"`)
+	if i < 0 || j < 0 || j < i {
+		t.Fatalf("ViewConsumes must list u.v1.Happened before t.v1.Happened:\n%s", content)
+	}
+}
+
+// assertAllImportsUsed parses generated Go and fails when an imported
+// package is never referenced in the file body: an unused import is a
+// compile error in the consumer's tree, not in the plugin's own tests.
+func assertAllImportsUsed(t *testing.T, content string) {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "generated.go", content, 0)
+	if err != nil {
+		t.Fatalf("generated code does not parse: %v\n%s", err, content)
+	}
+	used := map[string]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if id, ok := sel.X.(*ast.Ident); ok {
+				used[id.Name] = true
+			}
+		}
+		return true
+	})
+	for _, imp := range file.Imports {
+		name := ""
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		if name == "_" || name == "." {
+			continue
+		}
+		if name == "" {
+			path := strings.Trim(imp.Path.Value, `"`)
+			name = path[strings.LastIndex(path, "/")+1:]
+		}
+		if !used[name] {
+			t.Fatalf("generated code imports %s as %s but never uses it:\n%s", imp.Path.Value, name, content)
+		}
+	}
+}
+
 func TestReactionGeneratesIssuerAndRejectsNonCommand(t *testing.T) {
 	f := domainFile(true)
 	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
@@ -333,6 +430,7 @@ func TestReactionGeneratesIssuerAndRejectsNonCommand(t *testing.T) {
 		"func (i *ReactIssuer) Do(sid es.StreamID, cmd *Do)",
 		"StateRouter reaction.Dispatcher[Command]",
 		"func NewReactRunner(h ReactHandler, deps ReactDeps) *reaction.Runner",
+		"func ReactConsumes() []string",
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("generated code lacks %q:\n%s", want, content)

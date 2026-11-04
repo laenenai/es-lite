@@ -177,7 +177,9 @@ Rules the generator enforces (generation fails, not just lint):
 ## 6. What the generated Go looks like (for the gate/executor authors)
 
 For `CaseSummary` above, `gen/.../case_summary_es.pb.go` holds
-`CaseSummaryName`, `CaseSummarySubjects(workspace)`, `CaseSummaryHandler`
+`CaseSummaryName`, `CaseSummarySubjects(workspace)`, `CaseSummaryConsumes()`
+(the `consumes` option verbatim, in its order — seed and drift-check a
+server-side type filter from it), `CaseSummaryHandler`
 (`OnCaseOpened(ctx, env, ev *casev1.CaseOpened, state *casev1.Case) error`,
 …), `CaseSummaryCaseLoader` (satisfied by the embedded `aggregate.Runtime`
 and by a gate client), `CaseSummaryDeps{Case, CaseCodec, Marker}` and

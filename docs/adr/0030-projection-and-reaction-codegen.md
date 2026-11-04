@@ -270,6 +270,14 @@ express "one method per consumed type".
 - **`FETCH_MODE_UNSPECIFIED` is a generation error**, as are a missing
   `name`/`kind`, duplicate names across the run, duplicate consumed event or
   issued command Go names within one spec, and empty `consumes`.
+- **Imports are registered only when the generated code uses them.** The
+  dispatch registers `fmt` for its `errorf` only when it has a state-decoding
+  branch: a metadata-only spec is alone in its file downstream (no sum types
+  to mask it), and an unused import is a compile error there, not here.
+- **Every spec also exports `<Name>Consumes() []string`** — the `consumes`
+  option verbatim, in its order, next to `<Name>Subjects` — so a downstream
+  catalogue can seed and drift-check its server-side type filter without
+  re-reading proto options.
 - **Field-number change vs. the `contracts` original:** `rebuild` is 5 and
   `max_lag` 6 in `es.v1.ProjectionSpec` (`ceiling` is gone). Options are
   written by name, so the migration is mechanical

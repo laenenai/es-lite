@@ -31,6 +31,18 @@ func CounterViewSubjects(workspace string) []string {
 	}
 }
 
+// CounterViewConsumes returns the consumed event type URLs in the spec's
+// order — the proto consumes option verbatim. A catalogue or feed config
+// seeds and drift-checks its server-side type filter from it.
+func CounterViewConsumes() []string {
+	return []string{
+		"counter.v1.Initialized",
+		"counter.v1.Incremented",
+		"counter.v1.Decremented",
+		"counter.v1.Closed",
+	}
+}
+
 // counterViewConsumes reports whether env is one of the consumed types.
 func counterViewConsumes(env es.Envelope) bool {
 	switch env.TypeURL {
@@ -162,6 +174,16 @@ func CounterActivitySubjects(workspace string) []string {
 	}
 }
 
+// CounterActivityConsumes returns the consumed event type URLs in the spec's
+// order — the proto consumes option verbatim. A catalogue or feed config
+// seeds and drift-checks its server-side type filter from it.
+func CounterActivityConsumes() []string {
+	return []string{
+		"counter.v1.Incremented",
+		"counter.v1.Decremented",
+	}
+}
+
 // counterActivityConsumes reports whether env is one of the consumed types.
 func counterActivityConsumes(env es.Envelope) bool {
 	switch env.TypeURL {
@@ -218,6 +240,15 @@ func ResetOnClosedSubjects(workspace string) []string {
 	}
 	return []string{
 		"evt." + workspace + ".counter.closed",
+	}
+}
+
+// ResetOnClosedConsumes returns the consumed event type URLs in the spec's
+// order — the proto consumes option verbatim. A catalogue or feed config
+// seeds and drift-checks its server-side type filter from it.
+func ResetOnClosedConsumes() []string {
+	return []string{
+		"counter.v1.Closed",
 	}
 }
 

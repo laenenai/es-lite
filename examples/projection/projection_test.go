@@ -105,6 +105,14 @@ func TestProjectorLiveOverLogFeed(t *testing.T) {
 	if got := counterviewv1.CounterViewSubjects("*"); len(got) != 4 || got[0] != "evt.*.counter.initialized" {
 		t.Fatalf("subjects = %v", got)
 	}
+	if got, want := counterviewv1.CounterViewConsumes(), []string{
+		"counter.v1.Initialized",
+		"counter.v1.Incremented",
+		"counter.v1.Decremented",
+		"counter.v1.Closed",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("consumes = %v, want %v (the spec's order)", got, want)
+	}
 }
 
 // TestRebuildEqualsLive: a fresh read model rebuilt from position 0 equals

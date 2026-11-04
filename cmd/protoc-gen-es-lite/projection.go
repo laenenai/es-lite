@@ -153,6 +153,7 @@ func (p projSpec) catalogue() catalogueEntry {
 //
 //	const CounterViewName = "counter.view"
 //	func CounterViewSubjects(workspace string) []string
+//	func CounterViewConsumes() []string
 //	type CounterViewHandler interface { On<Event>(ctx, env[, ev, state]) error ... }
 //	type CounterView<State>Loader interface { LoadAsOfVersion(...) }   (STATE_AS_OF only)
 //	type CounterViewDeps struct { <State> <Loader>; <State>Codec es.Codec[<Event>]; Marker projection.Marker }
@@ -174,8 +175,9 @@ func writeProjection(g *protogen.GeneratedFile, p projSpec) {
 	g.P()
 }
 
-// writeSpecHeader emits the Name constant, the Subjects function and the
-// consumed-type filter shared by projections and reactions.
+// writeSpecHeader emits the Name constant, the Subjects function, the
+// exported Consumes list and the consumed-type filter shared by projections
+// and reactions.
 func writeSpecHeader(g *protogen.GeneratedFile, base, kind, name string, consumes []consumed, aggs *aggregateSet) {
 	envelope := g.QualifiedGoIdent(esPkgPath.Ident("Envelope"))
 	g.P("// ", base, "Name is the ", kind, "'s stable name: its marker key and durable name.")
@@ -191,6 +193,17 @@ func writeSpecHeader(g *protogen.GeneratedFile, base, kind, name string, consume
 	g.P("	return []string{")
 	for _, c := range consumes {
 		g.P("		\"evt.\" + workspace + ", fmt.Sprintf("%q", eventSubjectSuffix(c.agg, c.typeURL)), ",")
+	}
+	g.P("	}")
+	g.P("}")
+	g.P()
+	g.P("// ", base, "Consumes returns the consumed event type URLs in the spec's")
+	g.P("// order — the proto consumes option verbatim. A catalogue or feed config")
+	g.P("// seeds and drift-checks its server-side type filter from it.")
+	g.P("func ", base, "Consumes() []string {")
+	g.P("	return []string{")
+	for _, c := range consumes {
+		g.P("		", fmt.Sprintf("%q", c.typeURL), ",")
 	}
 	g.P("	}")
 	g.P("}")
@@ -297,9 +310,12 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	envelope := g.QualifiedGoIdent(esPkgPath.Ident("Envelope"))
 	encoded := g.QualifiedGoIdent(esPkgPath.Ident("EncodedEvent"))
-	errorf := g.QualifiedGoIdent(fmtPkgPath.Ident("Errorf"))
-
+	// fmt is registered only when the dispatch has a state-decoding branch:
+	// a metadata-only spec has no errorf, and an unconditional registration
+	// would leave the import unused — the file would not compile downstream.
+	var errorf string
 	if withState {
+		errorf = g.QualifiedGoIdent(fmtPkgPath.Ident("Errorf"))
 		aggs := newAggregateSet()
 		for _, c := range consumes {
 			aggs.add(c.agg)

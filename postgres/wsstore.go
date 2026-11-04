@@ -327,6 +327,73 @@ func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int)
 	return w.query(ctx, q, w.ws, fromPosition, limit)
 }
 
+// ReadAllBounded is ReadAll restricted to the given type URLs and bounded by
+// a payload-byte budget: the page a live feed or rebuild reads next. types is
+// the server-side filter — only rows whose type_url is in types are returned
+// (matched in SQL, before any payload is walked) and an empty types set
+// returns no events at all. The page holds at most limit events after from,
+// in global order, but stops before an event whose payload would push the
+// running payload total past maxBytes and reports truncated=true, so the
+// caller continues immediately instead of waiting out a poll. The first
+// event of a page is always included, even alone over budget: an oversized
+// event must be visible to the caller, not forever skipped.
+//
+// The budget counts the payload bytes this store returns, opaquely (ADR
+// 0025): for a sealed workspace these are the stored ciphertext bytes, and a
+// plaintext budget belongs to the sealing adapter above the store. maxBytes
+// <= 0 disables the budget. Like ReadAll it is deliberately not on es.Store.
+func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error) {
+	if len(types) == 0 {
+		return nil, false, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return nil, false, err
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT `+envelopeCols+` FROM events
+	      WHERE workspace_id = $1 AND global_position > $2 AND type_url = ANY($4)
+	      ORDER BY global_position ASC LIMIT $3`,
+		w.ws, from, limit, types)
+	if err != nil {
+		return nil, false, err
+	}
+	var (
+		out       []es.Envelope
+		total     int
+		truncated bool
+	)
+	for rows.Next() {
+		e, err := scanEnvelope(rows)
+		if err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		// len(out) == 0 carries the first row whatever its size; after
+		// that, stop before a row that would push the total past the
+		// budget. The row that stopped the page was read, so truncated is
+		// certain — more rows remain for the next call.
+		if len(out) > 0 && maxBytes > 0 && total+len(e.Payload) > maxBytes {
+			truncated = true
+			break
+		}
+		total += len(e.Payload)
+		out = append(out, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return out, truncated, nil
+}
+
 func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (uint64, error) {
 	if err := sid.Validate(); err != nil {
 		return 0, err
