@@ -55,7 +55,7 @@ func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 		}
 	}
 
-	// Now the upgrade: Migrate applies 0002 only.
+	// Now the upgrade: Migrate applies every embedded migration through 0003.
 	s, err := NewWithDB(ctx, db)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)

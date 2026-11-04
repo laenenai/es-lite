@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,17 @@ func openFeedStore(t *testing.T) *sqlite.Store {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// openFeedStoreAt opens a file-backed store so a test can close and reopen it,
+// proving durability rather than in-process reuse.
+func openFeedStoreAt(t *testing.T, path string) *sqlite.Store {
+	t.Helper()
+	s, err := sqlite.Open(context.Background(), "file:"+path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
 	return s
 }
 
@@ -69,23 +81,37 @@ func TestHeadEmptyAndAfterAppends(t *testing.T) {
 		t.Fatalf("head empty = %d, want 0", head)
 	}
 
-	sid := mustStreamID(t, "thing", "head")
+	// Interleave two streams so the log head (global position) and the
+	// highest per-stream version diverge: a version-based Head regression
+	// would return 2 here instead of 3.
+	a := mustStreamID(t, "thing", "head-a")
+	b := mustStreamID(t, "thing", "head-b")
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID: a,
+		Events:   []es.EventData{{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("one")}},
+	}); err != nil {
+		t.Fatalf("append a1: %v", err)
+	}
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID: b,
+		Events:   []es.EventData{{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("two")}},
+	}); err != nil {
+		t.Fatalf("append b1: %v", err)
+	}
 	res, err := s.Append(ctx, es.AppendParams{
-		StreamID: sid,
-		Events: []es.EventData{
-			{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("one")},
-			{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("two")},
-		},
+		StreamID:        a,
+		ExpectedVersion: 1,
+		Events:          []es.EventData{{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("three")}},
 	})
 	if err != nil {
-		t.Fatalf("append: %v", err)
+		t.Fatalf("append a2: %v", err)
 	}
 	head, err = s.Head(ctx)
 	if err != nil {
 		t.Fatalf("head: %v", err)
 	}
-	if want := res.Envelopes[len(res.Envelopes)-1].GlobalPosition; head != want {
-		t.Fatalf("head = %d, want %d", head, want)
+	if want := res.Envelopes[0].GlobalPosition; head != want || head != 3 {
+		t.Fatalf("head = %d, want %d (global position 3, not the stream version 2)", head, want)
 	}
 }
 
@@ -193,6 +219,50 @@ func TestReadAllBoundedByteBudget(t *testing.T) {
 	}
 	if len(got) != 4 || truncated {
 		t.Fatalf("unbounded page = %d events truncated=%v, want 4/false", len(got), truncated)
+	}
+}
+
+func TestReadAllBoundedExactBudgetFit(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	sid := mustStreamID(t, "thing", "exact-budget")
+	const typ = "thing.v1.Happened"
+
+	appendFeedEvent(t, s, sid, 0, typ, []byte("abcd")) // 4 bytes
+	appendFeedEvent(t, s, sid, 1, typ, []byte("efgh")) // 4 bytes
+
+	// The page totals exactly the budget and no rows remain: it must not be
+	// reported truncated. A >= comparison would stop after the first row.
+	got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 8, []string{typ})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 2 || truncated {
+		t.Fatalf("exact fit = %d events truncated=%v, want 2/false", len(got), truncated)
+	}
+}
+
+func TestReadAllBoundedDefaultLimit(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	sid := mustStreamID(t, "thing", "default-limit")
+	const typ = "thing.v1.Happened"
+
+	events := make([]es.EventData, 101)
+	for i := range events {
+		events[i] = es.EventData{TypeURL: typ, SchemaVersion: 1, Payload: []byte("x")}
+	}
+	if _, err := s.Append(ctx, es.AppendParams{StreamID: sid, Events: events}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// limit <= 0 selects the adapter default of 100, not "all".
+	got, _, err := s.ReadAllBounded(ctx, 0, 0, 0, []string{typ})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("default limit = %d events, want 100", len(got))
 	}
 }
 
@@ -352,6 +422,29 @@ func TestLeaseExactlyOneWinner(t *testing.T) {
 	}
 }
 
+func TestLeaseReacquireBySameOwnerUpdatesConsumer(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	leases := sqlite.NewLeaseStore(s)
+	key := "lease-reacquire"
+
+	if ok, err := leases.Acquire(ctx, key, "owner-a", "pod-a", time.Minute); err != nil || !ok {
+		t.Fatalf("first acquire = %v err=%v, want true/nil", ok, err)
+	}
+	// A reconnect by the same owner must succeed and refresh the consumer
+	// identity Status reports.
+	if ok, err := leases.Acquire(ctx, key, "owner-a", "pod-b", time.Minute); err != nil || !ok {
+		t.Fatalf("same-owner acquire = %v err=%v, want true/nil", ok, err)
+	}
+	lease, held, err := leases.Holder(ctx, key)
+	if err != nil || !held {
+		t.Fatalf("holder = found=%v err=%v, want held", held, err)
+	}
+	if lease.Owner != "owner-a" || lease.Consumer != "pod-b" {
+		t.Fatalf("holder = %+v, want owner-a/pod-b", lease)
+	}
+}
+
 func TestLeaseExpiryLetsAnotherOwnerWin(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
@@ -504,7 +597,8 @@ func (c *cancelSink) got() []es.Envelope {
 
 func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	ctx := context.Background()
-	s := openFeedStore(t)
+	path := filepath.Join(t.TempDir(), "feed.db")
+	s := openFeedStoreAt(t, path)
 	sid := mustStreamID(t, "counter", "e2e")
 
 	const (
@@ -523,15 +617,18 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	srv, err := feed.NewServer(feed.Config{
-		Logs:        sqlite.NewLogs(s),
-		Checkpoints: sqlite.NewCheckpointStore(s),
-		Leases:      sqlite.NewLeaseStore(s),
-		Poll:        10 * time.Millisecond,
-		Batch:       10,
-	})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
+	newServer := func(s *sqlite.Store) *feed.Server {
+		srv, err := feed.NewServer(feed.Config{
+			Logs:        sqlite.NewLogs(s),
+			Checkpoints: sqlite.NewCheckpointStore(s),
+			Leases:      sqlite.NewLeaseStore(s),
+			Poll:        10 * time.Millisecond,
+			Batch:       10,
+		})
+		if err != nil {
+			t.Fatalf("new server: %v", err)
+		}
+		return srv
 	}
 
 	req := feed.Request{
@@ -542,7 +639,9 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 		Definition: projection.Definition{Name: "p", Consumes: []string{consumed}},
 	}
 
-	// First subscription: collect the two consumed events and cancel.
+	// First process: collect the two consumed events, acknowledge, then close
+	// the store so the resume crosses a real reopen rather than reusing state.
+	srv := newServer(s)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel1()
 	sink1 := &cancelSink{want: 2, cancel: cancel1}
@@ -565,14 +664,21 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	if err := srv.Checkpoint(ctx, req.Scope, req.Projection, req.Instance, acked); err != nil {
 		t.Fatalf("checkpoint at %d: %v", acked, err)
 	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close first store: %v", err)
+	}
 
-	// New event after the checkpoint. A resumed subscription must see only it.
-	next := appendFeedEvent(t, s, sid, 3, consumed, []byte("a3"))
+	// Second process: reopen the same file, append one event, and prove the
+	// checkpoint survived.
+	s2 := openFeedStoreAt(t, path)
+	t.Cleanup(func() { _ = s2.Close() })
+	next := appendFeedEvent(t, s2, sid, 3, consumed, []byte("a3"))
+	srv2 := newServer(s2)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	sink2 := &cancelSink{want: 1, cancel: cancel2}
-	if err := srv.Subscribe(ctx2, req, sink2); err != nil && !errors.Is(err, context.Canceled) {
+	if err := srv2.Subscribe(ctx2, req, sink2); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("subscribe 2: %v", err)
 	}
 

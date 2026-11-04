@@ -220,7 +220,7 @@ func (l *LeaseStore) Acquire(ctx context.Context, key, owner, consumer string, t
 		     consumer = excluded.consumer,
 		     expires_at_ns = excluded.expires_at_ns
 		 WHERE feed_leases.owner = excluded.owner
-		    OR feed_leases.expires_at_ns < ?`,
+		    OR feed_leases.expires_at_ns <= ?`,
 		key, owner, consumer, now.Add(ttl).UnixNano(), now.UnixNano(),
 	)
 	if err != nil {
