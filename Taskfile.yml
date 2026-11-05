@@ -91,6 +91,19 @@ tasks:
       - defer: docker rm -f es-lite-pg
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -count=1 ./postgres/...
 
+  test:feedgate:
+    desc: >
+      Feed gate (Phase 1 / Gate 0): chaos no-loss, page-query plan and fleet
+      scenarios against a throwaway Docker Postgres. Too slow for the PR path;
+      CI runs it nightly. Benchmarks are run separately (-bench) for the
+      write-path baseline.
+    cmds:
+      - docker rm -f es-lite-pg 2>/dev/null || true
+      - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
+      - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      - defer: docker rm -f es-lite-pg
+      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -race -shuffle=on -tags feedgate -count=1 -timeout 45m ./postgres/ -run TestFeedGate
+
   vet:
     desc: go vet across the module and the cmdsvc nested module.
     cmds:
