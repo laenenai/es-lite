@@ -160,13 +160,20 @@ func (s *Server) newOwner() string {
 // stream with a *LeaseLostError. Subscribe always releases the lease before
 // returning, even when the stream failed.
 //
+// The lease owner is req.Owner verbatim, so the consumer can fence its
+// acknowledgements (Ack.Owner must match the holder). An empty req.Owner
+// makes the server mint an opaque owner, and such a stream is not ackable.
+//
 // Subscribe never saves checkpoints. The consumer acknowledges with
 // Checkpoint, so reconnecting resumes at its last acknowledged batch.
 func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err error) {
 	if err := validateRequest(req, sink); err != nil {
 		return err
 	}
-	owner := s.newOwner()
+	owner := req.Owner
+	if owner == "" {
+		owner = s.newOwner()
+	}
 
 	acquired, err := s.cfg.Leases.Acquire(ctx, req.Scope, req.Projection, req.Instance, owner, req.Consumer, s.cfg.LeaseTTL)
 	if err != nil {
@@ -379,14 +386,37 @@ func (s *Server) batchSize(requested int) int {
 	return requested
 }
 
-// Checkpoint records the consumer's acknowledged position. The consumer calls
-// this through the transport adapter; Subscribe itself never saves.
-func (s *Server) Checkpoint(ctx context.Context, scope, projection, instance string, position uint64) error {
-	if err := validateKey(scope, projection, instance); err != nil {
+// Checkpoint records the consumer's acknowledged position — the only writer
+// of the delivery cursor; Subscribe never saves. The ack is fenced on the
+// lease: the subscription key must be held by ack.Owner, so a stale
+// consumer's late ack (an in-flight receipt arriving after a takeover) or a
+// foreign owner's claim is rejected instead of advancing the shared cursor
+// past events the live subscriber has not delivered. Not held rejects with
+// an error matching ErrLeaseLost; a different holder with *LeaseHeldError.
+//
+// The holder check and the save are two steps, and a lease may be lost
+// between them. The failure mode stays safe: the ack is rejected and the
+// consumer reconnects — never an advanced cursor. A stream subscribed with
+// an empty Request.Owner has a server-minted, opaque owner and therefore
+// cannot ack. Ack.Definition is not persisted yet; Task 11 passes it to
+// CheckpointStore.Save, which gains the parameter then.
+func (s *Server) Checkpoint(ctx context.Context, ack Ack) error {
+	if err := validateKey(ack.Scope, ack.Projection, ack.Instance); err != nil {
 		return err
 	}
-	if err := s.cfg.Checkpoints.Save(ctx, scope, projection, instance, position); err != nil {
-		return fmt.Errorf("feed: save checkpoint %s/%s/%s at %d: %w", scope, projection, instance, position, err)
+	key := fmt.Sprintf("%s/%s/%s", ack.Scope, ack.Projection, ack.Instance)
+	lease, held, err := s.cfg.Leases.Holder(ctx, ack.Scope, ack.Projection, ack.Instance)
+	if err != nil {
+		return fmt.Errorf("feed: holder for %s: %w", key, err)
+	}
+	if !held {
+		return &LeaseLostError{Key: key, Owner: ack.Owner, Err: errLeaseExpired}
+	}
+	if lease.Owner != ack.Owner {
+		return &LeaseHeldError{Key: key, Lease: lease, Held: true}
+	}
+	if err := s.cfg.Checkpoints.Save(ctx, ack.Scope, ack.Projection, ack.Instance, ack.Position); err != nil {
+		return fmt.Errorf("feed: save checkpoint %s at %d: %w", key, ack.Position, err)
 	}
 	return nil
 }

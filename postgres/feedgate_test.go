@@ -428,8 +428,9 @@ type fgKillMark struct {
 }
 
 // fgConsumer is the chaos consumer harness: a feed.Sink that records every
-// delivery and acks every fgChaosAckEvery events through the CURRENT
-// Server.Checkpoint API, plus the reconnect loop that survives kills.
+// delivery and acks every fgChaosAckEvery events with a lease-fenced
+// feed.Ack under its Request.Owner token, plus the reconnect loop that
+// survives kills.
 type fgConsumer struct {
 	tb testing.TB
 
@@ -477,6 +478,11 @@ func newFGConsumer(tb testing.TB, idx int) *fgConsumer {
 		Projection: c.projection,
 		Instance:   c.instance,
 		Consumer:   "feedgate-chaos",
+		// A stable owner token: every generation of this consumer's
+		// reconnect loop re-subscribes under it, so its acks are fenced to
+		// the lease its own live stream holds (spec §5.4: a stable token
+		// gives self-stealing reconnects).
+		Owner:      fmt.Sprintf("feedgate-chaos-%d", idx),
 		Definition: projection.Definition{Name: c.projection, Consumes: []string{c.typeURL}},
 	}
 	return c
@@ -512,8 +518,15 @@ func (c *fgConsumer) Send(ctx context.Context, env es.Envelope) error {
 	gen := c.gen
 	c.mu.Unlock()
 	if needAck {
-		// TODO(Task 10): migrate this ack to the new Ack API.
-		if err := gen.srv.Checkpoint(ctx, c.scope, c.projection, c.instance, pos); err != nil {
+		// TODO(Task 11): Ack.Definition carries the consumer's
+		// Definition.Hash() once Checkpoint persists it; empty for now.
+		if err := gen.srv.Checkpoint(ctx, feed.Ack{
+			Scope:      c.scope,
+			Projection: c.projection,
+			Instance:   c.instance,
+			Owner:      c.req.Owner,
+			Position:   pos,
+		}); err != nil {
 			return fmt.Errorf("feedgate: ack %s/%s/%s at %d: %w", c.scope, c.projection, c.instance, pos, err)
 		}
 		c.mu.Lock()

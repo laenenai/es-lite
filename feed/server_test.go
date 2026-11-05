@@ -626,8 +626,14 @@ func TestValidateKeyRejectsControlBytes(t *testing.T) {
 		t.Fatalf("rejected requests acquired %d lease(s); validation must fail closed before the lease store", len(leases.acquired))
 	}
 
-	// The empty instance is the documented default instance and stays valid.
-	if err := srv.Checkpoint(context.Background(), "tenant", "counter.view", "", 1); err != nil {
+	// The empty instance is the documented default instance and stays valid:
+	// a fenced ack on the default key has to get past validateKey, so hold
+	// the key's lease first and checkpoint through the full path.
+	if _, err := leases.Acquire(context.Background(), "tenant", "counter.view", "", "owner-empty", "worker-1", time.Minute); err != nil {
+		t.Fatalf("acquire the default-instance lease: %v", err)
+	}
+	ack := feed.Ack{Scope: "tenant", Projection: "counter.view", Instance: "", Owner: "owner-empty", Position: 1}
+	if err := srv.Checkpoint(context.Background(), ack); err != nil {
 		t.Fatalf("Checkpoint with the default (empty) instance: %v", err)
 	}
 }
@@ -1242,16 +1248,242 @@ func TestConfigNegativeValueSemantics(t *testing.T) {
 
 func TestCheckpointSavesThePosition(t *testing.T) {
 	checkpoints := newMemCheckpoints(time.Now())
+	leases := newMemLeases()
 	srv := newServer(t, feed.Config{
-		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: newMemLogs(),
+		Checkpoints: checkpoints, Leases: leases, Logs: newMemLogs(),
 	})
-	if err := srv.Checkpoint(context.Background(), "tenant", "counter.view", "live", 42); err != nil {
+	// Checkpoint is fenced on the lease: the ack's owner must hold the key.
+	if _, err := leases.Acquire(context.Background(), "tenant", "counter.view", "live", "owner-a", "worker-1", time.Minute); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	ack := feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 42,
+	}
+	if err := srv.Checkpoint(context.Background(), ack); err != nil {
 		t.Fatalf("Checkpoint: %v", err)
 	}
 	pos, err := checkpoints.Load(context.Background(), "tenant", "counter.view", "live")
 	if err != nil || pos != 42 {
 		t.Fatalf("Load = %d, %v; want 42", pos, err)
 	}
+}
+
+// Review finding R2's zombie, end to end. Subscriber A delivers and acks
+// while it holds the lease; then A's lease expires and B takes the
+// subscription over, acks its own progress and leaves. The late ack from A —
+// an in-flight receipt from the dead subscription — must be rejected with
+// ErrLeaseLost, and the stored cursor must stay exactly where B's last ack
+// put it. The position assertion is the point: a rejected ack that still
+// moved the cursor would advance the shared subscription past events nobody
+// delivered, which is precisely the review's harm.
+func TestCheckpointRejectsStaleOwner(t *testing.T) {
+	checkpoints := newMemCheckpoints(time.Now())
+	leases := newMemLeases()
+	logs := newMemLogs(
+		ev(1, "counter.v1.Incremented", "one"),
+		ev(2, "counter.v1.Incremented", "two"),
+	)
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: logs,
+		Waiter:     &blockingWaiter{},
+		LeaseTTL:   40 * time.Millisecond,
+		RenewEvery: 4 * time.Millisecond,
+	})
+
+	// A subscribes with a caller-supplied owner, delivers both events and
+	// acks the delivered position while it holds the lease.
+	reqA := testRequest("live")
+	reqA.Owner = "owner-a"
+	sinkA := newMemSink()
+	_, doneA := start(t, srv, reqA, sinkA)
+	sinkA.waitFor(t, 2)
+	if err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 2,
+	}); err != nil {
+		t.Fatalf("A's ack while it holds the lease: %v", err)
+	}
+
+	// A's lease expires: its next renewal fails, the stream dies with
+	// ErrLeaseLost and the key is free again.
+	target := leases.failRenewalsFromNow()
+	waitRenewals(t, leases, target)
+	if err := await(t, doneA); !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("stream A error = %v, want ErrLeaseLost (its lease expired)", err)
+	}
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
+	leases.failAfter = -1 // re-arm the store so B's stream renews normally
+
+	// B takes the key over, delivers the event appended after A's ack and
+	// acks its own progress. B's stream ends too, leaving the key free.
+	logs.append("tenant", ev(3, "counter.v1.Incremented", "three"))
+	reqB := testRequest("live")
+	reqB.Owner = "owner-b"
+	sinkB := newMemSink()
+	cancelB, doneB := start(t, srv, reqB, sinkB)
+	sinkB.waitFor(t, 1)
+	if err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-b", Position: 3,
+	}); err != nil {
+		t.Fatalf("B's ack while it holds the lease: %v", err)
+	}
+	cancelB()
+	_ = await(t, doneB)
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
+
+	// A's zombie ack claims a position far past everything delivered.
+	// Nothing holds the key, so it is rejected with ErrLeaseLost ...
+	before, err := checkpoints.Load(context.Background(), "tenant", "counter.view", "live")
+	if err != nil {
+		t.Fatalf("Load before the stale ack: %v", err)
+	}
+	err = srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 99,
+	})
+	if !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("stale ack error = %v, want ErrLeaseLost", err)
+	}
+	var lost *feed.LeaseLostError
+	if !errors.As(err, &lost) || lost.Owner != "owner-a" {
+		t.Fatalf("stale ack error = %v (%T), want *LeaseLostError naming owner-a", err, err)
+	}
+	// ... and the stored cursor is unchanged: B's position, never A's claim.
+	after, err := checkpoints.Load(context.Background(), "tenant", "counter.view", "live")
+	if err != nil {
+		t.Fatalf("Load after the stale ack: %v", err)
+	}
+	if after != before || after != 3 {
+		t.Fatalf("stored position = %d after the stale ack, want %d (unchanged, never advanced past the delivered 3)", after, before)
+	}
+}
+
+// An ack whose owner is not the live holder is rejected with
+// *LeaseHeldError and never touches the cursor: the live subscriber's
+// redelivery position is the truth, not a foreign claim.
+func TestCheckpointRejectsForeignOwner(t *testing.T) {
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", 5)
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: newMemLogs(),
+		Waiter: &blockingWaiter{},
+	})
+	req := testRequest("live")
+	req.Owner = "owner-b"
+	cancel, done := start(t, srv, req, newMemSink())
+	waitHeld(t, leases, "tenant", "counter.view", "live", true)
+
+	err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 99,
+	})
+	if !errors.Is(err, feed.ErrLeaseHeld) {
+		t.Fatalf("foreign-owner ack error = %v, want ErrLeaseHeld", err)
+	}
+	var held *feed.LeaseHeldError
+	if !errors.As(err, &held) {
+		t.Fatalf("foreign-owner ack error = %T, want *LeaseHeldError", err)
+	}
+	if !held.Held || held.Lease.Owner != "owner-b" {
+		t.Fatalf("held error = %+v, want the live holder owner-b", held)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 5 {
+		t.Fatalf("stored position = %d, want 5 (a rejected ack never touches the cursor)", got)
+	}
+	cancel()
+	_ = await(t, done)
+}
+
+// An ack with no lease behind it at all — the key was never held, or its
+// holder is gone — is rejected with ErrLeaseLost and leaves the cursor
+// untouched.
+func TestCheckpointRejectsWithoutLease(t *testing.T) {
+	checkpoints := newMemCheckpoints(time.Now())
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: newMemLogs(),
+	})
+	err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 7,
+	})
+	if !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("ack without a lease error = %v, want ErrLeaseLost", err)
+	}
+	var lost *feed.LeaseLostError
+	if !errors.As(err, &lost) || lost.Owner != "owner-a" {
+		t.Fatalf("ack without a lease error = %v (%T), want *LeaseLostError naming owner-a", err, err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 0 {
+		t.Fatalf("stored position = %d, want 0 (a rejected ack never touches the cursor)", got)
+	}
+}
+
+// Request.Owner becomes the lease owner verbatim: it is what Holder reports,
+// what a second subscriber is refused against, and what Ack.Owner must
+// match. A reconnect reusing the same token re-acquires its own key
+// (self-steal) and streams; while both same-token streams are live an
+// owner-only lease port cannot tell them apart, but the steal fences the
+// first stream out as soon as the reconnect's stream ends and releases the
+// key: its next renewal fails and it dies with *LeaseLostError instead of
+// silently double-holding the subscription.
+func TestSubscribeUsesRequestOwnerAsLeaseOwner(t *testing.T) {
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases,
+		Logs:       newMemLogs(ev(1, "counter.v1.Incremented", "one")),
+		Waiter:     &blockingWaiter{},
+		LeaseTTL:   50 * time.Millisecond,
+		RenewEvery: 5 * time.Millisecond,
+	})
+	reqA := testRequest("live")
+	reqA.Owner = "owner-a"
+
+	// The first subscription acquires with the request's token, verbatim.
+	_, doneA := start(t, srv, reqA, newMemSink())
+	waitHeld(t, leases, "tenant", "counter.view", "live", true)
+	lease, held, err := leases.Holder(context.Background(), "tenant", "counter.view", "live")
+	if err != nil || !held {
+		t.Fatalf("Holder: held = %v, err = %v", held, err)
+	}
+	if lease.Owner != "owner-a" {
+		t.Fatalf("holder owner = %q, want the request's owner %q", lease.Owner, "owner-a")
+	}
+
+	// A second subscriber under a different owner is refused.
+	reqB := testRequest("live")
+	reqB.Owner = "owner-b"
+	err = srv.Subscribe(context.Background(), reqB, newMemSink())
+	if !errors.Is(err, feed.ErrLeaseHeld) {
+		t.Fatalf("second Subscribe with a different owner: error = %v, want ErrLeaseHeld", err)
+	}
+	var heldErr *feed.LeaseHeldError
+	if !errors.As(err, &heldErr) || heldErr.Lease.Owner != "owner-a" {
+		t.Fatalf("second Subscribe error = %v, want *LeaseHeldError naming the holder owner-a", err)
+	}
+
+	// Re-subscribing with the same token re-acquires the key (self-steal):
+	// the reconnect streams alongside the stolen-from stream.
+	sinkC := newMemSink()
+	cancelC, doneC := start(t, srv, reqA, sinkC)
+	sinkC.waitFor(t, 1) // the reconnect's stream is live and delivering
+
+	// The reconnect's stream ends and releases the key (as every Subscribe
+	// does before returning). The stolen-from stream's next renewal then
+	// fails and it dies with *LeaseLostError.
+	cancelC()
+	_ = await(t, doneC)
+	err = await(t, doneA)
+	if !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("first stream error = %v, want ErrLeaseLost after the self-steal's release", err)
+	}
+	var lost *feed.LeaseLostError
+	if !errors.As(err, &lost) {
+		t.Fatalf("first stream error = %T, want *LeaseLostError", err)
+	}
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
 }
 
 func TestResetCheckpointRefusesWhileHeldUnlessForced(t *testing.T) {

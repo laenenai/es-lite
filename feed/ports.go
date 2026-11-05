@@ -113,10 +113,37 @@ type Request struct {
 	// empty instance is the default instance.
 	Instance string
 	Consumer string
+	// Owner is the caller-supplied lease-owner token. Subscribe uses it
+	// verbatim, so the consumer can present it in Ack.Owner and its acks are
+	// fenced to its own lease. Empty means the server mints an opaque owner;
+	// such a stream is not ackable — a minted owner is never disclosed to the
+	// consumer, so no Ack.Owner can match its holder.
+	Owner string
 	// Definition supplies the authorized event type set Subscribe forwards to
 	// Log.ReadAllBounded and the projection name used in logs/errors.
 	Definition projection.Definition
 	BatchSize  int
+}
+
+// Ack is one acknowledged delivery position: the consumer's receipt for the
+// events it processed. It names the subscription the same way Request does,
+// plus the Owner token of the subscription that processed them; Checkpoint
+// fences the write on the lease holder, so only the live subscriber's
+// receipts land.
+type Ack struct {
+	// Scope, Projection and Instance name the checkpoint to advance.
+	Scope, Projection, Instance string
+	// Owner is the acking subscription's Request.Owner token. It must equal
+	// the lease holder's owner; a stream subscribed with an empty
+	// Request.Owner has a server-minted, opaque owner and cannot ack.
+	Owner string
+	// Position is the highest global_position the consumer acknowledges.
+	Position uint64
+	// Definition is the acking consumer's definition hash
+	// (Definition.Hash()); empty preserves the stored hash. Reserved for
+	// Task 11: Checkpoint does not persist it yet, because
+	// CheckpointStore.Save has no definition parameter until then.
+	Definition string
 }
 
 // Sink receives events in global order. Send must block for backpressure and

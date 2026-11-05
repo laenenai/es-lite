@@ -878,21 +878,28 @@ func TestLeaseStoreKeyCompositionIsPinned(t *testing.T) {
 // End to end: Store + feed.Server
 // ---------------------------------------------------------------------------
 
-// cancelSink records events and cancels its subscription once want events
-// have arrived.
+// cancelSink records events, acks the final delivered position through ack
+// (while the stream still holds its lease — acknowledgements are fenced on
+// it), and cancels its subscription once want events have arrived.
 type cancelSink struct {
 	mu     sync.Mutex
 	events []es.Envelope
 	want   int
 	cancel context.CancelFunc
+	ack    func(ctx context.Context, position uint64) error
 }
 
-func (c *cancelSink) Send(_ context.Context, env es.Envelope) error {
+func (c *cancelSink) Send(ctx context.Context, env es.Envelope) error {
 	c.mu.Lock()
 	c.events = append(c.events, env)
 	n := len(c.events)
 	c.mu.Unlock()
 	if n >= c.want {
+		if c.ack != nil {
+			if err := c.ack(ctx, env.GlobalPosition); err != nil {
+				return fmt.Errorf("ack at %d: %w", env.GlobalPosition, err)
+			}
+		}
 		c.cancel()
 	}
 	return nil
@@ -945,15 +952,25 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 		Projection: "p",
 		Instance:   "live",
 		Consumer:   "test",
+		// Caller-supplied owner: the fenced ack below must name it, and a
+		// minted owner (empty Request.Owner) is opaque to the consumer.
+		Owner:      "e2e-owner",
 		Definition: projection.Definition{Name: "p", Consumes: []string{consumed}},
 	}
 
 	// First process: collect the two consumed events, acknowledge, then close
 	// the store so the resume crosses a real reopen rather than reusing state.
+	// The ack happens inside Send, while the stream still holds its lease —
+	// Checkpoint rejects anything else.
 	srv := newServer(s)
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel1()
-	sink1 := &cancelSink{want: 2, cancel: cancel1}
+	sink1 := &cancelSink{want: 2, cancel: cancel1, ack: func(ctx context.Context, pos uint64) error {
+		return srv.Checkpoint(ctx, feed.Ack{
+			Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
+			Owner: req.Owner, Position: pos,
+		})
+	}}
 	if err := srv.Subscribe(ctx1, req, sink1); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("subscribe 1: %v", err)
 	}
@@ -969,10 +986,9 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 			res.Envelopes[0].GlobalPosition, res.Envelopes[2].GlobalPosition)
 	}
 
+	// The sink acked the last delivered position while the stream held its
+	// lease; the cursor is already durable here.
 	acked := first[len(first)-1].GlobalPosition
-	if err := srv.Checkpoint(ctx, req.Scope, req.Projection, req.Instance, acked); err != nil {
-		t.Fatalf("checkpoint at %d: %v", acked, err)
-	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close first store: %v", err)
 	}
