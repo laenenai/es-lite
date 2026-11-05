@@ -1155,9 +1155,10 @@ func TestFeedGatePageQueryPlan(t *testing.T) {
 	// the default target (100) the estimate for a type that rare swings
 	// enough that the position index occasionally looks cheaper than the
 	// composite — a first-run-fail / identical-tree-green planner toss-up
-	// (Task 18 carry). Target 1000 samples each partition fully, the
-	// rare-type estimate stops swinging, and the composite index wins
-	// deterministically.
+	// (Task 18 carry). Target 1000 lifts the sample on the fixture's
+	// populated partition to ~300k of its 1M rows (the other partitions
+	// are empty), which stabilizes the rare-type estimate enough to make
+	// the composite index win deterministically.
 	if _, err := pool.Exec(ctx, `ALTER TABLE events ALTER COLUMN type_url SET STATISTICS 1000`); err != nil {
 		t.Fatalf("feedgate: raise type_url statistics target: %v", err)
 	}

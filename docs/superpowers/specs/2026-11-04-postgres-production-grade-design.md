@@ -229,7 +229,7 @@ type Observer interface {
 
 ### 5.11 Docs and ADRs
 
-- **ADR 0037 — Commit-safe feed reads on Postgres**: the settled-ceiling mechanism and its losslessness argument (§5.1.3), the rejected A1/A2 with the interleavings that killed them, stall semantics, the fallback gate, the index build ordering, and the RLS role rollout.
+- **ADR 0037 — Commit-safe feed reads on Postgres**: the horizon-fence mechanism (§5.1 rev 3) and its losslessness argument (§5.1.3), the spike record (the falsified settled ceiling and its killer interleaving, §5.1.6), the rejected A1/A2 with the interleavings that killed them, stall semantics, the fallback gate, the index build ordering, and the RLS role rollout.
 - ADR 0001 §5 cross-references 0037; ADR 0010 records the non-`CONCURRENTLY` caveat and the runbook-first index order; ADR 0036 and the README delivery section state the settled-head semantics and a guarantees block.
 - Runbook (`docs/deploy/README.md`): poison/Skip, the stall alert and "analytics go to a replica", lease RTO (≤ `LeaseTTL`), `es_relay` creation and grant ordering, index build ordering.
 

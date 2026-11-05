@@ -170,7 +170,8 @@ What it guarantees:
   wedged transaction) surfaces via `Observer.OnStall` with the settled and
   raw heads; the failure mode of every interleaving is *delay*, not loss.
 - **Workspace isolation.** The Postgres feed tables are RLS-enabled with no
-  bypass arm; no session can reach another workspace's subscription state.
+  bypass arm; no non-superuser, non-`BYPASSRLS` session can reach another
+  workspace's subscription state.
 
 What it does **not** guarantee:
 

@@ -19,10 +19,11 @@ For the decisions behind the library boundary, see
 
 **Skip this section entirely if migration 0003 has already run** on the
 database in question — the indexes exist, the migration is a no-op, and
-re-running the manual steps only builds 16 redundant child indexes per
-index and then fails at `ATTACH PARTITION` (the partition indexes are
-already attached). The steps below are for databases upgrading from a
-pre-0003 schema where `events` already holds production data.
+re-running the manual steps only builds 8 redundant child indexes per
+index (16 across both) and then fails at `ATTACH PARTITION` (the
+partition indexes are already attached). The steps below are for
+databases upgrading from a pre-0003 schema where `events` already holds
+production data.
 
 Migrations run in one transaction (ADR 0010), so they cannot use
 `CREATE INDEX CONCURRENTLY`. A plain index build on a partitioned table with
@@ -210,8 +211,8 @@ autovacuum's freeze schedule unimpeded.
 - **Lease failover bounds the feed's RTO at `LeaseTTL`** (30 s default): a
   dead feed process's lease expires within the TTL and another process's
   subscriber acquires the key, resuming from the last acknowledged page.
-  Crash windows redeliver at most one page — that is the at-least-once
-  contract; the consumer's marker deduplicates.
+  Crash windows redeliver at most one page when acks are healthy — that
+  is the at-least-once contract; the consumer's marker deduplicates.
 - **`ResetCheckpoint` re-identifies, it does not clear.** A reset writes
   the reset request's definition hash as the checkpoint's new identity and
   moves the position; `DeleteSubscription` is the operation that removes

@@ -271,8 +271,9 @@ The fence protects *position* correctness; row-level security protects
   `feed_leases` and `feed_dead_letters` (migration 0004) are RLS-enabled
   with `FORCE ROW LEVEL SECURITY` and admit only the workspace arm
   (`workspace_id = current_setting('app.workspace_id', true)`). The feed is
-  per-workspace; no session — not even one holding `app.bypass_rls` — may
-  reach another workspace's subscription state. The conformance suite pins
+  per-workspace; no non-superuser, non-`BYPASSRLS` session — not even one
+  holding `app.bypass_rls` — may reach another workspace's subscription
+  state. The conformance suite pins
   cross-workspace refusal against a non-superuser probe role.
 - **The pre-existing bypass arms are role-gated.** The `events` and
   `unique_claims` policies (migration 0001) trusted any session that set
