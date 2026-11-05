@@ -726,14 +726,19 @@ type fgChaosRecord struct {
 // must fence around positions that are drawn but not yet committed. The
 // final fgChaosTailBatches batches are held behind release: the test lets the
 // consumers drain the in-load log first, then releases the tail so the
-// post-append kill can fire against a quiescent log. inLoad.Done is called
-// exactly once, whether the appender errors or reaches the gate.
+// post-append kill can fire against a quiescent log. inLoad.Done is wrapped
+// in a sync.Once and deferred, so the WaitGroup is released exactly once on
+// EVERY exit path — an in-load failure must not hang inLoadWg.Wait (and
+// swallow the appender error to the test timeout); the success path fires
+// it early, before the appender parks on release.
 func fgRunAppender(ctx context.Context, ws *postgres.Workspace, pool *pgxpool.Pool, idx int, typeURL string,
 	release <-chan struct{}, inLoad *sync.WaitGroup, recs, tailRecs *[]fgChaosRecord) error {
 
+	inLoaded := sync.OnceFunc(inLoad.Done)
+	defer inLoaded()
+
 	sid, err := es.NewStreamID("gate", fmt.Sprintf("app-%02d", idx))
 	if err != nil {
-		inLoad.Done()
 		return err
 	}
 	rng := rand.New(rand.NewPCG(uint64(idx)+1, 0xC0FFEE)) // per-appender, reproducible
@@ -780,12 +785,16 @@ func fgRunAppender(ctx context.Context, ws *postgres.Workspace, pool *pgxpool.Po
 		return nil
 	}
 
-	inLoaded := sync.OnceFunc(inLoad.Done)
 	for b := 0; b < fgChaosInLoadBatches; b++ {
 		if err := appendBatch(b, recs); err != nil {
-			return err
+			return err // the deferred inLoaded() releases the WaitGroup
 		}
 	}
+
+	// In-load batches committed. Fire the Once here — before parking on
+	// release — so inLoadWg.Wait observes phase completion on time; the
+	// deferred call above is then a no-op, and on any earlier error return
+	// it is the one that releases the WaitGroup.
 	inLoaded()
 
 	select {
