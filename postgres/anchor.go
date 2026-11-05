@@ -30,7 +30,17 @@ func (s *Store) ChainedSince(ctx context.Context) (time.Time, error) {
 
 // bypassTx opens a transaction with RLS bypassed — the admin/relay path, as
 // Drain uses (ADR 0004). Anchors span every workspace by construction.
+// The bypass is role-gated (migration 0005): like Drain, the session's
+// user must be an es_relay member — verified here, once per Store —
+// because the events policies hide every row from a non-member without
+// an error, and this path must not inherit that silence: Anchor would
+// otherwise record a root over zero heads as a real anchor, CheckAnchor
+// would report a spurious mismatch, and ListStreams would return
+// nothing.
 func (s *Store) bypassTx(ctx context.Context) (pgx.Tx, error) {
+	if err := s.checkRelayRole(ctx); err != nil {
+		return nil, err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin: %w", err)

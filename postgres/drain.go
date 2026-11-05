@@ -9,22 +9,25 @@ import (
 	"github.com/laenenai/es-lite/es"
 )
 
-// ErrRelayRoleMissing reports that Drain's session user is not a member of
-// the es_relay role, so the RLS bypass is denied to it (migration 0005):
-// continuing would silently claim zero rows and look like an empty
-// backlog. Drain fails fast with this error instead. The remedy — create
-// es_relay and grant it to the relay principal — is in the runbook
-// (docs/deploy/README.md).
+// ErrRelayRoleMissing reports that the session user reaching for the RLS
+// bypass — Drain, or the anchor path's bypassTx — is not a member of the
+// es_relay role, so the bypass is denied to it (migration 0005):
+// continuing would silently claim or read zero rows (and Anchor would
+// record a root over zero heads as a real anchor). Both paths fail fast
+// with this error instead. The remedy — create es_relay and grant it to
+// every bypass principal — is in the runbook (docs/deploy/README.md).
 var ErrRelayRoleMissing = errors.New("session user is not a member of the es_relay role; the RLS bypass is role-gated (see docs/deploy/README.md)")
 
-// checkRelayRole is Drain's startup check (spec §5.7): migration 0005
-// gates the events and unique_claims bypass arm on es_relay membership, so
-// a session outside the role would set app.bypass_rls and silently read
-// nothing — a delivery outage dressed up as an empty backlog. The verdict
-// is probed once per Store (relayRoleOnce) on the first Drain's context
-// and stands for the Store's lifetime, so a refused relay keeps failing
-// loudly until the runbook's GRANT lands and it is restarted. It runs
-// before Drain sets the bypass, so a refused session claims nothing.
+// checkRelayRole is the startup check every RLS-bypass path shares — Drain
+// and the anchor path's bypassTx (spec §5.7): migration 0005 gates the
+// events and unique_claims bypass arm on es_relay membership, so a
+// session outside the role would set app.bypass_rls and silently read
+// nothing — a delivery outage dressed up as an empty backlog, or a wrong
+// anchor. The verdict is probed once per Store (relayRoleOnce) on the
+// first bypassed call's context and stands for the Store's lifetime, so a
+// refused process keeps failing loudly until the runbook's GRANT lands
+// and it is restarted. It runs before the bypass is set, so a refused
+// session claims and records nothing.
 func (s *Store) checkRelayRole(ctx context.Context) error {
 	s.relayRoleOnce.Do(func() {
 		// A missing es_relay is the loudest form of missing membership,

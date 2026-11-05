@@ -21,6 +21,14 @@ import (
 // reading nothing (or, pre-0005, silently reading everything: the R11
 // hole).
 //
+// The fix round extends the same gate to the anchor path: Anchor,
+// CheckAnchor, ListStreams and ListAnchors all run under bypassTx, the
+// same bypass Drain uses, so a non-member session would not merely read
+// nothing — Anchor would record a root over zero heads as a real anchor.
+// TestAnchorPathFailsFastWithoutRelayRole pins that, with its own probe
+// role so the drain test's member-half GRANT (left in place) cannot leak
+// into its outsider half, whatever the run order.
+//
 // The test pool's login user is the container's superuser, and pg_has_role
 // is trivially true for superusers, so neither half can run as the login
 // user. Each half runs through a Store whose pooled sessions SET ROLE to a
@@ -29,8 +37,9 @@ import (
 // its own principal in the first place.
 
 const (
-	relayRole  = "es_relay"
-	drainProbe = "es_drain_probe"
+	relayRole   = "es_relay"
+	drainProbe  = "es_drain_probe"
+	anchorProbe = "es_anchor_probe"
 )
 
 // ensureDrainRole idempotently creates the non-superuser, non-BYPASSRLS
@@ -51,8 +60,10 @@ func ensureDrainRole(t *testing.T, ctx context.Context, s *postgres.Store) {
 // ensureRelayRole creates es_relay if missing. CI's test:pg setup — and
 // the production runbook — create it before anything migrates; the
 // idempotent ensure here keeps the test green against a bare container
-// too.
-func ensureRelayRole(t *testing.T, ctx context.Context, s *postgres.Store) {
+// too. The suite's shared openStoreWithOptions calls it as well, so
+// every superuser drain or anchor test runs with the role present,
+// whatever the order.
+func ensureRelayRole(t testing.TB, ctx context.Context, s *postgres.Store) {
 	t.Helper()
 	if _, err := s.Pool().Exec(ctx, `DO $$
 		BEGIN
@@ -61,6 +72,20 @@ func ensureRelayRole(t *testing.T, ctx context.Context, s *postgres.Store) {
 			END IF;
 		END $$`); err != nil {
 		t.Fatalf("create %s: %v", relayRole, err)
+	}
+}
+
+// ensureAnchorProbe idempotently creates the anchor path's probe — same
+// shape as the drain probe: no login, no superuser, no BYPASSRLS.
+func ensureAnchorProbe(t *testing.T, ctx context.Context, s *postgres.Store) {
+	t.Helper()
+	if _, err := s.Pool().Exec(ctx, `DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+anchorProbe+`') THEN
+				CREATE ROLE `+anchorProbe+` NOLOGIN NOSUPERUSER NOBYPASSRLS;
+			END IF;
+		END $$`); err != nil {
+		t.Fatalf("create %s: %v", anchorProbe, err)
 	}
 }
 
@@ -210,6 +235,116 @@ func TestDrainFailsFastWithoutRelayRole(t *testing.T) {
 	n, err = member.Drain(ctx, 10, func(context.Context, []es.Envelope) error { return nil })
 	if err != nil || n != 0 {
 		t.Fatalf("drain after backlog: n=%d err=%v, want 0/nil", n, err)
+	}
+}
+
+// TestAnchorPathFailsFastWithoutRelayRole pins the fix round's other half
+// of Review Focus 6: the anchor path reads events under the same bypass
+// Drain uses (bypassTx), so post-0005 a non-member session would not
+// merely read nothing — Anchor would compute a root over zero heads and
+// record it as a real anchor (the anchors policy is GUC-only, so the
+// write succeeds), and CheckAnchor would report a spurious mismatch. Every
+// entry point through bypassTx must fail fast with the same typed error
+// and mutate nothing; the same principal granted es_relay anchors and
+// verifies across workspaces as before.
+func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	ensureRelayRole(t, ctx, s)
+	ensureAnchorProbe(t, ctx, s)
+	// The anchor path's privileges as the probe: reading events (the log
+	// head, stream heads, the stream list) and reading/writing anchors.
+	// Nothing more — the bypass must stay a policy matter, not a
+	// privilege one.
+	if _, err := s.Pool().Exec(ctx,
+		`GRANT USAGE ON SCHEMA public TO `+anchorProbe+`;
+		 GRANT SELECT ON events TO `+anchorProbe+`;
+		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe); err != nil {
+		t.Fatalf("grant anchor-path privileges: %v", err)
+	}
+
+	// One event in each of two workspaces — what a zero read would hide,
+	// and what a working anchor must span.
+	for _, ws := range []string{"ws_anchor_a", "ws_anchor_b"} {
+		appendUnpublishedEvent(t, ctx, s, ws)
+	}
+	// A real anchor over both workspaces, as the superuser: what the
+	// outsider must refuse to verify, and what the member must reproduce.
+	good, err := s.Anchor(ctx, 0)
+	if err != nil || good.StreamCount != 2 {
+		t.Fatalf("superuser anchor: %+v err=%v, want 2 streams", good, err)
+	}
+
+	// Not an es_relay member: every anchor-path entry point fails fast
+	// with the typed error — before reading events or writing anchors.
+	outsider := drainStoreAs(t, anchorProbe)
+	_, err = outsider.Anchor(ctx, 0)
+	if !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("anchor as a non-member: err=%v, want ErrRelayRoleMissing — never a silently wrong anchor", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "docs/deploy/README.md") {
+		t.Fatalf("the error must point at the runbook, got %q", msg)
+	}
+	if err := outsider.CheckAnchor(ctx, good); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("check as a non-member: err=%v, want ErrRelayRoleMissing — never a spurious mismatch", err)
+	}
+	if _, err := outsider.ListStreams(ctx); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("list streams as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+	if _, err := outsider.ListAnchors(ctx); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("list anchors as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+	// Mutates nothing: only the superuser's anchor exists — a non-member
+	// session must not have recorded a root over zero heads behind the
+	// typed error's back.
+	var n int
+	if err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM anchors`).Scan(&n); err != nil {
+		t.Fatalf("count anchors: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("non-member anchor path left %d anchor rows, want 1 (nothing written)", n)
+	}
+	// The verdict is checked once per Store and stands: a second call
+	// fails the same way without re-probing.
+	if _, err := outsider.ListStreams(ctx); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("second call as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+
+	// The same principal, granted es_relay: the path works as before —
+	// the bypass spans workspaces, and the fresh Store re-verifies.
+	if _, err := s.Pool().Exec(ctx, `GRANT `+relayRole+` TO `+anchorProbe); err != nil {
+		t.Fatalf("grant %s to %s: %v", relayRole, anchorProbe, err)
+	}
+	member := drainStoreAs(t, anchorProbe)
+	a, err := member.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("anchor as an es_relay member: %v", err)
+	}
+	if a.StreamCount != 2 || a.UptoGlobalPosition != good.UptoGlobalPosition {
+		t.Fatalf("member anchor = %+v, want 2 streams at the superuser's head %d", a, good.UptoGlobalPosition)
+	}
+	if err := member.CheckAnchor(ctx, a); err != nil {
+		t.Fatalf("member check of its own anchor: %v", err)
+	}
+	if err := member.CheckAnchor(ctx, good); err != nil {
+		t.Fatalf("member check of the seeded anchor: %v", err)
+	}
+	refs, err := member.ListStreams(ctx)
+	if err != nil {
+		t.Fatalf("member list streams: %v", err)
+	}
+	workspaces := map[string]bool{}
+	for _, ref := range refs {
+		workspaces[ref.Workspace] = true
+	}
+	if len(refs) != 2 || len(workspaces) != 2 {
+		t.Fatalf("member list streams = %d refs over %d workspaces, want 2/2 (the bypass spans workspaces)",
+			len(refs), len(workspaces))
+	}
+	list, err := member.ListAnchors(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("member list anchors = %d err=%v, want 2 (the seeded anchor + the member's own)", len(list), err)
 	}
 }
 

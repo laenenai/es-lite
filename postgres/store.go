@@ -97,13 +97,14 @@ type Store struct {
 	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
 	maxPayloadBytes int
 
-	// relayRoleOnce runs Drain's es_relay startup check (checkRelayRole)
-	// at most once per Store. Migration 0005 gates the RLS bypass on that
-	// membership. The verdict is cached on the Store rather than the
-	// package: a process is expected to hold one Store (see Store's doc),
-	// so this is once per process, and a Store opened later — a different
-	// principal, or after the runbook's GRANT — re-verifies instead of
-	// inheriting another pool's verdict.
+	// relayRoleOnce runs the es_relay startup check that every RLS-bypass
+	// path shares — Drain and the anchor path's bypassTx
+	// (checkRelayRole) — at most once per Store. Migration 0005 gates the
+	// RLS bypass on that membership. The verdict is cached on the Store
+	// rather than the package: a process is expected to hold one Store
+	// (see Store's doc), so this is once per process, and a Store opened
+	// later — a different principal, or after the runbook's GRANT —
+	// re-verifies instead of inheriting another pool's verdict.
 	relayRoleOnce sync.Once
 
 	// relayRoleErr is the cached verdict of checkRelayRole:

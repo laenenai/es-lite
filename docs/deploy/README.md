@@ -79,30 +79,37 @@ migration — acceptable only for small databases.
 
 ## Relay role and RLS bypass (migration 0005)
 
-`Drain` — the delivery relay — is the only reader that works across
-workspaces, through the `app.bypass_rls` arm of the `events` and
-`unique_claims` policies. Migration 0005 role-gates that arm: it
+`Drain` — the delivery relay — and the anchor/verify path (`Anchor`,
+`CheckAnchor`, `ListStreams`, `ListAnchors`) are the only readers that
+work across workspaces, through the `app.bypass_rls` arm of the `events`
+and `unique_claims` policies. Migration 0005 role-gates that arm: it
 additionally requires `pg_has_role(current_user, 'es_relay', 'member')`,
 so the GUC alone — settable by any session — no longer lifts workspace
-isolation. `Store.Drain` verifies the membership once at startup and fails
-fast with `postgres.ErrRelayRoleMissing` instead of silently claiming zero
-rows, which would look exactly like an idle backlog.
+isolation. Both paths verify the membership once per `Store` at startup
+and fail fast with `postgres.ErrRelayRoleMissing` instead of silently
+reading nothing. The silence would look like an idle backlog for `Drain`
+— and be worse on the anchor path: `Anchor` would compute a root over
+zero heads and record it as a real anchor, and `CheckAnchor` would
+report a spurious mismatch.
 
-**Create the role and grant it before upgrading** — the create-role-then-
-migrate ordering is part of the migration. The moment 0005 applies, the
-bypass stops working for every session outside `es_relay`: with the grant
-already in place the relay keeps draining; without it, the relay fails fast
-on its next `Drain`:
+**Create the role and grant it to every bypass principal before
+upgrading** — the create-role-then-migrate ordering is part of the
+migration. The moment 0005 applies, the bypass stops working for every
+session outside `es_relay`: with the grants already in place the relay
+keeps draining and `es-verify` keeps anchoring; without them, both fail
+fast on their next bypassed call. The principals are the relay's login
+role and whatever login role the `es-verify anchor` CronJob runs as:
 
 ```sql
 -- before the upgrade that carries migration 0005:
 CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS;
-GRANT es_relay TO <the relay's login role>;
+GRANT es_relay TO <the relay's login role>, <the anchor scheduler's login role>;
 ```
 
 The membership verdict is checked once per `Store` and stands for its
-lifetime: after granting a missed role, restart the relay (a freshly
-opened `Store` re-verifies). Superusers are implicitly members of every
+lifetime: after granting a missed role, restart the refused processes —
+the relay, and the `es-verify` anchor job (a freshly opened `Store`
+re-verifies). Superusers are implicitly members of every
 role, so migrations and psql/admin tooling are unaffected; and ordinary
 workspace-pinned traffic takes the policies' workspace arm and never
 depends on `es_relay` existing.

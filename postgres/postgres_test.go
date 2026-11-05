@@ -38,6 +38,14 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
+	// The RLS bypass is role-gated (migration 0005): every Drain or
+	// anchor-path call probes es_relay membership, and even the
+	// superuser's probe needs the role to exist. The suite's shared
+	// setup ensures it idempotently — role creation belongs to test
+	// setup, never migrations (spec §5.7) — so the suite is green
+	// against a bare container, whatever the test order (chain_test's
+	// anchor tests run before drain_test's own ensure).
+	ensureRelayRole(t, ctx, s)
 	// Isolate each test: tests run sequentially, so a truncate is safe and
 	// keeps the shared partitioned tables clean.
 	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
