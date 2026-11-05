@@ -21,12 +21,14 @@ package postgres_test
 // are not part of the gate target; run them with -bench for the write-path
 // baseline and record both numbers in the Gate 0 exit review.
 //
-// The Postgres checkpoint/lease adapters do not exist yet (Task 13), so the
-// feed.Servers here run on small in-memory fakes (fgCheckpoints/fgLeases,
-// after feed/server_test.go's memCheckpoints/memLeases) while the LOG reads
-// are the real thing: *postgres.Workspace, fence and indexes included, via
-// the fgLogs adapter. The gate's point is the log reads. When Task 13 lands,
-// swap the fakes for the real adapters.
+// The Postgres feed adapters have landed (Task 13: postgres.NewLogs/
+// NewCheckpointStore/NewLeaseStore/NewDeadLetterStore), but the
+// feed.Servers here still run on small in-memory fakes (fgCheckpoints/
+// fgLeases, after feed/server_test.go's memCheckpoints/memLeases) while
+// the LOG reads are the real thing: *postgres.Workspace, fence and
+// indexes included, via the fgLogs adapter. The gate's point is the log
+// reads. Swapping the fakes for the real adapters is the gate task's
+// next step.
 
 import (
 	"bytes"

@@ -40,7 +40,7 @@ func openStoreWithOptions(t *testing.T, opts ...postgres.Option) *postgres.Store
 	}
 	// Isolate each test: tests run sequentially, so a truncate is safe and
 	// keeps the shared partitioned tables clean.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -277,9 +277,9 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0003 (feed indexes) made it three.
-	if v != 3 {
-		t.Fatalf("applied version = %d, want 3", v)
+	// Every embedded migration is applied on Open; 0004 (feed tables) made it four.
+	if v != 4 {
+		t.Fatalf("applied version = %d, want 4", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.
