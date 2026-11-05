@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,7 +65,9 @@ type Config struct {
 	// requires a positive budget. Default 16 MiB; zero and negative values
 	// take the default, so the log never receives a non-positive budget.
 	MaxBatchBytes int
-	// Poll is the idle wait between short pages. Default 250ms.
+	// Poll is the idle wait between short pages, scaled by a ±20% jitter
+	// (per idle wait) so a fleet of streams started together does not poll
+	// in lockstep. Default 250ms.
 	Poll time.Duration
 	// LeaseTTL is the lease lifetime. Default 30s.
 	LeaseTTL time.Duration
@@ -78,6 +81,12 @@ type Server struct {
 	cfg    Config
 	prefix string
 	seq    atomic.Uint64
+
+	// jitter scales one idle poll wait (spec §5.12): NewServer wires
+	// defaultJitter — the ±20% that keeps a fleet of streams started
+	// together from polling in lockstep — and internal tests pin fixed
+	// factors. Nil means no jitter.
+	jitter func(time.Duration) time.Duration
 }
 
 // NewServer validates cfg, fills defaults and returns a Server. It does not
@@ -136,7 +145,7 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, prefix: prefix}, nil
+	return &Server{cfg: cfg, prefix: prefix, jitter: defaultJitter}, nil
 }
 
 type systemClock struct{}
@@ -146,6 +155,15 @@ func (systemClock) Now() time.Time { return time.Now() }
 // randRead supplies newPrefix's entropy. It is a variable so the internal
 // test can force an entropy failure.
 var randRead = rand.Read
+
+// defaultJitter is the production idle-wait jitter source: it scales a poll
+// by a uniform random factor in [0.8, 1.2) — the ±20% of spec §5.12 — drawn
+// per idle wait, so a fleet of streams started together random-walks out of
+// lockstep instead of polling as one herd that micro-bursts the connection
+// pool. math/rand/v2's top-level functions are safe for concurrent use.
+var defaultJitter = func(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * (0.8 + 0.4*mathrand.Float64()))
+}
 
 // newPrefix returns a per-Server random identifier so lease owners are unique
 // across processes without another dependency. Without entropy no safe owner
@@ -408,6 +426,10 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 	}
 
 	for {
+		// One loop iteration's start: the idle wait's floor measures the
+		// page read, the sends and the wait against Poll from here, so an
+		// instantly-returning Waiter still yields one page read per poll.
+		iterStart := time.Now()
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -462,13 +484,16 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 		// committed backlog the settled reads cannot deliver — then wait
 		// out the poll.
 		probeStall()
-		if err := s.wait(ctx); err != nil {
+		if err := s.idleWait(ctx, iterStart); err != nil {
 			return err
 		}
 	}
 }
 
 // wait idles until the next poll, or until the Waiter reports new events.
+// The fence-clamp loop's re-head retry uses it: an unjittered, unfloored
+// pause is the right shape there — a bounded retry cadence, not the idle
+// poll. The read loop's idle branch uses idleWait instead.
 func (s *Server) wait(ctx context.Context) error {
 	if s.cfg.Waiter != nil {
 		return s.cfg.Waiter.Wait(ctx, s.cfg.Poll)
@@ -481,6 +506,53 @@ func (s *Server) wait(ctx context.Context) error {
 	case <-t.C:
 		return nil
 	}
+}
+
+// idleWait waits out one idle poll — the empty-or-short-page branch of the
+// read loop — and is the only wait that jitters (spec §5.12): the poll is
+// scaled by the jitter source, so a fleet of streams started together
+// de-synchronizes instead of polling in lockstep and micro-bursting the
+// connection pool. The factor is drawn per idle wait, so each stream's phase
+// random-walks away from the fleet's.
+//
+// The Waiter path is floored: Wait returning nil means "timeout" by the
+// Waiter contract, so a Waiter whose implementation returns nil immediately
+// must not turn the loop into a spin against the log. Whatever the Waiter
+// did, the loop iteration that began at iterStart has spent at least Poll by
+// the time idleWait returns — the server sleeps the remainder. The timer
+// path needs no floor: the timer itself waits the jittered poll out, and
+// sleeping a remainder on top would both double-sleep and cancel the
+// sub-Poll half of the jitter.
+func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
+	d := s.cfg.Poll
+	if s.jitter != nil {
+		d = s.jitter(d)
+	}
+	if s.cfg.Waiter == nil {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+			return nil
+		}
+	}
+	if err := s.cfg.Waiter.Wait(ctx, d); err != nil {
+		return err
+	}
+	// The floor: at least Poll since the iteration began. Cancellation
+	// still ends the stream promptly — the floor never blocks shutdown.
+	if rem := s.cfg.Poll - time.Since(iterStart); rem > 0 {
+		t := time.NewTimer(rem)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return nil
 }
 
 // batchSize resolves Request.BatchSize against Config.Batch and MaxBatch.

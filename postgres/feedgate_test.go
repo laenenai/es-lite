@@ -1252,13 +1252,45 @@ func TestFeedGatePageQueryPlan(t *testing.T) {
 // checkpoint/lease keys) on a feed.Server over the real log, with the pool
 // capped at MaxConns=50 — half the subscription count. After a quiet start,
 // one matching event must reach all 100 within a second, and the pool must
-// be healthy after the burst. Jitter-spread assertions arrive in Task 18.
+// be healthy after the burst. The quiet start also asserts the idle-poll
+// jitter spread (Task 18): with the production ±20% jitter the fleet's
+// polls must de-synchronize across the whole poll interval.
 
 const (
 	fleetSubs    = 100
 	fleetMaxConn = 50
 	fleetType    = "gate.v1.Fleet"
 )
+
+// fleetPollClock timestamps the fleet's idle polls: OnPage with zero events
+// is one empty-page read, and the fleet test asserts the spread of those
+// timestamps. The server's ±20% per-wait idle jitter random-walks each
+// subscriber's phase off the shared start; without it a fleet started
+// together polls in lockstep and clusters into a handful of 100ms buckets.
+type fleetPollClock struct {
+	mu    sync.Mutex
+	polls []time.Time
+}
+
+func (c *fleetPollClock) OnPage(events, _ int) {
+	if events != 0 {
+		return // only empty pages timestamp the idle cadence
+	}
+	c.mu.Lock()
+	c.polls = append(c.polls, time.Now())
+	c.mu.Unlock()
+}
+
+func (c *fleetPollClock) OnCheckpoint(uint64)                        {}
+func (c *fleetPollClock) OnLeaseLost(string, string, string, string) {}
+func (c *fleetPollClock) OnPoison(*feed.EventTooLargeError)          {}
+func (c *fleetPollClock) OnStall(uint64, uint64)                     {}
+
+func (c *fleetPollClock) snapshot() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Time(nil), c.polls...)
+}
 
 // fgFleetSink counts deliveries and signals each one.
 type fgFleetSink struct {
@@ -1323,12 +1355,15 @@ func TestFeedGateHundredIdleSubscribers(t *testing.T) {
 		t.Fatalf("feedgate: fleet pool MaxConns = %d, want %d", got, fleetMaxConn)
 	}
 
+	polls := &fleetPollClock{}
 	srv, err := feed.NewServer(feed.Config{
 		Checkpoints: postgres.NewCheckpointStore(s),
 		Leases:      postgres.NewLeaseStore(s),
 		Logs:        postgres.NewLogs(s),
+		Observer:    polls,
 		// DeadLetters stays nil: the fleet has no poison path.
-		// Everything else at the defaults: poll 250ms, lease TTL 30s,
+		// Everything else at the defaults: poll 250ms (with the
+		// production ±20% idle jitter the default wires), lease TTL 30s,
 		// batch 500 — the fleet runs production-shaped knobs.
 	})
 	if err != nil {
@@ -1388,6 +1423,51 @@ func TestFeedGateHundredIdleSubscribers(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+
+	// Idle jitter spread (Task 18, spec §5.12): over the quiet start, the
+	// fleet's poll timestamps must spread across at least 12 of the 100ms
+	// buckets in the 1.5s quiet window — the plan's "≥10 distinct 100ms
+	// buckets" bar, measured over the full quiet start and tuned into the
+	// measured gap between the two fleets. The ±20% per-wait jitter
+	// random-walks every subscriber's poll phase off the shared start, so
+	// the merged fleet covers the whole poll interval: a jittered fleet
+	// reaches 14/15 in every measured run (the one empty bucket is
+	// structural: the first jittered gap is ≥ 0.8*Poll, so the window's
+	// second 100ms bucket can only be reached by late drift). A fleet
+	// without the jitter polls the empty log in lockstep — herds of 100
+	// on the poll lattice, 6-8 buckets in every measured run — the
+	// thundering herd the jitter exists to break.
+	//
+	// The window is the full quiet start rather than a 1s slice of it:
+	// page-read costs stretch the lattice and open dead zones between
+	// its peaks, and on a slower runner a dead zone can fully swallow one
+	// 100ms bucket of a 1s slice (measured on this runner: 13 real 1s
+	// runs always hit 10/10, but one bucket held as few as 3 polls).
+	// Requiring 12 of the quiet window's 15 buckets keeps a ≥2-bucket
+	// margin on both sides of the gap across read-cost regimes, instead
+	// of gambling the nightly gate on dead-zone alignment.
+	const bucket = 100 * time.Millisecond
+	windowEnd := time.Now()
+	windowStart := windowEnd.Add(-1500 * time.Millisecond)
+	var perBucket [15]int
+	for _, ts := range polls.snapshot() {
+		if ts.After(windowStart) && ts.Before(windowEnd) {
+			perBucket[int(ts.Sub(windowStart)/bucket)]++
+		}
+	}
+	spread := 0
+	for _, n := range perBucket {
+		if n > 0 {
+			spread++
+		}
+	}
+	if spread < 12 {
+		cancel()
+		t.Fatalf("feedgate: fleet idle polls spread across %d of 15 %v buckets over the quiet start, want at least 12 (per-bucket polls: %v) — the idle jitter is missing or ineffective",
+			spread, bucket, perBucket)
+	}
+	t.Logf("feedgate: fleet idle polls spread across %d/15 %v buckets over the quiet start (per bucket: %v)",
+		spread, bucket, perBucket)
 
 	// One matching event; all 100 must deliver it within 1 second.
 	ws := s.WorkspaceStore("ws_fleet")
