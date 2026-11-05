@@ -17,6 +17,7 @@ var (
 	_ feed.Logs            = (*Logs)(nil)
 	_ feed.CheckpointStore = (*CheckpointStore)(nil)
 	_ feed.LeaseStore      = (*LeaseStore)(nil)
+	_ feed.DeadLetterStore = (*DeadLetterStore)(nil)
 )
 
 // Head returns the current log head: the highest global_position in the
@@ -254,6 +255,71 @@ func (c *CheckpointStore) Checkpoint(ctx context.Context, scope, projection, ins
 		return feed.Checkpoint{}, false, fmt.Errorf("sqlite: checkpoints: parse updated_at %q: %w", updatedAt, err)
 	}
 	return cp, true, nil
+}
+
+// DeadLetterStore records Skip's audit rows in SQLite: one row per
+// deliberately skipped position, keyed with the subscription and the
+// position — a repeat skip of the same position replaces the row. The row
+// is a pointer, not a copy (spec §5.3): the event itself stays in the
+// immutable log and the row only names it, so nothing is duplicated into a
+// second retention surface. Triage reads this table directly over SQL.
+type DeadLetterStore struct {
+	store *Store
+}
+
+// NewDeadLetterStore returns a DeadLetterStore backed by s.
+func NewDeadLetterStore(s *Store) *DeadLetterStore { return &DeadLetterStore{store: s} }
+
+// Record inserts one dead-letter row, replacing any earlier row for the
+// same (scope, projection, instance, position). Skip delivers the pointer
+// fields — key, position, reason, actor — and cannot know the skipped
+// event's type or size: a skip request carries no definition to authorize
+// a filtered log read, and the log port never materializes an over-cap
+// row. This store shares the database with the log, so when the incoming
+// DeadLetter carries no type it names the event from the events row at
+// dl.Position — metadata only: type_url and length(payload), never the
+// payload bytes. A position with no event row records the empty type and
+// zero size; Skip does not require the position to exist. A zero
+// CreatedAt is stamped here, like feed_checkpoints.updated_at.
+func (d *DeadLetterStore) Record(ctx context.Context, dl feed.DeadLetter) error {
+	if dl.TypeURL == "" {
+		// The core cannot know the skipped event's type or size, so name
+		// the event from the log this store shares a database with —
+		// metadata only: type_url and length(payload), never the payload
+		// bytes (the poison row's over-cap payload stays unscanned). A
+		// position with no event row names nothing; the pointer still
+		// lands, because Skip does not require the position to exist.
+		var (
+			typeURL string
+			size    int
+		)
+		err := d.store.db.QueryRowContext(ctx,
+			`SELECT type_url, length(payload) FROM events WHERE global_position = ?`,
+			dl.Position,
+		).Scan(&typeURL, &size)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+		}
+		if err != nil {
+			return fmt.Errorf("sqlite: dead letters: name the event at %d: %w", dl.Position, err)
+		}
+		dl.TypeURL, dl.SizeBytes = typeURL, size
+	}
+	createdAt := dl.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
+	_, err := d.store.db.ExecContext(ctx,
+		`INSERT OR REPLACE INTO feed_dead_letters
+		     (scope, projection, instance, position, type_url, size_bytes, reason, actor, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		dl.Scope, dl.Projection, dl.Instance, dl.Position,
+		dl.TypeURL, dl.SizeBytes, dl.Reason, dl.Actor, formatTS(createdAt),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: dead letters: record: %w", err)
+	}
+	return nil
 }
 
 // LeaseStore fences one active feed subscriber per key in SQLite, mirroring

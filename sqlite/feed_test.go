@@ -692,6 +692,121 @@ func TestCheckpointDefinitionHashRecordedAndPreserved(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// DeadLetterStore
+// ---------------------------------------------------------------------------
+
+// TestDeadLetterRecordInsertOrReplace pins the store contract: one pointer
+// row per skipped position, replaced (not duplicated) on a repeat skip of
+// the same key; the row is enriched with the skipped event's type and size
+// when the caller — the feed core — cannot know them (it selects metadata
+// only, never the payload bytes); a caller-supplied type passes through
+// untouched; and a position with no event row at all still records — Skip
+// does not require the position to exist.
+func TestDeadLetterRecordInsertOrReplace(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	dls := sqlite.NewDeadLetterStore(s)
+	const typ = "thing.v1.Happened"
+
+	// A normal event row the enrichment can name: 5 payload bytes.
+	env := appendFeedEvent(t, s, mustStreamID(t, "thing", "dl"), 0, typ, []byte("12345"))
+	at := time.Unix(1_700_000_000, 0).UTC()
+	later := at.Add(2 * time.Hour)
+	const tsLayout = "2006-01-02T15:04:05.000000000Z" // the fixed layout the adapter writes
+
+	type row struct {
+		typeURL   string
+		size      int
+		reason    string
+		actor     string
+		createdAt string
+	}
+	read := func(position uint64) row {
+		t.Helper()
+		var r row
+		err := s.DB().QueryRowContext(ctx,
+			`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
+			 WHERE scope = ? AND projection = ? AND instance = ? AND position = ?`,
+			"ws", "p", "live", position,
+		).Scan(&r.typeURL, &r.size, &r.reason, &r.actor, &r.createdAt)
+		if err != nil {
+			t.Fatalf("read dead letter at %d: %v", position, err)
+		}
+		return r
+	}
+	count := func() int {
+		t.Helper()
+		var n int
+		if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM feed_dead_letters`).Scan(&n); err != nil {
+			t.Fatalf("count dead letters: %v", err)
+		}
+		return n
+	}
+
+	// The core delivers a pointer — no type, no size. The store names the
+	// event from the log it shares a database with.
+	if err := dls.Record(ctx, feed.DeadLetter{
+		Scope: "ws", Projection: "p", Instance: "live",
+		Position: env.GlobalPosition, Reason: "poison: over cap", Actor: "oncall",
+		CreatedAt: at,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if r := read(env.GlobalPosition); r.typeURL != typ || r.size != 5 ||
+		r.reason != "poison: over cap" || r.actor != "oncall" ||
+		r.createdAt != at.Format(tsLayout) {
+		t.Fatalf("recorded row = %+v, want the event named (%q, 5 bytes) with the audit fields", r, typ)
+	}
+
+	// A repeat skip of the same position replaces the row: exactly one
+	// row, the latest reason, actor and timestamp.
+	if err := dls.Record(ctx, feed.DeadLetter{
+		Scope: "ws", Projection: "p", Instance: "live",
+		Position: env.GlobalPosition, Reason: "triaged: cap raised", Actor: "oncall-2",
+		CreatedAt: later,
+	}); err != nil {
+		t.Fatalf("re-record: %v", err)
+	}
+	if n := count(); n != 1 {
+		t.Fatalf("rows after the repeat = %d, want 1 (replaced, never duplicated)", n)
+	}
+	if r := read(env.GlobalPosition); r.reason != "triaged: cap raised" || r.actor != "oncall-2" ||
+		r.createdAt != later.Format(tsLayout) || r.typeURL != typ || r.size != 5 {
+		t.Fatalf("replaced row = %+v, want the latest audit fields over the same named event", r)
+	}
+
+	// A caller-supplied type and size pass through: the enrichment keeps a
+	// complete dead letter as delivered.
+	if err := dls.Record(ctx, feed.DeadLetter{
+		Scope: "ws", Projection: "p", Instance: "live",
+		Position: env.GlobalPosition, TypeURL: "custom.v1.Typed", SizeBytes: 99,
+		Reason: "named by the caller", Actor: "oncall-3", CreatedAt: later,
+	}); err != nil {
+		t.Fatalf("record with a type: %v", err)
+	}
+	if r := read(env.GlobalPosition); r.typeURL != "custom.v1.Typed" || r.size != 99 {
+		t.Fatalf("row with a caller-supplied type = %+v, want the caller's type/size kept", r)
+	}
+
+	// A position with no event row records the empty type and zero size:
+	// the pointer still lands, Skip does not require the position to exist.
+	const absent = 1 << 40
+	if err := dls.Record(ctx, feed.DeadLetter{
+		Scope: "ws", Projection: "p", Instance: "live",
+		Position: absent, Reason: "skipped past a restored log", Actor: "oncall",
+		CreatedAt: at,
+	}); err != nil {
+		t.Fatalf("record an absent position: %v", err)
+	}
+	if r := read(absent); r.typeURL != "" || r.size != 0 {
+		t.Fatalf("absent-position row = %+v, want the empty type and zero size", r)
+	}
+	if n := count(); n != 2 {
+		t.Fatalf("rows = %d, want 2 (the replaced key plus the absent position)", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // LeaseStore
 // ---------------------------------------------------------------------------
 
@@ -967,6 +1082,33 @@ func (c *cancelSink) got() []es.Envelope {
 	return append([]es.Envelope(nil), c.events...)
 }
 
+// ackingSink records events and acknowledges every delivered position
+// through ack while the stream still holds its lease — acknowledgements
+// are fenced on the lease, so this is the only moment an ack can land.
+type ackingSink struct {
+	mu     sync.Mutex
+	events []es.Envelope
+	ack    func(ctx context.Context, position uint64) error
+}
+
+func (a *ackingSink) Send(ctx context.Context, env es.Envelope) error {
+	a.mu.Lock()
+	a.events = append(a.events, env)
+	a.mu.Unlock()
+	if a.ack != nil {
+		if err := a.ack(ctx, env.GlobalPosition); err != nil {
+			return fmt.Errorf("ack at %d: %w", env.GlobalPosition, err)
+		}
+	}
+	return nil
+}
+
+func (a *ackingSink) got() []es.Envelope {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]es.Envelope(nil), a.events...)
+}
+
 func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "feed.db")
@@ -1074,5 +1216,153 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	if second[0].GlobalPosition != next.GlobalPosition {
 		t.Fatalf("resumed event position = %d, want %d (after checkpoint %d)",
 			second[0].GlobalPosition, next.GlobalPosition, acked)
+	}
+}
+
+// TestSkipResumesPastPoison walks the whole poison runbook end to end on a
+// real store: the over-cap row (inserted past the append cap by raw SQL,
+// the only way such a row can exist) kills a live subscription with
+// *feed.EventTooLargeError; the operator deliberately skips past it; the
+// dead letter lands in feed_dead_letters as a complete pointer — the
+// store names the event's type and size from the log without ever scanning
+// its payload — and the resubscription delivers exactly the events after
+// the poison position, never the poison itself. The skipped subscription's
+// definition fingerprint survives the skip, so the resubscription serves
+// under the identity the pre-poison ack recorded.
+func TestSkipResumesPastPoison(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStoreCapped(t) // store cap 64: a 4096-byte row is poison
+	const typ = "thing.v1.Happened"
+
+	// Global order: before < poison < after. The poison row enters via
+	// raw SQL because the append cap (Task 5) refuses it.
+	before := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-e2e-a"), 0, typ, []byte("ok"))
+	poisonGP := insertFeedRowDirect(t, s, mustStreamID(t, "thing", "poison-e2e"), 1, typ, bytes.Repeat([]byte("p"), 4096))
+	after1 := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-e2e-b"), 0, typ, []byte("after-1"))
+	after2 := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-e2e-b"), 1, typ, []byte("after-2"))
+	if !(before.GlobalPosition < poisonGP && poisonGP < after1.GlobalPosition && after1.GlobalPosition < after2.GlobalPosition) {
+		t.Fatalf("insert order: before=%d poison=%d after=%d,%d, want the poison between the normal rows",
+			before.GlobalPosition, poisonGP, after1.GlobalPosition, after2.GlobalPosition)
+	}
+
+	srv, err := feed.NewServer(feed.Config{
+		Logs:        sqlite.NewLogs(s),
+		Checkpoints: sqlite.NewCheckpointStore(s),
+		Leases:      sqlite.NewLeaseStore(s),
+		DeadLetters: sqlite.NewDeadLetterStore(s),
+		Poll:        10 * time.Millisecond,
+		Batch:       10,
+		LeaseTTL:    time.Minute,
+		RenewEvery:  30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	req := feed.Request{
+		Scope:      "ws",
+		Projection: "p",
+		Instance:   "live",
+		Consumer:   "test",
+		// Caller-supplied owner: the fenced acks below must name it.
+		Owner:      "skip-e2e-owner",
+		Definition: projection.Definition{Name: "p", Consumes: []string{typ}},
+	}
+
+	// The live subscription delivers the event before the poison, acks it
+	// under the definition, then dies on the poison row — never
+	// materialized (Task 6), never delivered.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel1()
+	sink := &ackingSink{ack: func(ctx context.Context, pos uint64) error {
+		return srv.Checkpoint(ctx, feed.Ack{
+			Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
+			Owner: req.Owner, Position: pos, Definition: req.Definition.Hash(),
+		})
+	}}
+	err = srv.Subscribe(ctx1, req, sink)
+	var tooLarge *feed.EventTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("subscribe error = %v (%T), want *feed.EventTooLargeError", err, err)
+	}
+	if tooLarge.Position != poisonGP || tooLarge.TypeURL != typ ||
+		tooLarge.Size != 4096 || tooLarge.Limit != 64 {
+		t.Fatalf("poison error = %+v, want position %d of type %q, 4096 bytes over the 64-byte cap",
+			tooLarge, poisonGP, typ)
+	}
+	if got := sink.got(); len(got) != 1 || got[0].GlobalPosition != before.GlobalPosition {
+		t.Fatalf("delivered before the poison = %v, want only the event at %d (the poison never delivered)",
+			feedPositions(got), before.GlobalPosition)
+	}
+
+	// The operator skips past the poison. No force: the poison error killed
+	// the stream and released its lease, so the fence is free.
+	skipAt := time.Now()
+	reason := "poison: 4096-byte payload over the 64-byte store cap"
+	if err := srv.Skip(ctx, feed.SkipRequest{
+		Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
+		Position: poisonGP, Actor: "oncall@example.com", Reason: reason,
+	}); err != nil {
+		t.Fatalf("Skip: %v", err)
+	}
+
+	// The dead letter landed in the real table — a complete pointer: the
+	// store named the event's type and size from the log (metadata only),
+	// and the row carries the operator's reason and actor.
+	var (
+		typeURL   string
+		size      int
+		dlReason  string
+		dlActor   string
+		createdAt string
+	)
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
+		 WHERE scope = ? AND projection = ? AND instance = ? AND position = ?`,
+		req.Scope, req.Projection, req.Instance, poisonGP,
+	).Scan(&typeURL, &size, &dlReason, &dlActor, &createdAt); err != nil {
+		t.Fatalf("read the landed dead letter: %v", err)
+	}
+	if typeURL != typ || size != 4096 || dlReason != reason || dlActor != "oncall@example.com" {
+		t.Fatalf("dead letter row = (%q, %d, %q, %q), want the poison named with the audit fields",
+			typeURL, size, dlReason, dlActor)
+	}
+	at, err := time.Parse("2006-01-02T15:04:05.000000000Z", createdAt)
+	if err != nil {
+		t.Fatalf("dead letter created_at %q does not parse: %v", createdAt, err)
+	}
+	if at.Before(skipAt.Add(-time.Second)) || at.After(time.Now().Add(time.Second)) {
+		t.Fatalf("dead letter created_at = %v, want around the skip at %v", at, skipAt)
+	}
+
+	// The checkpoint advanced to the poison position with the ack's
+	// definition fingerprint preserved — a skip is a position advance,
+	// never a redefinition.
+	cp, found, err := sqlite.NewCheckpointStore(s).Checkpoint(ctx, req.Scope, req.Projection, req.Instance)
+	if err != nil || !found {
+		t.Fatalf("checkpoint after the skip = found %v, err %v", found, err)
+	}
+	if cp.Position != poisonGP {
+		t.Fatalf("checkpoint = %d after the skip, want the poison position %d", cp.Position, poisonGP)
+	}
+	if cp.DefinitionHash != req.Definition.Hash() {
+		t.Fatalf("definition hash = %q after the skip, want the acked %q preserved", cp.DefinitionHash, req.Definition.Hash())
+	}
+
+	// The resubscription delivers exactly the events after the poison —
+	// never the poison itself.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	sink2 := &cancelSink{want: 2, cancel: cancel2}
+	if err := srv.Subscribe(ctx2, req, sink2); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("resubscribe: %v", err)
+	}
+	got := sink2.got()
+	want := []uint64{after1.GlobalPosition, after2.GlobalPosition}
+	if !slices.Equal(feedPositions(got), want) {
+		t.Fatalf("resumed positions = %v, want %v (the events after the poison, never the poison itself)",
+			feedPositions(got), want)
+	}
+	if slices.Contains(feedPositions(got), poisonGP) {
+		t.Fatalf("the poison event at %d was delivered after the skip", poisonGP)
 	}
 }

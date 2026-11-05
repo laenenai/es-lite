@@ -39,8 +39,14 @@ type Config struct {
 
 	// Waiter is an optional wakeup source; nil polls every Poll.
 	Waiter Waiter
-	// Clock supplies wall time for lease owner identity; nil is time.Now.
+	// Clock supplies wall time for lease owner identity and dead-letter
+	// timestamps; nil is time.Now.
 	Clock Clock
+	// DeadLetters is Skip's optional audit sink. When non-nil, Skip
+	// records one dead letter per call before advancing the checkpoint;
+	// nil means Skip still advances but records nothing — the skip works,
+	// only the audit trail is absent.
+	DeadLetters DeadLetterStore
 
 	// Batch is the page size when Request.BatchSize is zero. Default 500.
 	Batch int
@@ -471,6 +477,79 @@ func (s *Server) ResetCheckpoint(ctx context.Context, req Request, position uint
 	}
 	if err := s.cfg.Checkpoints.Reset(ctx, req.Scope, req.Projection, req.Instance, req.Definition.Hash(), position); err != nil {
 		return fmt.Errorf("feed: reset checkpoint %s/%s/%s to %d: %w", req.Scope, req.Projection, req.Instance, position, err)
+	}
+	return nil
+}
+
+// Skip deliberately advances a subscription's checkpoint to sr.Position —
+// resume reads strictly after it — and records the decision as a dead
+// letter: the operator's audited recovery path for a poison event, the
+// stream-killing payload a subscription can never deliver (a
+// *EventTooLargeError). It completes the poison path: the append cap stops
+// such events entering the log, the adapters never materialize them, and
+// Skip is how an operator deliberately moves past one.
+//
+// Skip is a position advance, never a redefinition: it preserves the
+// checkpoint's stored definition fingerprint, so the next Subscribe serves
+// under the identity the skipped history was acknowledged under. The dead
+// letter is a pointer, not a copy: the event stays in the immutable log,
+// and the runbook is triage by (scope, projection, reason) — fix the
+// cause, then either accept the gap as a recorded omission or replay it:
+// ResetCheckpoint to a position before the skip re-delivers the
+// dead-lettered event like any other.
+//
+// Unless sr.Force is set, Skip refuses while a live lease holds the key —
+// the same fence as ResetCheckpoint, so a running subscriber's cursor is
+// never moved underneath it. The normal flow needs no force: the poison
+// error already killed the stream and released its lease.
+//
+// Skip does not require the position to exist or the event to be over-cap;
+// it is a deliberate admin cursor-advance, and validateKey gates the
+// subscription identity.
+//
+// When Config.DeadLetters is non-nil, the dead letter is recorded BEFORE
+// the checkpoint advances: a crash between the two leaves an audit row
+// and an unadvanced cursor — safe, the skip is simply retried (the
+// store's insert-or-replace keeps the retry idempotent) — while the
+// reverse order could advance the cursor with no audit record at all. A
+// failed record refuses the skip: the cursor never advances unaudited.
+func (s *Server) Skip(ctx context.Context, sr SkipRequest) error {
+	if err := validateKey(sr.Scope, sr.Projection, sr.Instance); err != nil {
+		return err
+	}
+	if !sr.Force {
+		if err := s.refuseIfHeld(ctx, sr.Scope, sr.Projection, sr.Instance); err != nil {
+			return err
+		}
+	}
+	// Load the stored fingerprint and pass it back through Reset: a skip
+	// preserves the checkpoint's identity. An absent row carries the
+	// empty hash, which Reset's preserve-on-empty contract keeps unset.
+	cp, _, err := s.cfg.Checkpoints.Checkpoint(ctx, sr.Scope, sr.Projection, sr.Instance)
+	if err != nil {
+		return fmt.Errorf("feed: load checkpoint %s/%s/%s: %w", sr.Scope, sr.Projection, sr.Instance, err)
+	}
+	// Record the audit row before advancing: a crash between the two
+	// leaves a dead letter and an unadvanced cursor — safe, the skip is
+	// retried — while the reverse order could advance with no record at
+	// all. A failed record refuses the skip: never advance unaudited.
+	if s.cfg.DeadLetters != nil {
+		dl := DeadLetter{
+			Scope:      sr.Scope,
+			Projection: sr.Projection,
+			Instance:   sr.Instance,
+			Position:   sr.Position,
+			Reason:     sr.Reason,
+			Actor:      sr.Actor,
+			CreatedAt:  s.cfg.Clock.Now(),
+		}
+		if err := s.cfg.DeadLetters.Record(ctx, dl); err != nil {
+			return fmt.Errorf("feed: record dead letter %s/%s/%s at %d: %w",
+				sr.Scope, sr.Projection, sr.Instance, sr.Position, err)
+		}
+	}
+	if err := s.cfg.Checkpoints.Reset(ctx, sr.Scope, sr.Projection, sr.Instance, cp.DefinitionHash, sr.Position); err != nil {
+		return fmt.Errorf("feed: skip checkpoint %s/%s/%s to %d: %w", sr.Scope, sr.Projection, sr.Instance, sr.Position, err)
 	}
 	return nil
 }

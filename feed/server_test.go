@@ -96,6 +96,38 @@ func (m *memCheckpoints) set(scope, projection, instance string, position uint64
 	m.rows[m.key(scope, projection, instance)] = memCheckpoint{position: position, at: m.now}
 }
 
+// memDeadLetters is a recording DeadLetterStore: it keeps every DeadLetter
+// Record received, in order, and can be made to fail with err (a failed
+// Record stores nothing, like a store whose write did not land).
+type memDeadLetters struct {
+	mu   sync.Mutex
+	rows []feed.DeadLetter
+	err  error
+}
+
+func newMemDeadLetters() *memDeadLetters { return &memDeadLetters{} }
+
+func (m *memDeadLetters) Record(_ context.Context, dl feed.DeadLetter) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return m.err
+	}
+	m.rows = append(m.rows, dl)
+	return nil
+}
+
+func (m *memDeadLetters) recorded() []feed.DeadLetter {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]feed.DeadLetter(nil), m.rows...)
+}
+
+// fixedClock is a Clock frozen at one instant, for dead-letter timestamps.
+type fixedClock struct{ at time.Time }
+
+func (c fixedClock) Now() time.Time { return c.at }
+
 // memLeases is a LeaseStore. failAfter is the number of successful Renew
 // calls before every later Renew fails; -1 never fails.
 type memLeases struct {
@@ -1695,6 +1727,196 @@ func TestResetCheckpointRefusesWhileHeldUnlessForced(t *testing.T) {
 		t.Fatalf("forced checkpoint = %d, want 0", got)
 	}
 	_ = done
+}
+
+// Review Focus 4: the poison recovery must never move a live subscriber's
+// cursor underneath it. Skip carries the same fence as ResetCheckpoint —
+// a held lease refuses the skip unless forced, and a refused skip leaves
+// the checkpoint untouched. The normal flow needs no force at all: the
+// poison error has already killed the stream and released its lease.
+func TestSkipRefusesHeldLeaseWithoutForce(t *testing.T) {
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", 5)
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: newMemLogs(),
+		Waiter: &blockingWaiter{},
+	})
+	cancel, done := start(t, srv, testRequest("live"), newMemSink())
+	waitHeld(t, leases, "tenant", "counter.view", "live", true)
+
+	err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: 7, Actor: "oncall@example.com", Reason: "poison: over cap",
+	})
+	if !errors.Is(err, feed.ErrLeaseHeld) {
+		t.Fatalf("Skip while held = %v, want ErrLeaseHeld", err)
+	}
+	var held *feed.LeaseHeldError
+	if !errors.As(err, &held) {
+		t.Fatalf("Skip while held = %T, want *LeaseHeldError", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 5 {
+		t.Fatalf("checkpoint = %d after the refused skip, want 5 (unchanged)", got)
+	}
+
+	// Force advances the cursor to the skipped position — resume reads
+	// strictly after it — exactly like a forced reset.
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: 7, Actor: "oncall@example.com", Reason: "poison: over cap", Force: true,
+	}); err != nil {
+		t.Fatalf("forced Skip: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 7 {
+		t.Fatalf("checkpoint = %d after the forced skip, want 7 (the skipped position)", got)
+	}
+
+	cancel()
+	_ = await(t, done)
+}
+
+// Skip is the audited half of the poison path: advancing the cursor is
+// safe only because the decision is recorded. Exactly one dead letter
+// lands per skip, carrying what the core knows — the subscription key,
+// the skipped position, the operator's reason and actor, and the
+// server-clock timestamp — and the checkpoint advances to the position
+// with its stored definition fingerprint preserved (a skip is a position
+// advance, never a redefinition). The event's type and size are
+// deliberately absent: a skip request carries no definition to authorize a
+// filtered log read, and the log port never materializes an over-cap row,
+// so the core cannot know them — the store that shares the event database
+// names the event when it records (the sqlite end-to-end test pins the
+// landed row). The record precedes the advance: a failed record leaves
+// the cursor unmoved so the skip can be retried — never advanced
+// unaudited.
+func TestSkipRecordsDeadLetter(t *testing.T) {
+	const (
+		storedAt = 10
+		skipped  = 12
+	)
+	def := projection.Definition{Name: "counter.view", Consumes: []string{"counter.v1.Incremented"}}
+	at := time.Unix(1_700_000_000, 0)
+	checkpoints := newMemCheckpoints(time.Now())
+	deadLetters := newMemDeadLetters()
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: newMemLogs(),
+		DeadLetters: deadLetters,
+		Clock:       fixedClock{at},
+		Waiter:      &blockingWaiter{},
+	})
+
+	// A checkpoint acked under a definition carries that fingerprint; the
+	// skip below must preserve it.
+	if _, err := leases.Acquire(context.Background(), "tenant", "counter.view", "live", "owner-a", "worker-1", time.Minute); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: storedAt, Definition: def.Hash(),
+	}); err != nil {
+		t.Fatalf("ack under the deployed definition: %v", err)
+	}
+	if err := leases.Release(context.Background(), "tenant", "counter.view", "live", "owner-a"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: skipped, Actor: "oncall@example.com", Reason: "poison: payload over cap",
+	}); err != nil {
+		t.Fatalf("Skip: %v", err)
+	}
+
+	rows := deadLetters.recorded()
+	if len(rows) != 1 {
+		t.Fatalf("dead letters = %d, want exactly one per skip", len(rows))
+	}
+	dl := rows[0]
+	switch {
+	case dl.Scope != "tenant" || dl.Projection != "counter.view" || dl.Instance != "live":
+		t.Fatalf("dead letter key = %s/%s/%s, want tenant/counter.view/live", dl.Scope, dl.Projection, dl.Instance)
+	case dl.Position != skipped:
+		t.Fatalf("dead letter position = %d, want %d", dl.Position, skipped)
+	case dl.Actor != "oncall@example.com":
+		t.Fatalf("dead letter actor = %q, want the request's", dl.Actor)
+	case dl.Reason != "poison: payload over cap":
+		t.Fatalf("dead letter reason = %q, want the request's", dl.Reason)
+	case !dl.CreatedAt.Equal(at):
+		t.Fatalf("dead letter created_at = %v, want the server clock's %v", dl.CreatedAt, at)
+	case dl.TypeURL != "" || dl.SizeBytes != 0:
+		t.Fatalf("dead letter type/size = %q/%d, want empty: the core cannot know them, the store enriches at rest",
+			dl.TypeURL, dl.SizeBytes)
+	}
+
+	cp, found, err := checkpoints.Checkpoint(context.Background(), "tenant", "counter.view", "live")
+	if err != nil || !found {
+		t.Fatalf("checkpoint after the skip = found %v, err %v", found, err)
+	}
+	if cp.Position != skipped {
+		t.Fatalf("checkpoint = %d after the skip, want the skipped %d", cp.Position, skipped)
+	}
+	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != def.Hash() {
+		t.Fatalf("definition hash = %q after the skip, want the stored %q preserved (a skip is not a redefinition)", got, def.Hash())
+	}
+
+	// Config.DeadLetters is optional: nil advances without recording.
+	srvNoDL := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: newMemLogs(),
+		Clock:  fixedClock{at},
+		Waiter: &blockingWaiter{},
+	})
+	if err := srvNoDL.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: skipped + 1, Actor: "oncall@example.com", Reason: "poison: payload over cap",
+	}); err != nil {
+		t.Fatalf("Skip without a dead-letter store: %v", err)
+	}
+	if cp, _, _ := checkpoints.Checkpoint(context.Background(), "tenant", "counter.view", "live"); cp.Position != skipped+1 {
+		t.Fatalf("checkpoint = %d after the storeless skip, want %d", cp.Position, skipped+1)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 1 {
+		t.Fatalf("dead letters = %d after a skip with no store, want still 1", len(rows))
+	}
+
+	// A failed record must not advance the cursor unaudited: the skip is
+	// recorded first, so the whole skip can be retried once the store is
+	// back.
+	recordErr := errors.New("dead letter store unavailable")
+	deadLetters.err = recordErr
+	err = srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: skipped + 2, Actor: "oncall@example.com", Reason: "poison: payload over cap",
+	})
+	if !errors.Is(err, recordErr) {
+		t.Fatalf("Skip with a failing store = %v, want the record error", err)
+	}
+	if cp, _, _ := checkpoints.Checkpoint(context.Background(), "tenant", "counter.view", "live"); cp.Position != skipped+1 {
+		t.Fatalf("checkpoint = %d after the failed record, want %d (never advanced unaudited)", cp.Position, skipped+1)
+	}
+
+	// The retry, once the store recovers, records and advances.
+	deadLetters.err = nil
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: skipped + 2, Actor: "oncall@example.com", Reason: "poison: payload over cap",
+	}); err != nil {
+		t.Fatalf("retried Skip: %v", err)
+	}
+	rows = deadLetters.recorded()
+	if len(rows) != 2 {
+		t.Fatalf("dead letters = %d after the retry, want 2", len(rows))
+	}
+	if rows[1].Position != skipped+2 {
+		t.Fatalf("retried dead letter position = %d, want %d", rows[1].Position, skipped+2)
+	}
+	if cp, _, _ := checkpoints.Checkpoint(context.Background(), "tenant", "counter.view", "live"); cp.Position != skipped+2 {
+		t.Fatalf("checkpoint = %d after the retry, want %d", cp.Position, skipped+2)
+	}
+	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != def.Hash() {
+		t.Fatalf("definition hash = %q after the skips, want the stored %q still preserved", got, def.Hash())
+	}
 }
 
 func TestDeleteSubscriptionRefusesWhileHeld(t *testing.T) {

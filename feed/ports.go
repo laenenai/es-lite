@@ -104,6 +104,46 @@ type Logs interface {
 	Open(ctx context.Context, scope string) (Log, error)
 }
 
+// DeadLetter is the audit record of one deliberately skipped event: a
+// pointer, not a copy. The event itself stays in the immutable log; the
+// row names the subscription, the position, the reason and the actor, so
+// triage can find the cause and, when wanted, replay it — ResetCheckpoint
+// to a position before the skip re-delivers the dead-lettered event like
+// any other.
+type DeadLetter struct {
+	// Scope, Projection and Instance name the subscription that skipped.
+	Scope, Projection, Instance string
+	// TypeURL and SizeBytes identify the skipped event's type and stored
+	// size for triage. The core cannot know them — a skip request carries
+	// no definition to authorize a filtered log read, and the Log port
+	// never materializes an over-cap row — so it delivers them empty and
+	// the DeadLetterStore fills them when it can (an adapter sharing the
+	// event database names the event; metadata only, never the payload
+	// bytes). A caller that knows them may supply them.
+	TypeURL string
+	// Reason is the operator's own words: what triage should read.
+	Reason string
+	// Actor records who decided the skip.
+	Actor string
+	// Position is the skipped event's global position; resume reads
+	// strictly after it.
+	Position uint64
+	// SizeBytes is the skipped event's stored payload size, when known.
+	SizeBytes int
+	// CreatedAt is when the skip was recorded (the server's Clock).
+	CreatedAt time.Time
+}
+
+// DeadLetterStore records Skip's audit rows. Record is the only method:
+// triage reads the table directly over SQL — a list or replay API would
+// restate what the log, the checkpoint and the dead-letter rows already
+// hold. Skip calls Record before it advances the checkpoint, so a crash
+// in between leaves an audit row and an unadvanced cursor: safe, the skip
+// is simply retried, never an unaudited advance.
+type DeadLetterStore interface {
+	Record(ctx context.Context, dl DeadLetter) error
+}
+
 // Waiter is an optional wakeup source. Subscribe calls Wait after a short page
 // instead of sleeping; Wait returns when new events may exist, after timeout,
 // or when ctx ends. A normal timeout is a nil return: only ctx ending or a real
@@ -112,8 +152,9 @@ type Waiter interface {
 	Wait(ctx context.Context, timeout time.Duration) error
 }
 
-// Clock supplies wall time where the server needs it. Tests inject a fixed
-// clock; nil means time.Now.
+// Clock supplies wall time where the server needs it (lease owner
+// identity, dead-letter timestamps). Tests inject a fixed clock; nil
+// means time.Now.
 type Clock interface {
 	Now() time.Time
 }
@@ -166,6 +207,26 @@ type Ack struct {
 	// subscription must keep matching; an empty Definition preserves the
 	// stored hash instead of clearing it.
 	Definition string
+}
+
+// SkipRequest is one deliberate skip: an operator advancing a
+// subscription past a poison event. Scope, Projection and Instance name
+// the checkpoint to advance; Position is the event being skipped (resume
+// reads strictly after it); Actor and Reason carry the audit trail that
+// lands in the dead letter; Force authorizes the skip over a live lease,
+// exactly like ResetCheckpoint's force.
+type SkipRequest struct {
+	// Scope, Projection and Instance name the checkpoint to advance.
+	Scope, Projection, Instance string
+	// Position is the skipped event's global position.
+	Position uint64
+	// Actor records who decided the skip; it lands in the dead letter.
+	Actor string
+	// Reason records why the event is being skipped; it lands in the
+	// dead letter.
+	Reason string
+	// Force allows the skip while a live lease holds the key.
+	Force bool
 }
 
 // Sink receives events in global order. Send must block for backpressure and
