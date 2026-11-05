@@ -150,6 +150,20 @@ func validateAppend(p es.AppendParams) error {
 func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
 	var zero es.AppendResult
 
+	// Payload cap (production review): reject the whole batch before any
+	// statement runs — before the xid is drawn, before any insert — so a
+	// caller-owned transaction (AppendTx) is refused too and nothing
+	// reaches the log. A single oversized event otherwise wedges every
+	// feed subscription consuming its type. The error carries stream,
+	// version, type URL and size only — never the payload bytes.
+	for i, ev := range p.Events {
+		if w.store.maxPayloadBytes > 0 && len(ev.Payload) > w.store.maxPayloadBytes {
+			version := p.ExpectedVersion + uint64(i) + 1
+			return zero, fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
+				es.ErrPayloadTooLarge, p.StreamID, version, ev.TypeURL, len(ev.Payload), w.store.maxPayloadBytes)
+		}
+	}
+
 	// P1 (spec §5.1.3): assign this transaction's xid before any position
 	// is drawn. One bare read-only statement, before readHead: the xid is
 	// assigned here unconditionally — including on a stream's first

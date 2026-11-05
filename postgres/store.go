@@ -41,17 +41,38 @@ const migrateLockKey int64 = 0x65736C697465 // "eslite"
 // Option configures Open.
 type Option func(*openConfig)
 
-type openConfig struct{ autoMigrate bool }
+// defaultMaxPayloadBytes is the payload cap a Store enforces at append
+// time when WithMaxPayloadBytes is not given (or given as 0): 8 MiB, big
+// enough for any sane domain event and small enough that no single event
+// can wedge a feed subscription that would otherwise materialize it.
+const defaultMaxPayloadBytes = 8 << 20
+
+type openConfig struct {
+	autoMigrate     bool
+	maxPayloadBytes int
+}
 
 // WithoutAutoMigrate skips applying migrations on Open. Application replicas
 // use this and rely on a separate Migrate step / init container (ADR 0010);
 // the default auto-migrates so dev/single-node stays zero-config.
 func WithoutAutoMigrate() Option { return func(c *openConfig) { c.autoMigrate = false } }
 
+// WithMaxPayloadBytes caps the payload size Append may write: a batch
+// holding an event whose payload exceeds n bytes is rejected whole with
+// es.ErrPayloadTooLarge before anything is inserted, so writers learn at
+// write time instead of wedging feed subscriptions later. n == 0 selects
+// the default (8 MiB); n < 0 lifts the cap entirely.
+func WithMaxPayloadBytes(n int) Option { return func(c *openConfig) { c.maxPayloadBytes = n } }
+
 func newOpenConfig(opts []Option) openConfig {
-	c := openConfig{autoMigrate: true}
+	c := openConfig{autoMigrate: true, maxPayloadBytes: defaultMaxPayloadBytes}
 	for _, o := range opts {
 		o(&c)
+	}
+	// 0 selects the default; a negative value means unlimited. The stored
+	// field is the effective cap.
+	if c.maxPayloadBytes == 0 {
+		c.maxPayloadBytes = defaultMaxPayloadBytes
 	}
 	return c
 }
@@ -69,6 +90,11 @@ type Store struct {
 	// close it. False for a pool handed in by OpenWithPool, where the caller
 	// may still be using it for other work.
 	ownsPool bool
+
+	// maxPayloadBytes is the effective append-time payload cap
+	// (WithMaxPayloadBytes): appends holding a larger payload are rejected
+	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
+	maxPayloadBytes int
 }
 
 // Open connects to Postgres and applies migrations (unless WithoutAutoMigrate).
@@ -83,8 +109,9 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
 	}
-	s := &Store{pool: pool, ownsPool: true}
-	if err := s.migrateIfConfigured(ctx, opts); err != nil {
+	cfg := newOpenConfig(opts)
+	s := &Store{pool: pool, ownsPool: true, maxPayloadBytes: cfg.maxPayloadBytes}
+	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -110,8 +137,9 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 	if pool == nil {
 		return nil, fmt.Errorf("postgres: open with pool: pool is nil")
 	}
-	s := &Store{pool: pool, ownsPool: false}
-	if err := s.migrateIfConfigured(ctx, opts); err != nil {
+	cfg := newOpenConfig(opts)
+	s := &Store{pool: pool, ownsPool: false, maxPayloadBytes: cfg.maxPayloadBytes}
+	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -119,8 +147,8 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 
 // migrateIfConfigured applies migrations unless the options disable them. It
 // exists so Open and OpenWithPool cannot drift apart on migration behaviour.
-func (s *Store) migrateIfConfigured(ctx context.Context, opts []Option) error {
-	if !newOpenConfig(opts).autoMigrate {
+func (s *Store) migrateIfConfigured(ctx context.Context, cfg openConfig) error {
+	if !cfg.autoMigrate {
 		return nil
 	}
 	return s.Migrate(ctx)

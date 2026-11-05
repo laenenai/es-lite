@@ -72,6 +72,15 @@ var (
 	// envelope's TypeURL is not one the codec recognizes. Usually a
 	// version-skew deployment or a codec wired to the wrong aggregate.
 	ErrUnknownEventType = errors.New("es-lite: unknown event type url")
+
+	// ErrPayloadTooLarge reports that an Append batch contained an event
+	// whose payload exceeds the store's payload cap
+	// (WithMaxPayloadBytes; 8 MiB by default). The whole batch is
+	// rejected before anything is inserted, so the stream and the log
+	// are untouched. Errors wrapping it carry the stream id, the
+	// version the event would have taken, the event's type URL and the
+	// payload's size in bytes — never the payload bytes themselves.
+	ErrPayloadTooLarge = errors.New("es-lite: payload too large")
 )
 
 // DecidedAtSkewError is the structured form of ErrDecidedAtSkew: it carries

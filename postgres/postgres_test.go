@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -21,12 +22,19 @@ import (
 //	PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test ./postgres/...
 func openStore(t *testing.T) *postgres.Store {
 	t.Helper()
+	return openStoreWithOptions(t)
+}
+
+// openStoreWithOptions is openStore applying Open options, for tests that
+// configure the store (WithMaxPayloadBytes, WithoutAutoMigrate, ...).
+func openStoreWithOptions(t *testing.T, opts ...postgres.Option) *postgres.Store {
+	t.Helper()
 	dsn := os.Getenv("PG_DSN")
 	if dsn == "" {
 		t.Skip("set PG_DSN to run the Postgres integration tests")
 	}
 	ctx := context.Background()
-	s, err := postgres.Open(ctx, dsn)
+	s, err := postgres.Open(ctx, dsn, opts...)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -339,4 +347,136 @@ func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 	if _, found, err := ws.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
 	}
+}
+
+// TestAppendRejectsOversizedPayload pins the append-time payload cap
+// (WithMaxPayloadBytes): an over-cap batch is rejected whole with
+// es.ErrPayloadTooLarge before anything is inserted — on both the
+// self-transacting Append path and the caller-owned AppendTx path — 0
+// selects the 8 MiB default, a negative value lifts the cap, and the
+// wrapped error carries stream, version, type URL and size — never the
+// payload bytes.
+func TestAppendRejectsOversizedPayload(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("over cap is rejected before any insert", func(t *testing.T) {
+		s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(64))
+		ws := s.WorkspaceStore("ws_cap")
+		sid := streamID(t)
+
+		// Seed one event so the log has a non-zero baseline to compare
+		// against after the rejection.
+		if _, err := ws.Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 0,
+			Events:          []es.EventData{{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: []byte("x")}},
+		}); err != nil {
+			t.Fatalf("seed append: %v", err)
+		}
+		head, err := ws.Head(ctx)
+		if err != nil {
+			t.Fatalf("head: %v", err)
+		}
+		rawHead, err := ws.RawHead(ctx)
+		if err != nil {
+			t.Fatalf("raw head: %v", err)
+		}
+		if head == 0 || rawHead == 0 {
+			t.Fatalf("head=%d rawHead=%d, want a non-zero baseline", head, rawHead)
+		}
+
+		payload := bytes.Repeat([]byte("p"), 100)
+		_, err = ws.Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 1,
+			Events:          []es.EventData{{TypeURL: "counter.v1.Oversized", SchemaVersion: 1, Payload: payload}},
+		})
+		if !errors.Is(err, es.ErrPayloadTooLarge) {
+			t.Fatalf("oversized append: got %v, want ErrPayloadTooLarge", err)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "counter.v1.Oversized") || !strings.Contains(msg, "100") {
+			t.Fatalf("error %q lacks the type URL or the size", msg)
+		}
+		if strings.Contains(msg, string(payload)) {
+			t.Fatal("the error leaks the payload bytes")
+		}
+
+		// Nothing was appended: the stream version and both heads are
+		// exactly what they were before the rejected append.
+		if v, err := ws.CurrentStreamVersion(ctx, sid); err != nil || v != 1 {
+			t.Fatalf("stream version after rejected append = %d (err %v), want 1", v, err)
+		}
+		if h, err := ws.Head(ctx); err != nil || h != head {
+			t.Fatalf("head after rejected append = %d (err %v), want %d", h, err, head)
+		}
+		if h, err := ws.RawHead(ctx); err != nil || h != rawHead {
+			t.Fatalf("raw head after rejected append = %d (err %v), want %d", h, err, rawHead)
+		}
+	})
+
+	// The cap also guards a caller-owned transaction: AppendTx rejects the
+	// batch before any insert, leaving the caller's transaction usable.
+	t.Run("caller-owned transaction is rejected too", func(t *testing.T) {
+		s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(64))
+		ws := s.WorkspaceStore("ws_cap_tx")
+		sid := streamID(t)
+
+		tx, err := s.Pool().Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		narrow := narrowTx{tx}
+
+		_, err = ws.AppendTx(ctx, narrow, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 0,
+			Events:          []es.EventData{{TypeURL: "counter.v1.Oversized", SchemaVersion: 1, Payload: bytes.Repeat([]byte("p"), 100)}},
+		})
+		if !errors.Is(err, es.ErrPayloadTooLarge) {
+			t.Fatalf("oversized AppendTx: got %v, want ErrPayloadTooLarge", err)
+		}
+		if rows, err := ws.ReadStreamTx(ctx, narrow, sid, 0, 0); err != nil || len(rows) != 0 {
+			t.Fatalf("rows inside tx = %d (err %v), want 0 — nothing was inserted", len(rows), err)
+		}
+	})
+
+	// A negative option lifts the cap: even a payload over the 8 MiB
+	// default appends.
+	t.Run("negative option means unlimited", func(t *testing.T) {
+		s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(-1))
+		ws := s.WorkspaceStore("ws_cap_unlimited")
+		sid := streamID(t)
+		if _, err := ws.Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 0,
+			Events:          []es.EventData{{TypeURL: "counter.v1.Oversized", SchemaVersion: 1, Payload: bytes.Repeat([]byte("p"), 8<<20+1)}},
+		}); err != nil {
+			t.Fatalf("unlimited append: %v", err)
+		}
+	})
+
+	// Zero selects the default: 8 MiB exactly still fits, one byte over is
+	// rejected.
+	t.Run("zero option means the 8 MiB default", func(t *testing.T) {
+		s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(0))
+		ws := s.WorkspaceStore("ws_cap_default")
+		sid := streamID(t)
+		_, err := ws.Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 0,
+			Events:          []es.EventData{{TypeURL: "counter.v1.Oversized", SchemaVersion: 1, Payload: bytes.Repeat([]byte("p"), 8<<20+1)}},
+		})
+		if !errors.Is(err, es.ErrPayloadTooLarge) {
+			t.Fatalf("over-default append: got %v, want ErrPayloadTooLarge", err)
+		}
+		if _, err := ws.Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 0,
+			Events:          []es.EventData{{TypeURL: "counter.v1.MaxSize", SchemaVersion: 1, Payload: bytes.Repeat([]byte("p"), 8<<20)}},
+		}); err != nil {
+			t.Fatalf("at-cap append: %v", err)
+		}
+	})
 }
