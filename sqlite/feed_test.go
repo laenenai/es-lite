@@ -643,9 +643,9 @@ func TestLeaseExactlyOneWinner(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
 	leases := sqlite.NewLeaseStore(s)
-	key := "lease-one-winner"
+	const scope, projection, instance = "ws", "p", "live"
 
-	ok, err := leases.Acquire(ctx, key, "owner-a", "consumer-a", time.Minute)
+	ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute)
 	if err != nil {
 		t.Fatalf("acquire owner-a: %v", err)
 	}
@@ -653,7 +653,7 @@ func TestLeaseExactlyOneWinner(t *testing.T) {
 		t.Fatal("owner-a lost a free lease")
 	}
 
-	ok, err = leases.Acquire(ctx, key, "owner-b", "consumer-b", time.Minute)
+	ok, err = leases.Acquire(ctx, scope, projection, instance, "owner-b", "consumer-b", time.Minute)
 	if err != nil {
 		t.Fatalf("acquire owner-b: %v", err)
 	}
@@ -661,7 +661,7 @@ func TestLeaseExactlyOneWinner(t *testing.T) {
 		t.Fatal("owner-b took a lease owner-a still holds; want exactly one winner")
 	}
 
-	lease, held, err := leases.Holder(ctx, key)
+	lease, held, err := leases.Holder(ctx, scope, projection, instance)
 	if err != nil {
 		t.Fatalf("holder: %v", err)
 	}
@@ -677,17 +677,17 @@ func TestLeaseReacquireBySameOwnerUpdatesConsumer(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
 	leases := sqlite.NewLeaseStore(s)
-	key := "lease-reacquire"
+	const scope, projection, instance = "ws", "p", "live"
 
-	if ok, err := leases.Acquire(ctx, key, "owner-a", "pod-a", time.Minute); err != nil || !ok {
+	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "pod-a", time.Minute); err != nil || !ok {
 		t.Fatalf("first acquire = %v err=%v, want true/nil", ok, err)
 	}
 	// A reconnect by the same owner must succeed and refresh the consumer
 	// identity Status reports.
-	if ok, err := leases.Acquire(ctx, key, "owner-a", "pod-b", time.Minute); err != nil || !ok {
+	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "pod-b", time.Minute); err != nil || !ok {
 		t.Fatalf("same-owner acquire = %v err=%v, want true/nil", ok, err)
 	}
-	lease, held, err := leases.Holder(ctx, key)
+	lease, held, err := leases.Holder(ctx, scope, projection, instance)
 	if err != nil || !held {
 		t.Fatalf("holder = found=%v err=%v, want held", held, err)
 	}
@@ -700,15 +700,15 @@ func TestLeaseExpiryLetsAnotherOwnerWin(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
 	leases := sqlite.NewLeaseStore(s)
-	key := "lease-expiry"
+	const scope, projection, instance = "ws", "p", "live"
 
-	if ok, err := leases.Acquire(ctx, key, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
+	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
 		t.Fatalf("acquire owner-a = %v err=%v", ok, err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		ok, err := leases.Acquire(ctx, key, "owner-b", "consumer-b", time.Minute)
+		ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-b", "consumer-b", time.Minute)
 		if err != nil {
 			t.Fatalf("acquire owner-b: %v", err)
 		}
@@ -721,7 +721,7 @@ func TestLeaseExpiryLetsAnotherOwnerWin(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	lease, held, err := leases.Holder(ctx, key)
+	lease, held, err := leases.Holder(ctx, scope, projection, instance)
 	if err != nil || !held {
 		t.Fatalf("holder = found=%v err=%v, want the new owner", held, err)
 	}
@@ -734,17 +734,17 @@ func TestLeaseRenewByOwnerAndNonOwner(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
 	leases := sqlite.NewLeaseStore(s)
-	key := "lease-renew"
+	const scope, projection, instance = "ws", "p", "live"
 
-	if ok, err := leases.Acquire(ctx, key, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
+	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
 		t.Fatalf("acquire owner-a = %v err=%v", ok, err)
 	}
-	if ok, err := leases.Renew(ctx, key, "owner-b", time.Minute); err != nil {
+	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-b", time.Minute); err != nil {
 		t.Fatalf("renew owner-b: %v", err)
 	} else if ok {
 		t.Fatal("non-owner renewed the lease")
 	}
-	if ok, err := leases.Renew(ctx, key, "owner-a", time.Minute); err != nil {
+	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-a", time.Minute); err != nil {
 		t.Fatalf("renew owner-a: %v", err)
 	} else if !ok {
 		t.Fatal("owner failed to renew its own lease")
@@ -752,7 +752,7 @@ func TestLeaseRenewByOwnerAndNonOwner(t *testing.T) {
 
 	// Past the original TTL, the renewed lease is still held.
 	time.Sleep(80 * time.Millisecond)
-	lease, held, err := leases.Holder(ctx, key)
+	lease, held, err := leases.Holder(ctx, scope, projection, instance)
 	if err != nil || !held {
 		t.Fatalf("holder after renew = found=%v err=%v, want held", held, err)
 	}
@@ -765,24 +765,24 @@ func TestLeaseReleaseByOwnerAndNonOwner(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
 	leases := sqlite.NewLeaseStore(s)
-	key := "lease-release"
+	const scope, projection, instance = "ws", "p", "live"
 
-	if ok, err := leases.Acquire(ctx, key, "owner-a", "consumer-a", time.Minute); err != nil || !ok {
+	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute); err != nil || !ok {
 		t.Fatalf("acquire = %v err=%v", ok, err)
 	}
 
 	// A non-owner's release is a no-op, not an error.
-	if err := leases.Release(ctx, key, "owner-b"); err != nil {
+	if err := leases.Release(ctx, scope, projection, instance, "owner-b"); err != nil {
 		t.Fatalf("release owner-b: %v", err)
 	}
-	if _, held, err := leases.Holder(ctx, key); err != nil || !held {
+	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || !held {
 		t.Fatalf("holder after non-owner release = held=%v err=%v, want still held", held, err)
 	}
 
-	if err := leases.Release(ctx, key, "owner-a"); err != nil {
+	if err := leases.Release(ctx, scope, projection, instance, "owner-a"); err != nil {
 		t.Fatalf("release owner-a: %v", err)
 	}
-	if _, held, err := leases.Holder(ctx, key); err != nil || held {
+	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || held {
 		t.Fatalf("holder after owner release = held=%v err=%v, want free", held, err)
 	}
 }
@@ -791,18 +791,18 @@ func TestLeaseHolderOnlyUnexpired(t *testing.T) {
 	ctx := context.Background()
 	s := openFeedStore(t)
 	leases := sqlite.NewLeaseStore(s)
-	key := "lease-holder-expiry"
+	const scope, projection, instance = "ws", "p", "live"
 
-	if ok, err := leases.Acquire(ctx, key, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
+	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
 		t.Fatalf("acquire = %v err=%v", ok, err)
 	}
-	if _, held, err := leases.Holder(ctx, key); err != nil || !held {
+	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || !held {
 		t.Fatalf("holder before expiry = held=%v err=%v, want held", held, err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		_, held, err := leases.Holder(ctx, key)
+		_, held, err := leases.Holder(ctx, scope, projection, instance)
 		if err != nil {
 			t.Fatalf("holder: %v", err)
 		}
@@ -813,6 +813,31 @@ func TestLeaseHolderOnlyUnexpired(t *testing.T) {
 			t.Fatal("Holder kept reporting an expired lease")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The adapter composes its storage key from the (scope, projection,
+// instance) triple. Distinct triples must stay distinct rows even when a
+// part contains the separator-like "/" — ("ws","a/b","c") and ("ws","a",
+// "b/c") are different subscriptions, never one lease. This pins the
+// collision-freedom the feed core's validateKey guarantees (no control
+// bytes in any part) for every adapter that joins parts into one key.
+func TestLeaseDistinctTriplesNeverCollide(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	leases := sqlite.NewLeaseStore(s)
+
+	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-a", "consumer-a", time.Minute); err != nil || !ok {
+		t.Fatalf("acquire = %v err=%v, want true/nil", ok, err)
+	}
+	// The segment-shifted triple is a different subscription: another owner
+	// can hold it alongside the first.
+	if ok, err := leases.Acquire(ctx, "ws", "a", "b/c", "owner-b", "consumer-b", time.Minute); err != nil || !ok {
+		t.Fatalf("acquire of the shifted triple = %v err=%v, want true (distinct triples never collide)", ok, err)
+	}
+	// The original triple is still fenced by owner-a.
+	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-b", "consumer-b", time.Minute); err != nil || ok {
+		t.Fatalf("acquire of the held triple = %v err=%v, want false (still held by owner-a)", ok, err)
 	}
 }
 

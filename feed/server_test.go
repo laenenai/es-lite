@@ -106,10 +106,18 @@ func newMemLeases() *memLeases {
 	return &memLeases{rows: map[string]memLease{}, failAfter: -1}
 }
 
-func (m *memLeases) Acquire(_ context.Context, key, owner, consumer string, ttl time.Duration) (bool, error) {
+// key composes the fake's internal map key from the triple. The separator
+// cannot occur inside a part: validateKey refuses control bytes, and the
+// tests never put "|" in a part.
+func (m *memLeases) key(scope, projection, instance string) string {
+	return scope + "|" + projection + "|" + instance
+}
+
+func (m *memLeases) Acquire(_ context.Context, scope, projection, instance, owner, consumer string, ttl time.Duration) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.acquired = append(m.acquired, ttl)
+	key := m.key(scope, projection, instance)
 	if m.acquireErr != nil {
 		if m.acquireTrueOnErr {
 			// The lease was taken as a side effect even though the call
@@ -125,13 +133,14 @@ func (m *memLeases) Acquire(_ context.Context, key, owner, consumer string, ttl 
 	return true, nil
 }
 
-func (m *memLeases) Renew(_ context.Context, key, owner string, ttl time.Duration) (bool, error) {
+func (m *memLeases) Renew(_ context.Context, scope, projection, instance, owner string, ttl time.Duration) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.renewals++
 	if m.failAfter >= 0 && m.renewals > m.failAfter {
 		return false, m.renewErr
 	}
+	key := m.key(scope, projection, instance)
 	row, held := m.rows[key]
 	if !held || row.owner != owner {
 		return false, nil
@@ -141,20 +150,21 @@ func (m *memLeases) Renew(_ context.Context, key, owner string, ttl time.Duratio
 	return true, nil
 }
 
-func (m *memLeases) Release(_ context.Context, key, owner string) error {
+func (m *memLeases) Release(_ context.Context, scope, projection, instance, owner string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.releases++
+	key := m.key(scope, projection, instance)
 	if row, held := m.rows[key]; held && row.owner == owner {
 		delete(m.rows, key)
 	}
 	return m.releaseErr
 }
 
-func (m *memLeases) Holder(_ context.Context, key string) (feed.Lease, bool, error) {
+func (m *memLeases) Holder(_ context.Context, scope, projection, instance string) (feed.Lease, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	row, held := m.rows[key]
+	row, held := m.rows[m.key(scope, projection, instance)]
 	if !held || !time.Now().Before(row.expiresAt) {
 		return feed.Lease{}, false, nil
 	}
@@ -454,11 +464,11 @@ func await(t *testing.T, done <-chan error) error {
 	}
 }
 
-func waitHeld(t *testing.T, leases *memLeases, key string, want bool) {
+func waitHeld(t *testing.T, leases *memLeases, scope, projection, instance string, want bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		_, held, err := leases.Holder(context.Background(), key)
+		_, held, err := leases.Holder(context.Background(), scope, projection, instance)
 		if err != nil {
 			t.Fatalf("Holder: %v", err)
 		}
@@ -466,7 +476,7 @@ func waitHeld(t *testing.T, leases *memLeases, key string, want bool) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("lease %q held = %v, want %v", key, !want, want)
+			t.Fatalf("lease %s/%s/%s held = %v, want %v", scope, projection, instance, !want, want)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -522,15 +532,6 @@ func newServer(t *testing.T, cfg feed.Config) *feed.Server {
 // Tests
 // ---------------------------------------------------------------------------
 
-func TestLeaseKeyIsNULSeparated(t *testing.T) {
-	if got, want := feed.LeaseKey("t", "a/b", "c"), "t\x00a/b\x00c"; got != want {
-		t.Fatalf("LeaseKey = %q, want %q", got, want)
-	}
-	if feed.LeaseKey("t", "a/b", "c") == feed.LeaseKey("t", "a", "b/c") {
-		t.Fatal("LeaseKey collides across segment boundaries")
-	}
-}
-
 func TestNewServerRequiresStores(t *testing.T) {
 	base := feed.Config{
 		Checkpoints: newMemCheckpoints(time.Now()),
@@ -581,16 +582,16 @@ func TestSubscribeRejectsInvalidRequests(t *testing.T) {
 	if err := srv.Subscribe(context.Background(), testRequest("live"), nil); !errors.Is(err, feed.ErrInvalidRequest) {
 		t.Fatalf("nil sink error = %v, want ErrInvalidRequest", err)
 	}
-	if _, held, _ := leases.Holder(context.Background(), feed.LeaseKey("tenant", "p", "")); held {
+	if _, held, _ := leases.Holder(context.Background(), "tenant", "p", ""); held {
 		t.Fatal("invalid request acquired a lease")
 	}
 }
 
-// Control bytes anywhere in a subscription identity are refused: LeaseKey
-// joins the parts with NUL, so a NUL inside a part would collide distinct
-// triples into one lease/checkpoint key — LeaseKey("a\x00b","c","i") equals
-// LeaseKey("a","b\x00c","i"). The empty instance stays legal: it is the
-// documented default instance.
+// Control bytes anywhere in a subscription identity are refused: adapters may
+// join the parts into one storage key with NUL, so a NUL inside a part would
+// collide distinct triples into one lease/checkpoint key — ("a\x00b","c","i")
+// equals ("a","b\x00c","i") under a NUL join. The empty instance stays legal:
+// it is the documented default instance.
 func TestValidateKeyRejectsControlBytes(t *testing.T) {
 	leases := newMemLeases()
 	// The waiter fails fast so that, if validation regresses and accepts the
@@ -666,7 +667,7 @@ func TestSubscribeAllowsOneSubscriberPerKey(t *testing.T) {
 	req := testRequest("live")
 
 	_, done := start(t, srv, req, newMemSink())
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), true)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, true)
 
 	err := srv.Subscribe(context.Background(), req, newMemSink())
 	if !errors.Is(err, feed.ErrLeaseHeld) {
@@ -683,7 +684,7 @@ func TestSubscribeAllowsOneSubscriberPerKey(t *testing.T) {
 	// Another instance is a different key, so it is allowed.
 	other := testRequest("shadow")
 	_, otherDone := start(t, srv, other, newMemSink())
-	waitHeld(t, leases, feed.LeaseKey(other.Scope, other.Projection, other.Instance), true)
+	waitHeld(t, leases, other.Scope, other.Projection, other.Instance, true)
 
 	if err := srv.Subscribe(context.Background(), req, newMemSink()); !errors.Is(err, feed.ErrLeaseHeld) {
 		t.Fatalf("first stream lost its key: %v", err)
@@ -828,7 +829,7 @@ func TestSubscribeRejectsAnOversizedEventWithoutLeakingThePayload(t *testing.T) 
 	if len(sink.snapshot()) != 0 {
 		t.Fatal("oversized event was sent")
 	}
-	waitHeld(t, leases, feed.LeaseKey("tenant", "counter.view", "live"), false)
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
 }
 
 func TestSubscribeAllowsAnEventExactlyAtTheLimit(t *testing.T) {
@@ -928,7 +929,7 @@ func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {
 
 	req := testRequest("live")
 	_, done := start(t, srv, req, newMemSink())
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), true)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, true)
 
 	got, err = srv.Status(context.Background(), "tenant", "counter.view", "live")
 	if err != nil {
@@ -984,15 +985,14 @@ func TestSubscribeCancellationReleasesTheLease(t *testing.T) {
 		Waiter: &blockingWaiter{},
 	})
 	req := testRequest("live")
-	key := feed.LeaseKey(req.Scope, req.Projection, req.Instance)
 	cancel, done := start(t, srv, req, newMemSink())
-	waitHeld(t, leases, key, true)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, true)
 
 	cancel()
 	if err := await(t, done); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
 	}
-	waitHeld(t, leases, key, false)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 func TestSubscribeAbortsWhenRenewFails(t *testing.T) {
@@ -1022,7 +1022,7 @@ func TestSubscribeAbortsWhenRenewFails(t *testing.T) {
 	if strings.Contains(err.Error(), "context canceled") {
 		t.Fatalf("error = %v, want only the lease loss (the cancellation is derived)", err)
 	}
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 // A real stream error that races a lease loss must keep both diagnoses: the
@@ -1087,7 +1087,7 @@ func TestSubscribeJoinsDeadlineExceededOnce(t *testing.T) {
 	if n := strings.Count(err.Error(), "deadline exceeded"); n != 1 {
 		t.Fatalf("error mentions the deadline %d times, want exactly once: %q", n, err)
 	}
-	waitHeld(t, leases, feed.LeaseKey("tenant", "counter.view", "live"), false)
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
 }
 
 // A store may report an error after it took the lease. (true, err) means the
@@ -1114,7 +1114,7 @@ func TestSubscribeReleasesALeaseAcquiredWithAnError(t *testing.T) {
 	if releases := leases.releaseCount(); releases != 1 {
 		t.Fatalf("releases = %d, want exactly 1", releases)
 	}
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 func TestSubscribeReleasesTheLeaseWhenTheLogFails(t *testing.T) {
@@ -1129,7 +1129,7 @@ func TestSubscribeReleasesTheLeaseWhenTheLogFails(t *testing.T) {
 	if err := await(t, done); !errors.Is(err, logs.openErr) {
 		t.Fatalf("error = %v, want the Open error", err)
 	}
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 func TestSubscribeReturnsASinkErrorAndReleasesTheLease(t *testing.T) {
@@ -1147,7 +1147,7 @@ func TestSubscribeReturnsASinkErrorAndReleasesTheLease(t *testing.T) {
 	if err := await(t, done); !errors.Is(err, sendErr) {
 		t.Fatalf("error = %v, want the sink error", err)
 	}
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 func TestSubscribeReturnsAWaitErrorAndReleasesTheLease(t *testing.T) {
@@ -1162,7 +1162,7 @@ func TestSubscribeReturnsAWaitErrorAndReleasesTheLease(t *testing.T) {
 	if err := await(t, done); !errors.Is(err, waitErr) {
 		t.Fatalf("error = %v, want the wait error", err)
 	}
-	waitHeld(t, leases, feed.LeaseKey(req.Scope, req.Projection, req.Instance), false)
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 func TestSubscribeBatchSizeDefaultsAndClamps(t *testing.T) {
@@ -1263,7 +1263,7 @@ func TestResetCheckpointRefusesWhileHeldUnlessForced(t *testing.T) {
 		Waiter: &blockingWaiter{},
 	})
 	_, done := start(t, srv, testRequest("live"), newMemSink())
-	waitHeld(t, leases, feed.LeaseKey("tenant", "counter.view", "live"), true)
+	waitHeld(t, leases, "tenant", "counter.view", "live", true)
 
 	err := srv.ResetCheckpoint(context.Background(), "tenant", "counter.view", "live", 0, false)
 	if !errors.Is(err, feed.ErrLeaseHeld) {
@@ -1291,7 +1291,7 @@ func TestDeleteSubscriptionRefusesWhileHeld(t *testing.T) {
 		Waiter: &blockingWaiter{},
 	})
 	cancel, done := start(t, srv, testRequest("live"), newMemSink())
-	waitHeld(t, leases, feed.LeaseKey("tenant", "counter.view", "live"), true)
+	waitHeld(t, leases, "tenant", "counter.view", "live", true)
 
 	if err := srv.DeleteSubscription(context.Background(), "tenant", "counter.view", "live"); !errors.Is(err, feed.ErrLeaseHeld) {
 		t.Fatalf("DeleteSubscription while held = %v, want ErrLeaseHeld", err)

@@ -51,14 +51,18 @@ type CheckpointStore interface {
 }
 
 // LeaseStore fences one active subscriber per subscription key (ADR 0002).
-// Acquire succeeds when the key is free, expired, or already owned by owner;
-// Renew extends a lease only for its owner; Holder reports only unexpired
-// leases.
+// The key is the (scope, projection, instance) triple, passed as separate
+// parts so adapters can store them in their own shape — the Postgres adapter
+// needs the scope column for row-level security. Adapters that join the
+// parts into one storage key rely on validateKey refusing control bytes in
+// every part. Acquire succeeds when the key is free, expired, or already
+// owned by owner; Renew extends a lease only for its owner; Holder reports
+// only unexpired leases.
 type LeaseStore interface {
-	Acquire(ctx context.Context, key, owner, consumer string, ttl time.Duration) (bool, error)
-	Renew(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)
-	Release(ctx context.Context, key, owner string) error
-	Holder(ctx context.Context, key string) (Lease, bool, error)
+	Acquire(ctx context.Context, scope, projection, instance, owner, consumer string, ttl time.Duration) (bool, error)
+	Renew(ctx context.Context, scope, projection, instance, owner string, ttl time.Duration) (bool, error)
+	Release(ctx context.Context, scope, projection, instance, owner string) error
+	Holder(ctx context.Context, scope, projection, instance string) (Lease, bool, error)
 }
 
 // Log is one scope's event log as the feed reads it. ReadAllBounded returns
@@ -131,11 +135,4 @@ type Status struct {
 	Lag              int64
 	ActiveConsumer   string
 	LastCheckpointAt time.Time
-}
-
-// LeaseKey is the NUL-separated subscription identity. validateKey refuses
-// control bytes in every part, so NUL never occurs inside a part and distinct
-// triples cannot collide.
-func LeaseKey(scope, projection, instance string) string {
-	return scope + "\x00" + projection + "\x00" + instance
 }

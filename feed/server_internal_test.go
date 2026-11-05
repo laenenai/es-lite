@@ -25,14 +25,14 @@ func (stubCheckpoints) Checkpoint(context.Context, string, string, string) (Chec
 
 type stubLeases struct{}
 
-func (stubLeases) Acquire(context.Context, string, string, string, time.Duration) (bool, error) {
+func (stubLeases) Acquire(context.Context, string, string, string, string, string, time.Duration) (bool, error) {
 	return true, nil
 }
-func (stubLeases) Renew(context.Context, string, string, time.Duration) (bool, error) {
+func (stubLeases) Renew(context.Context, string, string, string, string, time.Duration) (bool, error) {
 	return true, nil
 }
-func (stubLeases) Release(context.Context, string, string) error { return nil }
-func (stubLeases) Holder(context.Context, string) (Lease, bool, error) {
+func (stubLeases) Release(context.Context, string, string, string, string) error { return nil }
+func (stubLeases) Holder(context.Context, string, string, string) (Lease, bool, error) {
 	return Lease{}, false, nil
 }
 

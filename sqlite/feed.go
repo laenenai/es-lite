@@ -260,11 +260,19 @@ type LeaseStore struct {
 // NewLeaseStore returns a LeaseStore backed by s.
 func NewLeaseStore(s *Store) *LeaseStore { return &LeaseStore{store: s} }
 
-// Acquire takes the lease for key, or fails when another live owner holds
-// it. Re-acquiring with the same owner succeeds and records the consumer
-// named on this call. Expiry is stored as an absolute Unix-nanosecond
-// instant.
-func (l *LeaseStore) Acquire(ctx context.Context, key, owner, consumer string, ttl time.Duration) (bool, error) {
+// leaseKey composes the TEXT key this adapter stores for the subscription
+// triple. The feed core's validateKey refuses control bytes in every part,
+// so the NUL separator can never occur inside a part and distinct triples
+// cannot collide.
+func leaseKey(scope, projection, instance string) string {
+	return scope + "\x00" + projection + "\x00" + instance
+}
+
+// Acquire takes the lease for the (scope, projection, instance) key, or fails
+// when another live owner holds it. Re-acquiring with the same owner succeeds
+// and records the consumer named on this call. Expiry is stored as an
+// absolute Unix-nanosecond instant.
+func (l *LeaseStore) Acquire(ctx context.Context, scope, projection, instance, owner, consumer string, ttl time.Duration) (bool, error) {
 	now := time.Now()
 	res, err := l.store.db.ExecContext(ctx,
 		`INSERT INTO feed_leases (key, owner, consumer, expires_at_ns)
@@ -275,7 +283,7 @@ func (l *LeaseStore) Acquire(ctx context.Context, key, owner, consumer string, t
 		     expires_at_ns = excluded.expires_at_ns
 		 WHERE feed_leases.owner = excluded.owner
 		    OR feed_leases.expires_at_ns <= ?`,
-		key, owner, consumer, now.Add(ttl).UnixNano(), now.UnixNano(),
+		leaseKey(scope, projection, instance), owner, consumer, now.Add(ttl).UnixNano(), now.UnixNano(),
 	)
 	if err != nil {
 		return false, fmt.Errorf("sqlite: leases: acquire: %w", err)
@@ -290,11 +298,11 @@ func (l *LeaseStore) Acquire(ctx context.Context, key, owner, consumer string, t
 // Renew extends the lease only for its current owner. Like the Postgres
 // adapter it does not check whether the row has already expired: the upsert
 // owner guard at Acquire is what decides a takeover.
-func (l *LeaseStore) Renew(ctx context.Context, key, owner string, ttl time.Duration) (bool, error) {
+func (l *LeaseStore) Renew(ctx context.Context, scope, projection, instance, owner string, ttl time.Duration) (bool, error) {
 	res, err := l.store.db.ExecContext(ctx,
 		`UPDATE feed_leases SET expires_at_ns = ?
 		 WHERE key = ? AND owner = ?`,
-		time.Now().Add(ttl).UnixNano(), key, owner,
+		time.Now().Add(ttl).UnixNano(), leaseKey(scope, projection, instance), owner,
 	)
 	if err != nil {
 		return false, fmt.Errorf("sqlite: leases: renew: %w", err)
@@ -308,20 +316,20 @@ func (l *LeaseStore) Renew(ctx context.Context, key, owner string, ttl time.Dura
 
 // Release drops the lease when owner still holds it. Releasing a lease
 // nobody holds, or one another owner took over, is not an error.
-func (l *LeaseStore) Release(ctx context.Context, key, owner string) error {
+func (l *LeaseStore) Release(ctx context.Context, scope, projection, instance, owner string) error {
 	if _, err := l.store.db.ExecContext(ctx,
 		`DELETE FROM feed_leases WHERE key = ? AND owner = ?`,
-		key, owner,
+		leaseKey(scope, projection, instance), owner,
 	); err != nil {
 		return fmt.Errorf("sqlite: leases: release: %w", err)
 	}
 	return nil
 }
 
-// Holder reports the live holder of key, or found=false when nobody holds
-// it. An expired row is not a holder: Acquire treats it as free, so this
-// must too.
-func (l *LeaseStore) Holder(ctx context.Context, key string) (feed.Lease, bool, error) {
+// Holder reports the live holder of the (scope, projection, instance) key,
+// or found=false when nobody holds it. An expired row is not a holder:
+// Acquire treats it as free, so this must too.
+func (l *LeaseStore) Holder(ctx context.Context, scope, projection, instance string) (feed.Lease, bool, error) {
 	var (
 		lease       feed.Lease
 		expiresAtNS int64
@@ -329,7 +337,7 @@ func (l *LeaseStore) Holder(ctx context.Context, key string) (feed.Lease, bool, 
 	err := l.store.db.QueryRowContext(ctx,
 		`SELECT owner, consumer, expires_at_ns FROM feed_leases
 		 WHERE key = ? AND expires_at_ns > ?`,
-		key, time.Now().UnixNano(),
+		leaseKey(scope, projection, instance), time.Now().UnixNano(),
 	).Scan(&lease.Owner, &lease.Consumer, &expiresAtNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return feed.Lease{}, false, nil

@@ -166,28 +166,27 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	if err := validateRequest(req, sink); err != nil {
 		return err
 	}
-	key := LeaseKey(req.Scope, req.Projection, req.Instance)
 	owner := s.newOwner()
 
-	acquired, err := s.cfg.Leases.Acquire(ctx, key, owner, req.Consumer, s.cfg.LeaseTTL)
+	acquired, err := s.cfg.Leases.Acquire(ctx, req.Scope, req.Projection, req.Instance, owner, req.Consumer, s.cfg.LeaseTTL)
 	if err != nil {
-		aerr := fmt.Errorf("feed: acquire lease %q: %w", key, err)
+		aerr := fmt.Errorf("feed: acquire lease %s/%s/%s: %w", req.Scope, req.Projection, req.Instance, err)
 		// A store may report an error after it took the lease (a failed
 		// post-commit step, for example). (true, err) means we own it, so
 		// release it rather than leaking the key.
 		if acquired {
-			if rerr := s.releaseLease(ctx, key, owner); rerr != nil {
-				aerr = errors.Join(aerr, fmt.Errorf("feed: release lease %q after acquire error: %w", key, rerr))
+			if rerr := s.releaseLease(ctx, req.Scope, req.Projection, req.Instance, owner); rerr != nil {
+				aerr = errors.Join(aerr, fmt.Errorf("feed: release lease %s/%s/%s after acquire error: %w", req.Scope, req.Projection, req.Instance, rerr))
 			}
 		}
 		return aerr
 	}
 	if !acquired {
-		lease, held, herr := s.cfg.Leases.Holder(ctx, key)
+		lease, held, herr := s.cfg.Leases.Holder(ctx, req.Scope, req.Projection, req.Instance)
 		if herr != nil {
-			return fmt.Errorf("feed: acquire lease %q: %w", key, herr)
+			return fmt.Errorf("feed: acquire lease %s/%s/%s: %w", req.Scope, req.Projection, req.Instance, herr)
 		}
-		return &LeaseHeldError{Key: key, Lease: lease, Held: held}
+		return &LeaseHeldError{Key: fmt.Sprintf("%s/%s/%s", req.Scope, req.Projection, req.Instance), Lease: lease, Held: held}
 	}
 
 	// runCtx is cancelled by the caller's ctx or by a failed renewal, so the
@@ -198,7 +197,7 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	renewals.Add(1)
 	go func() {
 		defer renewals.Done()
-		s.renew(runCtx, key, owner, lost, cancel)
+		s.renew(runCtx, req.Scope, req.Projection, req.Instance, owner, lost, cancel)
 	}()
 
 	// Release ordering: stop the stream, wait for the renewer to exit, then
@@ -208,8 +207,8 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	defer func() {
 		cancel()
 		renewals.Wait()
-		if rerr := s.releaseLease(ctx, key, owner); rerr != nil {
-			err = errors.Join(err, fmt.Errorf("feed: release lease %q: %w", key, rerr))
+		if rerr := s.releaseLease(ctx, req.Scope, req.Projection, req.Instance, owner); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("feed: release lease %s/%s/%s: %w", req.Scope, req.Projection, req.Instance, rerr))
 		}
 	}()
 
@@ -251,19 +250,20 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	return streamErr
 }
 
-// releaseLease releases key for owner on a context detached from the stream's
-// cancellation, bounded by leaseReleaseTimeout, so a cancelled stream still
-// frees its key and values (tenant scope, tracing) survive.
-func (s *Server) releaseLease(ctx context.Context, key, owner string) error {
+// releaseLease releases the subscription key for owner on a context detached
+// from the stream's cancellation, bounded by leaseReleaseTimeout, so a
+// cancelled stream still frees its key and values (tenant scope, tracing)
+// survive.
+func (s *Server) releaseLease(ctx context.Context, scope, projection, instance, owner string) error {
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), leaseReleaseTimeout)
 	defer cancel()
-	return s.cfg.Leases.Release(releaseCtx, key, owner)
+	return s.cfg.Leases.Release(releaseCtx, scope, projection, instance, owner)
 }
 
 // renew extends the lease every RenewEvery until ctx ends. On the first failed
 // renewal it records a *LeaseLostError and cancels the stream. The error is
 // buffered and recorded before the cancel, so Subscribe can always observe it.
-func (s *Server) renew(ctx context.Context, key, owner string, lost chan<- error, cancel context.CancelFunc) {
+func (s *Server) renew(ctx context.Context, scope, projection, instance, owner string, lost chan<- error, cancel context.CancelFunc) {
 	ticker := time.NewTicker(s.cfg.RenewEvery)
 	defer ticker.Stop()
 	for {
@@ -272,7 +272,7 @@ func (s *Server) renew(ctx context.Context, key, owner string, lost chan<- error
 			return
 		case <-ticker.C:
 		}
-		ok, rerr := s.cfg.Leases.Renew(ctx, key, owner, s.cfg.LeaseTTL)
+		ok, rerr := s.cfg.Leases.Renew(ctx, scope, projection, instance, owner, s.cfg.LeaseTTL)
 		if ctx.Err() != nil {
 			return // cancellation (caller or our own) ended the stream
 		}
@@ -283,7 +283,7 @@ func (s *Server) renew(ctx context.Context, key, owner string, lost chan<- error
 			rerr = errLeaseExpired
 		}
 		select {
-		case lost <- &LeaseLostError{Key: key, Owner: owner, Err: rerr}:
+		case lost <- &LeaseLostError{Key: fmt.Sprintf("%s/%s/%s", scope, projection, instance), Owner: owner, Err: rerr}:
 		default:
 		}
 		cancel()
@@ -455,7 +455,7 @@ func (s *Server) Status(ctx context.Context, scope, projection, instance string)
 		Lag:              int64(head) - int64(pos),
 		LastCheckpointAt: updated,
 	}
-	if lease, held, err := s.cfg.Leases.Holder(ctx, LeaseKey(scope, projection, instance)); err != nil {
+	if lease, held, err := s.cfg.Leases.Holder(ctx, scope, projection, instance); err != nil {
 		return Status{}, fmt.Errorf("feed: holder for %s/%s/%s: %w", scope, projection, instance, err)
 	} else if held {
 		st.ActiveConsumer = lease.Consumer
@@ -466,13 +466,12 @@ func (s *Server) Status(ctx context.Context, scope, projection, instance string)
 // refuseIfHeld returns a *LeaseHeldError when the subscription key has a live
 // holder.
 func (s *Server) refuseIfHeld(ctx context.Context, scope, projection, instance string) error {
-	key := LeaseKey(scope, projection, instance)
-	lease, held, err := s.cfg.Leases.Holder(ctx, key)
+	lease, held, err := s.cfg.Leases.Holder(ctx, scope, projection, instance)
 	if err != nil {
 		return fmt.Errorf("feed: holder for %s/%s/%s: %w", scope, projection, instance, err)
 	}
 	if held {
-		return &LeaseHeldError{Key: key, Lease: lease, Held: true}
+		return &LeaseHeldError{Key: fmt.Sprintf("%s/%s/%s", scope, projection, instance), Lease: lease, Held: true}
 	}
 	return nil
 }
@@ -504,8 +503,9 @@ func validateRequest(req Request, sink Sink) error {
 }
 
 // containsControl reports whether s contains an ASCII control byte (C0
-// controls or DEL). LeaseKey joins the key parts with NUL, so a control byte
-// inside any part would let distinct triples collide into one key.
+// controls or DEL). Adapters may join the key parts into one storage key
+// (the sqlite adapter joins them with NUL), so a control byte inside any
+// part would let distinct triples collide into one key.
 func containsControl(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if c := s[i]; c < 0x20 || c == 0x7f {
@@ -517,8 +517,9 @@ func containsControl(s string) bool {
 
 // validateKey checks one subscription identity. Scope and projection are
 // required; instance may be empty (the documented default instance). Control
-// bytes are refused in every part: LeaseKey joins the parts with NUL, so a
-// NUL inside a part would make distinct triples collide.
+// bytes are refused in every part: adapters may join the parts into one
+// storage key with NUL, so a NUL inside a part would make distinct triples
+// collide.
 func validateKey(scope, projection, instance string) error {
 	switch {
 	case scope == "":

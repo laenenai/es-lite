@@ -76,10 +76,12 @@ func newFGCheckpoints() *fgCheckpoints {
 	return &fgCheckpoints{rows: map[string]fgCP{}}
 }
 
-// fgCpKey reuses feed.LeaseKey's NUL-joined form so distinct triples cannot
-// collide.
-func fgCpKey(scope, projection, instance string) string {
-	return feed.LeaseKey(scope, projection, instance)
+// fgKey joins the (scope, projection, instance) triple with NUL — the same
+// form the sqlite adapter composes — so distinct triples cannot collide. The
+// feed core's validateKey refuses control bytes in every part, so a NUL
+// never occurs inside a part.
+func fgKey(scope, projection, instance string) string {
+	return scope + "\x00" + projection + "\x00" + instance
 }
 
 func (m *fgCheckpoints) Load(ctx context.Context, scope, projection, instance string) (uint64, error) {
@@ -88,7 +90,7 @@ func (m *fgCheckpoints) Load(ctx context.Context, scope, projection, instance st
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.rows[fgCpKey(scope, projection, instance)].pos, nil
+	return m.rows[fgKey(scope, projection, instance)].pos, nil
 }
 
 func (m *fgCheckpoints) Save(ctx context.Context, scope, projection, instance string, position uint64) error {
@@ -97,7 +99,7 @@ func (m *fgCheckpoints) Save(ctx context.Context, scope, projection, instance st
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := fgCpKey(scope, projection, instance)
+	k := fgKey(scope, projection, instance)
 	row := m.rows[k]
 	if position > row.pos {
 		row.pos = position
@@ -113,7 +115,7 @@ func (m *fgCheckpoints) Reset(ctx context.Context, scope, projection, instance s
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rows[fgCpKey(scope, projection, instance)] = fgCP{pos: position, at: time.Now()}
+	m.rows[fgKey(scope, projection, instance)] = fgCP{pos: position, at: time.Now()}
 	return nil
 }
 
@@ -123,7 +125,7 @@ func (m *fgCheckpoints) Delete(ctx context.Context, scope, projection, instance 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.rows, fgCpKey(scope, projection, instance))
+	delete(m.rows, fgKey(scope, projection, instance))
 	return nil
 }
 
@@ -133,7 +135,7 @@ func (m *fgCheckpoints) Checkpoint(ctx context.Context, scope, projection, insta
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	row, ok := m.rows[fgCpKey(scope, projection, instance)]
+	row, ok := m.rows[fgKey(scope, projection, instance)]
 	if !ok {
 		return feed.Checkpoint{}, false, nil
 	}
@@ -171,12 +173,13 @@ func newFGLeases() *fgLeases {
 	return &fgLeases{rows: map[string]fgLease{}}
 }
 
-func (m *fgLeases) Acquire(ctx context.Context, key, owner, consumer string, ttl time.Duration) (bool, error) {
+func (m *fgLeases) Acquire(ctx context.Context, scope, projection, instance, owner, consumer string, ttl time.Duration) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	key := fgKey(scope, projection, instance)
 	if row, held := m.rows[key]; held && time.Now().Before(row.expiresAt) && row.owner != owner {
 		return false, nil
 	}
@@ -184,12 +187,13 @@ func (m *fgLeases) Acquire(ctx context.Context, key, owner, consumer string, ttl
 	return true, nil
 }
 
-func (m *fgLeases) Renew(ctx context.Context, key, owner string, ttl time.Duration) (bool, error) {
+func (m *fgLeases) Renew(ctx context.Context, scope, projection, instance, owner string, ttl time.Duration) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	key := fgKey(scope, projection, instance)
 	row, held := m.rows[key]
 	if !held || row.owner != owner {
 		return false, nil
@@ -201,22 +205,23 @@ func (m *fgLeases) Renew(ctx context.Context, key, owner string, ttl time.Durati
 
 // Release deliberately ignores ctx: Subscribe releases through a detached
 // (WithoutCancel) context, and a cancelled stream must never leak its key.
-func (m *fgLeases) Release(_ context.Context, key, owner string) error {
+func (m *fgLeases) Release(_ context.Context, scope, projection, instance, owner string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	key := fgKey(scope, projection, instance)
 	if row, held := m.rows[key]; held && row.owner == owner {
 		delete(m.rows, key)
 	}
 	return nil
 }
 
-func (m *fgLeases) Holder(ctx context.Context, key string) (feed.Lease, bool, error) {
+func (m *fgLeases) Holder(ctx context.Context, scope, projection, instance string) (feed.Lease, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return feed.Lease{}, false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	row, held := m.rows[key]
+	row, held := m.rows[fgKey(scope, projection, instance)]
 	if !held || !time.Now().Before(row.expiresAt) {
 		return feed.Lease{}, false, nil
 	}
