@@ -14,8 +14,10 @@ type stubCheckpoints struct{}
 func (stubCheckpoints) Load(context.Context, string, string, string) (uint64, error) {
 	return 0, nil
 }
-func (stubCheckpoints) Save(context.Context, string, string, string, uint64) error { return nil }
-func (stubCheckpoints) Reset(context.Context, string, string, string, uint64) error {
+func (stubCheckpoints) Save(context.Context, string, string, string, string, uint64) error {
+	return nil
+}
+func (stubCheckpoints) Reset(context.Context, string, string, string, string, uint64) error {
 	return nil
 }
 func (stubCheckpoints) Delete(context.Context, string, string, string) error { return nil }

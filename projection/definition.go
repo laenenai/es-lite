@@ -1,5 +1,12 @@
 package projection
 
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
+	"strings"
+)
+
 // Definition is a projection's static metadata: the stable name that keys its
 // marker and durable consumer, and the event type URLs it declares as
 // consumed. A generated projection exposes exactly one via XDefinition(),
@@ -8,6 +15,31 @@ package projection
 type Definition struct {
 	Name     string
 	Consumes []string
+}
+
+// definitionHashPrefix namespaces the definition fingerprint inside the
+// SHA-256 input so a projection hash can never collide with any other
+// hashed value in the system. It is part of the pinned byte layout and
+// must never change: deployed checkpoints store Hash() values forever.
+const definitionHashPrefix = "es-lite/definition"
+
+// Hash returns the definition's stable fingerprint: SHA-256 over the
+// pinned byte layout "es-lite/definition\x00" + Name + "\x00" + the
+// Consumed type URLs sorted and NUL-joined. It is deterministic across
+// processes and releases, and insensitive to the order of Consumes —
+// reordering a declaration is not a definition change. The feed stores
+// it with a checkpoint and refuses to resume a subscription whose
+// definition hashes differently (spec §5.5).
+func (d Definition) Hash() string {
+	consumes := append([]string(nil), d.Consumes...)
+	sort.Strings(consumes)
+	h := sha256.New()
+	h.Write([]byte(definitionHashPrefix))
+	h.Write([]byte{'\x00'})
+	h.Write([]byte(d.Name))
+	h.Write([]byte{'\x00'})
+	h.Write([]byte(strings.Join(consumes, "\x00")))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Catalog is a read-only registry of projection definitions. Implementations

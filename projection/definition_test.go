@@ -8,6 +8,51 @@ import (
 	"github.com/laenenai/es-lite/projection"
 )
 
+// TestDefinitionHashIsStable pins the definition fingerprint (spec §5.5):
+// the hash is deterministic, insensitive to the order of Consumes, and
+// sensitive to the name and the type set. The golden values pin the
+// exact byte layout — "es-lite/definition\x00" + Name + "\x00" + the
+// NUL-joined sorted Consumes — because the fingerprint must be stable
+// across processes and releases: a changed formula would strand every
+// deployed checkpoint behind the feed's definition-drift refusal.
+func TestDefinitionHashIsStable(t *testing.T) {
+	one := projection.Definition{Name: "counter.view", Consumes: []string{"counter.v1.Incremented"}}
+	if got := one.Hash(); got != "f72e9d8512d02b94b3dea11d7ce4b27a89a01fa40272d100751ad0426783f3ab" {
+		t.Fatalf("Hash(%+v) = %q, want the pinned digest of the exact byte layout", one, got)
+	}
+	two := projection.Definition{Name: "counter.view", Consumes: []string{"b.v1.B", "a.v1.A"}}
+	if got := two.Hash(); got != "4bcf3165192dbb2d2ac02a619f50c1cf7ce5603d83286e2a7c01277167aa1036" {
+		t.Fatalf("Hash(%+v) = %q, want the pinned digest (Consumes sorted before the join)", two, got)
+	}
+
+	// Identical definitions hash equal.
+	same := projection.Definition{Name: "counter.view", Consumes: []string{"counter.v1.Incremented"}}
+	if one.Hash() != same.Hash() {
+		t.Fatal("identical definitions hash different")
+	}
+
+	// Consumes order is irrelevant: the fingerprint sorts before joining.
+	reordered := projection.Definition{Name: "counter.view", Consumes: []string{"a.v1.A", "b.v1.B"}}
+	if two.Hash() != reordered.Hash() {
+		t.Fatal("reordered Consumes hash different")
+	}
+
+	// A name change is a different projection identity.
+	renamed := projection.Definition{Name: "counter.activity", Consumes: []string{"counter.v1.Incremented"}}
+	if one.Hash() == renamed.Hash() {
+		t.Fatal("a name change hashed equal")
+	}
+
+	// A type-set change is a different identity, whichever way it moves.
+	if one.Hash() == two.Hash() {
+		t.Fatal("an added consumed type hashed equal")
+	}
+	dropped := projection.Definition{Name: "counter.view", Consumes: []string{"a.v1.A"}}
+	if reordered.Hash() == dropped.Hash() {
+		t.Fatal("a removed consumed type hashed equal")
+	}
+}
+
 func TestCatalogDefinitionAndOrder(t *testing.T) {
 	authz := []string{"space.v1.Created", "space.v1.Granted"}
 	activity := []string{"counter.v1.Incremented"}

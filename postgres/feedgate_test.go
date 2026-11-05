@@ -68,8 +68,9 @@ type fgCheckpoints struct {
 }
 
 type fgCP struct {
-	pos uint64
-	at  time.Time
+	pos  uint64
+	hash string
+	at   time.Time
 }
 
 func newFGCheckpoints() *fgCheckpoints {
@@ -93,7 +94,15 @@ func (m *fgCheckpoints) Load(ctx context.Context, scope, projection, instance st
 	return m.rows[fgKey(scope, projection, instance)].pos, nil
 }
 
-func (m *fgCheckpoints) Save(ctx context.Context, scope, projection, instance string, position uint64) error {
+// Save is monotonic — like the planned Postgres store's GREATEST update, a
+// rewind never lands, so a redelivery cannot regress the cursor — and
+// mirrors the port contract for the fingerprint: a non-empty definition
+// records it, an empty one preserves the stored hash. Every method honours
+// ctx, like a real database adapter: an ack raced by the stream's
+// cancellation fails instead of silently succeeding, which is what makes
+// the chaos kill window ("after a Send but before the Checkpoint call")
+// meaningful.
+func (m *fgCheckpoints) Save(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -104,18 +113,28 @@ func (m *fgCheckpoints) Save(ctx context.Context, scope, projection, instance st
 	if position > row.pos {
 		row.pos = position
 	}
+	if definition != "" {
+		row.hash = definition
+	}
 	row.at = time.Now()
 	m.rows[k] = row
 	return nil
 }
 
-func (m *fgCheckpoints) Reset(ctx context.Context, scope, projection, instance string, position uint64) error {
+func (m *fgCheckpoints) Reset(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rows[fgKey(scope, projection, instance)] = fgCP{pos: position, at: time.Now()}
+	k := fgKey(scope, projection, instance)
+	row := m.rows[k]
+	row.pos = position
+	if definition != "" {
+		row.hash = definition
+	}
+	row.at = time.Now()
+	m.rows[k] = row
 	return nil
 }
 
@@ -139,7 +158,7 @@ func (m *fgCheckpoints) Checkpoint(ctx context.Context, scope, projection, insta
 	if !ok {
 		return feed.Checkpoint{}, false, nil
 	}
-	return feed.Checkpoint{Position: row.pos, UpdatedAt: row.at}, true, nil
+	return feed.Checkpoint{Position: row.pos, DefinitionHash: row.hash, UpdatedAt: row.at}, true, nil
 }
 
 // carryInto copies all rows into dst. It stands in for the durability the
@@ -518,14 +537,16 @@ func (c *fgConsumer) Send(ctx context.Context, env es.Envelope) error {
 	gen := c.gen
 	c.mu.Unlock()
 	if needAck {
-		// TODO(Task 11): Ack.Definition carries the consumer's
-		// Definition.Hash() once Checkpoint persists it; empty for now.
+		// The ack carries the consumer's definition fingerprint, so a
+		// generation's reconnect is checked against the identity its
+		// predecessor recorded (a stable definition: never drifts here).
 		if err := gen.srv.Checkpoint(ctx, feed.Ack{
 			Scope:      c.scope,
 			Projection: c.projection,
 			Instance:   c.instance,
 			Owner:      c.req.Owner,
 			Position:   pos,
+			Definition: c.req.Definition.Hash(),
 		}); err != nil {
 			return fmt.Errorf("feedgate: ack %s/%s/%s at %d: %w", c.scope, c.projection, c.instance, pos, err)
 		}

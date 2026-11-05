@@ -28,6 +28,7 @@ type memCheckpoints struct {
 
 type memCheckpoint struct {
 	position uint64
+	hash     string
 	at       time.Time
 }
 
@@ -45,15 +46,23 @@ func (m *memCheckpoints) Load(_ context.Context, scope, projection, instance str
 	return m.rows[m.key(scope, projection, instance)].position, nil
 }
 
-func (m *memCheckpoints) Save(_ context.Context, scope, projection, instance string, position uint64) error {
+// Save mirrors the port contract: a non-empty definition becomes the
+// checkpoint's fingerprint, an empty one preserves the stored hash.
+func (m *memCheckpoints) Save(_ context.Context, scope, projection, instance, definition string, position uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rows[m.key(scope, projection, instance)] = memCheckpoint{position: position, at: m.now}
+	row := m.rows[m.key(scope, projection, instance)]
+	row.position = position
+	if definition != "" {
+		row.hash = definition
+	}
+	row.at = m.now
+	m.rows[m.key(scope, projection, instance)] = row
 	return nil
 }
 
-func (m *memCheckpoints) Reset(_ context.Context, scope, projection, instance string, position uint64) error {
-	return m.Save(context.Background(), scope, projection, instance, position)
+func (m *memCheckpoints) Reset(_ context.Context, scope, projection, instance, definition string, position uint64) error {
+	return m.Save(context.Background(), scope, projection, instance, definition, position)
 }
 
 func (m *memCheckpoints) Delete(_ context.Context, scope, projection, instance string) error {
@@ -70,7 +79,15 @@ func (m *memCheckpoints) Checkpoint(_ context.Context, scope, projection, instan
 	if !ok {
 		return feed.Checkpoint{}, false, nil
 	}
-	return feed.Checkpoint{Position: row.position, UpdatedAt: row.at}, true, nil
+	return feed.Checkpoint{Position: row.position, DefinitionHash: row.hash, UpdatedAt: row.at}, true, nil
+}
+
+// hashOf exposes the stored fingerprint so tests can pin what was
+// recorded (and that an empty definition preserved it).
+func (m *memCheckpoints) hashOf(scope, projection, instance string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rows[m.key(scope, projection, instance)].hash
 }
 
 func (m *memCheckpoints) set(scope, projection, instance string, position uint64) {
@@ -1421,6 +1438,172 @@ func TestCheckpointRejectsWithoutLease(t *testing.T) {
 	}
 }
 
+// Review finding R5, end to end. A deployed projection gains a consumed
+// event type: without a fingerprint the resubscription would resume at
+// the stored checkpoint and silently skip every event of the new type
+// below it — here the B events at 3 and 4 under the checkpoint at 10.
+// The ack records the definition hash with the position; a request under
+// a different definition fails closed with ErrDefinitionChanged naming
+// the projection and the recovery, and only ResetCheckpoint under the
+// new definition re-identifies the checkpoint so the replay includes the
+// previously skipped history.
+func TestSubscribeRejectsChangedDefinition(t *testing.T) {
+	const (
+		typeA = "counter.v1.Incremented"
+		typeB = "counter.v1.Zeroed"
+	)
+	defA := projection.Definition{Name: "counter.view", Consumes: []string{typeA}}
+	defB := projection.Definition{Name: "counter.view", Consumes: []string{typeA, typeB}}
+	logs := newMemLogs(
+		ev(1, typeA, "a1"),
+		ev(2, typeA, "a2"),
+		ev(3, typeB, "b1"),
+		ev(4, typeB, "b2"),
+		ev(5, typeA, "a5"),
+		ev(6, typeA, "a6"),
+	)
+	checkpoints := newMemCheckpoints(time.Now())
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: logs,
+		Waiter: &blockingWaiter{},
+	})
+
+	// The deployed projection {A} acked position 10; the checkpoint
+	// records the ack's definition fingerprint with the position.
+	if _, err := leases.Acquire(context.Background(), "tenant", "counter.view", "live", "owner-a", "worker-1", time.Minute); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 10, Definition: defA.Hash(),
+	}); err != nil {
+		t.Fatalf("ack under the deployed definition: %v", err)
+	}
+	if err := leases.Release(context.Background(), "tenant", "counter.view", "live", "owner-a"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != defA.Hash() {
+		t.Fatalf("stored fingerprint = %q, want the acked definition's", got)
+	}
+
+	// The projection widens to {A, B}. Subscribing under the new
+	// definition must fail closed instead of resuming at 10 and skipping
+	// B's history at 3 and 4. The short deadline keeps a regression from
+	// idling forever: the old behaviour streams nothing below the
+	// checkpoint and blocks on the waiter.
+	reqB := testRequest("live")
+	reqB.Definition = defB
+	ctxDrift, cancelDrift := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancelDrift()
+	sink := newMemSink()
+	err := srv.Subscribe(ctxDrift, reqB, sink)
+	if !errors.Is(err, feed.ErrDefinitionChanged) {
+		t.Fatalf("subscribe under a changed definition: error = %v, want ErrDefinitionChanged (B's history below checkpoint 10 would be skipped)", err)
+	}
+	var changed *feed.DefinitionChangedError
+	if !errors.As(err, &changed) {
+		t.Fatalf("error = %T, want *DefinitionChangedError", err)
+	}
+	if changed.Projection != "counter.view" {
+		t.Fatalf("error names projection %q, want counter.view", changed.Projection)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "ResetCheckpoint") {
+		t.Fatalf("error %q does not point at ResetCheckpoint", msg)
+	}
+	if got := sink.snapshot(); len(got) != 0 {
+		t.Fatalf("the refused subscription delivered %d events", len(got))
+	}
+	if calls := logs.callsSnapshot(); len(calls) != 0 {
+		t.Fatalf("the refused subscription read the log %d times", len(calls))
+	}
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
+	if pos, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); pos != 10 {
+		t.Fatalf("checkpoint = %d after the refused subscribe, want 10 (untouched)", pos)
+	}
+	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != defA.Hash() {
+		t.Fatalf("fingerprint = %q after the refused subscribe, want the acked one (untouched)", got)
+	}
+
+	// The operator resets under the new definition: a deliberate
+	// re-subscription that re-identifies the checkpoint. The replay starts
+	// at the reset point and includes B's history below the old
+	// checkpoint — exactly the events the old definition never saw.
+	if err := srv.ResetCheckpoint(context.Background(), reqB, 0, false); err != nil {
+		t.Fatalf("ResetCheckpoint under the new definition: %v", err)
+	}
+	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != defB.Hash() {
+		t.Fatalf("stored fingerprint = %q after the reset, want the new definition's", got)
+	}
+	sink2 := newMemSink()
+	cancel2, done2 := start(t, srv, reqB, sink2)
+	got := sink2.waitFor(t, 6)
+	if positions := positionsOf(got); !reflect.DeepEqual(positions, []uint64{1, 2, 3, 4, 5, 6}) {
+		t.Fatalf("replayed positions = %v, want [1 2 3 4 5 6] (the B events at 3 and 4 are no longer skipped)", positions)
+	}
+	if calls := logs.callsSnapshot(); calls[0].from != 0 {
+		t.Fatalf("replay reads from %d, want the reset point 0", calls[0].from)
+	}
+	cancel2()
+	_ = await(t, done2)
+}
+
+// A checkpoint with no recorded fingerprint — one acked before the
+// fingerprint existed, or by a consumer that passes no definition — never
+// fails the drift check: the fail-closed rule is "a recorded identity
+// mismatched", not "an identity is missing". Pre-fingerprint deployments
+// keep streaming while they upgrade, and their next definition-carrying
+// ack records the identity.
+func TestSubscribeDoesNotCheckDriftWithoutAStoredHash(t *testing.T) {
+	const (
+		typeA = "counter.v1.Incremented"
+		typeB = "counter.v1.Zeroed"
+	)
+	defB := projection.Definition{Name: "counter.view", Consumes: []string{typeA, typeB}}
+	logs := newMemLogs(
+		ev(1, typeA, "a1"),
+		ev(2, typeA, "a2"),
+		ev(3, typeB, "b1"),
+		ev(4, typeB, "b2"),
+	)
+	checkpoints := newMemCheckpoints(time.Now())
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: leases, Logs: logs,
+		Waiter: &blockingWaiter{},
+	})
+
+	// An ack with no definition records the position but no fingerprint.
+	if _, err := leases.Acquire(context.Background(), "tenant", "counter.view", "live", "owner-a", "worker-1", time.Minute); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := srv.Checkpoint(context.Background(), feed.Ack{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Owner: "owner-a", Position: 2,
+	}); err != nil {
+		t.Fatalf("ack without a definition: %v", err)
+	}
+	if err := leases.Release(context.Background(), "tenant", "counter.view", "live", "owner-a"); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != "" {
+		t.Fatalf("stored fingerprint = %q, want empty (an empty Definition preserves it)", got)
+	}
+
+	// Subscribing under a different definition streams: events of the new
+	// type above the checkpoint are delivered, not refused.
+	reqB := testRequest("live")
+	reqB.Definition = defB
+	sink := newMemSink()
+	cancel, done := start(t, srv, reqB, sink)
+	got := sink.waitFor(t, 2)
+	if positions := positionsOf(got); !reflect.DeepEqual(positions, []uint64{3, 4}) {
+		t.Fatalf("positions = %v, want [3 4] (no recorded fingerprint, no refusal)", positions)
+	}
+	cancel()
+	_ = await(t, done)
+}
+
 // Request.Owner becomes the lease owner verbatim: it is what Holder reports,
 // what a second subscriber is refused against, and what Ack.Owner must
 // match. A reconnect reusing the same token re-acquires its own key
@@ -1497,7 +1680,7 @@ func TestResetCheckpointRefusesWhileHeldUnlessForced(t *testing.T) {
 	_, done := start(t, srv, testRequest("live"), newMemSink())
 	waitHeld(t, leases, "tenant", "counter.view", "live", true)
 
-	err := srv.ResetCheckpoint(context.Background(), "tenant", "counter.view", "live", 0, false)
+	err := srv.ResetCheckpoint(context.Background(), testRequest("live"), 0, false)
 	if !errors.Is(err, feed.ErrLeaseHeld) {
 		t.Fatalf("ResetCheckpoint while held = %v, want ErrLeaseHeld", err)
 	}
@@ -1505,7 +1688,7 @@ func TestResetCheckpointRefusesWhileHeldUnlessForced(t *testing.T) {
 		t.Fatalf("checkpoint changed to %d without force", got)
 	}
 
-	if err := srv.ResetCheckpoint(context.Background(), "tenant", "counter.view", "live", 0, true); err != nil {
+	if err := srv.ResetCheckpoint(context.Background(), testRequest("live"), 0, true); err != nil {
 		t.Fatalf("forced ResetCheckpoint: %v", err)
 	}
 	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 0 {

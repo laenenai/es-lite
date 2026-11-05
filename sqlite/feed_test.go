@@ -558,7 +558,7 @@ func TestCheckpointLoadAbsentSaveAndNoRewind(t *testing.T) {
 		t.Fatalf("absent checkpoint = found=%v err=%v, want false/nil", found, err)
 	}
 
-	if err := cp.Save(ctx, "ws", "p", "live", 5); err != nil {
+	if err := cp.Save(ctx, "ws", "p", "live", "", 5); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
@@ -566,7 +566,7 @@ func TestCheckpointLoadAbsentSaveAndNoRewind(t *testing.T) {
 	}
 
 	// Save never rewinds.
-	if err := cp.Save(ctx, "ws", "p", "live", 3); err != nil {
+	if err := cp.Save(ctx, "ws", "p", "live", "", 3); err != nil {
 		t.Fatalf("save lower: %v", err)
 	}
 	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
@@ -574,7 +574,7 @@ func TestCheckpointLoadAbsentSaveAndNoRewind(t *testing.T) {
 	}
 
 	// A different instance is a different row.
-	if err := cp.Save(ctx, "ws", "p", "other", 2); err != nil {
+	if err := cp.Save(ctx, "ws", "p", "other", "", 2); err != nil {
 		t.Fatalf("save other: %v", err)
 	}
 	if pos, _ = cp.Load(ctx, "ws", "p", "other"); pos != 2 {
@@ -591,7 +591,7 @@ func TestCheckpointResetDeleteAndTimestamp(t *testing.T) {
 	cp := sqlite.NewCheckpointStore(s)
 
 	before := time.Now().Add(-time.Second)
-	if err := cp.Save(ctx, "ws", "p", "live", 7); err != nil {
+	if err := cp.Save(ctx, "ws", "p", "live", "", 7); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	checkpoint, found, err := cp.Checkpoint(ctx, "ws", "p", "live")
@@ -606,7 +606,7 @@ func TestCheckpointResetDeleteAndTimestamp(t *testing.T) {
 	}
 
 	// Reset overwrites, backwards included.
-	if err := cp.Reset(ctx, "ws", "p", "live", 1); err != nil {
+	if err := cp.Reset(ctx, "ws", "p", "live", "", 1); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
 	if pos, _ := cp.Load(ctx, "ws", "p", "live"); pos != 1 {
@@ -617,7 +617,7 @@ func TestCheckpointResetDeleteAndTimestamp(t *testing.T) {
 	}
 
 	// Delete removes exactly that row.
-	if err := cp.Save(ctx, "ws", "p", "other", 4); err != nil {
+	if err := cp.Save(ctx, "ws", "p", "other", "", 4); err != nil {
 		t.Fatalf("save other: %v", err)
 	}
 	if err := cp.Delete(ctx, "ws", "p", "live"); err != nil {
@@ -632,6 +632,62 @@ func TestCheckpointResetDeleteAndTimestamp(t *testing.T) {
 	// Deleting again is a no-op.
 	if err := cp.Delete(ctx, "ws", "p", "live"); err != nil {
 		t.Fatalf("delete absent: %v", err)
+	}
+}
+
+// The definition fingerprint round-trips through Checkpoint, and an empty
+// definition never clears a recorded one: Save and Reset both preserve
+// the stored hash when none is supplied — an ack that carries no
+// identity, and a position-only advance like Skip, must not re-identify
+// a checkpoint — while a non-empty definition becomes the checkpoint's
+// new identity (a reset under a changed definition).
+func TestCheckpointDefinitionHashRecordedAndPreserved(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	cp := sqlite.NewCheckpointStore(s)
+
+	h1 := projection.Definition{Name: "p", Consumes: []string{"a.v1.A"}}.Hash()
+	h2 := projection.Definition{Name: "p", Consumes: []string{"a.v1.A", "b.v1.B"}}.Hash()
+
+	// A save with no definition records no fingerprint.
+	if err := cp.Save(ctx, "ws", "p", "live", "", 5); err != nil {
+		t.Fatalf("save without definition: %v", err)
+	}
+	got, found, err := cp.Checkpoint(ctx, "ws", "p", "live")
+	if err != nil || !found || got.Position != 5 || got.DefinitionHash != "" {
+		t.Fatalf("checkpoint = %+v found=%v err=%v, want position 5 and no hash", got, found, err)
+	}
+
+	// A definition-carrying save records the fingerprint.
+	if err := cp.Save(ctx, "ws", "p", "live", h1, 6); err != nil {
+		t.Fatalf("save with definition: %v", err)
+	}
+	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.DefinitionHash != h1 || got.Position != 6 {
+		t.Fatalf("checkpoint = %+v, want position 6 under hash %q", got, h1)
+	}
+
+	// An empty definition preserves the recorded hash on Save ...
+	if err := cp.Save(ctx, "ws", "p", "live", "", 7); err != nil {
+		t.Fatalf("save without definition: %v", err)
+	}
+	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 7 || got.DefinitionHash != h1 {
+		t.Fatalf("checkpoint = %+v, want position 7 with the hash preserved", got)
+	}
+
+	// ... and on Reset, which may rewind but still must not clear it.
+	if err := cp.Reset(ctx, "ws", "p", "live", "", 1); err != nil {
+		t.Fatalf("reset without definition: %v", err)
+	}
+	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 1 || got.DefinitionHash != h1 {
+		t.Fatalf("checkpoint = %+v, want position 1 with the hash preserved", got)
+	}
+
+	// A reset under a new definition re-identifies the checkpoint.
+	if err := cp.Reset(ctx, "ws", "p", "live", h2, 0); err != nil {
+		t.Fatalf("reset with definition: %v", err)
+	}
+	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 0 || got.DefinitionHash != h2 {
+		t.Fatalf("checkpoint = %+v, want position 0 under the new hash", got)
 	}
 }
 
@@ -969,6 +1025,10 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 		return srv.Checkpoint(ctx, feed.Ack{
 			Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
 			Owner: req.Owner, Position: pos,
+			// The ack records the subscription's fingerprint, so the
+			// resumed subscription below crosses the reopen with a
+			// recorded identity that must still match the definition.
+			Definition: req.Definition.Hash(),
 		})
 	}}
 	if err := srv.Subscribe(ctx1, req, sink1); err != nil && !errors.Is(err, context.Canceled) {

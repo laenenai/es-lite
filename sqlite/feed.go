@@ -178,15 +178,19 @@ func (c *CheckpointStore) Load(ctx context.Context, scope, projection, instance 
 }
 
 // Save advances a checkpoint monotonically: a lower position never rewinds a
-// higher one. The timestamp still records the write.
-func (c *CheckpointStore) Save(ctx context.Context, scope, projection, instance string, position uint64) error {
+// higher one. definition is the checkpoint's new definition fingerprint
+// when non-empty; an empty definition preserves the stored hash, so an ack
+// that carries no identity cannot clear what a previous one recorded. The
+// timestamp still records the write.
+func (c *CheckpointStore) Save(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
 	_, err := c.store.db.ExecContext(ctx,
-		`INSERT INTO feed_checkpoints (scope, projection, instance, position, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO feed_checkpoints (scope, projection, instance, position, definition_hash, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(scope, projection, instance) DO UPDATE SET
 		     position = MAX(feed_checkpoints.position, excluded.position),
+		     definition_hash = CASE WHEN excluded.definition_hash = '' THEN feed_checkpoints.definition_hash ELSE excluded.definition_hash END,
 		     updated_at = excluded.updated_at`,
-		scope, projection, instance, position, formatTS(time.Now()),
+		scope, projection, instance, position, definition, formatTS(time.Now()),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: checkpoints: save: %w", err)
@@ -195,15 +199,18 @@ func (c *CheckpointStore) Save(ctx context.Context, scope, projection, instance 
 }
 
 // Reset overwrites a checkpoint, backwards included. A reset is a deliberate
-// replay decision, so unlike Save it does not keep the maximum.
-func (c *CheckpointStore) Reset(ctx context.Context, scope, projection, instance string, position uint64) error {
+// replay decision, so unlike Save it does not keep the maximum; an empty
+// definition still preserves the stored fingerprint — only a reset under a
+// new definition re-identifies the checkpoint.
+func (c *CheckpointStore) Reset(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
 	_, err := c.store.db.ExecContext(ctx,
-		`INSERT INTO feed_checkpoints (scope, projection, instance, position, updated_at)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO feed_checkpoints (scope, projection, instance, position, definition_hash, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(scope, projection, instance) DO UPDATE SET
 		     position = excluded.position,
+		     definition_hash = CASE WHEN excluded.definition_hash = '' THEN feed_checkpoints.definition_hash ELSE excluded.definition_hash END,
 		     updated_at = excluded.updated_at`,
-		scope, projection, instance, position, formatTS(time.Now()),
+		scope, projection, instance, position, definition, formatTS(time.Now()),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: checkpoints: reset: %w", err)
@@ -224,18 +231,18 @@ func (c *CheckpointStore) Delete(ctx context.Context, scope, projection, instanc
 	return nil
 }
 
-// Checkpoint returns the stored position and when it was last written, or
-// found=false when the instance has no row.
+// Checkpoint returns the stored position, its definition fingerprint and
+// when it was last written, or found=false when the instance has no row.
 func (c *CheckpointStore) Checkpoint(ctx context.Context, scope, projection, instance string) (feed.Checkpoint, bool, error) {
 	var (
 		cp        feed.Checkpoint
 		updatedAt string
 	)
 	err := c.store.db.QueryRowContext(ctx,
-		`SELECT position, updated_at FROM feed_checkpoints
+		`SELECT position, definition_hash, updated_at FROM feed_checkpoints
 		 WHERE scope = ? AND projection = ? AND instance = ?`,
 		scope, projection, instance,
-	).Scan(&cp.Position, &updatedAt)
+	).Scan(&cp.Position, &cp.DefinitionHash, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return feed.Checkpoint{}, false, nil
 	}

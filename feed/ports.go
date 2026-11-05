@@ -22,6 +22,13 @@ import (
 type Checkpoint struct {
 	// Position is the highest global_position the consumer acknowledged.
 	Position uint64
+	// DefinitionHash is the fingerprint of the definition the position
+	// was last acknowledged under (projection.Definition's Hash); empty
+	// when none has been recorded. Subscribe compares it with the
+	// request's definition and fails with ErrDefinitionChanged on a
+	// mismatch, so a projection that gains a consumed type cannot
+	// silently skip that type's history below the checkpoint.
+	DefinitionHash string
 	// UpdatedAt is when the checkpoint row was last written.
 	UpdatedAt time.Time
 }
@@ -38,15 +45,26 @@ type Lease struct {
 	ExpiresAt time.Time
 }
 
-// CheckpointStore persists per-(scope, projection, instance) delivery cursors.
-// Implementations may enforce monotonic Save (the platform's Postgres store
-// uses GREATEST); the core never assumes a rewind.
+// CheckpointStore persists per-(scope, projection, instance) delivery
+// cursors together with the definition fingerprint the position was last
+// acknowledged under. Implementations may enforce monotonic Save (the
+// platform's Postgres store uses GREATEST); the core never assumes a
+// rewind. Save and Reset take the fingerprint in definition: a non-empty
+// value records it as the checkpoint's identity, an empty one preserves
+// the stored hash — an ack that carries no identity, or a position-only
+// advance like Skip, must not clear what a previous ack recorded.
 type CheckpointStore interface {
 	// Load returns the stored position, or (0, nil) when no checkpoint exists.
 	Load(ctx context.Context, scope, projection, instance string) (uint64, error)
-	Save(ctx context.Context, scope, projection, instance string, position uint64) error
-	Reset(ctx context.Context, scope, projection, instance string, position uint64) error
+	// Save advances the checkpoint; definition is the new fingerprint
+	// (empty preserves the stored one).
+	Save(ctx context.Context, scope, projection, instance, definition string, position uint64) error
+	// Reset overwrites the checkpoint, backwards included; definition is
+	// the new fingerprint (empty preserves the stored one).
+	Reset(ctx context.Context, scope, projection, instance, definition string, position uint64) error
 	Delete(ctx context.Context, scope, projection, instance string) error
+	// Checkpoint returns the stored position, fingerprint and last write
+	// time, or found=false when the instance has no row.
 	Checkpoint(ctx context.Context, scope, projection, instance string) (Checkpoint, bool, error)
 }
 
@@ -120,7 +138,10 @@ type Request struct {
 	// consumer, so no Ack.Owner can match its holder.
 	Owner string
 	// Definition supplies the authorized event type set Subscribe forwards to
-	// Log.ReadAllBounded and the projection name used in logs/errors.
+	// Log.ReadAllBounded and the projection name used in logs/errors. Its
+	// Hash() is the fingerprint the checkpoint must match: a stored
+	// fingerprint from a different definition fails the subscription with
+	// ErrDefinitionChanged instead of silently skipping history.
 	Definition projection.Definition
 	BatchSize  int
 }
@@ -140,9 +161,10 @@ type Ack struct {
 	// Position is the highest global_position the consumer acknowledges.
 	Position uint64
 	// Definition is the acking consumer's definition hash
-	// (Definition.Hash()); empty preserves the stored hash. Reserved for
-	// Task 11: Checkpoint does not persist it yet, because
-	// CheckpointStore.Save has no definition parameter until then.
+	// (Definition.Hash()). Checkpoint persists it as the checkpoint's
+	// identity, so the first definition-carrying ack records what the
+	// subscription must keep matching; an empty Definition preserves the
+	// stored hash instead of clearing it.
 	Definition string
 }
 

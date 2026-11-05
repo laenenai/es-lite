@@ -160,6 +160,12 @@ func (s *Server) newOwner() string {
 // stream with a *LeaseLostError. Subscribe always releases the lease before
 // returning, even when the stream failed.
 //
+// A checkpoint last acknowledged under a different definition fails the
+// stream immediately with an error matching ErrDefinitionChanged: resuming
+// would silently skip the history of any newly consumed type below the
+// stored position. ResetCheckpoint under the new definition is the
+// recovery; it re-identifies the checkpoint so the next Subscribe serves.
+//
 // The lease owner is req.Owner verbatim, so the consumer can fence its
 // acknowledgements (Ack.Owner must match the holder). An empty req.Owner
 // makes the server mint an opaque owner, and such a stream is not ackable.
@@ -307,9 +313,28 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 	if err != nil {
 		return fmt.Errorf("feed: open log for scope %q: %w", req.Scope, err)
 	}
-	pos, err := s.cfg.Checkpoints.Load(ctx, req.Scope, req.Projection, req.Instance)
+	cp, found, err := s.cfg.Checkpoints.Checkpoint(ctx, req.Scope, req.Projection, req.Instance)
 	if err != nil {
 		return fmt.Errorf("feed: load checkpoint %s/%s/%s: %w", req.Scope, name, req.Instance, err)
+	}
+	var pos uint64
+	if found {
+		pos = cp.Position
+	}
+	// Fail closed on definition drift (spec §5.5): the checkpoint names
+	// the definition its position was acknowledged under, and resuming
+	// under a different one would silently skip the history of any newly
+	// consumed type below the stored position. A missing fingerprint —
+	// a checkpoint from before the fingerprint existed, or an ack that
+	// carried none — does not fail; only a recorded mismatch does.
+	// Recovery is explicit: ResetCheckpoint under the new definition.
+	requestHash := req.Definition.Hash()
+	if cp.DefinitionHash != "" && cp.DefinitionHash != requestHash {
+		return &DefinitionChangedError{
+			Projection:  name,
+			StoredHash:  cp.DefinitionHash,
+			RequestHash: requestHash,
+		}
 	}
 	head, err := log.Head(ctx)
 	if err != nil {
@@ -398,8 +423,9 @@ func (s *Server) batchSize(requested int) int {
 // between them. The failure mode stays safe: the ack is rejected and the
 // consumer reconnects — never an advanced cursor. A stream subscribed with
 // an empty Request.Owner has a server-minted, opaque owner and therefore
-// cannot ack. Ack.Definition is not persisted yet; Task 11 passes it to
-// CheckpointStore.Save, which gains the parameter then.
+// cannot ack. ack.Definition is the checkpoint's identity when non-empty:
+// it is persisted with the position, and an empty Definition preserves the
+// stored fingerprint.
 func (s *Server) Checkpoint(ctx context.Context, ack Ack) error {
 	if err := validateKey(ack.Scope, ack.Projection, ack.Instance); err != nil {
 		return err
@@ -415,26 +441,36 @@ func (s *Server) Checkpoint(ctx context.Context, ack Ack) error {
 	if lease.Owner != ack.Owner {
 		return &LeaseHeldError{Key: key, Lease: lease, Held: true}
 	}
-	if err := s.cfg.Checkpoints.Save(ctx, ack.Scope, ack.Projection, ack.Instance, ack.Position); err != nil {
+	if err := s.cfg.Checkpoints.Save(ctx, ack.Scope, ack.Projection, ack.Instance, ack.Definition, ack.Position); err != nil {
 		return fmt.Errorf("feed: save checkpoint %s at %d: %w", key, ack.Position, err)
 	}
 	return nil
 }
 
-// ResetCheckpoint rewinds or advances the checkpoint. Unless force is set it
-// refuses while a lease is held. Authorizing force is the caller's job: the
-// core only enforces the lease.
-func (s *Server) ResetCheckpoint(ctx context.Context, scope, projection, instance string, position uint64, force bool) error {
-	if err := validateKey(scope, projection, instance); err != nil {
+// ResetCheckpoint rewinds or advances the checkpoint and re-identifies it
+// under req's definition: the stored fingerprint becomes
+// req.Definition.Hash(), so a subscription under a changed definition can
+// serve again — a reset is a deliberate re-subscription under the new
+// identity, and it is the recovery for ErrDefinitionChanged. The
+// subscription key and the definition are read from req exactly like a
+// Subscribe call (Name must match Projection, Consumes must be
+// non-empty); req's stream-only fields (Owner, Consumer, BatchSize) are
+// ignored. Unless force is set it refuses while a lease is held.
+// Authorizing force is the caller's job: the core only enforces the lease.
+func (s *Server) ResetCheckpoint(ctx context.Context, req Request, position uint64, force bool) error {
+	if err := validateKey(req.Scope, req.Projection, req.Instance); err != nil {
+		return err
+	}
+	if err := validateDefinition(req); err != nil {
 		return err
 	}
 	if !force {
-		if err := s.refuseIfHeld(ctx, scope, projection, instance); err != nil {
+		if err := s.refuseIfHeld(ctx, req.Scope, req.Projection, req.Instance); err != nil {
 			return err
 		}
 	}
-	if err := s.cfg.Checkpoints.Reset(ctx, scope, projection, instance, position); err != nil {
-		return fmt.Errorf("feed: reset checkpoint %s/%s/%s to %d: %w", scope, projection, instance, position, err)
+	if err := s.cfg.Checkpoints.Reset(ctx, req.Scope, req.Projection, req.Instance, req.Definition.Hash(), position); err != nil {
+		return fmt.Errorf("feed: reset checkpoint %s/%s/%s to %d: %w", req.Scope, req.Projection, req.Instance, position, err)
 	}
 	return nil
 }
@@ -516,6 +552,21 @@ func validateRequest(req Request, sink Sink) error {
 	if err := validateKey(req.Scope, req.Projection, req.Instance); err != nil {
 		return err
 	}
+	if err := validateDefinition(req); err != nil {
+		return err
+	}
+	if sink == nil {
+		return fmt.Errorf("%w: sink is required", ErrInvalidRequest)
+	}
+	return nil
+}
+
+// validateDefinition checks the definition every definition-carrying call
+// must pass: a name that matches the projection and at least one consumed
+// type. Subscribe resolves and authorizes the type set before calling the
+// core; an empty definition would seal the stream silently, and a
+// mismatched name would file one projection's checkpoints under another's.
+func validateDefinition(req Request) error {
 	if req.Definition.Name == "" {
 		return fmt.Errorf("%w: definition name is required", ErrInvalidRequest)
 	}
@@ -525,9 +576,6 @@ func validateRequest(req Request, sink Sink) error {
 	}
 	if len(req.Definition.Consumes) == 0 {
 		return fmt.Errorf("%w: definition consumes is required", ErrInvalidRequest)
-	}
-	if sink == nil {
-		return fmt.Errorf("%w: sink is required", ErrInvalidRequest)
 	}
 	return nil
 }
