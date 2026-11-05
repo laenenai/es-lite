@@ -1149,6 +1149,18 @@ func TestFeedGatePageQueryPlan(t *testing.T) {
 			t.Fatalf("feedgate: seed chunk %d..%d: %v", lo, hi, err)
 		}
 	}
+	// Raise type_url's statistics target BEFORE ANALYZE (ALTER on the
+	// partitioned parent recurses to every partition, verified on PG 17).
+	// The Seed type is 0.2%-selectitive and ANALYZE samples randomly: with
+	// the default target (100) the estimate for a type that rare swings
+	// enough that the position index occasionally looks cheaper than the
+	// composite — a first-run-fail / identical-tree-green planner toss-up
+	// (Task 18 carry). Target 1000 samples each partition fully, the
+	// rare-type estimate stops swinging, and the composite index wins
+	// deterministically.
+	if _, err := pool.Exec(ctx, `ALTER TABLE events ALTER COLUMN type_url SET STATISTICS 1000`); err != nil {
+		t.Fatalf("feedgate: raise type_url statistics target: %v", err)
+	}
 	if _, err := pool.Exec(ctx, `ANALYZE events`); err != nil {
 		t.Fatalf("feedgate: analyze: %v", err)
 	}

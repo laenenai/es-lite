@@ -312,7 +312,9 @@ type Status struct {
 	Head uint64
 	// Lag is matchingHead − position: how far the subscription trails
 	// its own backlog. Negative when the checkpoint is ahead of a
-	// restored log.
+	// restored log — and, on a fence-bounded Log (Postgres, ADR 0037),
+	// transiently negative while a blocked fence settles MatchingHead
+	// to 0: an artifact of the fence, not of the backlog.
 	Lag              int64
 	ActiveConsumer   string
 	LastCheckpointAt time.Time

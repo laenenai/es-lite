@@ -22,6 +22,7 @@ Design decisions live in [`docs/adr`](./docs/adr).
 - [Packages](#packages)
 - [Architecture](#architecture)
 - [Backends](#backends)
+- [Delivery guarantees](#delivery-guarantees)
 - [Embedding es-lite](#embedding-es-lite)
 - [Security model](#security-model)
 - [Projections and reactions](#projections-and-reactions)
@@ -46,7 +47,7 @@ transport, authentication, encryption and business rules.
 | Optimistic concurrency | `UNIQUE (workspace, stream, version)` → `ErrConflict` |
 | Per-workspace data isolation (Postgres) | RLS + hash partitioning; the caller supplies the workspace |
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
-| At-least-once, in-process delivery | `delivery.Poller` / `delivery.Relay` over the log's global position |
+| At-least-once delivery, fenced | `feed` core + Postgres adapters; consumer adapter in `eventfeed`; legacy in-process `delivery.Poller`/`Relay`; Postgres feed reads are commit-safe via the horizon fence (ADR 0037) |
 | Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
 | Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes, computed in the append transaction; keyless verification (`es-verify`) and exportable anchors (ADR 0029) |
 | Schema lifecycle | versioned migrations (`es-migrate`) |
@@ -72,6 +73,8 @@ transport, authentication, encryption and business rules.
 | `sqlite` | single-workspace, pure-Go SQLite backend |
 | `projection` | projection runner, rebuild/replay, `LogFeed`, marker |
 | `feed` | transport-neutral feed core: checkpoint/lease/log ports and the subscribe loop |
+| `eventfeed` | the consumer adapter: binds `feed.Server` to `projection.Feed` — ack strictly after a successful handler, acks coalesced at page boundaries |
+| `feedtest` | the shared conformance suite for `Log`/`CheckpointStore`/`LeaseStore` adapters |
 | `delivery` | in-process poller and Postgres drain relay |
 | `migrate` | versioned schema migration loader |
 | `upcast` | event schema upgrade hooks |
@@ -102,7 +105,10 @@ transport, authentication, encryption and business rules.
 - **`es.Store` is the whole storage contract.** The aggregate runtime, decider
   and codec do not change when the backend changes.
 - **The log is the outbox.** Delivery tails `global_position`; there is no
-  separate outbox table and no broker.
+  separate outbox table and no broker. On Postgres the feed's tail is
+  fence-bounded (ADR 0037) so tailing cannot pass an in-flight lower
+  position; the exact guarantee boundary is the
+  [Delivery guarantees](#delivery-guarantees) section.
 - **Delivery is at-least-once.** Handlers must be idempotent; a last-applied
   position marker makes both delivery and rebuild correct.
 
@@ -110,7 +116,8 @@ transport, authentication, encryption and business rules.
 
 - **Postgres** (multi-workspace, production): shared tables + `workspace_id` +
   **RLS** + hash partitioning. `Store.Workspace(id)` scopes reads and writes to
-  one workspace; the gap-safe `Drain` claim-relay supports delivery.
+  one workspace; the feed reads are commit-safe (the horizon fence, ADR 0037)
+  and the `Drain` claim-relay has its own gap-safe cursor.
 - **SQLite** (single-workspace, dev/edge): single-writer, gap-free cursor,
   zero infrastructure — useful for tests and single-tenant nodes.
 
@@ -130,7 +137,69 @@ defer store.Close()
 Migrations are versioned (ADR 0010). For a multi-replica Postgres deployment,
 run `es-migrate` once and open the store with `postgres.WithoutAutoMigrate()`
 so application instances never touch DDL on boot. SQLite and tests use the
-default auto-migrate behaviour.
+default auto-migrate behaviour. Before upgrading a large database to a
+version that carries the feed indexes, follow the runbook's
+[index build order](./docs/deploy/README.md#index-build-order-migration-0003)
+— migration transactions cannot build indexes concurrently.
+
+## Delivery guarantees
+
+The `feed` package is the production delivery path (the design is ADR 0037;
+the operational companion is the [deployment runbook](./docs/deploy/README.md)).
+What it guarantees:
+
+- **Commit-safe reads.** On Postgres, every feed-facing read (`ReadAllBounded`,
+  `Head`, `MatchingHead`) is bounded by the horizon fence: a page never
+  advances past a position whose append is still in flight, no matter how
+  append transactions interleave — including caller-owned appends
+  (ADR 0035). On SQLite the single-writer connection makes the cursor
+  gap-free by construction.
+- **At-least-once, ordered.** Every event reaches the consumer at least once;
+  pages are ordered by `global_position`, and within a stream by version.
+  Acks are **fenced**: only the lease holder's receipts move the cursor.
+- **Fail-closed on definition drift.** The checkpoint records the
+  fingerprint of the projection's consumed type set; resubscribing under a
+  changed definition fails with `ErrDefinitionChanged` instead of silently
+  skipping the new type's history.
+- **Poison quarantined, audited, never silently skipped.** The store's
+  payload cap rejects oversized appends up front; an over-cap row that
+  enters anyway kills the stream with `*EventTooLargeError` (never
+  materialized), and `feed.Server.Skip` is the audited recovery — it
+  advances past the position and records a dead-letter row.
+- **Stalls are visible, never lossy.** A fence that waits (an in-flight or
+  wedged transaction) surfaces via `Observer.OnStall` with the settled and
+  raw heads; the failure mode of every interleaving is *delay*, not loss.
+- **Workspace isolation.** The Postgres feed tables are RLS-enabled with no
+  bypass arm; no session can reach another workspace's subscription state.
+
+What it does **not** guarantee:
+
+- **Exactly-once.** Crash windows and lease failover redeliver bounded
+  ranges; handlers must be idempotent, and a last-applied marker is the
+  standard dedup.
+- **Cross-stream causality.** `global_position` is a stable total order, but
+  under concurrent appends it is *assignment* order, not real time: never
+  infer "A happened before B" from delivery order across two streams.
+  Within one stream, version order is the append contract (ADR 0029's
+  chain pins it).
+- **Push.** No LISTEN/NOTIFY ships — the feed polls (~250 ms by default,
+  jittered ±20%). The `Waiter` port is the future hook; ADR 0037 records
+  the deferred design question.
+- **That every read API is fenced.** On Postgres, commit safety lives on
+  the feed-facing reads. The raw `Store.ReadAll` cursor — the in-process
+  `projection.LogFeed`/`Replay` tail and the legacy `delivery.Poller` — is
+  *not* fenced: under concurrent appenders it can skip, exactly the hazard
+  ADR 0001 §5 warned about. Use the feed (or `Drain`, which carries its
+  own claim-relay safety) whenever more than one writer appends to a
+  Postgres database.
+
+**Settled-head semantics (Postgres).** `Head` and `MatchingHead` report the
+*settled* head — never a position whose append is still in flight — so
+while a fence is blocked they transiently read 0 and `Status.Lag` can be
+transiently negative; `RawHead` is the unfiltered committed maximum, used
+for stall detection and the fence-aware resume clamp. A wedged long-lived
+transaction anywhere on the primary delays every feed page until it ends:
+observable, diagnosable, never a loss.
 
 ## Embedding es-lite
 
@@ -284,17 +353,24 @@ runner := counterviewv1.NewCounterViewRunner(myHandler, counterviewv1.CounterVie
 err := runner.Run(ctx, &projection.LogFeed{Source: store, From: 0})
 
 // Live, through the feed core: feed.Server streams to a caller-supplied Sink,
-// resuming from a durable checkpoint under a lease. The platform supplies the
-// checkpoint, lease and log ports; this module ships the Subscribe loop.
+// resuming from a durable checkpoint under a lease — at-least-once with
+// fenced acks. This module ships the core, the Postgres log/checkpoint/lease
+// adapters (feedtest.RunAll is their conformance suite), and the eventfeed
+// consumer adapter that binds feed.Server to projection.Feed (ack strictly
+// after the handler succeeds). The platform maps a transport to Sink and
+// resolves the authorized definition per caller.
 
 // Rebuild from position 0 through the same dispatch path:
 pos, err := runner.Rebuild(ctx, store, 500)
 ```
 
 `projection.LogFeed` polls `Store.ReadAll` and retries a failed handler on the
-same envelope, so delivery is at-least-once and ordered per stream. Rebuild
-reads the database log itself — not an external retention window — and shares
-the live apply path (ADR 0005).
+same envelope, so delivery is at-least-once and ordered per stream. On
+Postgres, `LogFeed` is the single-writer/quiescent-log path: its raw cursor is
+not commit-safe under concurrent appenders (see
+[Delivery guarantees](#delivery-guarantees)); `eventfeed` is the fenced
+consumer adapter for that backend. Rebuild reads the database log itself —
+not an external retention window — and shares the live apply path (ADR 0005).
 
 Reactions (`(es.v1.reaction)`) get a typed issuer and the executor loop
 (`reaction.Execute`: conflicts retried, a terminal target counts as done).
@@ -336,16 +412,19 @@ and reaction on SQLite), `upcast` — and [`cmdsvc/example`](./cmdsvc/example)
 ## Development
 
 Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.27.3, buf, task,
-govulncheck); run `mise install`. The module has no private dependencies.
-`cmdsvc/` is a nested Go module (connect-go + protovalidate stay out of the
-core graph); every `task` target covers both.
+golangci-lint, govulncheck); run `mise install`. The module has no private
+dependencies. `cmdsvc/` is a nested Go module (connect-go + protovalidate
+stay out of the core graph); every `task` target covers both.
 
 ```sh
 task                 # list tasks
 task generate        # buf lint + codegen (protoc-gen-go + protoc-gen-es-lite)
 task test            # unit tests (Postgres integration skips without PG_DSN)
 task test:race       # unit tests under the race detector
-task test:pg         # Postgres integration suite against a throwaway container
+task test:pg         # Postgres integration suite under -race -shuffle=on
+task lint:go         # golangci-lint (errcheck, govet, staticcheck)
+task coverage        # unit suite with a coverage floor ratchet
+task test:feedgate   # the heavy feed gate: chaos no-loss, plan, fleet (nightly)
 task vuln            # govulncheck
 task build vet
 ```
@@ -366,7 +445,8 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 
 - **[ADRs](./docs/adr)** — decision records (event-sourcing, workspaces,
   client-owned crypto, migrations, hash chain, codegen, caller-owned
-  transactions, no-broker boundary). Start at [the index](./docs/adr/README.md).
+  transactions, no-broker boundary, commit-safe feed reads). Start at
+  [the index](./docs/adr/README.md).
 - **[Migration notes](./docs/migration)** — what downstream repositories
   change when an ADR moves a contract (currently: projection options).
 - **[Backlog](./docs/backlog)** — tracked follow-ups.

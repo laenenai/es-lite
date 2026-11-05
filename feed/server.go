@@ -736,8 +736,9 @@ func (s *Server) DeleteSubscription(ctx context.Context, scope, projection, inst
 // once. Head is MatchingHead over req.Definition.Consumes — the highest
 // settled position among the subscription's own event types — and Lag is
 // matchingHead − position, negative when the checkpoint is ahead of a
-// restored log. Status never fails on definition drift: it observes, it
-// does not gate.
+// restored log, and transiently negative on a fence-bounded Log (Postgres,
+// ADR 0037) while a blocked fence settles MatchingHead to 0. Status never
+// fails on definition drift: it observes, it does not gate.
 func (s *Server) Status(ctx context.Context, req Request) (Status, error) {
 	if err := validateKey(req.Scope, req.Projection, req.Instance); err != nil {
 		return Status{}, err

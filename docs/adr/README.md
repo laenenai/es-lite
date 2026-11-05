@@ -34,6 +34,7 @@ than editing history.
 | 0034 | [The Server Stamps Decision Time; `decided_at` Is Only Intent](./0034-server-stamped-decided-at.md) | Accepted (implemented; supersedes 0032 §2) |
 | 0035 | [Caller-Owned Transactions for Atomic Appends](./0035-caller-owned-transactions.md) | Accepted (implemented; additive to 0008) |
 | 0036 | [No Broker in es-lite; Postgres and SQLite Only](./0036-postgres-only-no-broker.md) | Accepted (implemented); supersedes 0003/0009/0028 |
+| 0037 | [Commit-Safe Feed Reads on Postgres](./0037-commit-safe-feed-reads.md) | Accepted (implemented); closes ADR 0001 §5's deferred Postgres gap |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in

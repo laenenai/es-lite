@@ -1,0 +1,95 @@
+# golangci-lint v2 config — the CI lint gate (production review A4, spec
+# §5.10.2): errcheck, govet and staticcheck over the core module; run from
+# cmdsvc with -c ../.golangci.yml for the nested module. `task lint:go` wires
+# both, and ci.yml runs it on every PR.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+  settings:
+    errcheck:
+      exclude-functions:
+        # Deferred transaction teardown, in the shape the drivers themselves
+        # bless: pgx's Tx.Rollback documents that "a defer tx.Rollback() is
+        # safe even if tx.Commit() will be called first" (it returns
+        # ErrTxClosed after commit), and database/sql's Rollback returns
+        # ErrTxDone on the same path. Rollbacks on an error return path
+        # repeat the error the function is already reporting.
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - (*database/sql.Tx).Rollback
+        # Deferred row cleanup: once rows are exhausted nothing actionable
+        # remains from Close; the query's own error path reports real
+        # failures. (pgx v5's Rows.Close returns nothing to check.)
+        - (*database/sql.Rows).Close
+        # Shutdown/error-path closes of the store's own handles: es-migrate
+        # defers Store.Close and exits with the migrate result, and
+        # sqlite.Open closes its half-open handle on the migrate-failure
+        # path while returning the migration error.
+        - (*github.com/laenenai/es-lite/sqlite.Store).Close
+    staticcheck:
+      checks:
+        # staticcheck's own default set: every class except QF (quickfix —
+        # editor suggestions, not CI findings) and the opt-in ST checks
+        # golangci-lint documents as its default exclusions.
+        - all
+        - -QF*
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+  exclusions:
+    rules:
+      # Test-teardown idioms: t.Cleanup store closes, the deliberately
+      # in-flight rollbacks of the ordering tests (rollback is the tested
+      # behavior there, not an error path), and harness Run calls whose
+      # outcome the test asserts elsewhere.
+      - path: _test\.go
+        linters:
+          - errcheck
+      # feed.Server.stream never returns nil — Subscribe blocks until the
+      # caller's ctx ends, so every exit of the stream loop returns an
+      # error. The nil half of the comparison at the Subscribe tail is
+      # staticcheck-redundant today and stays: it documents the contract,
+      # and becomes load-bearing the day stream grows a clean exit.
+      - path: feed/server\.go
+        linters:
+          - staticcheck
+        text: ^SA4023
+      # The reconnect loop deliberately drops the inner feed's error and
+      # retries; making that error observable is review item A12/A14
+      # (docs/review/20261104_feed_review.md), tracked as Gate 2 work.
+      # Excluding the finding keeps the gate honest about what the code
+      # does instead of pretending it was cleaned up.
+      - path: projection/reconnecting\.go
+        linters:
+          - staticcheck
+        text: ^SA4006
+      # Error-path handle cleanup while returning the real error: the
+      # half-open sqlite handle Close on the migrate-failure path. Nothing
+      # further is reportable — the migration error is the diagnosis.
+      - path: sqlite/store\.go
+        linters:
+          - errcheck
+        text: '`db\.Close`'
+      # The advisory-lock release on Migrate's return path: a session-level
+      # advisory lock is released by the unlock OR by the connection going
+      # back to the pool, and a failed unlock while already returning is
+      # not actionable. Scoped to this file's conn.Exec; every other Exec
+      # there checks its error.
+      - path: postgres/store\.go
+        linters:
+          - errcheck
+        text: '`conn\.Exec`'
+
+issues:
+  # Report everything. A gate that de-duplicates identical messages (the
+  # default caps them at 3) would pass while findings pile up behind the
+  # cap; the excluded idioms above are the complete, reviewed list.
+  max-issues-per-linter: 0
+  max-same-issues: 0
