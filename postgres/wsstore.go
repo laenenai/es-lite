@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/laenenai/es-lite/es"
+	"github.com/laenenai/es-lite/feed"
 )
 
 // DBTX is the narrow database handle the transaction-aware methods need:
@@ -503,6 +504,17 @@ func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error)
 // event of a page is always included, even alone over budget: an oversized
 // event must be visible to the caller, not forever skipped.
 //
+// The page is fetched in two steps so a payload over the store's cap
+// (WithMaxPayloadBytes) is never materialized (production review): step 1
+// selects positions, type URLs and octet_length(payload) — sizes only,
+// never the bytes — under the filter and applies the count/budget/cap
+// selection; step 2 fetches full rows for the chosen positions alone. A
+// first row over the cap is a poison event: the page refuses to carry it
+// and returns *feed.EventTooLargeError naming position, type URL, size and
+// limit — never the payload. A later row over the cap stops the page
+// before it with truncated=true, so the next page makes it the first row
+// and surfaces the error.
+//
 // The page is also bounded by the horizon fence (spec §5.1): positions are
 // only delivered up to the L recorded at the start of the round, and only
 // once every transaction that existed when the round drew its R has
@@ -538,8 +550,11 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	if err := setWorkspace(ctx, tx, w.ws); err != nil {
 		return nil, false, err
 	}
+	// Step 1: positions, type URLs and payload sizes under the filter and
+	// the fence bound — never the payload bytes. octet_length measures in
+	// the database, so an over-cap row costs one integer, not its payload.
 	rows, err := tx.Query(ctx,
-		`SELECT `+envelopeCols+` FROM events
+		`SELECT global_position, type_url, octet_length(payload) FROM events
 	      WHERE workspace_id = $1 AND global_position > $2 AND type_url = ANY($4)
 	          AND global_position <= $5
 	      ORDER BY global_position ASC LIMIT $3`,
@@ -548,29 +563,68 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 		return nil, false, err
 	}
 	var (
-		out       []es.Envelope
+		positions []uint64
 		total     int
 		truncated bool
 	)
 	for rows.Next() {
-		e, err := scanEnvelope(rows)
-		if err != nil {
+		var (
+			pos     uint64
+			typeURL string
+			size    int
+		)
+		if err := rows.Scan(&pos, &typeURL, &size); err != nil {
 			rows.Close()
 			return nil, false, err
 		}
-		// len(out) == 0 carries the first row whatever its size; after
-		// that, stop before a row that would push the total past the
-		// budget. The row that stopped the page was read, so truncated is
-		// certain — more rows remain for the next call.
-		if len(out) > 0 && maxBytes > 0 && total+len(e.Payload) > maxBytes {
+		if len(positions) == 0 && w.store.maxPayloadBytes > 0 && size > w.store.maxPayloadBytes {
+			// The first row of the page is over the store's cap: a poison
+			// event. Refuse to materialize it; the typed error names it
+			// without the payload bytes ever leaving the database.
+			rows.Close()
+			return nil, false, &feed.EventTooLargeError{
+				Position: pos,
+				TypeURL:  typeURL,
+				Size:     size,
+				Limit:    w.store.maxPayloadBytes,
+			}
+		}
+		// A later row over the cap stops the page before it — the next
+		// page makes it the first row and surfaces the error — and so does
+		// a row that would push the total past the budget. The stopping
+		// row was seen, so truncated is certain: more rows remain for the
+		// next call.
+		if len(positions) > 0 &&
+			((w.store.maxPayloadBytes > 0 && size > w.store.maxPayloadBytes) ||
+				(maxBytes > 0 && total+size > maxBytes)) {
 			truncated = true
 			break
 		}
-		total += len(e.Payload)
-		out = append(out, e)
+		total += size
+		positions = append(positions, pos)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(positions) == 0 {
+		return nil, false, nil
+	}
+	// Step 2: fetch full rows for the chosen positions only, in the same
+	// transaction and therefore the same snapshot — the page cannot change
+	// under the fetch, and no payload the selection did not clear is ever
+	// selected. global_position is bigint, so positions always fit int64
+	// (pgx sends []uint64 as numeric[], which would force a cast).
+	positions64 := make([]int64, len(positions))
+	for i, p := range positions {
+		positions64[i] = int64(p)
+	}
+	out, err := queryDB(ctx, tx,
+		`SELECT `+envelopeCols+` FROM events
+		  WHERE workspace_id = $1 AND global_position = ANY($2)
+		  ORDER BY global_position ASC`,
+		w.ws, positions64)
+	if err != nil {
 		return nil, false, err
 	}
 	return out, truncated, nil

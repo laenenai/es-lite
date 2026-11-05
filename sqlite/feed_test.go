@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -287,6 +288,138 @@ func TestReadAllBoundedFirstOversizedEventIsIncluded(t *testing.T) {
 	if !truncated {
 		t.Fatal("oversized first event did not report truncated")
 	}
+}
+
+// openFeedStoreCapped opens a fresh in-memory store with a 64-byte payload
+// cap: small enough that a test payload towers over it. It is the fixture
+// for the poison-row contract — the store cap the adapters must honor on
+// the read side, not just at append.
+func openFeedStoreCapped(t *testing.T) *sqlite.Store {
+	t.Helper()
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "-") + "?mode=memory&cache=shared"
+	s, err := sqlite.Open(context.Background(), dsn, sqlite.WithMaxPayloadBytes(64))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// insertFeedRowDirect inserts one events row with raw SQL, bypassing the
+// append-time cap — after Task 5 that is the only way a stored payload can
+// exceed the store's cap (a lowered cap, direct SQL or corruption). It
+// returns the row's global position. The timestamp literal matches the
+// fixed-width layout the store writes (tsLayout) so a materialized row
+// still parses.
+func insertFeedRowDirect(t *testing.T, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
+	t.Helper()
+	var gp uint64
+	err := s.DB().QueryRowContext(context.Background(),
+		`INSERT INTO events (
+			event_id, stream_type, stream_id, version,
+			type_url, schema_version, occurred_at, recorded_at,
+			correlation_id, causation_id, command_id,
+			actor_type, actor_id, actor_principal, payload
+		) VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?)
+		RETURNING global_position`,
+		"11111111-1111-7111-8111-111111111111", "thing", sid.Canonical(), version,
+		typeURL, 1, "2026-01-01T00:00:00.000000000Z", "2026-01-01T00:00:00.000000000Z",
+		"", "", "",
+		"thing", "poison", "thing:poison", payload,
+	).Scan(&gp)
+	if err != nil {
+		t.Fatalf("direct insert: %v", err)
+	}
+	return gp
+}
+
+// TestOversizedFirstRowIsNotMaterialized pins the read-side poison contract
+// (production review focus 3): a stored payload over the store's cap is
+// never materialized into a page — the adapter must refuse to scan its
+// bytes. The over-cap row enters via direct SQL because the append cap now
+// refuses it. When it is the FIRST row of a page, ReadAllBounded returns
+// *feed.EventTooLargeError naming position, type URL, size and limit, with
+// no envelopes. When it is a LATER row, the page stops before it with
+// truncated=true, and the next page makes it the first row and surfaces
+// the error.
+func TestOversizedFirstRowIsNotMaterialized(t *testing.T) {
+	const typ = "thing.v1.Happened"
+	oversized := bytes.Repeat([]byte("p"), 4096)
+
+	t.Run("first row over cap is refused, not materialized", func(t *testing.T) {
+		ctx := context.Background()
+		s := openFeedStoreCapped(t)
+
+		gp := insertFeedRowDirect(t, s, mustStreamID(t, "thing", "poison-first"), 1, typ, oversized)
+		// A normal row follows the poison row.
+		appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-first-ok"), 0, typ, []byte("ok"))
+
+		got, _, err := s.ReadAllBounded(ctx, 0, 10, 0, []string{typ})
+		var tooLarge *feed.EventTooLargeError
+		if !errors.As(err, &tooLarge) {
+			t.Fatalf("ReadAllBounded error = %v (%T), want *feed.EventTooLargeError", err, err)
+		}
+		if tooLarge.Position != gp || tooLarge.TypeURL != typ ||
+			tooLarge.Size != len(oversized) || tooLarge.Limit != 64 {
+			t.Fatalf("error fields = (pos %d, type %q, size %d, limit %d), want (pos %d, type %q, size %d, limit 64)",
+				tooLarge.Position, tooLarge.TypeURL, tooLarge.Size, tooLarge.Limit, gp, typ, len(oversized))
+		}
+		if len(got) != 0 {
+			t.Fatalf("over-cap first row was materialized: %d envelopes, want none", len(got))
+		}
+	})
+
+	t.Run("later row over cap stops the page before it", func(t *testing.T) {
+		ctx := context.Background()
+		s := openFeedStoreCapped(t)
+
+		first := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-later"), 0, typ, []byte("ok"))
+		gp := insertFeedRowDirect(t, s, mustStreamID(t, "thing", "poison-later-b"), 1, typ, oversized)
+		after := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-later-after"), 0, typ, []byte("after"))
+		if !(first.GlobalPosition < gp && gp < after.GlobalPosition) {
+			t.Fatalf("insert order: first=%d poison=%d after=%d, want the poison row between the normal rows",
+				first.GlobalPosition, gp, after.GlobalPosition)
+		}
+
+		// The page delivers only the rows before the poison row and stops
+		// before it: truncated=true is certain — the stopping row was seen.
+		got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 0, []string{typ})
+		if err != nil {
+			t.Fatalf("ReadAllBounded: %v", err)
+		}
+		if len(got) != 1 || got[0].GlobalPosition != first.GlobalPosition {
+			t.Fatalf("page = %d envelopes at %v, want only the event before the poison row (pos %d)",
+				len(got), feedPositions(got), first.GlobalPosition)
+		}
+		if !truncated {
+			t.Fatal("page stopped before an over-cap row without truncated=true")
+		}
+
+		// The next page makes the poison row the first row: the typed error,
+		// again with no envelopes materialized.
+		got, _, err = s.ReadAllBounded(ctx, first.GlobalPosition, 10, 0, []string{typ})
+		var tooLarge *feed.EventTooLargeError
+		if !errors.As(err, &tooLarge) {
+			t.Fatalf("next page error = %v (%T), want *feed.EventTooLargeError", err, err)
+		}
+		if tooLarge.Position != gp || tooLarge.TypeURL != typ ||
+			tooLarge.Size != len(oversized) || tooLarge.Limit != 64 {
+			t.Fatalf("error fields = (pos %d, type %q, size %d, limit %d), want (pos %d, type %q, size %d, limit 64)",
+				tooLarge.Position, tooLarge.TypeURL, tooLarge.Size, tooLarge.Limit, gp, typ, len(oversized))
+		}
+		if len(got) != 0 {
+			t.Fatalf("over-cap first row was materialized: %d envelopes, want none", len(got))
+		}
+	})
+}
+
+// feedPositions collects a page's global positions for failure messages.
+func feedPositions(envs []es.Envelope) []uint64 {
+	out := make([]uint64, len(envs))
+	for i, e := range envs {
+		out[i] = e.GlobalPosition
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

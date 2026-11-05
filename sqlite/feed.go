@@ -42,6 +42,17 @@ func (s *Store) Head(ctx context.Context) (uint64, error) {
 // event is always included even alone over budget, so an oversized event is
 // never silently skipped. maxBytes <= 0 disables the budget.
 //
+// The page is fetched in two steps so a payload over the store's cap
+// (WithMaxPayloadBytes) is never materialized (production review): step 1
+// selects positions, type URLs and length(payload) — sizes only, never the
+// bytes — under the filter and applies the count/budget/cap selection;
+// step 2 fetches full rows for the chosen positions alone. A first row over
+// the cap is a poison event: the page refuses to carry it and returns
+// *feed.EventTooLargeError naming position, type URL, size and limit —
+// never the payload. A later row over the cap stops the page before it
+// with truncated=true, so the next page makes it the first row and
+// surfaces the error.
+//
 // The budget counts the opaque payload bytes this store returns (ADR 0025):
 // for a sealed workspace those are the stored ciphertext bytes. Like the
 // Postgres adapter it is deliberately not on es.Store.
@@ -53,8 +64,12 @@ func (s *Store) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes
 		limit = 100
 	}
 
+	// Step 1: positions, type URLs and payload sizes under the filter —
+	// never the payload bytes. length() counts bytes for the BLOB payloads
+	// this store writes, so an over-cap row costs one integer, not its
+	// payload.
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(types)), ",")
-	q := `SELECT ` + envelopeCols + ` FROM events
+	q := `SELECT global_position, type_url, length(payload) FROM events
 	      WHERE global_position > ? AND type_url IN (` + placeholders + `)
 	      ORDER BY global_position ASC LIMIT ?`
 	args := make([]any, 0, len(types)+2)
@@ -71,26 +86,65 @@ func (s *Store) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes
 	defer rows.Close()
 
 	var (
-		out       []es.Envelope
+		positions []uint64
 		total     int
 		truncated bool
 	)
 	for rows.Next() {
-		e, err := scanEnvelope(rows)
-		if err != nil {
+		var (
+			pos     uint64
+			typeURL string
+			size    int
+		)
+		if err := rows.Scan(&pos, &typeURL, &size); err != nil {
 			return nil, false, fmt.Errorf("sqlite: read feed: %w", err)
 		}
-		// The first row is carried whatever its size; after that, stop
-		// before a row that would exceed the budget. The stopping row was
-		// read, so more matching rows remain for the next call.
-		if len(out) > 0 && maxBytes > 0 && total+len(e.Payload) > maxBytes {
+		if len(positions) == 0 && s.maxPayloadBytes > 0 && size > s.maxPayloadBytes {
+			// The first row of the page is over the store's cap: a poison
+			// event. Refuse to materialize it; the typed error names it
+			// without the payload bytes ever leaving the database.
+			return nil, false, &feed.EventTooLargeError{
+				Position: pos,
+				TypeURL:  typeURL,
+				Size:     size,
+				Limit:    s.maxPayloadBytes,
+			}
+		}
+		// A later row over the cap stops the page before it — the next
+		// page makes it the first row and surfaces the error — and so does
+		// a row that would push the total past the budget. The stopping
+		// row was seen, so truncated is certain: more rows remain for the
+		// next call.
+		if len(positions) > 0 &&
+			((s.maxPayloadBytes > 0 && size > s.maxPayloadBytes) ||
+				(maxBytes > 0 && total+size > maxBytes)) {
 			truncated = true
 			break
 		}
-		total += len(e.Payload)
-		out = append(out, e)
+		total += size
+		positions = append(positions, pos)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("sqlite: read feed: %w", err)
+	}
+	if len(positions) == 0 {
+		return nil, false, nil
+	}
+	// Step 2: fetch full rows for the chosen positions only. This store
+	// runs on a single connection, so the page is a stable snapshot by
+	// construction; closing step 1's rows first is what frees the one
+	// connection for the fetch.
+	rows.Close()
+	posPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(positions)), ",")
+	fetch := `SELECT ` + envelopeCols + ` FROM events
+	      WHERE global_position IN (` + posPlaceholders + `)
+	      ORDER BY global_position ASC`
+	fetchArgs := make([]any, 0, len(positions))
+	for _, p := range positions {
+		fetchArgs = append(fetchArgs, int64(p))
+	}
+	out, err := s.queryEnvelopes(ctx, fetch, fetchArgs...)
+	if err != nil {
 		return nil, false, fmt.Errorf("sqlite: read feed: %w", err)
 	}
 	return out, truncated, nil
