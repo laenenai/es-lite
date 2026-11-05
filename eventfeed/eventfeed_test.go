@@ -21,7 +21,8 @@ import (
 // fenced feed protocol load-bearing (review R8). Everything runs against
 // the real feed core over the real SQLite adapters — the e2e test drives
 // the adapter through cancellation and reconnect, the ack test pins the
-// page-coalescing policy:
+// page-coalescing policy, the failing-handler test pins that nothing is
+// ever acked past a failing handler:
 //
 //   - at-least-once across reconnects: set equality after the marker
 //     dedups redelivery, and each reconnect's first delivery within one
@@ -29,7 +30,11 @@ import (
 //   - exactly one fenced ack per full page (never per event), trailing
 //     sub-pages acking on the AckInterval tick while the stream is live
 //     and at stream end — while the lease is still held, so the final
-//     ack passes the fence.
+//     ack passes the fence;
+//   - a failing handler never advances the checkpoint past the position
+//     it is failing on: not through the page-boundary ack, the idle tick
+//     or the stream-end flush — the failing envelope is retried in place
+//     at the AckInterval cadence.
 
 // typConsumed is the single event type the test projection consumes. The
 // test log holds only this type, so global positions are contiguous
@@ -129,6 +134,18 @@ func checkpointPosition(t testing.TB, cp feed.CheckpointStore) uint64 {
 		t.Fatalf("read checkpoint: %v", err)
 	}
 	if !found {
+		return 0
+	}
+	return c.Position
+}
+
+// readCheckpoint is checkpointPosition's non-failing form, for calls from
+// the feed goroutine — the handler — where t.Fatalf is not allowed: a
+// read error or a missing checkpoint records position 0, which no
+// below-the-failing-position assertion can mistake for progress.
+func readCheckpoint(cp feed.CheckpointStore) uint64 {
+	c, found, err := cp.Checkpoint(context.Background(), testScope, testDefinition.Name, testInstance)
+	if err != nil || !found {
 		return 0
 	}
 	return c.Position
@@ -501,6 +518,221 @@ func TestEventfeedAcksAtPageBoundary(t *testing.T) {
 		t.Fatalf("stream-end acks = %+v, want exactly one at position %d", acks, 3*batchSize)
 	}
 	assertAckShape(t, acks...)
+}
+
+// TestEventfeedDoesNotAckPastAFailingHandler pins the invariant the
+// adapter exists to enforce (review R8): a position enters the ack
+// window only once handle has returned nil, so the durable checkpoint
+// can never advance past a delivered position that was not handled —
+// not by the page-boundary ack, not by the idle tick, not by the
+// stream-end flush. Every other test's handler always succeeds, so all
+// of them would stay green if the window were accounted before handle
+// returned; this is the test that goes red then.
+//
+// The handler reads the durable checkpoint at every delivery — before
+// it acts, so the read is exactly what had been acked by then — and
+// fails position failPos, which sits on a page boundary where the
+// full-window ack fires, for its first two deliveries, and position
+// foreverPos, appended once the stream is caught up, on every delivery
+// until the test cancels mid-failure:
+//
+//   - throughout both failure windows every observed checkpoint is
+//     strictly below the failing position;
+//   - the failing envelope is retried in place, consecutive deliveries
+//     spaced by at least one AckInterval — the retry cadence — and the
+//     stream moves past it only once handle succeeds;
+//   - cancelling with a handler still failing leaves the checkpoint at
+//     the last handled position: the stream-end flush does not ack the
+//     position the stream was failing on.
+func TestEventfeedDoesNotAckPastAFailingHandler(t *testing.T) {
+	store := openStore(t)
+	sid := mustStreamID(t, "eventfeed", "failing-handle")
+	checkpoints := sqlite.NewCheckpointStore(store)
+	server := newServer(t, store, checkpoints)
+
+	const (
+		batchSize   = 4
+		ackInterval = 50 * time.Millisecond
+		failFirst   = 2 // deliveries of failPos that fail before it succeeds
+	)
+	// failPos sits on the first page boundary — where the full-window
+	// ack fires — so an ack window accounted before handle returned
+	// would be flushed while failPos is still failing. foreverPos is
+	// appended once the stream is caught up and fails every delivery
+	// until the test cancels mid-failure.
+	const (
+		failPos    = uint64(batchSize)     // 4: the page-boundary failure
+		pageTwoEnd = uint64(2 * batchSize) // 8: the last handled position
+		foreverPos = pageTwoEnd + 1        // 9: fails until cancel
+	)
+	ef := eventfeed.New(eventfeed.Config{
+		Server:      server,
+		Definition:  testDefinition,
+		Scope:       testScope,
+		Instance:    testInstance,
+		Consumer:    "eventfeed-failing",
+		BatchSize:   batchSize,
+		AckInterval: ackInterval,
+	})
+
+	errTransient := errors.New("apply failed: transient")
+
+	// oneDelivery is one delivery as seen from inside the handler: the
+	// position, when it began, what the durable checkpoint was when it
+	// began — read before the handler acts — and whether the handler
+	// failed it.
+	type oneDelivery struct {
+		position   uint64
+		at         time.Time
+		checkpoint uint64
+		failed     bool
+	}
+	var (
+		mu        sync.Mutex
+		delivered = map[uint64]int{} // deliveries so far, per position
+		log       []oneDelivery      // every delivery, in order
+	)
+	handle := func(_ context.Context, e es.Envelope) error {
+		mu.Lock()
+		delivered[e.GlobalPosition]++
+		n := delivered[e.GlobalPosition]
+		d := oneDelivery{position: e.GlobalPosition, at: time.Now()}
+		mu.Unlock()
+		d.checkpoint = readCheckpoint(checkpoints)
+		// failPos fails its first failFirst deliveries — retried in
+		// place — and foreverPos fails every delivery until cancel.
+		var err error
+		switch {
+		case e.GlobalPosition == failPos && n <= failFirst:
+			err = errTransient
+		case e.GlobalPosition == foreverPos:
+			err = errTransient
+		}
+		d.failed = err != nil
+		mu.Lock()
+		log = append(log, d)
+		mu.Unlock()
+		return err
+	}
+
+	// Two pages up front: positions 1..8, with failPos on the first page
+	// boundary, so the page-boundary ack path is live while it fails.
+	for k := 0; k < 2*batchSize; k++ {
+		appendEvent(t, store, sid, uint64(k))
+	}
+
+	// assertNotAcked fails if any delivery of pos saw the checkpoint
+	// already at or past pos: the position was acked before its handler
+	// ever succeeded.
+	assertNotAcked := func(pos uint64) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, d := range log {
+			if d.position == pos && d.checkpoint >= pos {
+				t.Fatalf("a delivery of position %d saw checkpoint %d — the position was acked before its handler succeeded",
+					pos, d.checkpoint)
+			}
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- ef.Feed(ctx, handle) }()
+
+	// Phase 1: failPos fails twice, succeeds on the third delivery, and
+	// the stream delivers the whole log past it.
+	waitFor(t, "the log past the failing position to be delivered", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return delivered[failPos] >= failFirst+1 && delivered[pageTwoEnd] >= 1
+	})
+	assertNotAcked(failPos)
+	waitFor(t, "the handled pages to be acked", func() bool {
+		return checkpointPosition(t, checkpoints) == pageTwoEnd
+	})
+
+	// Phase 2: foreverPos fails every delivery — the tick keeps firing
+	// through the retries — until the test cancels mid-failure.
+	appendEvent(t, store, sid, pageTwoEnd)
+	waitFor(t, "the forever-failing position to be retried", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return delivered[foreverPos] >= 3
+	})
+	assertNotAcked(foreverPos)
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("feed: %v", err)
+	}
+
+	// The complete sweep — no delivery can land anymore — and the
+	// stream-end verdict: the flush does not ack the position the
+	// handler was failing on when the caller cancelled.
+	assertNotAcked(failPos)
+	assertNotAcked(foreverPos)
+	if got := checkpointPosition(t, checkpoints); got != pageTwoEnd {
+		t.Fatalf("checkpoint = %d after cancelling on a failing handler, want %d — an unhandled position was acked at stream end",
+			got, pageTwoEnd)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// failPos was retried in place, consecutive deliveries spaced by at
+	// least one ack interval (the retry cadence), succeeded on delivery
+	// failFirst+1, and only then did the stream move past it.
+	var atFailPos []oneDelivery
+	for _, d := range log {
+		if d.position == failPos {
+			atFailPos = append(atFailPos, d)
+		}
+	}
+	if len(atFailPos) < failFirst+1 {
+		t.Fatalf("position %d was delivered %d times, want at least %d — it must be retried in place until handle succeeds",
+			failPos, len(atFailPos), failFirst+1)
+	}
+	for i, d := range atFailPos {
+		if i < failFirst && !d.failed {
+			t.Fatalf("delivery %d of position %d succeeded, want the first %d to fail", i+1, failPos, failFirst)
+		}
+		if i > 0 && atFailPos[i-1].failed {
+			if gap := d.at.Sub(atFailPos[i-1].at); gap < ackInterval {
+				t.Fatalf("retry %d of position %d came after %s, want at least one ack interval (%s)",
+					i+1, failPos, gap, ackInterval)
+			}
+		}
+	}
+	if atFailPos[len(atFailPos)-1].failed {
+		t.Fatalf("position %d never succeeded", failPos)
+	}
+	// The stream moved past the failing position only after its success:
+	// every position beyond it was delivered after the delivery that
+	// succeeded.
+	firstSuccess, firstPast := -1, -1
+	for i, d := range log {
+		if firstSuccess < 0 && d.position == failPos && !d.failed {
+			firstSuccess = i
+		}
+		if firstPast < 0 && d.position == failPos+1 {
+			firstPast = i
+		}
+	}
+	if firstSuccess < 0 || firstPast < 0 || firstPast < firstSuccess {
+		t.Fatalf("position %d was delivered at log index %d while the success over position %d was at index %d — the stream moved past a failing handler",
+			failPos+1, firstPast, failPos, firstSuccess)
+	}
+	// foreverPos was still failing when the test cancelled, after
+	// enough retried deliveries to span several ack ticks.
+	for _, d := range log {
+		if d.position == foreverPos && !d.failed {
+			t.Fatalf("position %d succeeded, want it still failing when the test cancelled", foreverPos)
+		}
+	}
+	if n := delivered[foreverPos]; n < 3 {
+		t.Fatalf("position %d was delivered %d times before the cancel, want at least 3", foreverPos, n)
+	}
 }
 
 // TestEventfeedReportsPoisonThroughObserver pins the observability

@@ -95,6 +95,19 @@ var _ projection.Feed = (*Feed)(nil)
 // Scope, a Definition without a name or consumed types — because they are
 // programming errors, not runtime conditions: retrying them would only
 // hide the mistake behind a reconnect loop.
+//
+// The reconnect token policy is the stable-token choice (the spec leaves
+// it to the builder): the Feed mints one lease-owner token at
+// construction and re-acquires under it on every reconnect, so it
+// self-steals its own lingering lease instead of waiting out the TTL —
+// a same-owner acquire succeeds where a fresh token would loop on
+// LeaseHeld. The trade-off (spec §5.4): because Renew carries no epoch,
+// a zombie stream of this same Feed can keep renewing for a bounded
+// overlap window after a self-steal, so both the old and the new stream
+// deliver — duplicates, never loss: the marker dedups, and the
+// monotonic cursor never advances past a position a holder actually
+// delivered. A foreign owner still fails closed: cross-owner takeover
+// is rejected at acquire, and the loser's next renewal fails.
 func New(cfg Config) *Feed {
 	switch {
 	case cfg.Server == nil:
