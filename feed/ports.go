@@ -92,11 +92,34 @@ type LeaseStore interface {
 // instead of polling. The first event of a page is included even when it alone
 // exceeds maxBytes, so an oversized event is visible to the caller.
 //
+// Head, RawHead and MatchingHead are the three head views the feed's
+// resume, stall detection and lag reporting need. On a fence-bounded Log
+// (Postgres, spec §5.1) they disagree while a transaction is in flight:
+// Head and MatchingHead settle only past the fence; RawHead never waits.
+//
 // limit <= 0 and maxBytes <= 0 are adapter-defined defaults; the feed always
 // passes positive values from its Config.
 type Log interface {
 	ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error)
+	// Head returns the scope's settled log head: the highest position
+	// known to have settled — never one whose append is still in flight
+	// — so it is the position a feed may resume from and a checkpoint may
+	// be reset to. On a fence-bounded Log it can transiently report 0
+	// while the fence is blocked.
 	Head(ctx context.Context) (uint64, error)
+	// RawHead returns the scope's raw committed maximum with no settle
+	// bound: it can jump past positions whose appends are still in
+	// flight, so it is never a resume position. It exists for the
+	// fence-aware resume clamp — raw >= checkpoint proves the
+	// checkpoint's events are still in the log, so a low Head is a
+	// blocked fence, not a restored log — and for stall detection
+	// (Observer.OnStall).
+	RawHead(ctx context.Context) (uint64, error)
+	// MatchingHead returns the highest settled position among events of
+	// types — the subscription's own head, what Status reports and
+	// measures lag against. It is fence-bounded exactly like Head on
+	// backends that fence. An empty types set matches nothing: 0.
+	MatchingHead(ctx context.Context, types []string) (uint64, error)
 }
 
 // Logs opens the Log for one scope (the platform's tenant/workspace).
@@ -158,6 +181,47 @@ type Waiter interface {
 type Clock interface {
 	Now() time.Time
 }
+
+// Observer is the feed's optional observability sink: the operational
+// signals a deployment wires to metrics, logs or alerting. Config.Observer
+// is optional — nil behaves exactly like NoopObserver — and the server
+// calls it from its own goroutines (the stream and its renewer) and from
+// Checkpoint's caller, so implementations must be safe for concurrent use
+// and must not block: the stream never waits for an observer.
+type Observer interface {
+	// OnPage reports one page read from the Log, empty pages included:
+	// events is the page's row count and bytes the sum of its payload
+	// bytes as stored.
+	OnPage(events, bytes int)
+	// OnCheckpoint reports one successful fenced ack: the position the
+	// subscription's cursor advanced to. Rejected acks report nothing.
+	OnCheckpoint(position uint64)
+	// OnLeaseLost reports a failed renewal: the stream that held the
+	// key under owner has been cancelled and will not deliver again
+	// until it reconnects and re-acquires.
+	OnLeaseLost(scope, projection, instance, owner string)
+	// OnPoison reports the oversized first row that ended a stream: the
+	// stream dies with the same *EventTooLargeError, the payload never
+	// leaves the log, and Skip past the position is the recovery.
+	OnPoison(err *EventTooLargeError)
+	// OnStall reports a stalled stream: the page came back empty while
+	// RawHead is above the stream's settled position — committed backlog
+	// the settled reads cannot deliver yet, typically because an
+	// in-flight transaction holds the fence. Exactly one OnStall per
+	// stall episode; the probes behind it are rate-limited, so a fleet
+	// of idle streams cannot stampede the log.
+	OnStall(settledHead, rawHead uint64)
+}
+
+// NoopObserver is the default Observer: it discards every signal. A nil
+// Config.Observer behaves exactly like NoopObserver.
+type NoopObserver struct{}
+
+func (NoopObserver) OnPage(int, int)                            {}
+func (NoopObserver) OnCheckpoint(uint64)                        {}
+func (NoopObserver) OnLeaseLost(string, string, string, string) {}
+func (NoopObserver) OnPoison(*EventTooLargeError)               {}
+func (NoopObserver) OnStall(uint64, uint64)                     {}
 
 // Request is one subscription. Scope, Projection and Instance identify the
 // checkpoint/lease key. Definition is the projection's generated metadata
@@ -240,8 +304,15 @@ type Sink interface {
 
 // Status is a subscription's observable state.
 type Status struct {
-	Position         uint64
-	Head             uint64
+	// Position is the stored checkpoint.
+	Position uint64
+	// Head is the subscription's matching head: the highest settled
+	// position among events of the request definition's consumed types
+	// (MatchingHead), not the all-type log maximum.
+	Head uint64
+	// Lag is matchingHead − position: how far the subscription trails
+	// its own backlog. Negative when the checkpoint is ahead of a
+	// restored log.
 	Lag              int64
 	ActiveConsumer   string
 	LastCheckpointAt time.Time

@@ -58,8 +58,8 @@ func (s *Store) runWorkspace(ctx context.Context, ws string, fn func(tx DBTX) er
 // Logs opens the per-scope feed Log (feed.Logs). The feed's scope maps
 // 1:1 to a workspace id — the platform's transport authorizes the scope
 // upstream — and Open hands back the workspace-pinned *Workspace, which
-// already implements feed.Log: fenced ReadAllBounded pages (spec §5.1)
-// and the settled Head. MatchingHead lands with Task 16.
+// implements feed.Log: fenced ReadAllBounded pages (spec §5.1), the
+// settled Head and MatchingHead, and the unbounded RawHead.
 type Logs struct {
 	store *Store
 }

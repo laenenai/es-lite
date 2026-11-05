@@ -47,6 +47,10 @@ type Config struct {
 	// nil means Skip still advances but records nothing — the skip works,
 	// only the audit trail is absent.
 	DeadLetters DeadLetterStore
+	// Observer is the optional observability sink (OnPage, OnCheckpoint,
+	// OnLeaseLost, OnPoison, OnStall). nil behaves exactly like
+	// NoopObserver: no signals, no cost.
+	Observer Observer
 
 	// Batch is the page size when Request.BatchSize is zero. Default 500.
 	Batch int
@@ -89,6 +93,9 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if cfg.Clock == nil {
 		cfg.Clock = systemClock{}
+	}
+	if cfg.Observer == nil {
+		cfg.Observer = NoopObserver{}
 	}
 	if cfg.Batch <= 0 {
 		cfg.Batch = defaultBatch
@@ -301,6 +308,7 @@ func (s *Server) renew(ctx context.Context, scope, projection, instance, owner s
 		if rerr == nil {
 			rerr = errLeaseExpired
 		}
+		s.cfg.Observer.OnLeaseLost(scope, projection, instance, owner)
 		select {
 		case lost <- &LeaseLostError{Key: fmt.Sprintf("%s/%s/%s", scope, projection, instance), Owner: owner, Err: rerr}:
 		default:
@@ -309,6 +317,11 @@ func (s *Server) renew(ctx context.Context, scope, projection, instance, owner s
 		return
 	}
 }
+
+// stallProbeEvery bounds the OnStall probe cadence: a stream idling on
+// empty pages consults Log.RawHead at most once per window, so a fleet of
+// idle subscribers cannot stampede the log with probes (spec §5.12).
+const stallProbeEvery = 3 * time.Second
 
 // stream is the read/send loop. It runs under runCtx, which the renewer may
 // cancel; Subscribe translates the result. The event type set is the
@@ -346,11 +359,52 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 	if err != nil {
 		return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
 	}
-	// A log restored to an earlier point leaves the checkpoint ahead of the
-	// head. Clamp locally; do not stall on a position the log no longer has
-	// and do not rewrite the consumer's checkpoint.
-	if pos > head {
-		pos = head
+	// A checkpoint ahead of the settled head is ambiguous (spec §5.1):
+	// either the log was restored to an earlier point or is empty —
+	// clamp locally, never rewriting the consumer's checkpoint — or the
+	// head is only transiently low because a fence-bounded Log (Postgres)
+	// reports 0 while a transaction blocks the fence, and clamping would
+	// replay the whole log below the checkpoint. RawHead separates the
+	// regimes: raw >= pos proves the checkpoint's position is still in
+	// the committed log, so the fence is merely blocked and the stream
+	// waits and re-heads; only raw < pos (the position is gone) clamps.
+	for pos > head {
+		raw, rerr := log.RawHead(ctx)
+		if rerr != nil {
+			return fmt.Errorf("feed: raw head for scope %q: %w", req.Scope, rerr)
+		}
+		if raw < pos {
+			pos = head
+			break
+		}
+		if werr := s.wait(ctx); werr != nil {
+			return werr
+		}
+		if head, err = log.Head(ctx); err != nil {
+			return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
+		}
+	}
+
+	// Stall detection state (spec §5.8): the probe is rate-limited and
+	// one OnStall fires per stall episode, re-armed by the next page that
+	// delivers.
+	var (
+		lastProbe     time.Time
+		stallReported bool
+	)
+	probeStall := func() {
+		if stallReported || time.Since(lastProbe) < stallProbeEvery {
+			return
+		}
+		lastProbe = time.Now()
+		raw, rerr := log.RawHead(ctx)
+		if rerr != nil {
+			return // observability must never kill the stream
+		}
+		if raw > pos {
+			stallReported = true
+			s.cfg.Observer.OnStall(pos, raw)
+		}
 	}
 
 	for {
@@ -359,29 +413,55 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 		}
 		envs, truncated, err := log.ReadAllBounded(ctx, pos, batch, s.cfg.MaxBatchBytes, req.Definition.Consumes)
 		if err != nil {
+			// The adapters' poison contract: a first row over the
+			// store's cap surfaces as *EventTooLargeError without the
+			// payload ever being materialized (spec §5.3).
+			var poison *EventTooLargeError
+			if errors.As(err, &poison) {
+				s.cfg.Observer.OnPoison(poison)
+			}
 			return fmt.Errorf("feed: read %s/%s/%s from %d: %w", req.Scope, name, req.Instance, pos, err)
 		}
+		pageBytes := 0
+		for _, env := range envs {
+			pageBytes += len(env.Payload)
+		}
+		s.cfg.Observer.OnPage(len(envs), pageBytes)
 		for _, env := range envs {
 			if s.cfg.MaxPayloadBytes > 0 && len(env.Payload) > s.cfg.MaxPayloadBytes {
-				return &EventTooLargeError{
+				// The server's own backstop check: the row was
+				// materialized, but the stream refuses to send it.
+				poison := &EventTooLargeError{
 					Position: env.GlobalPosition,
 					TypeURL:  env.TypeURL,
 					Size:     len(env.Payload),
 					Limit:    s.cfg.MaxPayloadBytes,
 				}
+				s.cfg.Observer.OnPoison(poison)
+				return poison
 			}
 			if err := sink.Send(ctx, env); err != nil {
 				return fmt.Errorf("feed: send event at position %d: %w", env.GlobalPosition, err)
 			}
 			pos = env.GlobalPosition
 		}
-		// A budget-truncated page, or a full page, means more matching events
-		// are already there: continue without waiting. Guard on a non-empty
-		// page: an adapter that reports truncated with zero rows must not make
-		// the loop spin — wait like any other empty page.
-		if len(envs) > 0 && (truncated || len(envs) >= batch) {
-			continue
+		if len(envs) > 0 {
+			// A delivered page ended any stall episode: the next
+			// one reports again.
+			stallReported = false
+			// A budget-truncated page, or a full page, means more matching
+			// events are already there: continue without waiting. Guard on
+			// a non-empty page: an adapter that reports truncated with zero
+			// rows must not make the loop spin — wait like any other empty
+			// page.
+			if truncated || len(envs) >= batch {
+				continue
+			}
 		}
+		// The log has nothing more to deliver now: probe for a stall —
+		// committed backlog the settled reads cannot deliver — then wait
+		// out the poll.
+		probeStall()
 		if err := s.wait(ctx); err != nil {
 			return err
 		}
@@ -450,6 +530,7 @@ func (s *Server) Checkpoint(ctx context.Context, ack Ack) error {
 	if err := s.cfg.Checkpoints.Save(ctx, ack.Scope, ack.Projection, ack.Instance, ack.Definition, ack.Position); err != nil {
 		return fmt.Errorf("feed: save checkpoint %s at %d: %w", key, ack.Position, err)
 	}
+	s.cfg.Observer.OnCheckpoint(ack.Position)
 	return nil
 }
 
@@ -463,6 +544,13 @@ func (s *Server) Checkpoint(ctx context.Context, ack Ack) error {
 // non-empty); req's stream-only fields (Owner, Consumer, BatchSize) are
 // ignored. Unless force is set it refuses while a lease is held.
 // Authorizing force is the caller's job: the core only enforces the lease.
+//
+// Force moves the cursor but does not stop the stream it displaces: a live
+// subscriber under the old definition still holds the lease, and its next
+// ack — fenced on ownership, which it still passes — re-records the old
+// definition fingerprint and its own position, flipping the reset back. A
+// forced reset sticks only after the old stream ends; stop it first when
+// the reset must hold.
 func (s *Server) ResetCheckpoint(ctx context.Context, req Request, position uint64, force bool) error {
 	if err := validateKey(req.Scope, req.Projection, req.Instance); err != nil {
 		return err
@@ -569,39 +657,46 @@ func (s *Server) DeleteSubscription(ctx context.Context, scope, projection, inst
 	return nil
 }
 
-// Status reports the stored checkpoint, the log head, positional lag and the
-// active lease holder. Lag is head - position, and is negative when the
-// checkpoint is ahead of a restored log.
-func (s *Server) Status(ctx context.Context, scope, projection, instance string) (Status, error) {
-	if err := validateKey(scope, projection, instance); err != nil {
+// Status reports the subscription's observable state: the stored
+// checkpoint, the matching head and lag for req's definition, and the
+// active lease holder. req identifies the subscription exactly like a
+// Subscribe call and is validated the same way; the checkpoint is read
+// once. Head is MatchingHead over req.Definition.Consumes — the highest
+// settled position among the subscription's own event types — and Lag is
+// matchingHead − position, negative when the checkpoint is ahead of a
+// restored log. Status never fails on definition drift: it observes, it
+// does not gate.
+func (s *Server) Status(ctx context.Context, req Request) (Status, error) {
+	if err := validateKey(req.Scope, req.Projection, req.Instance); err != nil {
 		return Status{}, err
 	}
-	pos, err := s.cfg.Checkpoints.Load(ctx, scope, projection, instance)
+	if err := validateDefinition(req); err != nil {
+		return Status{}, err
+	}
+	cp, found, err := s.cfg.Checkpoints.Checkpoint(ctx, req.Scope, req.Projection, req.Instance)
 	if err != nil {
-		return Status{}, fmt.Errorf("feed: load checkpoint %s/%s/%s: %w", scope, projection, instance, err)
+		return Status{}, fmt.Errorf("feed: checkpoint %s/%s/%s: %w", req.Scope, req.Projection, req.Instance, err)
+	}
+	log, err := s.cfg.Logs.Open(ctx, req.Scope)
+	if err != nil {
+		return Status{}, fmt.Errorf("feed: open log for scope %q: %w", req.Scope, err)
+	}
+	head, err := log.MatchingHead(ctx, req.Definition.Consumes)
+	if err != nil {
+		return Status{}, fmt.Errorf("feed: matching head for scope %q: %w", req.Scope, err)
 	}
 	var updated time.Time
-	if cp, found, err := s.cfg.Checkpoints.Checkpoint(ctx, scope, projection, instance); err != nil {
-		return Status{}, fmt.Errorf("feed: checkpoint %s/%s/%s: %w", scope, projection, instance, err)
-	} else if found {
-		pos, updated = cp.Position, cp.UpdatedAt
-	}
-	log, err := s.cfg.Logs.Open(ctx, scope)
-	if err != nil {
-		return Status{}, fmt.Errorf("feed: open log for scope %q: %w", scope, err)
-	}
-	head, err := log.Head(ctx)
-	if err != nil {
-		return Status{}, fmt.Errorf("feed: head for scope %q: %w", scope, err)
+	if found {
+		updated = cp.UpdatedAt
 	}
 	st := Status{
-		Position:         pos,
+		Position:         cp.Position,
 		Head:             head,
-		Lag:              int64(head) - int64(pos),
+		Lag:              int64(head) - int64(cp.Position),
 		LastCheckpointAt: updated,
 	}
-	if lease, held, err := s.cfg.Leases.Holder(ctx, scope, projection, instance); err != nil {
-		return Status{}, fmt.Errorf("feed: holder for %s/%s/%s: %w", scope, projection, instance, err)
+	if lease, held, err := s.cfg.Leases.Holder(ctx, req.Scope, req.Projection, req.Instance); err != nil {
+		return Status{}, fmt.Errorf("feed: holder for %s/%s/%s: %w", req.Scope, req.Projection, req.Instance, err)
 	} else if held {
 		st.ActiveConsumer = lease.Consumer
 	}

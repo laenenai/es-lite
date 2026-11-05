@@ -203,6 +203,57 @@ func TestSQLiteFeedConformance(t *testing.T) {
 	feedtest.RunAll(t, feedtest.Fixture{NewStore: newSqliteFeedStore})
 }
 
+// TestMatchingHeadIsTheFilteredMax pins the SQLite adapter's MatchingHead
+// (spec §5.8): the maximum position among the requested types only — the
+// subscription's own head, what Status measures lag against — and 0 for an
+// empty type set or when nothing matches. RawHead equals Head here: SQLite
+// has no horizon fence, so the settled and raw views cannot diverge.
+func TestMatchingHeadIsTheFilteredMax(t *testing.T) {
+	s := openFeedStore(t)
+	sid := mustStreamID(t, "thing", "matching-head")
+	ctx := context.Background()
+
+	a1 := appendFeedEvent(t, s, sid, 0, "thing.v1.Happened", []byte("a"))
+	b1 := appendFeedEvent(t, s, sid, 1, "thing.v1.Ignored", []byte("b"))
+	a2 := appendFeedEvent(t, s, sid, 2, "thing.v1.Happened", []byte("c"))
+	if !(a1.GlobalPosition < b1.GlobalPosition && b1.GlobalPosition < a2.GlobalPosition) {
+		t.Fatalf("insert order: %d, %d, %d, want ascending", a1.GlobalPosition, b1.GlobalPosition, a2.GlobalPosition)
+	}
+
+	cases := []struct {
+		types []string
+		want  uint64
+	}{
+		{[]string{"thing.v1.Happened"}, a2.GlobalPosition},
+		{[]string{"thing.v1.Ignored"}, b1.GlobalPosition},
+		{[]string{"thing.v1.Happened", "thing.v1.Ignored"}, a2.GlobalPosition},
+		{[]string{"thing.v1.Absent"}, 0},
+		{nil, 0},
+	}
+	for _, c := range cases {
+		head, err := s.MatchingHead(ctx, c.types)
+		if err != nil {
+			t.Fatalf("MatchingHead (%v): %v", c.types, err)
+		}
+		if head != c.want {
+			t.Fatalf("MatchingHead (%v) = %d, want %d", c.types, head, c.want)
+		}
+	}
+
+	head, err := s.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	raw, err := s.RawHead(ctx)
+	if err != nil {
+		t.Fatalf("RawHead: %v", err)
+	}
+	if head != a2.GlobalPosition || raw != a2.GlobalPosition {
+		t.Fatalf("Head = %d, RawHead = %d, want both %d (no fence on SQLite: the views agree)",
+			head, raw, a2.GlobalPosition)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency guard: the single-connection invariant
 // ---------------------------------------------------------------------------

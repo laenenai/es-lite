@@ -134,6 +134,92 @@ func TestHeadIsSettledWhileAppendInFlight(t *testing.T) {
 	}
 }
 
+// TestWorkspaceMatchingHeadIsFenceBoundedAndFiltered pins MatchingHead's
+// two semantics (spec §5.8): the filtered maximum — only the requested
+// types' positions count — and the fence bound — while a transaction
+// blocks the fence, MatchingHead reports 0 exactly like Head, reusing the
+// stored fence round instead of drawing a fresh one per probe. RawHead
+// sees the committed maximum immediately, the contrast that makes stall
+// detection meaningful.
+func TestWorkspaceMatchingHeadIsFenceBoundedAndFiltered(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_matching_head")
+	const (
+		typeA = "feedtest.v1.E1" // tx1, lower position, held in flight
+		typeB = "feedtest.v1.E2" // tx2, higher position, committed
+	)
+
+	// tx1 draws the lower position and stays open.
+	tx1, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	gpA := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "matching-head-a"), 0, typeA)
+
+	// tx2 draws the higher position and commits.
+	tx2, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+	gpB := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "matching-head-b"), 0, typeB)
+	if gpA >= gpB {
+		t.Fatalf("insert order: tx1 gp=%d, tx2 gp=%d, want tx1 lower", gpA, gpB)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit tx2: %v", err)
+	}
+
+	// The raw maximum is committed and visible; the matching heads are
+	// not: the fence is blocked by tx1, so both filter shapes report 0.
+	// The second call reuses the stored fence round — still 0, still no
+	// error — instead of drawing a fresh fence per probe.
+	if raw, err := ws.RawHead(ctx); err != nil {
+		t.Fatalf("RawHead: %v", err)
+	} else if raw != gpB {
+		t.Fatalf("RawHead = %d, want %d (the committed maximum, unfenced)", raw, gpB)
+	}
+	for i := 0; i < 2; i++ {
+		for _, types := range [][]string{{typeA}, {typeA, typeB}, nil} {
+			head, err := ws.MatchingHead(ctx, types)
+			if err != nil {
+				t.Fatalf("MatchingHead poll %d (%v): %v", i, types, err)
+			}
+			if head != 0 {
+				t.Fatalf("MatchingHead poll %d (%v) = %d while gp=%d is in flight, want 0 (the fence is blocked, like Head)",
+					i, types, head, gpA)
+			}
+		}
+	}
+
+	// tx1 settles: the fence clears and MatchingHead reports each type
+	// set's own maximum. An empty type set matches nothing.
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit tx1: %v", err)
+	}
+	cases := []struct {
+		types []string
+		want  uint64
+	}{
+		{[]string{typeA}, gpA},
+		{[]string{typeB}, gpB},
+		{[]string{typeA, typeB}, gpB},
+		{[]string{"feedtest.v1.Absent"}, 0},
+		{nil, 0},
+	}
+	for _, c := range cases {
+		head, err := ws.MatchingHead(ctx, c.types)
+		if err != nil {
+			t.Fatalf("MatchingHead (%v): %v", c.types, err)
+		}
+		if head != c.want {
+			t.Fatalf("MatchingHead (%v) = %d, want %d", c.types, head, c.want)
+		}
+	}
+}
+
 // appendEvents is the ReadAllBounded fixture: it appends one event per
 // (typeURL, payload) pair to ws and fails the test on the first error.
 func appendEvents(ctx context.Context, t *testing.T, ws *postgres.Workspace, sid es.StreamID, events []es.EventData) []es.Envelope {

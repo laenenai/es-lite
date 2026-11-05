@@ -255,6 +255,9 @@ type memLogs struct {
 	// emptyTruncated makes every page report truncated with zero rows, the
 	// pathological adapter the loop must not spin on.
 	emptyTruncated bool
+	// readErr makes every page fail with it: the adapter error path,
+	// where the poison test plants *feed.EventTooLargeError.
+	readErr error
 }
 
 type readCall struct {
@@ -321,6 +324,39 @@ func (l *memLog) Head(context.Context) (uint64, error) {
 	return l.parent.headOf(l.scope), nil
 }
 
+// RawHead reports the raw committed maximum: every seeded event's
+// position, ignoring the Head override, like an unbounded MAX.
+func (l *memLog) RawHead(context.Context) (uint64, error) {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+	var h uint64
+	for _, e := range l.parent.events[l.scope] {
+		if e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
+// MatchingHead reports the highest position among events of types: the
+// subscription's own head, computed with the same filter ReadAllBounded
+// applies.
+func (l *memLog) MatchingHead(_ context.Context, types []string) (uint64, error) {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var h uint64
+	for _, e := range l.parent.events[l.scope] {
+		if want[e.TypeURL] && e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
 func (l *memLog) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -331,6 +367,9 @@ func (l *memLog) ReadAllBounded(ctx context.Context, from uint64, limit, maxByte
 		scope: l.scope, from: from, limit: limit, maxBytes: maxBytes,
 		types: append([]string(nil), types...),
 	})
+	if l.parent.readErr != nil {
+		return nil, false, l.parent.readErr
+	}
 	if l.parent.emptyTruncated {
 		return nil, true, nil
 	}
@@ -472,6 +511,204 @@ func (w *blockingWaiter) count() int {
 	defer w.mu.Unlock()
 	return w.waits
 }
+
+// recordingObserver captures every Observer signal so tests can pin what
+// the server reported. Its accessors copy under the mutex: the renewer
+// goroutine (OnLeaseLost) and the stream goroutine call in concurrently.
+type recordingObserver struct {
+	mu          sync.Mutex
+	pages       []obsPage
+	checkpoints []uint64
+	leaseLost   []obsLeaseLost
+	poisons     []*feed.EventTooLargeError
+	stalls      []obsStall
+}
+
+type obsPage struct{ events, bytes int }
+
+type obsLeaseLost struct{ scope, projection, instance, owner string }
+
+type obsStall struct{ settled, raw uint64 }
+
+func (o *recordingObserver) OnPage(events, bytes int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pages = append(o.pages, obsPage{events, bytes})
+}
+
+func (o *recordingObserver) OnCheckpoint(position uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.checkpoints = append(o.checkpoints, position)
+}
+
+func (o *recordingObserver) OnLeaseLost(scope, projection, instance, owner string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.leaseLost = append(o.leaseLost, obsLeaseLost{scope, projection, instance, owner})
+}
+
+func (o *recordingObserver) OnPoison(err *feed.EventTooLargeError) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.poisons = append(o.poisons, err)
+}
+
+func (o *recordingObserver) OnStall(settled, raw uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.stalls = append(o.stalls, obsStall{settled, raw})
+}
+
+func (o *recordingObserver) pagesSnapshot() []obsPage {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]obsPage(nil), o.pages...)
+}
+
+func (o *recordingObserver) checkpointsSnapshot() []uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]uint64(nil), o.checkpoints...)
+}
+
+func (o *recordingObserver) leaseLostSnapshot() []obsLeaseLost {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]obsLeaseLost(nil), o.leaseLost...)
+}
+
+func (o *recordingObserver) poisonsSnapshot() []*feed.EventTooLargeError {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]*feed.EventTooLargeError(nil), o.poisons...)
+}
+
+func (o *recordingObserver) stallsSnapshot() []obsStall {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]obsStall(nil), o.stalls...)
+}
+
+// fenceBlockedLog is the fence-bounded Log the clamp and stall tests run
+// against: while blocked it models a horizon fence held open by an
+// in-flight transaction (spec §5.1) — Head reports 0 because nothing has
+// settled past the fence, ReadAllBounded returns empty pages, RawHead
+// still reports the raw committed maximum. unblock commits the in-flight
+// transaction: the fence clears, Head converges and pages deliver. Every
+// ReadAllBounded from and every RawHead probe is recorded so the tests
+// can pin exactly what the stream did while the fence was blocked.
+type fenceBlockedLog struct {
+	mu      sync.Mutex
+	events  []es.Envelope
+	blocked bool
+	reads   []uint64 // ReadAllBounded from arguments, in order
+	probes  int      // RawHead calls
+}
+
+// headLocked returns the raw committed maximum; l.mu must be held.
+func (l *fenceBlockedLog) headLocked() uint64 {
+	var h uint64
+	for _, e := range l.events {
+		if e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h
+}
+
+func (l *fenceBlockedLog) Head(context.Context) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.blocked {
+		return 0, nil
+	}
+	return l.headLocked(), nil
+}
+
+// RawHead sees the committed maximum immediately, the fence never bounds
+// it — the view stall detection probes with.
+func (l *fenceBlockedLog) RawHead(context.Context) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.probes++
+	return l.headLocked(), nil
+}
+
+func (l *fenceBlockedLog) MatchingHead(_ context.Context, types []string) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.blocked {
+		return 0, nil
+	}
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var h uint64
+	for _, e := range l.events {
+		if want[e.TypeURL] && e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
+func (l *fenceBlockedLog) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.reads = append(l.reads, from)
+	if l.blocked {
+		return nil, false, nil
+	}
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var (
+		out       []es.Envelope
+		total     int
+		truncated bool
+	)
+	for _, e := range l.events {
+		if e.GlobalPosition <= from || !want[e.TypeURL] {
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		if len(out) > 0 && maxBytes > 0 && total+len(e.Payload) > maxBytes {
+			truncated = true
+			break
+		}
+		total += len(e.Payload)
+		out = append(out, e)
+	}
+	return out, truncated, nil
+}
+
+// unblock commits the in-flight transaction: the fence clears.
+func (l *fenceBlockedLog) unblock() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.blocked = false
+}
+
+// snapshotReads copies the recorded ReadAllBounded from arguments.
+func (l *fenceBlockedLog) snapshotReads() []uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]uint64(nil), l.reads...)
+}
+
+// singleLogs opens the same Log for every scope: the opener for fakes
+// that are one self-contained Log (fenceBlockedLog).
+type singleLogs struct{ log feed.Log }
+
+func (s singleLogs) Open(context.Context, string) (feed.Log, error) { return s.log, nil }
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -824,6 +1061,81 @@ func TestSubscribeClampsCheckpointAheadOfHead(t *testing.T) {
 	}
 }
 
+// TestSubscribeResumeClampIsFenceAware pins the Task 3 review ruling: the
+// resume clamp (pos > head) exists for restored or empty logs only. On a
+// fence-bounded Log (Postgres, spec §5.1) Head transiently reports 0 while
+// an in-flight transaction blocks the fence — the checkpoint's events are
+// all still in the committed log, and clamping pos to the blocked head
+// would replay the whole log below the checkpoint. RawHead separates the
+// regimes: raw >= pos means the fence is merely blocked, so the stream
+// waits and re-heads instead of clamping, never reading a page below the
+// checkpoint; only raw < pos (the position is gone: restored or empty
+// log) clamps. Once the fence clears, delivery resumes from the
+// checkpoint.
+func TestSubscribeResumeClampIsFenceAware(t *testing.T) {
+	const checkpoint = uint64(5000)
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", checkpoint)
+	log := &fenceBlockedLog{
+		events: []es.Envelope{
+			ev(5001, "counter.v1.Incremented", "one"),
+			ev(5002, "counter.v1.Incremented", "two"),
+		},
+		blocked: true,
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(),
+		Logs: singleLogs{log},
+		Poll: 5 * time.Millisecond,
+	})
+	sink := newMemSink()
+	cancel, done := start(t, srv, testRequest("live"), sink)
+
+	// While the fence is blocked the stream must keep probing RawHead and
+	// re-heading — the fence-aware non-clamp — and must not read any page.
+	// The old clamp read its first page from 0 immediately.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		log.mu.Lock()
+		probes, reads := log.probes, len(log.reads)
+		log.mu.Unlock()
+		if reads > 0 {
+			from := log.snapshotReads()[0]
+			t.Fatalf("read a page from %d while the fence was blocked, want no page below the checkpoint %d (the clamp replayed from 0)",
+				from, checkpoint)
+		}
+		if probes >= 2 {
+			break // the re-head loop is waiting out the blocked fence
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %d RawHead probes, want the fence-aware loop probing and re-heading", probes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The in-flight transaction commits: delivery resumes strictly after
+	// the checkpoint — never from the clamped head 0.
+	log.unblock()
+	got := sink.waitFor(t, 2)
+	if positions := positionsOf(got); !reflect.DeepEqual(positions, []uint64{5001, 5002}) {
+		t.Fatalf("positions = %v, want [5001 5002] (resume after the checkpoint %d)", positions, checkpoint)
+	}
+	reads := log.snapshotReads()
+	if len(reads) == 0 {
+		t.Fatal("no pages were read after the fence cleared")
+	}
+	for _, from := range reads {
+		if from < checkpoint {
+			t.Fatalf("read a page from %d, want >= %d on every page (no clamp replay)", from, checkpoint)
+		}
+	}
+
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
 func TestSubscribeRequestsOnlyTheGivenEventTypes(t *testing.T) {
 	logs := newMemLogs(
 		ev(1, "a.v1.One", "a1"),
@@ -959,16 +1271,19 @@ func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
 	checkpoints := newMemCheckpoints(at)
 	checkpoints.set("tenant", "counter.view", "live", 2)
-	logs := newMemLogs()
-	logs.setHead(5)
+	logs := newMemLogs(
+		ev(2, "counter.v1.Incremented", "two"),
+		ev(5, "counter.v1.Incremented", "five"),
+	)
 	leases := newMemLeases()
 	srv := newServer(t, feed.Config{
 		Checkpoints: checkpoints, Leases: leases, Logs: logs,
 		Waiter: &blockingWaiter{},
 	})
+	req := testRequest("live")
 
-	// No subscriber: position and head, no active consumer.
-	got, err := srv.Status(context.Background(), "tenant", "counter.view", "live")
+	// No subscriber: position, matching head and lag, no active consumer.
+	got, err := srv.Status(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
@@ -982,11 +1297,10 @@ func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {
 		t.Fatalf("LastCheckpointAt = %v, want %v", got.LastCheckpointAt, at)
 	}
 
-	req := testRequest("live")
 	_, done := start(t, srv, req, newMemSink())
 	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, true)
 
-	got, err = srv.Status(context.Background(), "tenant", "counter.view", "live")
+	got, err = srv.Status(context.Background(), req)
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
@@ -1001,7 +1315,7 @@ func TestStatusWithoutACheckpoint(t *testing.T) {
 	srv := newServer(t, feed.Config{
 		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
 	})
-	got, err := srv.Status(context.Background(), "tenant", "counter.view", "live")
+	got, err := srv.Status(context.Background(), testRequest("live"))
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
@@ -1019,18 +1333,245 @@ func TestStatusWithoutACheckpoint(t *testing.T) {
 func TestStatusReportsNegativeLagWhenCheckpointIsAhead(t *testing.T) {
 	checkpoints := newMemCheckpoints(time.Now())
 	checkpoints.set("tenant", "counter.view", "live", 9)
-	logs := newMemLogs()
-	logs.setHead(4)
+	// The log only reaches position 4 (a matching event, so the matching
+	// head — not an all-type override — is what reports it).
+	logs := newMemLogs(ev(4, "counter.v1.Incremented", "four"))
 	srv := newServer(t, feed.Config{
 		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: logs,
 	})
-	got, err := srv.Status(context.Background(), "tenant", "counter.view", "live")
+	got, err := srv.Status(context.Background(), testRequest("live"))
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
 	if got.Position != 9 || got.Head != 4 || got.Lag != -5 {
 		t.Fatalf("Status = %+v, want position 9 head 4 lag -5", got)
 	}
+}
+
+// TestStatusLagIsFilterAware pins the filter-aware lag: a subscription
+// consuming typeA, caught up at the matching head 100, has zero lag however
+// many events of other types sit above it (all-type head 500 here). The old
+// type-blind Status measured against the all-type head and reported 400.
+func TestStatusLagIsFilterAware(t *testing.T) {
+	const (
+		typeA = "counter.v1.Incremented"
+		typeB = "counter.v1.Zeroed"
+	)
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", 100)
+	logs := newMemLogs(
+		ev(100, typeA, "a"),
+		ev(500, typeB, "b"), // not consumed: raises only the all-type head
+	)
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: logs,
+	})
+	req := testRequest("live")
+	req.Definition = projection.Definition{Name: "counter.view", Consumes: []string{typeA}}
+
+	got, err := srv.Status(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if got.Position != 100 || got.Head != 100 || got.Lag != 0 {
+		t.Fatalf("Status = %+v, want position 100, matching head 100, lag 0 (the type-blind lag was 400)", got)
+	}
+}
+
+// TestObserverReportsStall pins the stall signal (spec §5.8): while an
+// in-flight transaction holds the fence, a fence-bounded Log's settled
+// reads return empty pages even though committed events exist above them
+// — RawHead sees the backlog, Head and the pages do not. The stream must
+// probe RawHead in the empty-page branch, rate-limited, and report
+// exactly one OnStall per stall episode, with raw above the settled head;
+// once the transaction commits and delivery resumes, no further stall is
+// reported for the episode.
+func TestObserverReportsStall(t *testing.T) {
+	obs := &recordingObserver{}
+	log := &fenceBlockedLog{
+		events: []es.Envelope{
+			ev(1, "counter.v1.Incremented", "one"),
+			ev(2, "counter.v1.Incremented", "two"),
+			ev(3, "counter.v1.Incremented", "three"),
+		},
+		blocked: true,
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(),
+		Logs:     singleLogs{log},
+		Observer: obs,
+		Poll:     5 * time.Millisecond,
+	})
+	sink := newMemSink()
+	cancel, done := start(t, srv, testRequest("live"), sink)
+
+	// Two consecutive empty pages while the fence is blocked. The first
+	// probed RawHead and reported the stall; the second page's probe is
+	// rate-limited away, so the episode reports exactly once.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if reads := len(log.snapshotReads()); reads >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for two empty pages, got %d reads", len(log.snapshotReads()))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stalls := obs.stallsSnapshot()
+	if len(stalls) != 1 {
+		t.Fatalf("OnStall calls = %d after two consecutive empty pages, want exactly 1 (the rate limit suppresses the second probe)", len(stalls))
+	}
+	if stalls[0].settled != 0 || stalls[0].raw != 3 {
+		t.Fatalf("OnStall = settled %d, raw %d, want settled 0 (the resume head) and raw 3 (the committed backlog)", stalls[0].settled, stalls[0].raw)
+	}
+	if stalls[0].raw <= stalls[0].settled {
+		t.Fatalf("OnStall = settled %d, raw %d, want raw > settled", stalls[0].settled, stalls[0].raw)
+	}
+
+	// The transaction commits: delivery resumes from the backlog and the
+	// episode ends — no further stall is reported for it.
+	log.unblock()
+	got := sink.waitFor(t, 3)
+	if positions := positionsOf(got); !reflect.DeepEqual(positions, []uint64{1, 2, 3}) {
+		t.Fatalf("positions after commit = %v, want [1 2 3] (delivery resumes)", positions)
+	}
+	time.Sleep(60 * time.Millisecond) // a few more poll cycles, caught up
+	if stalls := obs.stallsSnapshot(); len(stalls) != 1 {
+		t.Fatalf("OnStall calls = %d after delivery resumed, want still 1 (a caught-up stream reports no stall)", len(stalls))
+	}
+
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
+// TestObserverReportsPagesCheckpointsLeaseLossAndPoison pins the
+// remaining observer wiring (spec §5.8): every page reports its rows and
+// payload bytes, every accepted fenced ack its position, a failed renewal
+// the lease it lost, and a poison row the stream died on — whether the
+// server's own size backstop caught the materialized row or the adapter
+// refused to materialize it. OnStall has its own test above.
+func TestObserverReportsPagesCheckpointsLeaseLossAndPoison(t *testing.T) {
+	t.Run("OnPage reports every page's rows and payload bytes", func(t *testing.T) {
+		obs := &recordingObserver{}
+		logs := newMemLogs(
+			ev(1, "counter.v1.Incremented", "one"),
+			ev(2, "counter.v1.Incremented", "two"),
+		)
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+			Observer: obs, Waiter: &blockingWaiter{},
+		})
+		sink := newMemSink()
+		cancel, done := start(t, srv, testRequest("live"), sink)
+		sink.waitFor(t, 2)
+
+		pages := obs.pagesSnapshot()
+		if len(pages) != 1 || pages[0].events != 2 || pages[0].bytes != 6 {
+			t.Fatalf("OnPage = %+v, want exactly one page of 2 events and 6 payload bytes", pages)
+		}
+		cancel()
+		_ = await(t, done)
+	})
+
+	t.Run("OnCheckpoint reports accepted acks, never rejected ones", func(t *testing.T) {
+		obs := &recordingObserver{}
+		leases := newMemLeases()
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+			Observer: obs,
+		})
+		if _, err := leases.Acquire(context.Background(), "tenant", "counter.view", "live", "owner-a", "worker-1", time.Minute); err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		ack := feed.Ack{Scope: "tenant", Projection: "counter.view", Instance: "live", Owner: "owner-a", Position: 42}
+		if err := srv.Checkpoint(context.Background(), ack); err != nil {
+			t.Fatalf("Checkpoint: %v", err)
+		}
+		// A foreign owner's ack is rejected by the lease fence and must
+		// report nothing.
+		foreign := ack
+		foreign.Owner, foreign.Position = "owner-b", 43
+		if err := srv.Checkpoint(context.Background(), foreign); !errors.Is(err, feed.ErrLeaseHeld) {
+			t.Fatalf("foreign ack error = %v, want ErrLeaseHeld", err)
+		}
+		if got := obs.checkpointsSnapshot(); !reflect.DeepEqual(got, []uint64{42}) {
+			t.Fatalf("OnCheckpoint = %v, want exactly [42] (accepted fenced acks only)", got)
+		}
+	})
+
+	t.Run("OnLeaseLost reports the failed renewal that killed the stream", func(t *testing.T) {
+		obs := &recordingObserver{}
+		leases := newMemLeases()
+		leases.failAfter = 0
+		leases.renewErr = errors.New("lease store unavailable")
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+			Observer:   obs,
+			Waiter:     &blockingWaiter{},
+			LeaseTTL:   50 * time.Millisecond,
+			RenewEvery: 2 * time.Millisecond,
+		})
+		req := testRequest("live")
+		req.Owner = "owner-a"
+		_, done := start(t, srv, req, newMemSink())
+
+		if err := await(t, done); !errors.Is(err, feed.ErrLeaseLost) {
+			t.Fatalf("Subscribe error = %v, want ErrLeaseLost", err)
+		}
+		got := obs.leaseLostSnapshot()
+		if len(got) != 1 ||
+			got[0].scope != "tenant" || got[0].projection != "counter.view" || got[0].instance != "live" || got[0].owner != "owner-a" {
+			t.Fatalf("OnLeaseLost = %+v, want exactly the lost key and its owner", got)
+		}
+	})
+
+	t.Run("OnPoison reports the server's own backstop catch", func(t *testing.T) {
+		obs := &recordingObserver{}
+		const payload = "supersecret-payload"
+		logs := newMemLogs(ev(7, "counter.v1.Incremented", payload))
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+			Observer: obs, Waiter: &blockingWaiter{}, MaxPayloadBytes: 4,
+		})
+		_, done := start(t, srv, testRequest("live"), newMemSink())
+
+		err := await(t, done)
+		var tooLarge *feed.EventTooLargeError
+		if !errors.As(err, &tooLarge) {
+			t.Fatalf("Subscribe error = %v (%T), want *EventTooLargeError", err, err)
+		}
+		poisons := obs.poisonsSnapshot()
+		if len(poisons) != 1 || poisons[0] != tooLarge {
+			t.Fatalf("OnPoison = %v, want exactly the error the stream died on", poisons)
+		}
+		if poisons[0].Position != 7 || poisons[0].Size != len(payload) || poisons[0].Limit != 4 {
+			t.Fatalf("OnPoison = %+v, want position 7, size %d, limit 4", poisons[0], len(payload))
+		}
+	})
+
+	t.Run("OnPoison reports the adapter's unmaterialized poison row", func(t *testing.T) {
+		obs := &recordingObserver{}
+		poison := &feed.EventTooLargeError{Position: 9, TypeURL: "counter.v1.Incremented", Size: 99, Limit: 8}
+		logs := newMemLogs()
+		logs.readErr = poison
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+			Observer: obs,
+		})
+
+		err := srv.Subscribe(context.Background(), testRequest("live"), newMemSink())
+		var tooLarge *feed.EventTooLargeError
+		if !errors.As(err, &tooLarge) || tooLarge != poison {
+			t.Fatalf("Subscribe error = %v (%T), want the adapter's *EventTooLargeError", err, err)
+		}
+		poisons := obs.poisonsSnapshot()
+		if len(poisons) != 1 || poisons[0] != poison {
+			t.Fatalf("OnPoison = %v, want exactly the adapter's error, delivered without the payload", poisons)
+		}
+	})
 }
 
 func TestSubscribeCancellationReleasesTheLease(t *testing.T) {

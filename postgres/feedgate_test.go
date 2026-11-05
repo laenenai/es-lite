@@ -146,13 +146,16 @@ func fgPayload(sid es.StreamID, version uint64) []byte {
 // over the delivered envelopes, a content re-computation, and per-kill
 // redelivery bounds:
 //
-//   - The in-load kills are bounded by a full replay of everything the
-//     consumer had seen at the kill. That envelope is deliberate: while
-//     appends are in flight, Workspace.Head can transiently report 0 (the
-//     plan-mandated fence semantics of Task 3) and feed.Server's resume
-//     clamp then replays from 0 — loss-safe, cost-unsafe, ruled a Task 16
-//     fix (progress.md, Task 3 review: fence-aware clamp). The gate does not
-//     hide this: it counts and logs the clamp replays as measured evidence.
+//   - Every kill — in-load and post-append alike — is bounded by the
+//     resume-from-checkpoint envelope: the unacked window plus one
+//     in-flight page. Task 16 made the resume clamp fence-aware (it
+//     consults RawHead before clamping, so a fence-blocked Head 0 no
+//     longer replays the log from 0), so a kill whose fence is still
+//     blocked makes the reconnect wait and re-head instead of replaying.
+//     The measured cost after the fix is a few dozen redeliveries per
+//     kill; a reintroduced clamp regression replays everything the
+//     consumer had seen at the kill — thousands of events — and fails
+//     the bound by an order of magnitude.
 //   - The post-append kill is the resume WITNESS: with every append
 //     committed, no transaction is in flight, Head settles to the full max
 //     on its first fence round and the clamp cannot fire. That kill must
@@ -875,7 +878,6 @@ func TestFeedGateNoLoss(t *testing.T) {
 		delivered := c.delivered
 		dupByGen := c.dupByGen
 		killList := c.killList
-		killSeen := c.killSeen
 		c.mu.Unlock()
 
 		// ---- Oracle 1: set equality (no omission, no invention).
@@ -910,24 +912,24 @@ func TestFeedGateNoLoss(t *testing.T) {
 
 		// ---- Oracle 3: per-kill redelivery bounds.
 		// Generation g's duplicates are the cost of the kill that ended
-		// generation g-1. In-load kills are bounded by a full replay of
-		// everything seen (the Task 16-owned resume-clamp gap); the
-		// post-append kill is bounded by the unacked window + one in-flight
-		// page, because with no appends in flight Head settles and the
-		// clamp cannot fire.
+		// generation g-1. Every kill is bounded by the same
+		// resume-from-checkpoint envelope — the unacked window plus one
+		// in-flight page — because the resume clamp is fence-aware
+		// (Task 16): an in-load kill whose fence is blocked makes the
+		// reconnect wait and re-head instead of replaying from the
+		// blocked Head 0. A reintroduced clamp regression redelivers
+		// everything seen at the kill and fails the bound.
 		var totalDup int64
 		clampReplays := 0
 		for ki, mark := range killList {
 			dupK := dupByGen[mark.gen+1]
 			totalDup += dupK
-			var bound int64
-			if mark.postAppend {
-				bound = fgChaosAckEvery + fgChaosPageSize + 64
-			} else {
-				bound = killSeen[mark.gen] + fgChaosPageSize + fgChaosAckEvery + 64
-				if dupK > fgChaosAckEvery+fgChaosPageSize+64 {
-					clampReplays++
-				}
+			bound := int64(fgChaosAckEvery + fgChaosPageSize + 64)
+			if !mark.postAppend && dupK > bound {
+				// In-load kills exceeding the resume envelope are
+				// clamp-style replays; the bound below is what fails
+				// them, this counter keeps them visible in the log.
+				clampReplays++
 			}
 			if dupK < 1 {
 				t.Errorf("feedgate: consumer %d: kill %d (gen %d) redelivered nothing — the window must bite",
@@ -938,7 +940,7 @@ func TestFeedGateNoLoss(t *testing.T) {
 					i, ki, mark.gen, mark.postAppend, dupK, bound)
 			}
 		}
-		t.Logf("feedgate: consumer %d (%s): %d unique positions, %d redeliveries over %d kills (%d clamp replays, Task 16 gap)",
+		t.Logf("feedgate: consumer %d (%s): %d unique positions, %d redeliveries over %d kills (%d clamp replays)",
 			i, c.typeURL, len(seen), totalDup, len(killList), clampReplays)
 
 		// ---- Oracle 4: per-stream hash chain over the DELIVERED envelopes

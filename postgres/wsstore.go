@@ -518,7 +518,8 @@ func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error)
 // The page is also bounded by the horizon fence (spec §5.1): positions are
 // only delivered up to the L recorded at the start of the round, and only
 // once every transaction that existed when the round drew its R has
-// settled. While an append is in flight below L the page is empty
+// settled — the horizon check is transaction-global, not append-specific.
+// While such a transaction is in flight the page is empty
 // (truncated=false) and the fence stays stored on this Workspace; the
 // feed's wait cycle retries. A delivered page therefore never has a live
 // hole inside it — nothing in the delivered range can appear later — and
@@ -659,18 +660,18 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 //
 // Head is eventually consistent. It shares this Workspace's horizon fence
 // with ReadAllBounded (spec §5.1) — the same (boundL, fenceR) round — so
-// while that fence is blocked by an in-flight append, Head reports a value
-// below the raw max: 0 until a fence clears, then whatever has settled up
-// to the clearing round's L. It converges to the full settled max once the
-// blocking transaction commits or aborts. Callers that need the immediate
-// committed maximum — for stall detection — use RawHead.
+// while that fence is blocked by an in-flight transaction, Head reports a
+// value below the raw max: 0 until a fence clears, then whatever has
+// settled up to the clearing round's L. It converges to the full settled
+// max once the blocking transaction commits or aborts. Callers that need
+// the immediate committed maximum — for stall detection — use RawHead.
 func (w *Workspace) Head(ctx context.Context) (uint64, error) {
 	// One fence round (spec §5.1.1), from 0: Head reads the whole log, so
 	// any drawn position is new and the idle shortcut never fires — every
 	// call either checks the stored fence or draws a fresh one. A zero
-	// bound means no settled range yet — an append is in flight below the
-	// fence — and Head reports 0 rather than a position it would have to
-	// take back.
+	// bound means no settled range yet — a transaction is in flight that
+	// blocks the fence — and Head reports 0 rather than a position it
+	// would have to take back.
 	bound, err := w.fenceBound(ctx, 0)
 	if err != nil {
 		return 0, err
@@ -691,6 +692,46 @@ func (w *Workspace) Head(ctx context.Context) (uint64, error) {
 		`SELECT COALESCE(MAX(global_position), 0) FROM events
 		  WHERE workspace_id = $1 AND global_position <= $2`,
 		w.ws, bound,
+	).Scan(&head)
+	return head, err
+}
+
+// MatchingHead returns the highest settled position among events of the
+// given types — the subscription's own head, what Status reports and
+// measures lag against. It is fence-bounded exactly like Head (spec
+// §5.1): it shares this Workspace's (boundL, fenceR) round, so while the
+// fence is blocked it reports 0, and a probe while blocked reuses the
+// stored round — one horizon check, no fresh fence, no transaction id
+// burned. An empty types set matches nothing: 0. Deliberately not on
+// es.Store.
+func (w *Workspace) MatchingHead(ctx context.Context, types []string) (uint64, error) {
+	if len(types) == 0 {
+		return 0, nil
+	}
+	// One fence round from 0, like Head: MatchingHead reads the whole
+	// log's matching maximum, so any drawn position is new and the idle
+	// shortcut never fires. A zero bound means the fence is blocked —
+	// report 0 rather than a position above the unsettled horizon.
+	bound, err := w.fenceBound(ctx, 0)
+	if err != nil {
+		return 0, err
+	}
+	if bound == 0 {
+		return 0, nil
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events
+		  WHERE workspace_id = $1 AND global_position <= $2 AND type_url = ANY($3)`,
+		w.ws, bound, types,
 	).Scan(&head)
 	return head, err
 }

@@ -34,6 +34,46 @@ func (s *Store) Head(ctx context.Context) (uint64, error) {
 	return head, nil
 }
 
+// RawHead returns the raw committed maximum with no settle bound: the
+// highest global_position among committed events, or 0 when there are
+// none. SQLite has no horizon fence (spec §5.1 is Postgres-only — one
+// connection serializes writers, so a reader can never observe a position
+// whose insert committed later), so RawHead equals Head; it exists because
+// the feed's stall probe and fence-aware resume clamp ask every Log for
+// the unbounded view.
+func (s *Store) RawHead(ctx context.Context) (uint64, error) {
+	var head uint64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events`,
+	).Scan(&head)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: raw head: %w", err)
+	}
+	return head, nil
+}
+
+// MatchingHead returns the highest global_position among events of the
+// given types, or 0 when none match — an empty types set matches nothing.
+// It is the subscription's own head: what Status reports and measures
+// lag against. On SQLite it is a simple filtered MAX.
+func (s *Store) MatchingHead(ctx context.Context, types []string) (uint64, error) {
+	if len(types) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(types)), ",")
+	q := `SELECT COALESCE(MAX(global_position), 0) FROM events
+	      WHERE type_url IN (` + placeholders + `)`
+	args := make([]any, 0, len(types))
+	for _, t := range types {
+		args = append(args, t)
+	}
+	var head uint64
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&head); err != nil {
+		return 0, fmt.Errorf("sqlite: matching head: %w", err)
+	}
+	return head, nil
+}
+
 // ReadAllBounded is the feed's paged read: events after from, in global
 // order, filtered server-side to types, and bounded by a payload-byte budget
 // over the bytes as stored. An empty types set returns no events at all.
