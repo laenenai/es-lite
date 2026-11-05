@@ -1,8 +1,8 @@
 package sqlite_test
 
 import (
-	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -14,11 +14,30 @@ import (
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/feed"
+	"github.com/laenenai/es-lite/feedtest"
 	"github.com/laenenai/es-lite/projection"
 	"github.com/laenenai/es-lite/sqlite"
 )
 
-func openFeedStore(t *testing.T) *sqlite.Store {
+// The SQLite feed adapters' tests. The port contracts — the checkpoint,
+// lease, log, dead-letter and end-to-end behaviors both backends must
+// honor — now live in the shared conformance suite (feedtest, spec
+// §5.6), wired at the bottom of this file; what stays here is
+// SQLite-specific:
+//
+//   - the single-connection gap-free safety guard (spec §5.10.1.4),
+//   - the persisted lease-key composition pin (an upgrade must keep
+//     reading existing rows),
+//   - the caller-supplied half of the deliberate CreatedAt divergence
+//     (the suite asserts presence/reasonableness only),
+//   - the close/reopen durability the file-backed store proves across a
+//     real process-shaped restart.
+
+// tsLayout is the fixed-width timestamp layout the store writes
+// (store.tsLayout): 9-digit nanoseconds, always UTC.
+const tsLayout = "2006-01-02T15:04:05.000000000Z"
+
+func openFeedStore(t testing.TB) *sqlite.Store {
 	t.Helper()
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "-") + "?mode=memory&cache=shared"
 	s, err := sqlite.Open(context.Background(), dsn)
@@ -42,7 +61,7 @@ func openFeedStoreAt(t *testing.T, path string) *sqlite.Store {
 
 // appendFeedEvent appends one event to sid at the given expected version and
 // returns the committed envelope.
-func appendFeedEvent(t *testing.T, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
+func appendFeedEvent(t testing.TB, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
 	t.Helper()
 	res, err := s.Append(context.Background(), es.AppendParams{
 		StreamID:        sid,
@@ -59,7 +78,7 @@ func appendFeedEvent(t *testing.T, s *sqlite.Store, sid es.StreamID, version uin
 	return res.Envelopes[0]
 }
 
-func mustStreamID(t *testing.T, typ, id string) es.StreamID {
+func mustStreamID(t testing.TB, typ, id string) es.StreamID {
 	t.Helper()
 	sid, err := es.NewStreamID(typ, id)
 	if err != nil {
@@ -68,233 +87,11 @@ func mustStreamID(t *testing.T, typ, id string) es.StreamID {
 	return sid
 }
 
-// ---------------------------------------------------------------------------
-// Log: Head, ReadAllBounded
-// ---------------------------------------------------------------------------
-
-func TestHeadEmptyAndAfterAppends(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-
-	head, err := s.Head(ctx)
-	if err != nil {
-		t.Fatalf("head empty: %v", err)
-	}
-	if head != 0 {
-		t.Fatalf("head empty = %d, want 0", head)
-	}
-
-	// Interleave two streams so the log head (global position) and the
-	// highest per-stream version diverge: a version-based Head regression
-	// would return 2 here instead of 3.
-	a := mustStreamID(t, "thing", "head-a")
-	b := mustStreamID(t, "thing", "head-b")
-	if _, err := s.Append(ctx, es.AppendParams{
-		StreamID: a,
-		Events:   []es.EventData{{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("one")}},
-	}); err != nil {
-		t.Fatalf("append a1: %v", err)
-	}
-	if _, err := s.Append(ctx, es.AppendParams{
-		StreamID: b,
-		Events:   []es.EventData{{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("two")}},
-	}); err != nil {
-		t.Fatalf("append b1: %v", err)
-	}
-	res, err := s.Append(ctx, es.AppendParams{
-		StreamID:        a,
-		ExpectedVersion: 1,
-		Events:          []es.EventData{{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte("three")}},
-	})
-	if err != nil {
-		t.Fatalf("append a2: %v", err)
-	}
-	head, err = s.Head(ctx)
-	if err != nil {
-		t.Fatalf("head: %v", err)
-	}
-	if want := res.Envelopes[0].GlobalPosition; head != want || head != 3 {
-		t.Fatalf("head = %d, want %d (global position 3, not the stream version 2)", head, want)
-	}
-}
-
-func TestReadAllBoundedFiltersOrdersAndLimits(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	sid := mustStreamID(t, "thing", "bounded")
-
-	const (
-		consumed = "thing.v1.Consumed"
-		ignored  = "thing.v1.Ignored"
-	)
-	var appended []es.Envelope
-	for i, typ := range []string{consumed, ignored, consumed, ignored, consumed} {
-		appended = append(appended, appendFeedEvent(t, s, sid, uint64(i), typ, []byte("x")))
-	}
-
-	got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 0, []string{consumed})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if truncated {
-		t.Fatal("unbounded read reported truncated")
-	}
-	if len(got) != 3 {
-		t.Fatalf("got %d events, want 3 (type-filtered)", len(got))
-	}
-	for i, env := range got {
-		want := appended[i*2]
-		if env.GlobalPosition != want.GlobalPosition {
-			t.Fatalf("event %d position = %d, want %d (global order)", i, env.GlobalPosition, want.GlobalPosition)
-		}
-	}
-
-	got, _, err = s.ReadAllBounded(ctx, 0, 2, 0, []string{consumed})
-	if err != nil {
-		t.Fatalf("read limit: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("limit read returned %d events, want 2", len(got))
-	}
-
-	got, _, err = s.ReadAllBounded(ctx, appended[2].GlobalPosition, 10, 0, []string{consumed})
-	if err != nil {
-		t.Fatalf("read from: %v", err)
-	}
-	if len(got) != 1 || got[0].GlobalPosition != appended[4].GlobalPosition {
-		t.Fatalf("read from position = %+v, want only the last consumed event", got)
-	}
-}
-
-func TestReadAllBoundedEmptyTypes(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	sid := mustStreamID(t, "thing", "empty-types")
-	appendFeedEvent(t, s, sid, 0, "thing.v1.Happened", []byte("x"))
-
-	got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 0, nil)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if got != nil || truncated {
-		t.Fatalf("empty types = (%v, %v), want (nil, false)", got, truncated)
-	}
-}
-
-func TestReadAllBoundedByteBudget(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	sid := mustStreamID(t, "thing", "budget")
-	const typ = "thing.v1.Happened"
-
-	var appended []es.Envelope
-	for i := 0; i < 4; i++ {
-		appended = append(appended, appendFeedEvent(t, s, sid, uint64(i), typ, []byte("abcd"))) // 4 bytes each
-	}
-
-	// Budget 10: 4 + 4 fit, the third row (would be 12) stops the page.
-	got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 10, []string{typ})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(got) != 2 || !truncated {
-		t.Fatalf("budget page = %d events truncated=%v, want 2/true", len(got), truncated)
-	}
-	if got[0].GlobalPosition != appended[0].GlobalPosition || got[1].GlobalPosition != appended[1].GlobalPosition {
-		t.Fatalf("budget page positions = %d,%d, want %d,%d",
-			got[0].GlobalPosition, got[1].GlobalPosition,
-			appended[0].GlobalPosition, appended[1].GlobalPosition)
-	}
-
-	// Resuming from the last returned position makes progress.
-	got, _, err = s.ReadAllBounded(ctx, got[1].GlobalPosition, 10, 10, []string{typ})
-	if err != nil {
-		t.Fatalf("read resume: %v", err)
-	}
-	if len(got) != 2 || got[0].GlobalPosition != appended[2].GlobalPosition {
-		t.Fatalf("resume page = %+v, want the next two events", got)
-	}
-
-	// maxBytes <= 0 disables the budget.
-	got, truncated, err = s.ReadAllBounded(ctx, 0, 10, -1, []string{typ})
-	if err != nil {
-		t.Fatalf("read unbounded: %v", err)
-	}
-	if len(got) != 4 || truncated {
-		t.Fatalf("unbounded page = %d events truncated=%v, want 4/false", len(got), truncated)
-	}
-}
-
-func TestReadAllBoundedExactBudgetFit(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	sid := mustStreamID(t, "thing", "exact-budget")
-	const typ = "thing.v1.Happened"
-
-	appendFeedEvent(t, s, sid, 0, typ, []byte("abcd")) // 4 bytes
-	appendFeedEvent(t, s, sid, 1, typ, []byte("efgh")) // 4 bytes
-
-	// The page totals exactly the budget and no rows remain: it must not be
-	// reported truncated. A >= comparison would stop after the first row.
-	got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 8, []string{typ})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(got) != 2 || truncated {
-		t.Fatalf("exact fit = %d events truncated=%v, want 2/false", len(got), truncated)
-	}
-}
-
-func TestReadAllBoundedDefaultLimit(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	sid := mustStreamID(t, "thing", "default-limit")
-	const typ = "thing.v1.Happened"
-
-	events := make([]es.EventData, 101)
-	for i := range events {
-		events[i] = es.EventData{TypeURL: typ, SchemaVersion: 1, Payload: []byte("x")}
-	}
-	if _, err := s.Append(ctx, es.AppendParams{StreamID: sid, Events: events}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-
-	// limit <= 0 selects the adapter default of 100, not "all".
-	got, _, err := s.ReadAllBounded(ctx, 0, 0, 0, []string{typ})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(got) != 100 {
-		t.Fatalf("default limit = %d events, want 100", len(got))
-	}
-}
-
-func TestReadAllBoundedFirstOversizedEventIsIncluded(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	sid := mustStreamID(t, "thing", "oversized")
-	const typ = "thing.v1.Happened"
-
-	appendFeedEvent(t, s, sid, 0, typ, []byte("12345")) // 5 bytes
-	appendFeedEvent(t, s, sid, 1, typ, []byte("67890"))
-
-	got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 3, []string{typ})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if len(got) != 1 {
-		t.Fatalf("got %d events, want the first oversized event only", len(got))
-	}
-	if !truncated {
-		t.Fatal("oversized first event did not report truncated")
-	}
-}
-
 // openFeedStoreCapped opens a fresh in-memory store with a 64-byte payload
 // cap: small enough that a test payload towers over it. It is the fixture
 // for the poison-row contract — the store cap the adapters must honor on
 // the read side, not just at append.
-func openFeedStoreCapped(t *testing.T) *sqlite.Store {
+func openFeedStoreCapped(t testing.TB) *sqlite.Store {
 	t.Helper()
 	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "-") + "?mode=memory&cache=shared"
 	s, err := sqlite.Open(context.Background(), dsn, sqlite.WithMaxPayloadBytes(64))
@@ -311,7 +108,7 @@ func openFeedStoreCapped(t *testing.T) *sqlite.Store {
 // returns the row's global position. The timestamp literal matches the
 // fixed-width layout the store writes (tsLayout) so a materialized row
 // still parses.
-func insertFeedRowDirect(t *testing.T, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
+func insertFeedRowDirect(t testing.TB, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
 	t.Helper()
 	var gp uint64
 	err := s.DB().QueryRowContext(context.Background(),
@@ -322,10 +119,10 @@ func insertFeedRowDirect(t *testing.T, s *sqlite.Store, sid es.StreamID, version
 			actor_type, actor_id, actor_principal, payload
 		) VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?)
 		RETURNING global_position`,
-		"11111111-1111-7111-8111-111111111111", "thing", sid.Canonical(), version,
+		"11111111-1111-7111-8111-111111111111", sid.Type, sid.Canonical(), version,
 		typeURL, 1, "2026-01-01T00:00:00.000000000Z", "2026-01-01T00:00:00.000000000Z",
 		"", "", "",
-		"thing", "poison", "thing:poison", payload,
+		sid.Type, "poison", "conformance:poison", payload,
 	).Scan(&gp)
 	if err != nil {
 		t.Fatalf("direct insert: %v", err)
@@ -333,93 +130,77 @@ func insertFeedRowDirect(t *testing.T, s *sqlite.Store, sid es.StreamID, version
 	return gp
 }
 
-// TestOversizedFirstRowIsNotMaterialized pins the read-side poison contract
-// (production review focus 3): a stored payload over the store's cap is
-// never materialized into a page — the adapter must refuse to scan its
-// bytes. The over-cap row enters via direct SQL because the append cap now
-// refuses it. When it is the FIRST row of a page, ReadAllBounded returns
-// *feed.EventTooLargeError naming position, type URL, size and limit, with
-// no envelopes. When it is a LATER row, the page stops before it with
-// truncated=true, and the next page makes it the first row and surfaces
-// the error.
-func TestOversizedFirstRowIsNotMaterialized(t *testing.T) {
-	const typ = "thing.v1.Happened"
-	oversized := bytes.Repeat([]byte("p"), 4096)
+// ---------------------------------------------------------------------------
+// The shared conformance suite (spec §5.6)
+// ---------------------------------------------------------------------------
 
-	t.Run("first row over cap is refused, not materialized", func(t *testing.T) {
-		ctx := context.Background()
-		s := openFeedStoreCapped(t)
-
-		gp := insertFeedRowDirect(t, s, mustStreamID(t, "thing", "poison-first"), 1, typ, oversized)
-		// A normal row follows the poison row.
-		appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-first-ok"), 0, typ, []byte("ok"))
-
-		got, _, err := s.ReadAllBounded(ctx, 0, 10, 0, []string{typ})
-		var tooLarge *feed.EventTooLargeError
-		if !errors.As(err, &tooLarge) {
-			t.Fatalf("ReadAllBounded error = %v (%T), want *feed.EventTooLargeError", err, err)
-		}
-		if tooLarge.Position != gp || tooLarge.TypeURL != typ ||
-			tooLarge.Size != len(oversized) || tooLarge.Limit != 64 {
-			t.Fatalf("error fields = (pos %d, type %q, size %d, limit %d), want (pos %d, type %q, size %d, limit 64)",
-				tooLarge.Position, tooLarge.TypeURL, tooLarge.Size, tooLarge.Limit, gp, typ, len(oversized))
-		}
-		if len(got) != 0 {
-			t.Fatalf("over-cap first row was materialized: %d envelopes, want none", len(got))
-		}
-	})
-
-	t.Run("later row over cap stops the page before it", func(t *testing.T) {
-		ctx := context.Background()
-		s := openFeedStoreCapped(t)
-
-		first := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-later"), 0, typ, []byte("ok"))
-		gp := insertFeedRowDirect(t, s, mustStreamID(t, "thing", "poison-later-b"), 1, typ, oversized)
-		after := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-later-after"), 0, typ, []byte("after"))
-		if !(first.GlobalPosition < gp && gp < after.GlobalPosition) {
-			t.Fatalf("insert order: first=%d poison=%d after=%d, want the poison row between the normal rows",
-				first.GlobalPosition, gp, after.GlobalPosition)
-		}
-
-		// The page delivers only the rows before the poison row and stops
-		// before it: truncated=true is certain — the stopping row was seen.
-		got, truncated, err := s.ReadAllBounded(ctx, 0, 10, 0, []string{typ})
-		if err != nil {
-			t.Fatalf("ReadAllBounded: %v", err)
-		}
-		if len(got) != 1 || got[0].GlobalPosition != first.GlobalPosition {
-			t.Fatalf("page = %d envelopes at %v, want only the event before the poison row (pos %d)",
-				len(got), feedPositions(got), first.GlobalPosition)
-		}
-		if !truncated {
-			t.Fatal("page stopped before an over-cap row without truncated=true")
-		}
-
-		// The next page makes the poison row the first row: the typed error,
-		// again with no envelopes materialized.
-		got, _, err = s.ReadAllBounded(ctx, first.GlobalPosition, 10, 0, []string{typ})
-		var tooLarge *feed.EventTooLargeError
-		if !errors.As(err, &tooLarge) {
-			t.Fatalf("next page error = %v (%T), want *feed.EventTooLargeError", err, err)
-		}
-		if tooLarge.Position != gp || tooLarge.TypeURL != typ ||
-			tooLarge.Size != len(oversized) || tooLarge.Limit != 64 {
-			t.Fatalf("error fields = (pos %d, type %q, size %d, limit %d), want (pos %d, type %q, size %d, limit 64)",
-				tooLarge.Position, tooLarge.TypeURL, tooLarge.Size, tooLarge.Limit, gp, typ, len(oversized))
-		}
-		if len(got) != 0 {
-			t.Fatalf("over-cap first row was materialized: %d envelopes, want none", len(got))
-		}
-	})
+// newSqliteFeedStore wires SQLite into the shared feed conformance suite
+// (feedtest): every port over one in-memory store — one database per test
+// name, capped at 64 payload bytes so the poison contract is exercisable —
+// plus the seeding hooks. SQLite is single-workspace by design, so the
+// scope arguments are carried for parity with multi-tenant backends and
+// ignored, and the fixture leaves MultiWorkspace false: the suite's
+// cross-workspace section does not apply to a one-database workspace.
+func newSqliteFeedStore(ctx context.Context, t testing.TB) (feedtest.Store, func()) {
+	dsn := "file:" + strings.ReplaceAll(t.Name(), "/", "-") + "?mode=memory&cache=shared"
+	s, err := sqlite.Open(ctx, dsn, sqlite.WithMaxPayloadBytes(64))
+	if err != nil {
+		t.Fatalf("sqlite: conformance store: open: %v", err)
+	}
+	return feedtest.Store{
+		Logs:            sqlite.NewLogs(s),
+		Checkpoints:     sqlite.NewCheckpointStore(s),
+		Leases:          sqlite.NewLeaseStore(s),
+		DeadLetters:     sqlite.NewDeadLetterStore(s),
+		MaxPayloadBytes: 64,
+		Append: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
+			return appendFeedEvent(t, s, sid, version, typeURL, payload)
+		},
+		PlantOverCap: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
+			return insertFeedRowDirect(t, s, sid, version, typeURL, payload)
+		},
+		ReadDeadLetter: func(ctx context.Context, t testing.TB, scope, projection, instance string, position uint64) (feedtest.DeadLetterRow, bool) {
+			var (
+				row       feedtest.DeadLetterRow
+				createdAt string
+			)
+			err := s.DB().QueryRowContext(ctx,
+				`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
+				 WHERE scope = ? AND projection = ? AND instance = ? AND position = ?`,
+				scope, projection, instance, position,
+			).Scan(&row.TypeURL, &row.SizeBytes, &row.Reason, &row.Actor, &createdAt)
+			if errors.Is(err, sql.ErrNoRows) {
+				return feedtest.DeadLetterRow{}, false
+			}
+			if err != nil {
+				t.Fatalf("sqlite: conformance store: read dead letter at %d: %v", position, err)
+			}
+			at, err := time.Parse(tsLayout, createdAt)
+			if err != nil {
+				t.Fatalf("sqlite: conformance store: dead letter created_at %q does not parse: %v", createdAt, err)
+			}
+			row.CreatedAt = at
+			return row, true
+		},
+		CountDeadLetters: func(ctx context.Context, t testing.TB, scope string) int {
+			var n int
+			if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM feed_dead_letters`).Scan(&n); err != nil {
+				t.Fatalf("sqlite: conformance store: count dead letters: %v", err)
+			}
+			return n
+		},
+	}, func() { _ = s.Close() }
 }
 
-// feedPositions collects a page's global positions for failure messages.
-func feedPositions(envs []es.Envelope) []uint64 {
-	out := make([]uint64, len(envs))
-	for i, e := range envs {
-		out[i] = e.GlobalPosition
-	}
-	return out
+// TestSQLiteFeedConformance runs the shared feed port conformance suite
+// against the SQLite adapters. Everything the adapter tests used to pin
+// in duplicate with Postgres — monotonic Save, rewinding Reset,
+// empty-definition preserve, definition round-trip, the lease takeover
+// and renew contracts, the bounded page and poison contracts, the
+// dead-letter pointer contract, the end-to-end resume and skip runbooks
+// — is pinned once, here, by feedtest.RunAll.
+func TestSQLiteFeedConformance(t *testing.T) {
+	feedtest.RunAll(t, feedtest.Fixture{NewStore: newSqliteFeedStore})
 }
 
 // ---------------------------------------------------------------------------
@@ -539,488 +320,18 @@ func TestConcurrentAppendsKeepPositionsGapFree(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// CheckpointStore
+// SQLite-specific storage pins
 // ---------------------------------------------------------------------------
-
-func TestCheckpointLoadAbsentSaveAndNoRewind(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	cp := sqlite.NewCheckpointStore(s)
-
-	pos, err := cp.Load(ctx, "ws", "p", "live")
-	if err != nil {
-		t.Fatalf("load absent: %v", err)
-	}
-	if pos != 0 {
-		t.Fatalf("absent load = %d, want 0", pos)
-	}
-	if _, found, err := cp.Checkpoint(ctx, "ws", "p", "live"); err != nil || found {
-		t.Fatalf("absent checkpoint = found=%v err=%v, want false/nil", found, err)
-	}
-
-	if err := cp.Save(ctx, "ws", "p", "live", "", 5); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
-		t.Fatalf("load = %d, want 5", pos)
-	}
-
-	// Save never rewinds.
-	if err := cp.Save(ctx, "ws", "p", "live", "", 3); err != nil {
-		t.Fatalf("save lower: %v", err)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
-		t.Fatalf("load after lower save = %d, want 5 (monotonic)", pos)
-	}
-
-	// A different instance is a different row.
-	if err := cp.Save(ctx, "ws", "p", "other", "", 2); err != nil {
-		t.Fatalf("save other: %v", err)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "other"); pos != 2 {
-		t.Fatalf("other instance = %d, want 2", pos)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
-		t.Fatalf("live instance = %d, want 5", pos)
-	}
-}
-
-func TestCheckpointResetDeleteAndTimestamp(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	cp := sqlite.NewCheckpointStore(s)
-
-	before := time.Now().Add(-time.Second)
-	if err := cp.Save(ctx, "ws", "p", "live", "", 7); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	checkpoint, found, err := cp.Checkpoint(ctx, "ws", "p", "live")
-	if err != nil || !found {
-		t.Fatalf("checkpoint = found=%v err=%v, want true/nil", found, err)
-	}
-	if checkpoint.Position != 7 {
-		t.Fatalf("checkpoint position = %d, want 7", checkpoint.Position)
-	}
-	if checkpoint.UpdatedAt.Before(before) || checkpoint.UpdatedAt.After(time.Now().Add(time.Second)) {
-		t.Fatalf("checkpoint updated_at = %v, want a recent time", checkpoint.UpdatedAt)
-	}
-
-	// Reset overwrites, backwards included.
-	if err := cp.Reset(ctx, "ws", "p", "live", "", 1); err != nil {
-		t.Fatalf("reset: %v", err)
-	}
-	if pos, _ := cp.Load(ctx, "ws", "p", "live"); pos != 1 {
-		t.Fatalf("load after reset = %d, want 1", pos)
-	}
-	if checkpoint, _, _ = cp.Checkpoint(ctx, "ws", "p", "live"); checkpoint.Position != 1 {
-		t.Fatalf("checkpoint after reset = %d, want 1", checkpoint.Position)
-	}
-
-	// Delete removes exactly that row.
-	if err := cp.Save(ctx, "ws", "p", "other", "", 4); err != nil {
-		t.Fatalf("save other: %v", err)
-	}
-	if err := cp.Delete(ctx, "ws", "p", "live"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, found, err := cp.Checkpoint(ctx, "ws", "p", "live"); err != nil || found {
-		t.Fatalf("checkpoint after delete = found=%v err=%v, want false/nil", found, err)
-	}
-	if pos, _ := cp.Load(ctx, "ws", "p", "other"); pos != 4 {
-		t.Fatalf("other instance after delete = %d, want 4", pos)
-	}
-	// Deleting again is a no-op.
-	if err := cp.Delete(ctx, "ws", "p", "live"); err != nil {
-		t.Fatalf("delete absent: %v", err)
-	}
-}
-
-// The definition fingerprint round-trips through Checkpoint, and an empty
-// definition never clears a recorded one: Save and Reset both preserve
-// the stored hash when none is supplied — an ack that carries no
-// identity, and a position-only advance like Skip, must not re-identify
-// a checkpoint — while a non-empty definition becomes the checkpoint's
-// new identity (a reset under a changed definition).
-func TestCheckpointDefinitionHashRecordedAndPreserved(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	cp := sqlite.NewCheckpointStore(s)
-
-	h1 := projection.Definition{Name: "p", Consumes: []string{"a.v1.A"}}.Hash()
-	h2 := projection.Definition{Name: "p", Consumes: []string{"a.v1.A", "b.v1.B"}}.Hash()
-
-	// A save with no definition records no fingerprint.
-	if err := cp.Save(ctx, "ws", "p", "live", "", 5); err != nil {
-		t.Fatalf("save without definition: %v", err)
-	}
-	got, found, err := cp.Checkpoint(ctx, "ws", "p", "live")
-	if err != nil || !found || got.Position != 5 || got.DefinitionHash != "" {
-		t.Fatalf("checkpoint = %+v found=%v err=%v, want position 5 and no hash", got, found, err)
-	}
-
-	// A definition-carrying save records the fingerprint.
-	if err := cp.Save(ctx, "ws", "p", "live", h1, 6); err != nil {
-		t.Fatalf("save with definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.DefinitionHash != h1 || got.Position != 6 {
-		t.Fatalf("checkpoint = %+v, want position 6 under hash %q", got, h1)
-	}
-
-	// An empty definition preserves the recorded hash on Save ...
-	if err := cp.Save(ctx, "ws", "p", "live", "", 7); err != nil {
-		t.Fatalf("save without definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 7 || got.DefinitionHash != h1 {
-		t.Fatalf("checkpoint = %+v, want position 7 with the hash preserved", got)
-	}
-
-	// ... and on Reset, which may rewind but still must not clear it.
-	if err := cp.Reset(ctx, "ws", "p", "live", "", 1); err != nil {
-		t.Fatalf("reset without definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 1 || got.DefinitionHash != h1 {
-		t.Fatalf("checkpoint = %+v, want position 1 with the hash preserved", got)
-	}
-
-	// A reset under a new definition re-identifies the checkpoint.
-	if err := cp.Reset(ctx, "ws", "p", "live", h2, 0); err != nil {
-		t.Fatalf("reset with definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 0 || got.DefinitionHash != h2 {
-		t.Fatalf("checkpoint = %+v, want position 0 under the new hash", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// DeadLetterStore
-// ---------------------------------------------------------------------------
-
-// TestDeadLetterRecordInsertOrReplace pins the store contract: one pointer
-// row per skipped position, replaced (not duplicated) on a repeat skip of
-// the same key; the row is enriched with the skipped event's type and size
-// when the caller — the feed core — cannot know them (it selects metadata
-// only, never the payload bytes); a caller-supplied type passes through
-// untouched; and a position with no event row at all still records — Skip
-// does not require the position to exist.
-func TestDeadLetterRecordInsertOrReplace(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	dls := sqlite.NewDeadLetterStore(s)
-	const typ = "thing.v1.Happened"
-
-	// A normal event row the enrichment can name: 5 payload bytes.
-	env := appendFeedEvent(t, s, mustStreamID(t, "thing", "dl"), 0, typ, []byte("12345"))
-	at := time.Unix(1_700_000_000, 0).UTC()
-	later := at.Add(2 * time.Hour)
-	const tsLayout = "2006-01-02T15:04:05.000000000Z" // the fixed layout the adapter writes
-
-	type row struct {
-		typeURL   string
-		size      int
-		reason    string
-		actor     string
-		createdAt string
-	}
-	read := func(position uint64) row {
-		t.Helper()
-		var r row
-		err := s.DB().QueryRowContext(ctx,
-			`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
-			 WHERE scope = ? AND projection = ? AND instance = ? AND position = ?`,
-			"ws", "p", "live", position,
-		).Scan(&r.typeURL, &r.size, &r.reason, &r.actor, &r.createdAt)
-		if err != nil {
-			t.Fatalf("read dead letter at %d: %v", position, err)
-		}
-		return r
-	}
-	count := func() int {
-		t.Helper()
-		var n int
-		if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM feed_dead_letters`).Scan(&n); err != nil {
-			t.Fatalf("count dead letters: %v", err)
-		}
-		return n
-	}
-
-	// The core delivers a pointer — no type, no size. The store names the
-	// event from the log it shares a database with.
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: "ws", Projection: "p", Instance: "live",
-		Position: env.GlobalPosition, Reason: "poison: over cap", Actor: "oncall",
-		CreatedAt: at,
-	}); err != nil {
-		t.Fatalf("record: %v", err)
-	}
-	if r := read(env.GlobalPosition); r.typeURL != typ || r.size != 5 ||
-		r.reason != "poison: over cap" || r.actor != "oncall" ||
-		r.createdAt != at.Format(tsLayout) {
-		t.Fatalf("recorded row = %+v, want the event named (%q, 5 bytes) with the audit fields", r, typ)
-	}
-
-	// A repeat skip of the same position replaces the row: exactly one
-	// row, the latest reason, actor and timestamp.
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: "ws", Projection: "p", Instance: "live",
-		Position: env.GlobalPosition, Reason: "triaged: cap raised", Actor: "oncall-2",
-		CreatedAt: later,
-	}); err != nil {
-		t.Fatalf("re-record: %v", err)
-	}
-	if n := count(); n != 1 {
-		t.Fatalf("rows after the repeat = %d, want 1 (replaced, never duplicated)", n)
-	}
-	if r := read(env.GlobalPosition); r.reason != "triaged: cap raised" || r.actor != "oncall-2" ||
-		r.createdAt != later.Format(tsLayout) || r.typeURL != typ || r.size != 5 {
-		t.Fatalf("replaced row = %+v, want the latest audit fields over the same named event", r)
-	}
-
-	// A caller-supplied type and size pass through: the enrichment keeps a
-	// complete dead letter as delivered.
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: "ws", Projection: "p", Instance: "live",
-		Position: env.GlobalPosition, TypeURL: "custom.v1.Typed", SizeBytes: 99,
-		Reason: "named by the caller", Actor: "oncall-3", CreatedAt: later,
-	}); err != nil {
-		t.Fatalf("record with a type: %v", err)
-	}
-	if r := read(env.GlobalPosition); r.typeURL != "custom.v1.Typed" || r.size != 99 {
-		t.Fatalf("row with a caller-supplied type = %+v, want the caller's type/size kept", r)
-	}
-
-	// A position with no event row records the empty type and zero size:
-	// the pointer still lands, Skip does not require the position to exist.
-	const absent = 1 << 40
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: "ws", Projection: "p", Instance: "live",
-		Position: absent, Reason: "skipped past a restored log", Actor: "oncall",
-		CreatedAt: at,
-	}); err != nil {
-		t.Fatalf("record an absent position: %v", err)
-	}
-	if r := read(absent); r.typeURL != "" || r.size != 0 {
-		t.Fatalf("absent-position row = %+v, want the empty type and zero size", r)
-	}
-	if n := count(); n != 2 {
-		t.Fatalf("rows = %d, want 2 (the replaced key plus the absent position)", n)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// LeaseStore
-// ---------------------------------------------------------------------------
-
-func TestLeaseExactlyOneWinner(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire owner-a: %v", err)
-	}
-	if !ok {
-		t.Fatal("owner-a lost a free lease")
-	}
-
-	ok, err = leases.Acquire(ctx, scope, projection, instance, "owner-b", "consumer-b", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire owner-b: %v", err)
-	}
-	if ok {
-		t.Fatal("owner-b took a lease owner-a still holds; want exactly one winner")
-	}
-
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil {
-		t.Fatalf("holder: %v", err)
-	}
-	if !held || lease.Owner != "owner-a" || lease.Consumer != "consumer-a" {
-		t.Fatalf("holder = %+v held=%v, want owner-a/consumer-a", lease, held)
-	}
-	if !lease.ExpiresAt.After(time.Now()) {
-		t.Fatalf("holder ExpiresAt %v is not in the future", lease.ExpiresAt)
-	}
-}
-
-func TestLeaseReacquireBySameOwnerUpdatesConsumer(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "pod-a", time.Minute); err != nil || !ok {
-		t.Fatalf("first acquire = %v err=%v, want true/nil", ok, err)
-	}
-	// A reconnect by the same owner must succeed and refresh the consumer
-	// identity Status reports.
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "pod-b", time.Minute); err != nil || !ok {
-		t.Fatalf("same-owner acquire = %v err=%v, want true/nil", ok, err)
-	}
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil || !held {
-		t.Fatalf("holder = found=%v err=%v, want held", held, err)
-	}
-	if lease.Owner != "owner-a" || lease.Consumer != "pod-b" {
-		t.Fatalf("holder = %+v, want owner-a/pod-b", lease)
-	}
-}
-
-func TestLeaseExpiryLetsAnotherOwnerWin(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
-		t.Fatalf("acquire owner-a = %v err=%v", ok, err)
-	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-b", "consumer-b", time.Minute)
-		if err != nil {
-			t.Fatalf("acquire owner-b: %v", err)
-		}
-		if ok {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("owner-b never acquired the lease after it expired")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil || !held {
-		t.Fatalf("holder = found=%v err=%v, want the new owner", held, err)
-	}
-	if lease.Owner != "owner-b" {
-		t.Fatalf("holder owner = %q, want owner-b", lease.Owner)
-	}
-}
-
-func TestLeaseRenewByOwnerAndNonOwner(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
-		t.Fatalf("acquire owner-a = %v err=%v", ok, err)
-	}
-	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-b", time.Minute); err != nil {
-		t.Fatalf("renew owner-b: %v", err)
-	} else if ok {
-		t.Fatal("non-owner renewed the lease")
-	}
-	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-a", time.Minute); err != nil {
-		t.Fatalf("renew owner-a: %v", err)
-	} else if !ok {
-		t.Fatal("owner failed to renew its own lease")
-	}
-
-	// Past the original TTL, the renewed lease is still held.
-	time.Sleep(80 * time.Millisecond)
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil || !held {
-		t.Fatalf("holder after renew = found=%v err=%v, want held", held, err)
-	}
-	if lease.Owner != "owner-a" {
-		t.Fatalf("holder owner = %q, want owner-a", lease.Owner)
-	}
-}
-
-func TestLeaseReleaseByOwnerAndNonOwner(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire = %v err=%v", ok, err)
-	}
-
-	// A non-owner's release is a no-op, not an error.
-	if err := leases.Release(ctx, scope, projection, instance, "owner-b"); err != nil {
-		t.Fatalf("release owner-b: %v", err)
-	}
-	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || !held {
-		t.Fatalf("holder after non-owner release = held=%v err=%v, want still held", held, err)
-	}
-
-	if err := leases.Release(ctx, scope, projection, instance, "owner-a"); err != nil {
-		t.Fatalf("release owner-a: %v", err)
-	}
-	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || held {
-		t.Fatalf("holder after owner release = held=%v err=%v, want free", held, err)
-	}
-}
-
-func TestLeaseHolderOnlyUnexpired(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", 40*time.Millisecond); err != nil || !ok {
-		t.Fatalf("acquire = %v err=%v", ok, err)
-	}
-	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || !held {
-		t.Fatalf("holder before expiry = held=%v err=%v, want held", held, err)
-	}
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		_, held, err := leases.Holder(ctx, scope, projection, instance)
-		if err != nil {
-			t.Fatalf("holder: %v", err)
-		}
-		if !held {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("Holder kept reporting an expired lease")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-// The adapter composes its storage key from the (scope, projection,
-// instance) triple. Distinct triples must stay distinct rows even when a
-// part contains the separator-like "/" — ("ws","a/b","c") and ("ws","a",
-// "b/c") are different subscriptions, never one lease. This pins the
-// collision-freedom the feed core's validateKey guarantees (no control
-// bytes in any part) for every adapter that joins parts into one key.
-func TestLeaseDistinctTriplesNeverCollide(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStore(t)
-	leases := sqlite.NewLeaseStore(s)
-
-	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-a", "consumer-a", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire = %v err=%v, want true/nil", ok, err)
-	}
-	// The segment-shifted triple is a different subscription: another owner
-	// can hold it alongside the first.
-	if ok, err := leases.Acquire(ctx, "ws", "a", "b/c", "owner-b", "consumer-b", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire of the shifted triple = %v err=%v, want true (distinct triples never collide)", ok, err)
-	}
-	// The original triple is still fenced by owner-a.
-	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-b", "consumer-b", time.Minute); err != nil || ok {
-		t.Fatalf("acquire of the held triple = %v err=%v, want false (still held by owner-a)", ok, err)
-	}
-}
 
 // TestLeaseStoreKeyCompositionIsPinned pins the persisted storage contract:
 // feed_leases.key holds the NUL-joined triple, byte-exactly. Lease rows are
 // durable state an upgrade must keep reading — a composition change
 // (different separator, different part order) would pass the collision test
-// above yet orphan every existing row, splitting the lease domain and
-// admitting duplicate subscribers. This is a regression pin, green-on-arrival
-// by design: it pins current storage behavior so a future composition change
-// fails loudly here. It reads the stored row directly, after
-// insertFeedRowDirect's raw-SQL pattern, because the public API never
+// the suite runs yet orphan every existing row, splitting the lease domain
+// and admitting duplicate subscribers. This is a regression pin,
+// green-on-arrival by design: it pins current storage behavior so a future
+// composition change fails loudly here. It reads the stored row directly,
+// after insertFeedRowDirect's raw-SQL pattern, because the public API never
 // exposes the composed key.
 func TestLeaseStoreKeyCompositionIsPinned(t *testing.T) {
 	ctx := context.Background()
@@ -1045,8 +356,60 @@ func TestLeaseStoreKeyCompositionIsPinned(t *testing.T) {
 	}
 }
 
+// TestDeadLetterCreatedAtIsCallerSupplied pins the SQLite half of the
+// deliberate CreatedAt divergence (controller ruling): this store honors the
+// caller's dl.CreatedAt — the feed core's Clock — writing it byte-exactly in
+// the fixed-width layout, and stamps its own now when the caller supplies the
+// zero time. The shared suite asserts only presence/reasonableness because
+// the Postgres store stamps the database's clock instead; each backend keeps
+// its own half exact.
+func TestDeadLetterCreatedAtIsCallerSupplied(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	dls := sqlite.NewDeadLetterStore(s)
+	at := time.Unix(1_700_000_000, 0).UTC()
+
+	if err := dls.Record(ctx, feed.DeadLetter{
+		Scope: "ws", Projection: "p", Instance: "live",
+		Position: 42, Reason: "caller-stamped", Actor: "oncall", CreatedAt: at,
+	}); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	var createdAt string
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT created_at FROM feed_dead_letters WHERE position = ?`, 42,
+	).Scan(&createdAt); err != nil {
+		t.Fatalf("read dead letter: %v", err)
+	}
+	if want := at.Format(tsLayout); createdAt != want {
+		t.Fatalf("created_at = %q, want %q (the caller-supplied time, byte-exact)", createdAt, want)
+	}
+
+	// A zero CreatedAt is stamped here, like feed_checkpoints.updated_at.
+	before := time.Now()
+	if err := dls.Record(ctx, feed.DeadLetter{
+		Scope: "ws", Projection: "p", Instance: "live",
+		Position: 43, Reason: "store-stamped", Actor: "oncall",
+	}); err != nil {
+		t.Fatalf("record with a zero CreatedAt: %v", err)
+	}
+	var stamped string
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT created_at FROM feed_dead_letters WHERE position = ?`, 43,
+	).Scan(&stamped); err != nil {
+		t.Fatalf("read dead letter: %v", err)
+	}
+	parsed, err := time.Parse(tsLayout, stamped)
+	if err != nil {
+		t.Fatalf("stamped created_at %q does not parse: %v", stamped, err)
+	}
+	if parsed.Before(before.Add(-time.Second)) || parsed.After(time.Now().Add(time.Second)) {
+		t.Fatalf("stamped created_at = %v, want a recent instant", parsed)
+	}
+}
+
 // ---------------------------------------------------------------------------
-// End to end: Store + feed.Server
+// End to end across a real close/reopen: the SQLite durability shape
 // ---------------------------------------------------------------------------
 
 // cancelSink records events, acks the final delivered position through ack
@@ -1082,33 +445,12 @@ func (c *cancelSink) got() []es.Envelope {
 	return append([]es.Envelope(nil), c.events...)
 }
 
-// ackingSink records events and acknowledges every delivered position
-// through ack while the stream still holds its lease — acknowledgements
-// are fenced on the lease, so this is the only moment an ack can land.
-type ackingSink struct {
-	mu     sync.Mutex
-	events []es.Envelope
-	ack    func(ctx context.Context, position uint64) error
-}
-
-func (a *ackingSink) Send(ctx context.Context, env es.Envelope) error {
-	a.mu.Lock()
-	a.events = append(a.events, env)
-	a.mu.Unlock()
-	if a.ack != nil {
-		if err := a.ack(ctx, env.GlobalPosition); err != nil {
-			return fmt.Errorf("ack at %d: %w", env.GlobalPosition, err)
-		}
-	}
-	return nil
-}
-
-func (a *ackingSink) got() []es.Envelope {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]es.Envelope(nil), a.events...)
-}
-
+// TestFeedEndToEndResumesFromCheckpoint is the SQLite-specific durability
+// shape: the contract behaviors (filtered delivery, fenced acks, resume
+// past the checkpoint) are pinned by the shared suite; what only this
+// backend can prove is that the checkpoint survives a real close/reopen of
+// the file-backed store — the process-shaped restart — rather than
+// in-process reuse.
 func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "feed.db")
@@ -1216,153 +558,5 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	if second[0].GlobalPosition != next.GlobalPosition {
 		t.Fatalf("resumed event position = %d, want %d (after checkpoint %d)",
 			second[0].GlobalPosition, next.GlobalPosition, acked)
-	}
-}
-
-// TestSkipResumesPastPoison walks the whole poison runbook end to end on a
-// real store: the over-cap row (inserted past the append cap by raw SQL,
-// the only way such a row can exist) kills a live subscription with
-// *feed.EventTooLargeError; the operator deliberately skips past it; the
-// dead letter lands in feed_dead_letters as a complete pointer — the
-// store names the event's type and size from the log without ever scanning
-// its payload — and the resubscription delivers exactly the events after
-// the poison position, never the poison itself. The skipped subscription's
-// definition fingerprint survives the skip, so the resubscription serves
-// under the identity the pre-poison ack recorded.
-func TestSkipResumesPastPoison(t *testing.T) {
-	ctx := context.Background()
-	s := openFeedStoreCapped(t) // store cap 64: a 4096-byte row is poison
-	const typ = "thing.v1.Happened"
-
-	// Global order: before < poison < after. The poison row enters via
-	// raw SQL because the append cap (Task 5) refuses it.
-	before := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-e2e-a"), 0, typ, []byte("ok"))
-	poisonGP := insertFeedRowDirect(t, s, mustStreamID(t, "thing", "poison-e2e"), 1, typ, bytes.Repeat([]byte("p"), 4096))
-	after1 := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-e2e-b"), 0, typ, []byte("after-1"))
-	after2 := appendFeedEvent(t, s, mustStreamID(t, "thing", "poison-e2e-b"), 1, typ, []byte("after-2"))
-	if !(before.GlobalPosition < poisonGP && poisonGP < after1.GlobalPosition && after1.GlobalPosition < after2.GlobalPosition) {
-		t.Fatalf("insert order: before=%d poison=%d after=%d,%d, want the poison between the normal rows",
-			before.GlobalPosition, poisonGP, after1.GlobalPosition, after2.GlobalPosition)
-	}
-
-	srv, err := feed.NewServer(feed.Config{
-		Logs:        sqlite.NewLogs(s),
-		Checkpoints: sqlite.NewCheckpointStore(s),
-		Leases:      sqlite.NewLeaseStore(s),
-		DeadLetters: sqlite.NewDeadLetterStore(s),
-		Poll:        10 * time.Millisecond,
-		Batch:       10,
-		LeaseTTL:    time.Minute,
-		RenewEvery:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
-	req := feed.Request{
-		Scope:      "ws",
-		Projection: "p",
-		Instance:   "live",
-		Consumer:   "test",
-		// Caller-supplied owner: the fenced acks below must name it.
-		Owner:      "skip-e2e-owner",
-		Definition: projection.Definition{Name: "p", Consumes: []string{typ}},
-	}
-
-	// The live subscription delivers the event before the poison, acks it
-	// under the definition, then dies on the poison row — never
-	// materialized (Task 6), never delivered.
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel1()
-	sink := &ackingSink{ack: func(ctx context.Context, pos uint64) error {
-		return srv.Checkpoint(ctx, feed.Ack{
-			Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
-			Owner: req.Owner, Position: pos, Definition: req.Definition.Hash(),
-		})
-	}}
-	err = srv.Subscribe(ctx1, req, sink)
-	var tooLarge *feed.EventTooLargeError
-	if !errors.As(err, &tooLarge) {
-		t.Fatalf("subscribe error = %v (%T), want *feed.EventTooLargeError", err, err)
-	}
-	if tooLarge.Position != poisonGP || tooLarge.TypeURL != typ ||
-		tooLarge.Size != 4096 || tooLarge.Limit != 64 {
-		t.Fatalf("poison error = %+v, want position %d of type %q, 4096 bytes over the 64-byte cap",
-			tooLarge, poisonGP, typ)
-	}
-	if got := sink.got(); len(got) != 1 || got[0].GlobalPosition != before.GlobalPosition {
-		t.Fatalf("delivered before the poison = %v, want only the event at %d (the poison never delivered)",
-			feedPositions(got), before.GlobalPosition)
-	}
-
-	// The operator skips past the poison. No force: the poison error killed
-	// the stream and released its lease, so the fence is free.
-	skipAt := time.Now()
-	reason := "poison: 4096-byte payload over the 64-byte store cap"
-	if err := srv.Skip(ctx, feed.SkipRequest{
-		Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
-		Position: poisonGP, Actor: "oncall@example.com", Reason: reason,
-	}); err != nil {
-		t.Fatalf("Skip: %v", err)
-	}
-
-	// The dead letter landed in the real table — a complete pointer: the
-	// store named the event's type and size from the log (metadata only),
-	// and the row carries the operator's reason and actor.
-	var (
-		typeURL   string
-		size      int
-		dlReason  string
-		dlActor   string
-		createdAt string
-	)
-	if err := s.DB().QueryRowContext(ctx,
-		`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
-		 WHERE scope = ? AND projection = ? AND instance = ? AND position = ?`,
-		req.Scope, req.Projection, req.Instance, poisonGP,
-	).Scan(&typeURL, &size, &dlReason, &dlActor, &createdAt); err != nil {
-		t.Fatalf("read the landed dead letter: %v", err)
-	}
-	if typeURL != typ || size != 4096 || dlReason != reason || dlActor != "oncall@example.com" {
-		t.Fatalf("dead letter row = (%q, %d, %q, %q), want the poison named with the audit fields",
-			typeURL, size, dlReason, dlActor)
-	}
-	at, err := time.Parse("2006-01-02T15:04:05.000000000Z", createdAt)
-	if err != nil {
-		t.Fatalf("dead letter created_at %q does not parse: %v", createdAt, err)
-	}
-	if at.Before(skipAt.Add(-time.Second)) || at.After(time.Now().Add(time.Second)) {
-		t.Fatalf("dead letter created_at = %v, want around the skip at %v", at, skipAt)
-	}
-
-	// The checkpoint advanced to the poison position with the ack's
-	// definition fingerprint preserved — a skip is a position advance,
-	// never a redefinition.
-	cp, found, err := sqlite.NewCheckpointStore(s).Checkpoint(ctx, req.Scope, req.Projection, req.Instance)
-	if err != nil || !found {
-		t.Fatalf("checkpoint after the skip = found %v, err %v", found, err)
-	}
-	if cp.Position != poisonGP {
-		t.Fatalf("checkpoint = %d after the skip, want the poison position %d", cp.Position, poisonGP)
-	}
-	if cp.DefinitionHash != req.Definition.Hash() {
-		t.Fatalf("definition hash = %q after the skip, want the acked %q preserved", cp.DefinitionHash, req.Definition.Hash())
-	}
-
-	// The resubscription delivers exactly the events after the poison —
-	// never the poison itself.
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel2()
-	sink2 := &cancelSink{want: 2, cancel: cancel2}
-	if err := srv.Subscribe(ctx2, req, sink2); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("resubscribe: %v", err)
-	}
-	got := sink2.got()
-	want := []uint64{after1.GlobalPosition, after2.GlobalPosition}
-	if !slices.Equal(feedPositions(got), want) {
-		t.Fatalf("resumed positions = %v, want %v (the events after the poison, never the poison itself)",
-			feedPositions(got), want)
-	}
-	if slices.Contains(feedPositions(got), poisonGP) {
-		t.Fatalf("the poison event at %d was delivered after the skip", poisonGP)
 	}
 }

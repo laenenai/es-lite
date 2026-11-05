@@ -21,14 +21,13 @@ package postgres_test
 // are not part of the gate target; run them with -bench for the write-path
 // baseline and record both numbers in the Gate 0 exit review.
 //
-// The Postgres feed adapters have landed (Task 13: postgres.NewLogs/
-// NewCheckpointStore/NewLeaseStore/NewDeadLetterStore), but the
-// feed.Servers here still run on small in-memory fakes (fgCheckpoints/
-// fgLeases, after feed/server_test.go's memCheckpoints/memLeases) while
-// the LOG reads are the real thing: *postgres.Workspace, fence and
-// indexes included, via the fgLogs adapter. The gate's point is the log
-// reads. Swapping the fakes for the real adapters is the gate task's
-// next step.
+// The feed.Servers here run on the REAL Postgres feed adapters (Task 13:
+// postgres.NewLogs/NewCheckpointStore/NewLeaseStore; DeadLetters stays nil,
+// the gate has no poison path), so the gate exercises the log reads —
+// *postgres.Workspace, fence and indexes included — AND the store
+// close/reopen kill window exercises real durable checkpoints: a killed
+// generation's cursor survives the pool death in feed_checkpoints, the
+// same database the next generation reconnects to.
 
 import (
 	"bytes"
@@ -52,221 +51,6 @@ import (
 	"github.com/laenenai/es-lite/postgres"
 	"github.com/laenenai/es-lite/projection"
 )
-
-// ---------------------------------------------------------------------------
-// Fakes: checkpoints, leases, logs (feed.Server dependencies; Task 13 will
-// replace the two in-memory ones with the real Postgres adapters).
-// ---------------------------------------------------------------------------
-
-// fgCheckpoints is an in-memory CheckpointStore. Save is monotonic — like the
-// planned Postgres store's GREATEST update, a rewind never lands, so a
-// redelivery cannot regress the cursor. Every method honours ctx, like a
-// real database adapter: an ack raced by the stream's cancellation fails
-// instead of silently succeeding, which is what makes the chaos kill window
-// ("after a Send but before the Checkpoint call") meaningful.
-type fgCheckpoints struct {
-	mu   sync.Mutex
-	rows map[string]fgCP
-}
-
-type fgCP struct {
-	pos  uint64
-	hash string
-	at   time.Time
-}
-
-func newFGCheckpoints() *fgCheckpoints {
-	return &fgCheckpoints{rows: map[string]fgCP{}}
-}
-
-// fgKey joins the (scope, projection, instance) triple with NUL — the same
-// form the sqlite adapter composes — so distinct triples cannot collide. The
-// feed core's validateKey refuses control bytes in every part, so a NUL
-// never occurs inside a part.
-func fgKey(scope, projection, instance string) string {
-	return scope + "\x00" + projection + "\x00" + instance
-}
-
-func (m *fgCheckpoints) Load(ctx context.Context, scope, projection, instance string) (uint64, error) {
-	if err := ctx.Err(); err != nil {
-		return 0, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.rows[fgKey(scope, projection, instance)].pos, nil
-}
-
-// Save is monotonic — like the planned Postgres store's GREATEST update, a
-// rewind never lands, so a redelivery cannot regress the cursor — and
-// mirrors the port contract for the fingerprint: a non-empty definition
-// records it, an empty one preserves the stored hash. Every method honours
-// ctx, like a real database adapter: an ack raced by the stream's
-// cancellation fails instead of silently succeeding, which is what makes
-// the chaos kill window ("after a Send but before the Checkpoint call")
-// meaningful.
-func (m *fgCheckpoints) Save(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := fgKey(scope, projection, instance)
-	row := m.rows[k]
-	if position > row.pos {
-		row.pos = position
-	}
-	if definition != "" {
-		row.hash = definition
-	}
-	row.at = time.Now()
-	m.rows[k] = row
-	return nil
-}
-
-func (m *fgCheckpoints) Reset(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	k := fgKey(scope, projection, instance)
-	row := m.rows[k]
-	row.pos = position
-	if definition != "" {
-		row.hash = definition
-	}
-	row.at = time.Now()
-	m.rows[k] = row
-	return nil
-}
-
-func (m *fgCheckpoints) Delete(ctx context.Context, scope, projection, instance string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.rows, fgKey(scope, projection, instance))
-	return nil
-}
-
-func (m *fgCheckpoints) Checkpoint(ctx context.Context, scope, projection, instance string) (feed.Checkpoint, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return feed.Checkpoint{}, false, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	row, ok := m.rows[fgKey(scope, projection, instance)]
-	if !ok {
-		return feed.Checkpoint{}, false, nil
-	}
-	return feed.Checkpoint{Position: row.pos, DefinitionHash: row.hash, UpdatedAt: row.at}, true, nil
-}
-
-// carryInto copies all rows into dst. It stands in for the durability the
-// Task 13 Postgres checkpoint store will have: a consumer's cursor survives
-// its log store dying. The gate's reopen kill relies on that simulation.
-func (m *fgCheckpoints) carryInto(dst *fgCheckpoints) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	dst.mu.Lock()
-	defer dst.mu.Unlock()
-	for k, v := range m.rows {
-		dst.rows[k] = v
-	}
-}
-
-// fgLeases is an in-memory, owner-guarded LeaseStore (after
-// feed/server_test.go's memLeases, without the failure injection): Acquire
-// succeeds when the key is free, expired or already owned by the same owner;
-// Renew extends only for the owner; Release deletes only for the owner.
-type fgLeases struct {
-	mu   sync.Mutex
-	rows map[string]fgLease
-}
-
-type fgLease struct {
-	owner, consumer string
-	expiresAt       time.Time
-}
-
-func newFGLeases() *fgLeases {
-	return &fgLeases{rows: map[string]fgLease{}}
-}
-
-func (m *fgLeases) Acquire(ctx context.Context, scope, projection, instance, owner, consumer string, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := fgKey(scope, projection, instance)
-	if row, held := m.rows[key]; held && time.Now().Before(row.expiresAt) && row.owner != owner {
-		return false, nil
-	}
-	m.rows[key] = fgLease{owner: owner, consumer: consumer, expiresAt: time.Now().Add(ttl)}
-	return true, nil
-}
-
-func (m *fgLeases) Renew(ctx context.Context, scope, projection, instance, owner string, ttl time.Duration) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := fgKey(scope, projection, instance)
-	row, held := m.rows[key]
-	if !held || row.owner != owner {
-		return false, nil
-	}
-	row.expiresAt = time.Now().Add(ttl)
-	m.rows[key] = row
-	return true, nil
-}
-
-// Release deliberately ignores ctx: Subscribe releases through a detached
-// (WithoutCancel) context, and a cancelled stream must never leak its key.
-func (m *fgLeases) Release(_ context.Context, scope, projection, instance, owner string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := fgKey(scope, projection, instance)
-	if row, held := m.rows[key]; held && row.owner == owner {
-		delete(m.rows, key)
-	}
-	return nil
-}
-
-func (m *fgLeases) Holder(ctx context.Context, scope, projection, instance string) (feed.Lease, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return feed.Lease{}, false, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	row, held := m.rows[fgKey(scope, projection, instance)]
-	if !held || !time.Now().Before(row.expiresAt) {
-		return feed.Lease{}, false, nil
-	}
-	return feed.Lease{Owner: row.owner, Consumer: row.consumer, ExpiresAt: row.expiresAt}, true, nil
-}
-
-// count reports how many keys are currently held (the fleet test uses it to
-// observe that all subscriptions started).
-func (m *fgLeases) count() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.rows)
-}
-
-// fgLogs adapts the real *postgres.Workspace to feed.Logs: Open returns the
-// store's workspace-scoped handle, whose ReadAllBounded and Head are exactly
-// the methods under gate — horizon fence, two-step pages, indexes.
-type fgLogs struct {
-	store *postgres.Store
-}
-
-func (l fgLogs) Open(_ context.Context, scope string) (feed.Log, error) {
-	return l.store.WorkspaceStore(scope), nil
-}
 
 // ---------------------------------------------------------------------------
 // Harness plumbing shared by the gate tests.
@@ -308,7 +92,10 @@ func fgOpenStore(ctx context.Context, tb testing.TB, dsn string, maxConns int32,
 	if truncate {
 		// Each gate test owns the database for its duration (the gate runs
 		// the package sequentially, like the other integration tests).
-		if _, err := pool.Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors`); err != nil {
+		// The feed tables are included now that the Servers run on the
+		// real adapters: stale checkpoint or lease rows would seed a
+		// resume or fence a fresh subscription.
+		if _, err := pool.Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
 			s.Close()
 			pool.Close()
 			return nil, nil, fmt.Errorf("feedgate: truncate: %w", err)
@@ -348,7 +135,7 @@ func fgPayload(sid es.StreamID, version uint64) []byte {
 //     DELIVERED envelopes) is meaningful.
 //   - Kill windows per consumer: two mid-page cancels (after a Send, before
 //     the Checkpoint call) and one full store close/reopen (close pool,
-//     re-Open, re-create Server + fakes, resume from the carried
+//     re-Open, re-create Server + adapters, resume from the durable
 //     checkpoint) while appenders are in flight; plus one more mid-page
 //     cancel AFTER every append has committed.
 //
@@ -427,13 +214,14 @@ type fgWindow struct {
 
 // fgGen is one consumer subscription attempt. The generation index advances
 // on EVERY reconnect (the killer waits on it between kills). A cancel kill
-// reuses the generation's server, fakes and store with a fresh subscription
-// ctx; a reopen kill rebuilds everything — the checkpoint rows are carried
-// into the new fake, standing in for Task 13's durable store.
+// reuses the generation's server and store with a fresh subscription ctx;
+// a reopen kill rebuilds everything over a fresh pool to the SAME
+// database — the killed generation's checkpoints and leases are still
+// there, durable in Postgres, which is exactly what the reopen kill
+// exists to exercise.
 type fgGen struct {
 	idx    int
 	srv    *feed.Server
-	cps    *fgCheckpoints
 	store  *postgres.Store
 	pool   *pgxpool.Pool
 	cancel context.CancelFunc
@@ -571,10 +359,11 @@ func (c *fgConsumer) recordUnexpected(msg string) {
 	c.unexpectedMu.Unlock()
 }
 
-// buildGeneration opens a fresh store (its own pool), fakes and Server. The
-// previous generation's checkpoint rows are carried into the new fake: Task
-// 13's Postgres checkpoint store will persist them across a store reopen,
-// and the gate's resume-from-checkpoint kill depends on that.
+// buildGeneration opens a fresh store (its own pool) and Server over the
+// REAL Postgres feed adapters. No checkpoint carry: the rows live in
+// feed_checkpoints in the same database the new pool connects to, so the
+// previous generation's cursor survives the store death — the real
+// durability the in-memory fakes used to simulate.
 func (c *fgConsumer) buildGeneration(ctx context.Context, dsn string, prev *fgGen) (*fgGen, error) {
 	idx := 0
 	if prev != nil {
@@ -584,24 +373,21 @@ func (c *fgConsumer) buildGeneration(ctx context.Context, dsn string, prev *fgGe
 	if err != nil {
 		return nil, err
 	}
-	cps := newFGCheckpoints()
-	if prev != nil {
-		prev.cps.carryInto(cps)
-	}
 	srv, err := feed.NewServer(feed.Config{
-		Checkpoints: cps,
-		Leases:      newFGLeases(),
-		Logs:        fgLogs{store: store},
-		LeaseTTL:    100 * time.Millisecond, // the brief's chaos TTL
-		RenewEvery:  0,                      // derived: TTL/3
-		Batch:       fgChaosPageSize,
-		MaxBatch:    fgChaosPageSize * 5,
-		Poll:        50 * time.Millisecond,
+		Checkpoints: postgres.NewCheckpointStore(store),
+		Leases:      postgres.NewLeaseStore(store),
+		Logs:        postgres.NewLogs(store),
+		// DeadLetters stays nil: the gate has no poison path.
+		LeaseTTL:   100 * time.Millisecond, // the brief's chaos TTL
+		RenewEvery: 0,                      // derived: TTL/3
+		Batch:      fgChaosPageSize,
+		MaxBatch:   fgChaosPageSize * 5,
+		Poll:       50 * time.Millisecond,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("feedgate: new server: %w", err)
 	}
-	return &fgGen{idx: idx, srv: srv, cps: cps, store: store, pool: pool}, nil
+	return &fgGen{idx: idx, srv: srv, store: store, pool: pool}, nil
 }
 
 // run is the consumer's reconnect loop: subscribe, classify the death,
@@ -628,11 +414,10 @@ func (c *fgConsumer) run(ctx context.Context, dsn string) {
 			}
 			gen = g
 		} else {
-			// Cancel kill: same server, fakes and store, fresh subscription.
+			// Cancel kill: same server and store, fresh subscription.
 			gen = &fgGen{
 				idx:   prev.idx + 1,
 				srv:   prev.srv,
-				cps:   prev.cps,
 				store: prev.store,
 				pool:  prev.pool,
 			}
@@ -696,10 +481,12 @@ func (c *fgConsumer) runKiller(ctx context.Context, plan []fgKill, armed chan<- 
 		w := &fgWindow{now: make(chan struct{}), release: make(chan struct{})}
 		if k.kind == fgKillReopen {
 			// While the store dies, no ack may land for the windowed
-			// events: the checkpoint store is independent of the log store
-			// (and in-memory here), so without holding the acks the kill
-			// could ack away its own redelivery. Real durability keeps
-			// landed acks; the gate wants the worst case.
+			// events: an ack racing the pool close would fail on the
+			// dead connection, but one could still land just before the
+			// close and ack away the kill's own redelivery window. The
+			// gate wants the worst case pinned: hold the acks until the
+			// release, so the window must bite. Landed acks stay
+			// durable in feed_checkpoints either way.
 			c.holdAcks.Store(true)
 		}
 		c.win.Store(w)
@@ -1534,16 +1321,28 @@ func TestFeedGateHundredIdleSubscribers(t *testing.T) {
 		t.Fatalf("feedgate: fleet pool MaxConns = %d, want %d", got, fleetMaxConn)
 	}
 
-	leases := newFGLeases()
 	srv, err := feed.NewServer(feed.Config{
-		Checkpoints: newFGCheckpoints(),
-		Leases:      leases,
-		Logs:        fgLogs{store: s},
+		Checkpoints: postgres.NewCheckpointStore(s),
+		Leases:      postgres.NewLeaseStore(s),
+		Logs:        postgres.NewLogs(s),
+		// DeadLetters stays nil: the fleet has no poison path.
 		// Everything else at the defaults: poll 250ms, lease TTL 30s,
 		// batch 500 — the fleet runs production-shaped knobs.
 	})
 	if err != nil {
 		t.Fatalf("feedgate: new server: %v", err)
+	}
+
+	// heldLeases counts the lease rows the fleet's subscriptions hold:
+	// one row per acquired key, scoped to the fleet's workspace.
+	heldLeases := func() int {
+		var n int
+		if err := s.Pool().QueryRow(ctx,
+			`SELECT COUNT(*) FROM feed_leases WHERE workspace_id = $1`, "ws_fleet",
+		).Scan(&n); err != nil {
+			t.Fatalf("feedgate: count fleet leases: %v", err)
+		}
+		return n
 	}
 
 	type sub struct {
@@ -1570,10 +1369,10 @@ func TestFeedGateHundredIdleSubscribers(t *testing.T) {
 	// Quiet start: every subscription holds its lease and has polled the
 	// empty log, and not one has delivered anything.
 	deadline := time.Now().Add(10 * time.Second)
-	for leases.count() < fleetSubs {
+	for heldLeases() < fleetSubs {
 		if time.Now().After(deadline) {
 			cancel()
-			t.Fatalf("feedgate: only %d of %d subscriptions acquired their lease", leases.count(), fleetSubs)
+			t.Fatalf("feedgate: only %d of %d subscriptions acquired their lease", heldLeases(), fleetSubs)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

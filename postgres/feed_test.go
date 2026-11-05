@@ -1,9 +1,7 @@
 package postgres_test
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -11,7 +9,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/laenenai/es-lite/es"
-	"github.com/laenenai/es-lite/feed"
 	"github.com/laenenai/es-lite/postgres"
 )
 
@@ -290,7 +287,7 @@ func TestReadAllBoundedPassesAbortedHole(t *testing.T) {
 // returns the global_position the insert drew. The test pool connects as
 // the table-owning superuser, so the direct insert crosses the RLS the
 // workspace-scoped reads still enforce.
-func insertPoisonRow(t *testing.T, ctx context.Context, s *postgres.Store, ws string, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
+func insertPoisonRow(t testing.TB, ctx context.Context, s *postgres.Store, ws string, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
 	t.Helper()
 	var gp uint64
 	err := s.Pool().QueryRow(ctx,
@@ -301,112 +298,13 @@ func insertPoisonRow(t *testing.T, ctx context.Context, s *postgres.Store, ws st
 			actor_type, actor_id, actor_principal, payload
 		) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15,$16)
 		RETURNING global_position`,
-		ws, "11111111-1111-7111-8111-111111111111", "thing", sid.Canonical(), version,
+		ws, "11111111-1111-7111-8111-111111111111", sid.Type, sid.Canonical(), version,
 		typeURL, 1, time.Now(), time.Now(),
 		"", "", "",
-		"thing", "poison", "thing:poison", payload,
+		sid.Type, "poison", "conformance:poison", payload,
 	).Scan(&gp)
 	if err != nil {
 		t.Fatalf("direct insert: %v", err)
 	}
 	return gp
-}
-
-// appendPoisonFixture appends one normal (under-cap) event of typ through
-// ws and returns its global_position.
-func appendPoisonFixture(t *testing.T, ctx context.Context, ws *postgres.Workspace, sid es.StreamID, typ string) uint64 {
-	t.Helper()
-	res, err := ws.Append(ctx, es.AppendParams{
-		StreamID: sid,
-		Events:   []es.EventData{{TypeURL: typ, SchemaVersion: 1, Payload: []byte("ok")}},
-	})
-	if err != nil {
-		t.Fatalf("append fixture: %v", err)
-	}
-	return res.Envelopes[0].GlobalPosition
-}
-
-// TestOversizedFirstRowIsNotMaterialized pins the read-side poison contract
-// (production review focus 3): a stored payload over the store's cap is
-// never materialized into a page — the adapter must refuse to scan its
-// bytes, fence and all. The over-cap row enters via direct SQL because the
-// append cap now refuses it. When it is the FIRST row of a page,
-// ReadAllBounded returns *feed.EventTooLargeError naming position, type
-// URL, size and limit, with no envelopes. When it is a LATER row, the page
-// stops before it with truncated=true, and the next page makes it the
-// first row and surfaces the error.
-func TestOversizedFirstRowIsNotMaterialized(t *testing.T) {
-	const typ = "feedtest.v1.Poison"
-	oversized := bytes.Repeat([]byte("p"), 4096)
-
-	t.Run("first row over cap is refused, not materialized", func(t *testing.T) {
-		ctx := context.Background()
-		s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(64))
-		ws := s.WorkspaceStore("ws_poison_first")
-
-		gp := insertPoisonRow(t, ctx, s, "ws_poison_first", feedStream(t, "poison-a"), 1, typ, oversized)
-		// A normal row follows the poison row.
-		ok := appendPoisonFixture(t, ctx, ws, feedStream(t, "poison-a-ok"), typ)
-		if ok < gp {
-			t.Fatalf("append order: poison=%d ok=%d, want the poison row first", gp, ok)
-		}
-
-		got, _, err := ws.ReadAllBounded(ctx, 0, 10, 0, []string{typ})
-		var tooLarge *feed.EventTooLargeError
-		if !errors.As(err, &tooLarge) {
-			t.Fatalf("ReadAllBounded error = %v (%T), want *feed.EventTooLargeError", err, err)
-		}
-		if tooLarge.Position != gp || tooLarge.TypeURL != typ ||
-			tooLarge.Size != len(oversized) || tooLarge.Limit != 64 {
-			t.Fatalf("error fields = (pos %d, type %q, size %d, limit %d), want (pos %d, type %q, size %d, limit 64)",
-				tooLarge.Position, tooLarge.TypeURL, tooLarge.Size, tooLarge.Limit, gp, typ, len(oversized))
-		}
-		if len(got) != 0 {
-			t.Fatalf("over-cap first row was materialized: %d envelopes, want none", len(got))
-		}
-	})
-
-	t.Run("later row over cap stops the page before it", func(t *testing.T) {
-		ctx := context.Background()
-		s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(64))
-		ws := s.WorkspaceStore("ws_poison_later")
-
-		first := appendPoisonFixture(t, ctx, ws, feedStream(t, "poison-b-before"), typ)
-		gp := insertPoisonRow(t, ctx, s, "ws_poison_later", feedStream(t, "poison-b"), 1, typ, oversized)
-		after := appendPoisonFixture(t, ctx, ws, feedStream(t, "poison-b-after"), typ)
-		if !(first < gp && gp < after) {
-			t.Fatalf("insert order: first=%d poison=%d after=%d, want the poison row between the normal rows",
-				first, gp, after)
-		}
-
-		// The page delivers only the rows before the poison row and stops
-		// before it: truncated=true is certain — the stopping row was seen.
-		got, truncated, err := ws.ReadAllBounded(ctx, 0, 10, 0, []string{typ})
-		if err != nil {
-			t.Fatalf("ReadAllBounded: %v", err)
-		}
-		if len(got) != 1 || got[0].GlobalPosition != first {
-			t.Fatalf("page = %v, want only the event before the poison row (pos %d)",
-				positions(got), first)
-		}
-		if !truncated {
-			t.Fatal("page stopped before an over-cap row without truncated=true")
-		}
-
-		// The next page makes the poison row the first row: the typed error,
-		// again with no envelopes materialized.
-		got, _, err = ws.ReadAllBounded(ctx, first, 10, 0, []string{typ})
-		var tooLarge *feed.EventTooLargeError
-		if !errors.As(err, &tooLarge) {
-			t.Fatalf("next page error = %v (%T), want *feed.EventTooLargeError", err, err)
-		}
-		if tooLarge.Position != gp || tooLarge.TypeURL != typ ||
-			tooLarge.Size != len(oversized) || tooLarge.Limit != 64 {
-			t.Fatalf("error fields = (pos %d, type %q, size %d, limit %d), want (pos %d, type %q, size %d, limit 64)",
-				tooLarge.Position, tooLarge.TypeURL, tooLarge.Size, tooLarge.Limit, gp, typ, len(oversized))
-		}
-		if len(got) != 0 {
-			t.Fatalf("over-cap first row was materialized: %d envelopes, want none", len(got))
-		}
-	})
 }

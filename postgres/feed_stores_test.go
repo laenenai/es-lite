@@ -1,13 +1,10 @@
 package postgres_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
-	"slices"
+	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,20 +12,31 @@ import (
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/feed"
+	"github.com/laenenai/es-lite/feedtest"
 	"github.com/laenenai/es-lite/postgres"
-	"github.com/laenenai/es-lite/projection"
 )
 
-// The workspace-scoped feed adapters (spec §5.6): checkpoint, lease,
-// dead-letter and Logs behavior over a real Postgres — the mirror of
-// sqlite/feed_test.go's adapter tests, plus the RLS isolation the
-// Postgres tables add (Review Focus 5). Everything here skips without
-// PG_DSN, like the rest of the Postgres suite.
+// The Postgres feed adapters' tests. The port contracts — the checkpoint,
+// lease, log, dead-letter and end-to-end behaviors both backends must
+// honor — now live in the shared conformance suite (feedtest, spec §5.6),
+// wired below with MultiWorkspace set; what stays here is Postgres-
+// specific:
+//
+//   - the workspace-pinned Logs pin (Open hands back the *Workspace),
+//   - the deterministic lease-expiry takeover (the row is pushed into
+//     the past with SQL — no timing), and the DB-clock TTL window,
+//   - the DB-clock half of the deliberate CreatedAt divergence (the
+//     suite asserts presence/reasonableness only),
+//   - the RLS policy mechanics: probe-role GUC probes, the events
+//     policy binding, WITH CHECK, and the pg_policies shape.
+//
+// Everything here skips without PG_DSN, like the rest of the Postgres
+// suite.
 
 // feedDBClock reads the database's own clock, so timestamp assertions
 // compare DB-stamped values against DB time — immune to any skew
 // between the test process's clock and the database's.
-func feedDBClock(t *testing.T, ctx context.Context, s *postgres.Store) time.Time {
+func feedDBClock(t testing.TB, ctx context.Context, s *postgres.Store) time.Time {
 	t.Helper()
 	var now time.Time
 	if err := s.Pool().QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
@@ -55,7 +63,7 @@ func expireFeedLease(t *testing.T, ctx context.Context, s *postgres.Store, scope
 
 // feedAppendEvent appends one event to sid in workspace scope at the
 // given expected version and returns the committed envelope.
-func feedAppendEvent(t *testing.T, ctx context.Context, s *postgres.Store, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
+func feedAppendEvent(t testing.TB, ctx context.Context, s *postgres.Store, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
 	t.Helper()
 	res, err := s.WorkspaceStore(scope).Append(ctx, es.AppendParams{
 		StreamID:        sid,
@@ -66,6 +74,70 @@ func feedAppendEvent(t *testing.T, ctx context.Context, s *postgres.Store, scope
 		t.Fatalf("append %s at v%d in %s: %v", typeURL, version+1, scope, err)
 	}
 	return res.Envelopes[0]
+}
+
+// ---------------------------------------------------------------------------
+// The shared conformance suite (spec §5.6)
+// ---------------------------------------------------------------------------
+
+// newPostgresFeedStore wires Postgres into the shared feed conformance
+// suite (feedtest): every port over one store — freshly truncated, capped
+// at 64 payload bytes so the poison contract is exercisable — plus the
+// seeding hooks. Postgres isolates workspaces by row-level security, so
+// the fixture reports MultiWorkspace: the suite's cross-workspace section
+// runs against the real policies.
+func newPostgresFeedStore(ctx context.Context, t testing.TB) (feedtest.Store, func()) {
+	s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(64))
+	return feedtest.Store{
+		Logs:            postgres.NewLogs(s),
+		Checkpoints:     postgres.NewCheckpointStore(s),
+		Leases:          postgres.NewLeaseStore(s),
+		DeadLetters:     postgres.NewDeadLetterStore(s),
+		MaxPayloadBytes: 64,
+		Append: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
+			return feedAppendEvent(t, ctx, s, scope, sid, version, typeURL, payload)
+		},
+		PlantOverCap: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
+			return insertPoisonRow(t, ctx, s, scope, sid, version, typeURL, payload)
+		},
+		ReadDeadLetter: func(ctx context.Context, t testing.TB, scope, projection, instance string, position uint64) (feedtest.DeadLetterRow, bool) {
+			var row feedtest.DeadLetterRow
+			err := s.Pool().QueryRow(ctx,
+				`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
+				 WHERE workspace_id = $1 AND projection = $2 AND instance = $3 AND position = $4`,
+				scope, projection, instance, int64(position),
+			).Scan(&row.TypeURL, &row.SizeBytes, &row.Reason, &row.Actor, &row.CreatedAt)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return feedtest.DeadLetterRow{}, false
+			}
+			if err != nil {
+				t.Fatalf("postgres: conformance store: read dead letter at %d: %v", position, err)
+			}
+			return row, true
+		},
+		CountDeadLetters: func(ctx context.Context, t testing.TB, scope string) int {
+			var n int
+			if err := s.Pool().QueryRow(ctx,
+				`SELECT COUNT(*) FROM feed_dead_letters WHERE workspace_id = $1`, scope,
+			).Scan(&n); err != nil {
+				t.Fatalf("postgres: conformance store: count dead letters: %v", err)
+			}
+			return n
+		},
+	}, func() { s.Close() }
+}
+
+// TestPostgresFeedConformance runs the shared feed port conformance suite
+// against the Postgres adapters — the same suite sqlite runs — plus, via
+// the MultiWorkspace capability, the cross-workspace isolation section.
+func TestPostgresFeedConformance(t *testing.T) {
+	if os.Getenv("PG_DSN") == "" {
+		t.Skip("set PG_DSN to run the Postgres integration tests")
+	}
+	feedtest.RunAll(t, feedtest.Fixture{
+		NewStore:       newPostgresFeedStore,
+		MultiWorkspace: true,
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -123,274 +195,16 @@ func TestLogsOpenReturnsTheWorkspaceLog(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// CheckpointStore
+// LeaseStore: the Postgres-specific pins
 // ---------------------------------------------------------------------------
-
-func TestCheckpointLoadAbsentSaveAndNoRewind(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	cp := postgres.NewCheckpointStore(s)
-
-	pos, err := cp.Load(ctx, "ws", "p", "live")
-	if err != nil {
-		t.Fatalf("load absent: %v", err)
-	}
-	if pos != 0 {
-		t.Fatalf("absent load = %d, want 0", pos)
-	}
-	if _, found, err := cp.Checkpoint(ctx, "ws", "p", "live"); err != nil || found {
-		t.Fatalf("absent checkpoint = found=%v err=%v, want false/nil", found, err)
-	}
-
-	if err := cp.Save(ctx, "ws", "p", "live", "", 5); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
-		t.Fatalf("load = %d, want 5", pos)
-	}
-
-	// Save never rewinds: GREATEST in SQL keeps the higher position.
-	if err := cp.Save(ctx, "ws", "p", "live", "", 3); err != nil {
-		t.Fatalf("save lower: %v", err)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
-		t.Fatalf("load after lower save = %d, want 5 (monotonic)", pos)
-	}
-
-	// A different instance is a different row.
-	if err := cp.Save(ctx, "ws", "p", "other", "", 2); err != nil {
-		t.Fatalf("save other: %v", err)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "other"); pos != 2 {
-		t.Fatalf("other instance = %d, want 2", pos)
-	}
-	if pos, _ = cp.Load(ctx, "ws", "p", "live"); pos != 5 {
-		t.Fatalf("live instance = %d, want 5", pos)
-	}
-}
-
-func TestCheckpointResetDeleteAndTimestamp(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	cp := postgres.NewCheckpointStore(s)
-
-	// updated_at is the database's clock (clock_timestamp() in SQL), not
-	// the writer's: bracket the write with two reads of the DB's own
-	// clock and the stamp must fall between them. A skewed application
-	// clock could never place the value outside this window.
-	dbBefore := feedDBClock(t, ctx, s)
-	if err := cp.Save(ctx, "ws", "p", "live", "", 7); err != nil {
-		t.Fatalf("save: %v", err)
-	}
-	dbAfter := feedDBClock(t, ctx, s)
-	checkpoint, found, err := cp.Checkpoint(ctx, "ws", "p", "live")
-	if err != nil || !found {
-		t.Fatalf("checkpoint = found=%v err=%v, want true/nil", found, err)
-	}
-	if checkpoint.Position != 7 {
-		t.Fatalf("checkpoint position = %d, want 7", checkpoint.Position)
-	}
-	if checkpoint.UpdatedAt.Before(dbBefore) || checkpoint.UpdatedAt.After(dbAfter) {
-		t.Fatalf("checkpoint updated_at = %v, want the DB clock between %v and %v (not app time)",
-			checkpoint.UpdatedAt, dbBefore, dbAfter)
-	}
-
-	// Reset overwrites, backwards included.
-	if err := cp.Reset(ctx, "ws", "p", "live", "", 1); err != nil {
-		t.Fatalf("reset: %v", err)
-	}
-	if pos, _ := cp.Load(ctx, "ws", "p", "live"); pos != 1 {
-		t.Fatalf("load after reset = %d, want 1", pos)
-	}
-	if checkpoint, _, _ = cp.Checkpoint(ctx, "ws", "p", "live"); checkpoint.Position != 1 {
-		t.Fatalf("checkpoint after reset = %d, want 1", checkpoint.Position)
-	}
-
-	// Delete removes exactly that row.
-	if err := cp.Save(ctx, "ws", "p", "other", "", 4); err != nil {
-		t.Fatalf("save other: %v", err)
-	}
-	if err := cp.Delete(ctx, "ws", "p", "live"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if _, found, err := cp.Checkpoint(ctx, "ws", "p", "live"); err != nil || found {
-		t.Fatalf("checkpoint after delete = found=%v err=%v, want false/nil", found, err)
-	}
-	if pos, _ := cp.Load(ctx, "ws", "p", "other"); pos != 4 {
-		t.Fatalf("other instance after delete = %d, want 4", pos)
-	}
-	// Deleting again is a no-op.
-	if err := cp.Delete(ctx, "ws", "p", "live"); err != nil {
-		t.Fatalf("delete absent: %v", err)
-	}
-}
-
-// The definition fingerprint round-trips through Checkpoint, and an
-// empty definition never clears a recorded one: Save and Reset both
-// preserve the stored hash when none is supplied — an ack that carries
-// no identity, and a position-only advance like Skip, must not
-// re-identify a checkpoint — while a non-empty definition becomes the
-// checkpoint's new identity (a reset under a changed definition).
-func TestCheckpointDefinitionHashRecordedAndPreserved(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	cp := postgres.NewCheckpointStore(s)
-
-	h1 := projection.Definition{Name: "p", Consumes: []string{"a.v1.A"}}.Hash()
-	h2 := projection.Definition{Name: "p", Consumes: []string{"a.v1.A", "b.v1.B"}}.Hash()
-
-	// A save with no definition records no fingerprint.
-	if err := cp.Save(ctx, "ws", "p", "live", "", 5); err != nil {
-		t.Fatalf("save without definition: %v", err)
-	}
-	got, found, err := cp.Checkpoint(ctx, "ws", "p", "live")
-	if err != nil || !found || got.Position != 5 || got.DefinitionHash != "" {
-		t.Fatalf("checkpoint = %+v found=%v err=%v, want position 5 and no hash", got, found, err)
-	}
-
-	// A definition-carrying save records the fingerprint.
-	if err := cp.Save(ctx, "ws", "p", "live", h1, 6); err != nil {
-		t.Fatalf("save with definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.DefinitionHash != h1 || got.Position != 6 {
-		t.Fatalf("checkpoint = %+v, want position 6 under hash %q", got, h1)
-	}
-
-	// An empty definition preserves the recorded hash on Save ...
-	if err := cp.Save(ctx, "ws", "p", "live", "", 7); err != nil {
-		t.Fatalf("save without definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 7 || got.DefinitionHash != h1 {
-		t.Fatalf("checkpoint = %+v, want position 7 with the hash preserved", got)
-	}
-
-	// ... and on Reset, which may rewind but still must not clear it.
-	if err := cp.Reset(ctx, "ws", "p", "live", "", 1); err != nil {
-		t.Fatalf("reset without definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 1 || got.DefinitionHash != h1 {
-		t.Fatalf("checkpoint = %+v, want position 1 with the hash preserved", got)
-	}
-
-	// A reset under a new definition re-identifies the checkpoint.
-	if err := cp.Reset(ctx, "ws", "p", "live", h2, 0); err != nil {
-		t.Fatalf("reset with definition: %v", err)
-	}
-	if got, _, _ := cp.Checkpoint(ctx, "ws", "p", "live"); got.Position != 0 || got.DefinitionHash != h2 {
-		t.Fatalf("checkpoint = %+v, want position 0 under the new hash", got)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// LeaseStore
-// ---------------------------------------------------------------------------
-
-func TestLeaseExactlyOneWinner(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	leases := postgres.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire owner-a: %v", err)
-	}
-	if !ok {
-		t.Fatal("owner-a lost a free lease")
-	}
-
-	ok, err = leases.Acquire(ctx, scope, projection, instance, "owner-b", "consumer-b", time.Minute)
-	if err != nil {
-		t.Fatalf("acquire owner-b: %v", err)
-	}
-	if ok {
-		t.Fatal("owner-b took a lease owner-a still holds; want exactly one winner")
-	}
-
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil {
-		t.Fatalf("holder: %v", err)
-	}
-	if !held || lease.Owner != "owner-a" || lease.Consumer != "consumer-a" {
-		t.Fatalf("holder = %+v held=%v, want owner-a/consumer-a", lease, held)
-	}
-	// The expiry is absolute DB time ttl from the acquire: it must still
-	// be in the future of the DB's own clock, and no further than ttl
-	// past a clock read taken after the acquire.
-	dbNow := feedDBClock(t, ctx, s)
-	if !lease.ExpiresAt.After(dbNow) {
-		t.Fatalf("holder ExpiresAt %v is not in the future of the DB clock %v", lease.ExpiresAt, dbNow)
-	}
-	if lease.ExpiresAt.After(dbNow.Add(time.Minute + 5*time.Second)) {
-		t.Fatalf("holder ExpiresAt %v is more than the 1m TTL past %v", lease.ExpiresAt, dbNow)
-	}
-}
-
-func TestLeaseReacquireBySameOwnerUpdatesConsumer(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	leases := postgres.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "pod-a", time.Minute); err != nil || !ok {
-		t.Fatalf("first acquire = %v err=%v, want true/nil", ok, err)
-	}
-	// A reconnect by the same owner must succeed and refresh the consumer
-	// identity Status reports.
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "pod-b", time.Minute); err != nil || !ok {
-		t.Fatalf("same-owner acquire = %v err=%v, want true/nil", ok, err)
-	}
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil || !held {
-		t.Fatalf("holder = found=%v err=%v, want held", held, err)
-	}
-	if lease.Owner != "owner-a" || lease.Consumer != "pod-b" {
-		t.Fatalf("holder = %+v, want owner-a/pod-b", lease)
-	}
-}
-
-func TestLeaseRenewByOwnerAndNonOwner(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	leases := postgres.NewLeaseStore(s)
-	const scope, projection, instance = "ws", "p", "live"
-
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire owner-a = %v err=%v", ok, err)
-	}
-	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-b", time.Minute); err != nil {
-		t.Fatalf("renew owner-b: %v", err)
-	} else if ok {
-		t.Fatal("non-owner renewed the lease")
-	}
-	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-a", 2*time.Hour); err != nil {
-		t.Fatalf("renew owner-a: %v", err)
-	} else if !ok {
-		t.Fatal("owner failed to renew its own lease")
-	}
-
-	// The renewal extended the expiry: the holder now reports a further
-	// deadline than the 1m TTL the acquire set — no sleeps needed.
-	lease, held, err := leases.Holder(ctx, scope, projection, instance)
-	if err != nil || !held {
-		t.Fatalf("holder after renew = found=%v err=%v, want held", held, err)
-	}
-	dbNow := feedDBClock(t, ctx, s)
-	if !lease.ExpiresAt.After(dbNow.Add(time.Minute + 30*time.Second)) {
-		t.Fatalf("renewed ExpiresAt %v did not extend past the original TTL (DB clock %v)", lease.ExpiresAt, dbNow)
-	}
-	if lease.Owner != "owner-a" {
-		t.Fatalf("holder owner = %q, want owner-a", lease.Owner)
-	}
-}
 
 // TestLeaseExpiryTakeoverAndHolderUnexpired pins the expiry half of the
 // lease contract without a single sleep: the row's expires_at is pushed
 // into the past with raw SQL (the deterministic stand-in for waiting out
 // a TTL), after which Holder must report the key free and another owner
-// must take the lease over — the same `<=` takeover arm the SQLite
-// adapter pins. The unexpired side (a live row IS a holder and DOES
-// fence a second owner) is the other tests' assertions.
+// must take the lease over — the same `<=` takeover arm the shared suite
+// pins through a real short TTL. The unexpired side (a live row IS a
+// holder and DOES fence a second owner) is the suite's assertions.
 func TestLeaseExpiryTakeoverAndHolderUnexpired(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -423,211 +237,124 @@ func TestLeaseExpiryTakeoverAndHolderUnexpired(t *testing.T) {
 	}
 }
 
-func TestLeaseReleaseByOwnerAndNonOwner(t *testing.T) {
+// TestLeaseExpiryIsDBClockBound pins the Postgres half of the lease clock
+// contract: expiry is computed inside SQL from the database's own clock
+// (clock_timestamp() + ttl), never the caller's, so feed replicas whose
+// application clocks run skewed never extend a lease into extra fence
+// life — and an owner's renewal extends past the original TTL in DB time.
+// The shared suite asserts only a plausible window around the test
+// clock; this keeps the DB-clock source exact.
+func TestLeaseExpiryIsDBClockBound(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	leases := postgres.NewLeaseStore(s)
 	const scope, projection, instance = "ws", "p", "live"
 
+	dbBefore := feedDBClock(t, ctx, s)
 	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-a", "consumer-a", time.Minute); err != nil || !ok {
 		t.Fatalf("acquire = %v err=%v", ok, err)
 	}
+	dbAfter := feedDBClock(t, ctx, s)
+	lease, held, err := leases.Holder(ctx, scope, projection, instance)
+	if err != nil || !held {
+		t.Fatalf("holder = held=%v err=%v", held, err)
+	}
+	if lease.ExpiresAt.Before(dbBefore) || lease.ExpiresAt.After(dbAfter.Add(time.Minute)) {
+		t.Fatalf("holder ExpiresAt = %v, want the DB clock plus the 1m TTL between %v and %v",
+			lease.ExpiresAt, dbBefore, dbAfter.Add(time.Minute))
+	}
 
-	// A non-owner's release is a no-op, not an error.
-	if err := leases.Release(ctx, scope, projection, instance, "owner-b"); err != nil {
-		t.Fatalf("release owner-b: %v", err)
+	// The renewal extends only for the owner, and the extension too is
+	// DB-clock arithmetic: expires_at lands exactly at the DB clock at
+	// the renew plus the 2h TTL.
+	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-b", time.Hour); err != nil {
+		t.Fatalf("renew owner-b: %v", err)
+	} else if ok {
+		t.Fatal("non-owner renewed the lease")
 	}
-	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || !held {
-		t.Fatalf("holder after non-owner release = held=%v err=%v, want still held", held, err)
+	dbBefore = feedDBClock(t, ctx, s)
+	if ok, err := leases.Renew(ctx, scope, projection, instance, "owner-a", 2*time.Hour); err != nil || !ok {
+		t.Fatalf("renew owner-a = %v err=%v", ok, err)
 	}
-
-	if err := leases.Release(ctx, scope, projection, instance, "owner-a"); err != nil {
-		t.Fatalf("release owner-a: %v", err)
+	dbAfter = feedDBClock(t, ctx, s)
+	lease, held, err = leases.Holder(ctx, scope, projection, instance)
+	if err != nil || !held {
+		t.Fatalf("holder after renew = held=%v err=%v", held, err)
 	}
-	if _, held, err := leases.Holder(ctx, scope, projection, instance); err != nil || held {
-		t.Fatalf("holder after owner release = held=%v err=%v, want free", held, err)
-	}
-	// Releasing a free key is a no-op, and the next owner can take it.
-	if err := leases.Release(ctx, scope, projection, instance, "owner-a"); err != nil {
-		t.Fatalf("release free key: %v", err)
-	}
-	if ok, err := leases.Acquire(ctx, scope, projection, instance, "owner-b", "consumer-b", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire after release = %v err=%v, want true/nil", ok, err)
+	if lease.ExpiresAt.Before(dbBefore.Add(2*time.Hour)) || lease.ExpiresAt.After(dbAfter.Add(2*time.Hour)) {
+		t.Fatalf("renewed ExpiresAt = %v, want the DB clock plus the 2h TTL between %v and %v",
+			lease.ExpiresAt, dbBefore.Add(2*time.Hour), dbAfter.Add(2*time.Hour))
 	}
 }
 
-// The subscription key is the (scope, projection, instance) triple, here
-// three columns — distinct triples must stay distinct rows even when a
-// part contains the separator-like "/" — ("ws","a/b","c") and ("ws","a",
-// "b/c") are different subscriptions, never one lease.
-func TestLeaseDistinctTriplesNeverCollide(t *testing.T) {
+// TestCheckpointUpdatedAtIsDBClock pins the Postgres clock contract for
+// checkpoint rows: updated_at is the database's own clock at the write
+// (clock_timestamp() in SQL), never the writer's — a skewed application
+// clock can never place the stamp outside the DB-clock window. The
+// shared suite asserts only presence/reasonableness; this keeps the
+// clock source exact.
+func TestCheckpointUpdatedAtIsDBClock(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
-	leases := postgres.NewLeaseStore(s)
+	cp := postgres.NewCheckpointStore(s)
 
-	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-a", "consumer-a", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire = %v err=%v, want true/nil", ok, err)
+	dbBefore := feedDBClock(t, ctx, s)
+	if err := cp.Save(ctx, "ws_cp_clock", "p", "live", "", 7); err != nil {
+		t.Fatalf("save: %v", err)
 	}
-	// The segment-shifted triple is a different subscription: another owner
-	// can hold it alongside the first.
-	if ok, err := leases.Acquire(ctx, "ws", "a", "b/c", "owner-b", "consumer-b", time.Minute); err != nil || !ok {
-		t.Fatalf("acquire of the shifted triple = %v err=%v, want true (distinct triples never collide)", ok, err)
+	dbAfter := feedDBClock(t, ctx, s)
+	checkpoint, found, err := cp.Checkpoint(ctx, "ws_cp_clock", "p", "live")
+	if err != nil || !found {
+		t.Fatalf("checkpoint = found=%v err=%v, want true/nil", found, err)
 	}
-	// The original triple is still fenced by owner-a.
-	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-b", "consumer-b", time.Minute); err != nil || ok {
-		t.Fatalf("acquire of the held triple = %v err=%v, want false (still held by owner-a)", ok, err)
+	if checkpoint.UpdatedAt.Before(dbBefore) || checkpoint.UpdatedAt.After(dbAfter) {
+		t.Fatalf("checkpoint updated_at = %v, want the DB clock between %v and %v (not app time)",
+			checkpoint.UpdatedAt, dbBefore, dbAfter)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// DeadLetterStore
+// DeadLetterStore: the Postgres-specific pin
 // ---------------------------------------------------------------------------
 
-// TestDeadLetterRecordInsertOrReplace pins the store contract, mirroring
-// the SQLite adapter test: one pointer row per skipped position,
-// replaced (not duplicated) on a repeat skip of the same key; the row is
-// enriched with the skipped event's type and size when the caller — the
-// feed core — cannot know them (metadata only: an over-cap poison row's
-// 4096-byte payload is never scanned, exactly the production poison
-// path); a caller-supplied type passes through untouched; a position
-// with no event row records the empty type and zero size; and a position
-// belonging to ANOTHER workspace names nothing — the enrichment is
-// workspace-pinned. created_at is the database's clock, not the
-// caller's timestamp.
-func TestDeadLetterRecordInsertOrReplace(t *testing.T) {
+// TestDeadLetterCreatedAtIsDBClock pins the Postgres half of the
+// deliberate CreatedAt divergence (controller ruling): Record stamps
+// clock_timestamp() in SQL and ignores the caller's dl.CreatedAt, so
+// every replica's audit trail shares the database's monotone clock. The
+// shared suite asserts only presence/reasonableness because the SQLite
+// store honors the caller's time instead; each backend keeps its own
+// half exact (TestDeadLetterCreatedAtIsCallerSupplied is the other).
+func TestDeadLetterCreatedAtIsDBClock(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	dls := postgres.NewDeadLetterStore(s)
-	const (
-		scope      = "ws_dl"
-		other      = "ws_dl_other"
-		projection = "p"
-		instance   = "live"
-		typ        = "feedtest.v1.Happened"
-	)
 
-	// The poison fixture: an over-cap events row enters via raw SQL (the
-	// only way one exists — the append cap refuses it), in this scope.
-	poisonGP := insertPoisonRow(t, ctx, s, scope, feedStream(t, "dl-poison"), 1, typ, bytes.Repeat([]byte("p"), 4096))
-	// A position that belongs to another workspace: the enrichment must
-	// not name it, even though the row exists in the same database.
-	foreign := feedAppendEvent(t, ctx, s, other, feedStream(t, "dl-foreign"), 0, typ, []byte("12345"))
-
-	type row struct {
-		typeURL   string
-		size      int
-		reason    string
-		actor     string
-		createdAt time.Time
-	}
-	read := func(position uint64) row {
-		t.Helper()
-		var r row
-		err := s.Pool().QueryRow(ctx,
-			`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
-			 WHERE workspace_id = $1 AND projection = $2 AND instance = $3 AND position = $4`,
-			scope, projection, instance, int64(position),
-		).Scan(&r.typeURL, &r.size, &r.reason, &r.actor, &r.createdAt)
-		if err != nil {
-			t.Fatalf("read dead letter at %d: %v", position, err)
-		}
-		return r
-	}
-	count := func() int {
-		t.Helper()
-		var n int
-		if err := s.Pool().QueryRow(ctx,
-			`SELECT COUNT(*) FROM feed_dead_letters WHERE workspace_id = $1`, scope,
-		).Scan(&n); err != nil {
-			t.Fatalf("count dead letters: %v", err)
-		}
-		return n
-	}
-
-	// The core delivers a pointer — no type, no size. The store names the
-	// event from the log it shares a database with, metadata only.
 	dbBefore := feedDBClock(t, ctx, s)
 	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: scope, Projection: projection, Instance: instance,
-		Position: poisonGP, Reason: "poison: over cap", Actor: "oncall",
+		Scope: "ws_dl_clock", Projection: "p", Instance: "live",
+		Position: 42, Reason: "db-stamped", Actor: "oncall",
 		// Deliberately ancient: the DB clock wins, so this must be ignored.
 		CreatedAt: time.Unix(1, 0).UTC(),
 	}); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	dbAfter := feedDBClock(t, ctx, s)
-	if r := read(poisonGP); r.typeURL != typ || r.size != 4096 ||
-		r.reason != "poison: over cap" || r.actor != "oncall" {
-		t.Fatalf("recorded row = %+v, want the poison named (%q, 4096 bytes) with the audit fields", r, typ)
+
+	var createdAt time.Time
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT created_at FROM feed_dead_letters WHERE workspace_id = $1 AND position = 42`,
+		"ws_dl_clock",
+	).Scan(&createdAt); err != nil {
+		t.Fatalf("read dead letter: %v", err)
 	}
-	if r := read(poisonGP); r.createdAt.Before(dbBefore) || r.createdAt.After(dbAfter) {
+	if createdAt.Before(dbBefore) || createdAt.After(dbAfter) {
 		t.Fatalf("created_at = %v, want the DB clock between %v and %v (not the caller's dl.CreatedAt)",
-			r.createdAt, dbBefore, dbAfter)
-	}
-
-	// A repeat skip of the same position replaces the row: exactly one
-	// row, the latest reason, actor and timestamp.
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: scope, Projection: projection, Instance: instance,
-		Position: poisonGP, Reason: "triaged: cap raised", Actor: "oncall-2",
-	}); err != nil {
-		t.Fatalf("re-record: %v", err)
-	}
-	if n := count(); n != 1 {
-		t.Fatalf("rows after the repeat = %d, want 1 (replaced, never duplicated)", n)
-	}
-	if r := read(poisonGP); r.reason != "triaged: cap raised" || r.actor != "oncall-2" ||
-		r.typeURL != typ || r.size != 4096 {
-		t.Fatalf("replaced row = %+v, want the latest audit fields over the same named event", r)
-	}
-
-	// A caller-supplied type and size pass through: the enrichment keeps a
-	// complete dead letter as delivered.
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: scope, Projection: projection, Instance: instance,
-		Position: poisonGP, TypeURL: "custom.v1.Typed", SizeBytes: 99,
-		Reason: "named by the caller", Actor: "oncall-3",
-	}); err != nil {
-		t.Fatalf("record with a type: %v", err)
-	}
-	if r := read(poisonGP); r.typeURL != "custom.v1.Typed" || r.size != 99 {
-		t.Fatalf("row with a caller-supplied type = %+v, want the caller's type/size kept", r)
-	}
-
-	// A position with no event row records the empty type and zero size:
-	// the pointer still lands, Skip does not require the position to exist.
-	const absent = uint64(1) << 40
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: scope, Projection: projection, Instance: instance,
-		Position: absent, Reason: "skipped past a restored log", Actor: "oncall",
-	}); err != nil {
-		t.Fatalf("record an absent position: %v", err)
-	}
-	if r := read(absent); r.typeURL != "" || r.size != 0 {
-		t.Fatalf("absent-position row = %+v, want the empty type and zero size", r)
-	}
-
-	// A position whose event belongs to another workspace names nothing:
-	// the enrichment read is workspace-pinned (explicit workspace_id
-	// filter and RLS), so the pointer records ''/0 rather than naming a
-	// foreign tenant's event.
-	if err := dls.Record(ctx, feed.DeadLetter{
-		Scope: scope, Projection: projection, Instance: instance,
-		Position: foreign.GlobalPosition, Reason: "probe", Actor: "oncall",
-	}); err != nil {
-		t.Fatalf("record a foreign-workspace position: %v", err)
-	}
-	if r := read(foreign.GlobalPosition); r.typeURL != "" || r.size != 0 {
-		t.Fatalf("foreign-position row = %+v, want ''/0 — the enrichment must not see across workspaces", r)
-	}
-
-	if n := count(); n != 3 {
-		t.Fatalf("rows = %d, want 3 (the replaced key plus the absent and foreign positions)", n)
+			createdAt, dbBefore, dbAfter)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Cross-workspace isolation (Review Focus 5)
+// RLS policy mechanics (Review Focus 5)
 // ---------------------------------------------------------------------------
 
 // The raw-GUC probes below run as a dedicated non-superuser role. Why:
@@ -684,20 +411,22 @@ func probePinned(t *testing.T, ctx context.Context, s *postgres.Store, ws string
 	return fn(tx)
 }
 
-// TestFeedStoresRefuseCrossWorkspaceAccess is Review Focus 5. The feed
-// tables' policies have no bypass arm; this proves both halves:
+// TestFeedStoresRefuseCrossWorkspaceAccess is Review Focus 5's POLICY
+// half. The behavioral isolation through the adapters — B's checkpoint
+// writes never clobber A's, the same lease key is free in another
+// workspace, the dead-letter enrichment never names a foreign event — is
+// pinned by the shared conformance suite (the fixture reports
+// MultiWorkspace). What only this test can prove is the policies
+// themselves:
 //
-//   - behavior: rows written under workspace A are invisible under B's
-//     GUC and vice versa — on all three tables, in both directions,
-//     through the adapters AND through raw GUC-pinned queries with no
-//     workspace_id filter (where the policy alone decides), as a role
-//     the policies bind;
+//   - behavior: as a role the policies bind, with no workspace_id
+//     filter anywhere (the policy alone decides), rows written under
+//     workspace A are invisible under B's GUC and vice versa — on all
+//     three tables, in both directions — the dead-letter enrichment
+//     lookup over events is policy-bound, and a cross-workspace insert
+//     is refused at the policy's WITH CHECK;
 //   - schema: pg_policies for the three tables keys on app.workspace_id
 //     with NO app.bypass_rls reference, and both RLS flags are set.
-//
-// It also proves the policies' WITH CHECK: a cross-workspace insert is
-// refused at the policy, and that the dead-letter enrichment lookup
-// over events is policy-bound as well.
 func TestFeedStoresRefuseCrossWorkspaceAccess(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -714,7 +443,8 @@ func TestFeedStoresRefuseCrossWorkspaceAccess(t *testing.T) {
 
 	// Rows written under A through the adapters, then rows with the same
 	// keys under B: if any feed table keyed its rows without
-	// workspace_id, B's writes would clobber A's.
+	// workspace_id, B's writes would clobber A's. (The suite pins the
+	// adapter-level read-back; these writes seed the probes below.)
 	if err := cps.Save(ctx, wsA, projection, instance, "", 10); err != nil {
 		t.Fatalf("save under %s: %v", wsA, err)
 	}
@@ -738,23 +468,6 @@ func TestFeedStoresRefuseCrossWorkspaceAccess(t *testing.T) {
 		Position: 43, Reason: "rls probe", Actor: "probe",
 	}); err != nil {
 		t.Fatalf("record under %s: %v", wsB, err)
-	}
-
-	// Adapter level: each scope's store sees only its own rows, and A's
-	// rows survived B's writes to the same keys.
-	if pos, err := cps.Load(ctx, wsA, projection, instance); err != nil || pos != 10 {
-		t.Fatalf("load under %s = %d err=%v, want 10 (B's write must not clobber it)", wsA, pos, err)
-	}
-	if pos, err := cps.Load(ctx, wsB, projection, instance); err != nil || pos != 20 {
-		t.Fatalf("load under %s = %d err=%v, want 20 — A's row leaked", wsB, pos, err)
-	}
-	leaseA, held, err := leases.Holder(ctx, wsA, projection, instance)
-	if err != nil || !held || leaseA.Owner != "owner-a" {
-		t.Fatalf("holder under %s = %+v held=%v err=%v, want owner-a", wsA, leaseA, held, err)
-	}
-	leaseB, held, err := leases.Holder(ctx, wsB, projection, instance)
-	if err != nil || !held || leaseB.Owner != "owner-b" {
-		t.Fatalf("holder under %s = %+v held=%v err=%v, want owner-b — A's lease leaked", wsB, leaseB, held, err)
 	}
 
 	// Raw GUC probes: no workspace_id filter anywhere — the policy alone
@@ -851,7 +564,7 @@ func TestFeedStoresRefuseCrossWorkspaceAccess(t *testing.T) {
 	// WITH CHECK: a cross-workspace insert is refused at the policy —
 	// and there is no bypass arm to escape through, because the policy
 	// never references one.
-	err = probePinned(t, ctx, s, wsA, func(tx pgx.Tx) error {
+	err := probePinned(t, ctx, s, wsA, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx,
 			`INSERT INTO feed_checkpoints (workspace_id, projection, instance, position, definition_hash, updated_at)
 			 VALUES ($1, 'p', 'foreign', 99, '', clock_timestamp())`, wsB)
@@ -920,316 +633,5 @@ func TestFeedStoresRefuseCrossWorkspaceAccess(t *testing.T) {
 		if !enabled || !forced {
 			t.Fatalf("%s: RLS enabled=%v forced=%v, want both true (FORCE keeps the table owner subject)", table, enabled, forced)
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// End to end: the adapters under the real feed core
-// ---------------------------------------------------------------------------
-
-// feedCancelSink records events, acks the final delivered position
-// through ack (while the stream still holds its lease —
-// acknowledgements are fenced on it), and cancels its subscription once
-// want events have arrived.
-type feedCancelSink struct {
-	mu     sync.Mutex
-	events []es.Envelope
-	want   int
-	cancel context.CancelFunc
-	ack    func(ctx context.Context, position uint64) error
-}
-
-func (c *feedCancelSink) Send(ctx context.Context, env es.Envelope) error {
-	c.mu.Lock()
-	c.events = append(c.events, env)
-	n := len(c.events)
-	c.mu.Unlock()
-	if n >= c.want {
-		if c.ack != nil {
-			if err := c.ack(ctx, env.GlobalPosition); err != nil {
-				return fmt.Errorf("ack at %d: %w", env.GlobalPosition, err)
-			}
-		}
-		c.cancel()
-	}
-	return nil
-}
-
-func (c *feedCancelSink) got() []es.Envelope {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]es.Envelope(nil), c.events...)
-}
-
-// feedAckingSink records events and acknowledges every delivered
-// position through ack while the stream still holds its lease —
-// acknowledgements are fenced on the lease, so this is the only moment
-// an ack can land.
-type feedAckingSink struct {
-	mu     sync.Mutex
-	events []es.Envelope
-	ack    func(ctx context.Context, position uint64) error
-}
-
-func (a *feedAckingSink) Send(ctx context.Context, env es.Envelope) error {
-	a.mu.Lock()
-	a.events = append(a.events, env)
-	a.mu.Unlock()
-	if a.ack != nil {
-		if err := a.ack(ctx, env.GlobalPosition); err != nil {
-			return fmt.Errorf("ack at %d: %w", env.GlobalPosition, err)
-		}
-	}
-	return nil
-}
-
-func (a *feedAckingSink) got() []es.Envelope {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return append([]es.Envelope(nil), a.events...)
-}
-
-// newPGFeedServer wires a feed.Server over the real Postgres adapters.
-func newPGFeedServer(t *testing.T, s *postgres.Store) *feed.Server {
-	t.Helper()
-	srv, err := feed.NewServer(feed.Config{
-		Logs:        postgres.NewLogs(s),
-		Checkpoints: postgres.NewCheckpointStore(s),
-		Leases:      postgres.NewLeaseStore(s),
-		DeadLetters: postgres.NewDeadLetterStore(s),
-		Poll:        10 * time.Millisecond,
-		Batch:       10,
-		LeaseTTL:    time.Minute,
-		RenewEvery:  30 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("new server: %v", err)
-	}
-	return srv
-}
-
-// TestFeedEndToEndResumesFromCheckpoint runs the feed core over the
-// Postgres adapters: a subscription delivers only its definition's
-// consumed types, the fenced ack lands a durable checkpoint in
-// feed_checkpoints, and a second subscription resumes from it — exactly
-// the events the log holds after the checkpoint, never anything before.
-func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	const scope = "ws_feed_e2e"
-	sid := feedStream(t, "feed-e2e")
-
-	const (
-		consumed = "feedtest.v1.Consumed"
-		ignored  = "feedtest.v1.Ignored"
-	)
-	res, err := s.WorkspaceStore(scope).Append(ctx, es.AppendParams{
-		StreamID: sid,
-		Events: []es.EventData{
-			{TypeURL: consumed, SchemaVersion: 1, Payload: []byte("a1")},
-			{TypeURL: ignored, SchemaVersion: 1, Payload: []byte("b1")},
-			{TypeURL: consumed, SchemaVersion: 1, Payload: []byte("a2")},
-		},
-	})
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
-
-	srv := newPGFeedServer(t, s)
-	req := feed.Request{
-		Scope:      scope,
-		Projection: "p",
-		Instance:   "live",
-		Consumer:   "test",
-		// Caller-supplied owner: the fenced ack below must name it.
-		Owner:      "e2e-owner",
-		Definition: projection.Definition{Name: "p", Consumes: []string{consumed}},
-	}
-
-	// First subscription: collect the two consumed events, ack under the
-	// definition, then cancel.
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel1()
-	sink1 := &feedCancelSink{want: 2, cancel: cancel1, ack: func(ctx context.Context, pos uint64) error {
-		return srv.Checkpoint(ctx, feed.Ack{
-			Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
-			Owner: req.Owner, Position: pos,
-			// The ack records the subscription's fingerprint, so the
-			// resumed subscription crosses with a recorded identity.
-			Definition: req.Definition.Hash(),
-		})
-	}}
-	if err := srv.Subscribe(ctx1, req, sink1); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("subscribe 1: %v", err)
-	}
-
-	first := sink1.got()
-	if len(first) != 2 {
-		t.Fatalf("first subscription got %d events, want 2: %+v", len(first), first)
-	}
-	if first[0].GlobalPosition != res.Envelopes[0].GlobalPosition ||
-		first[1].GlobalPosition != res.Envelopes[2].GlobalPosition {
-		t.Fatalf("first subscription positions = %d,%d, want %d,%d (the consumed events, in order)",
-			first[0].GlobalPosition, first[1].GlobalPosition,
-			res.Envelopes[0].GlobalPosition, res.Envelopes[2].GlobalPosition)
-	}
-	acked := first[len(first)-1].GlobalPosition
-
-	// The checkpoint the acks wrote is durable in Postgres.
-	cp, found, err := postgres.NewCheckpointStore(s).Checkpoint(ctx, req.Scope, req.Projection, req.Instance)
-	if err != nil || !found {
-		t.Fatalf("checkpoint after the acks = found %v err %v, want found", found, err)
-	}
-	if cp.Position != acked {
-		t.Fatalf("checkpoint = %d, want the acked %d", cp.Position, acked)
-	}
-
-	// Append one more consumed event; the resumed subscription delivers
-	// exactly it — never the events before the checkpoint.
-	next := feedAppendEvent(t, ctx, s, scope, sid, 3, consumed, []byte("a3"))
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel2()
-	sink2 := &feedCancelSink{want: 1, cancel: cancel2}
-	if err := srv.Subscribe(ctx2, req, sink2); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("subscribe 2: %v", err)
-	}
-	second := sink2.got()
-	if len(second) != 1 {
-		t.Fatalf("resumed subscription got %d events, want 1: %+v", len(second), second)
-	}
-	if second[0].GlobalPosition != next.GlobalPosition {
-		t.Fatalf("resumed event position = %d, want %d (after checkpoint %d)",
-			second[0].GlobalPosition, next.GlobalPosition, acked)
-	}
-}
-
-// TestSkipResumesPastPoison walks the whole poison runbook end to end on
-// Postgres, mirroring the SQLite e2e: the over-cap row (inserted past
-// the append cap by raw SQL, the only way such a row can exist) kills a
-// live subscription with *feed.EventTooLargeError; the operator
-// deliberately skips past it; the dead letter lands in feed_dead_letters
-// as a complete pointer — the store names the event's type and size from
-// the log without ever scanning its payload — and the resubscription
-// delivers exactly the events after the poison position, never the
-// poison itself. The skipped subscription's definition fingerprint
-// survives the skip.
-func TestSkipResumesPastPoison(t *testing.T) {
-	ctx := context.Background()
-	s := openStoreWithOptions(t, postgres.WithMaxPayloadBytes(64))
-	const scope = "ws_skip_e2e"
-	const typ = "feedtest.v1.Poison"
-
-	// Global order: before < poison < after1 < after2. The poison row
-	// enters via raw SQL because the append cap refuses it.
-	before := feedAppendEvent(t, ctx, s, scope, feedStream(t, "poison-e2e-a"), 0, typ, []byte("ok"))
-	poisonGP := insertPoisonRow(t, ctx, s, scope, feedStream(t, "poison-e2e"), 1, typ, bytes.Repeat([]byte("p"), 4096))
-	after1 := feedAppendEvent(t, ctx, s, scope, feedStream(t, "poison-e2e-b"), 0, typ, []byte("after-1"))
-	after2 := feedAppendEvent(t, ctx, s, scope, feedStream(t, "poison-e2e-b"), 1, typ, []byte("after-2"))
-	if !(before.GlobalPosition < poisonGP && poisonGP < after1.GlobalPosition && after1.GlobalPosition < after2.GlobalPosition) {
-		t.Fatalf("insert order: before=%d poison=%d after=%d,%d, want the poison between the normal rows",
-			before.GlobalPosition, poisonGP, after1.GlobalPosition, after2.GlobalPosition)
-	}
-
-	srv := newPGFeedServer(t, s)
-	req := feed.Request{
-		Scope:      scope,
-		Projection: "p",
-		Instance:   "live",
-		Consumer:   "test",
-		Owner:      "skip-e2e-owner",
-		Definition: projection.Definition{Name: "p", Consumes: []string{typ}},
-	}
-
-	// The live subscription delivers the event before the poison, acks it
-	// under the definition, then dies on the poison row — never
-	// materialized, never delivered.
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel1()
-	sink := &feedAckingSink{ack: func(ctx context.Context, pos uint64) error {
-		return srv.Checkpoint(ctx, feed.Ack{
-			Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
-			Owner: req.Owner, Position: pos, Definition: req.Definition.Hash(),
-		})
-	}}
-	err := srv.Subscribe(ctx1, req, sink)
-	var tooLarge *feed.EventTooLargeError
-	if !errors.As(err, &tooLarge) {
-		t.Fatalf("subscribe error = %v (%T), want *feed.EventTooLargeError", err, err)
-	}
-	if tooLarge.Position != poisonGP || tooLarge.TypeURL != typ ||
-		tooLarge.Size != 4096 || tooLarge.Limit != 64 {
-		t.Fatalf("poison error = %+v, want position %d of type %q, 4096 bytes over the 64-byte cap",
-			tooLarge, poisonGP, typ)
-	}
-	if got := sink.got(); len(got) != 1 || got[0].GlobalPosition != before.GlobalPosition {
-		t.Fatalf("delivered before the poison = %v, want only the event at %d (the poison never delivered)",
-			positions(got), before.GlobalPosition)
-	}
-
-	// The operator skips past the poison. No force: the poison error
-	// killed the stream and released its lease, so the fence is free.
-	dbBefore := feedDBClock(t, ctx, s)
-	reason := "poison: 4096-byte payload over the 64-byte store cap"
-	if err := srv.Skip(ctx, feed.SkipRequest{
-		Scope: req.Scope, Projection: req.Projection, Instance: req.Instance,
-		Position: poisonGP, Actor: "oncall@example.com", Reason: reason,
-	}); err != nil {
-		t.Fatalf("Skip: %v", err)
-	}
-	dbAfter := feedDBClock(t, ctx, s)
-
-	// The dead letter landed as a complete pointer: the store named the
-	// event's type and size from the log (metadata only — the 4096-byte
-	// payload was never scanned), and the row carries the operator's
-	// reason and actor with the DB clock's created_at.
-	var (
-		typeURL     string
-		size        int
-		dlReason    string
-		dlActor     string
-		dlCreatedAt time.Time
-	)
-	if err := s.Pool().QueryRow(ctx,
-		`SELECT type_url, size_bytes, reason, actor, created_at FROM feed_dead_letters
-		 WHERE workspace_id = $1 AND projection = $2 AND instance = $3 AND position = $4`,
-		req.Scope, req.Projection, req.Instance, int64(poisonGP),
-	).Scan(&typeURL, &size, &dlReason, &dlActor, &dlCreatedAt); err != nil {
-		t.Fatalf("read the landed dead letter: %v", err)
-	}
-	if typeURL != typ || size != 4096 || dlReason != reason || dlActor != "oncall@example.com" {
-		t.Fatalf("dead letter row = (%q, %d, %q, %q), want the poison named with the audit fields",
-			typeURL, size, dlReason, dlActor)
-	}
-	if dlCreatedAt.Before(dbBefore) || dlCreatedAt.After(dbAfter) {
-		t.Fatalf("dead letter created_at = %v, want the DB clock between %v and %v", dlCreatedAt, dbBefore, dbAfter)
-	}
-
-	// The checkpoint advanced to the poison position with the ack's
-	// definition fingerprint preserved — a skip is a position advance,
-	// never a redefinition.
-	cp, found, err := postgres.NewCheckpointStore(s).Checkpoint(ctx, req.Scope, req.Projection, req.Instance)
-	if err != nil || !found {
-		t.Fatalf("checkpoint after the skip = found %v err %v", found, err)
-	}
-	if cp.Position != poisonGP {
-		t.Fatalf("checkpoint = %d after the skip, want the poison position %d", cp.Position, poisonGP)
-	}
-	if cp.DefinitionHash != req.Definition.Hash() {
-		t.Fatalf("definition hash = %q after the skip, want the acked %q preserved", cp.DefinitionHash, req.Definition.Hash())
-	}
-
-	// The resubscription delivers exactly the events after the poison —
-	// never the poison itself.
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel2()
-	sink2 := &feedCancelSink{want: 2, cancel: cancel2}
-	if err := srv.Subscribe(ctx2, req, sink2); err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("resubscribe: %v", err)
-	}
-	got := sink2.got()
-	want := []uint64{after1.GlobalPosition, after2.GlobalPosition}
-	if !slices.Equal(positions(got), want) {
-		t.Fatalf("resumed positions = %v, want %v (the events after the poison, never the poison itself)",
-			positions(got), want)
 	}
 }

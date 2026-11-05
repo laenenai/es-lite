@@ -20,14 +20,14 @@ import (
 //
 //	docker run -d --rm --name pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
 //	PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test ./postgres/...
-func openStore(t *testing.T) *postgres.Store {
+func openStore(t testing.TB) *postgres.Store {
 	t.Helper()
 	return openStoreWithOptions(t)
 }
 
 // openStoreWithOptions is openStore applying Open options, for tests that
 // configure the store (WithMaxPayloadBytes, WithoutAutoMigrate, ...).
-func openStoreWithOptions(t *testing.T, opts ...postgres.Option) *postgres.Store {
+func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store {
 	t.Helper()
 	dsn := os.Getenv("PG_DSN")
 	if dsn == "" {
