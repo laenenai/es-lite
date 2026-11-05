@@ -105,8 +105,10 @@ type Clock interface {
 type Request struct {
 	Scope      string
 	Projection string
-	Instance   string
-	Consumer   string
+	// Instance distinguishes concurrent subscriptions of one projection; the
+	// empty instance is the default instance.
+	Instance string
+	Consumer string
 	// Definition supplies the authorized event type set Subscribe forwards to
 	// Log.ReadAllBounded and the projection name used in logs/errors.
 	Definition projection.Definition
@@ -131,8 +133,9 @@ type Status struct {
 	LastCheckpointAt time.Time
 }
 
-// LeaseKey is the NUL-separated subscription identity. NUL cannot appear in a
-// scope, projection or instance name, so distinct triples cannot collide.
+// LeaseKey is the NUL-separated subscription identity. validateKey refuses
+// control bytes in every part, so NUL never occurs inside a part and distinct
+// triples cannot collide.
 func LeaseKey(scope, projection, instance string) string {
 	return scope + "\x00" + projection + "\x00" + instance
 }

@@ -586,6 +586,76 @@ func TestSubscribeRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+// Control bytes anywhere in a subscription identity are refused: LeaseKey
+// joins the parts with NUL, so a NUL inside a part would collide distinct
+// triples into one lease/checkpoint key — LeaseKey("a\x00b","c","i") equals
+// LeaseKey("a","b\x00c","i"). The empty instance stays legal: it is the
+// documented default instance.
+func TestValidateKeyRejectsControlBytes(t *testing.T) {
+	leases := newMemLeases()
+	// The waiter fails fast so that, if validation regresses and accepts the
+	// key, the stream errors out instead of idling and hanging the test.
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+		Waiter: &blockingWaiter{err: errors.New("wakeup source failed")},
+	})
+	sink := newMemSink()
+
+	for _, bad := range []string{"\x00", "\x01", "\x7f"} {
+		for _, field := range []string{"scope", "projection", "instance"} {
+			req := testRequest("live")
+			switch field {
+			case "scope":
+				req.Scope = "ten" + bad + "ant"
+			case "projection":
+				req.Projection = "counter." + bad + "view"
+				req.Definition.Name = req.Projection
+			case "instance":
+				req.Instance = "live" + bad
+			}
+			t.Run(fmt.Sprintf("%s %q", field, bad), func(t *testing.T) {
+				err := srv.Subscribe(context.Background(), req, sink)
+				if !errors.Is(err, feed.ErrInvalidRequest) {
+					t.Fatalf("Subscribe with %s %q: error = %v, want ErrInvalidRequest", field, bad, err)
+				}
+			})
+		}
+	}
+	if len(leases.acquired) != 0 {
+		t.Fatalf("rejected requests acquired %d lease(s); validation must fail closed before the lease store", len(leases.acquired))
+	}
+
+	// The empty instance is the documented default instance and stays valid.
+	if err := srv.Checkpoint(context.Background(), "tenant", "counter.view", "", 1); err != nil {
+		t.Fatalf("Checkpoint with the default (empty) instance: %v", err)
+	}
+}
+
+// Request.Projection and Definition.Name name the same projection. A silent
+// mismatch would stream one projection's type set but file its checkpoints
+// under another projection's name.
+func TestSubscribeRejectsProjectionNameMismatch(t *testing.T) {
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+		// A failing waiter keeps a regressed (accepted) request from idling
+		// forever: the stream errors out immediately instead.
+		Waiter: &blockingWaiter{err: errors.New("wakeup source failed")},
+	})
+	req := testRequest("live")
+	req.Projection = "counter-view"
+	req.Definition.Name = "counterview"
+
+	err := srv.Subscribe(context.Background(), req, newMemSink())
+	if !errors.Is(err, feed.ErrInvalidRequest) {
+		t.Fatalf("Subscribe with projection %q but definition %q: error = %v, want ErrInvalidRequest",
+			req.Projection, req.Definition.Name, err)
+	}
+	if len(leases.acquired) != 0 {
+		t.Fatal("a mismatched request acquired a lease")
+	}
+}
+
 func TestSubscribeAllowsOneSubscriberPerKey(t *testing.T) {
 	checkpoints := newMemCheckpoints(time.Now())
 	leases := newMemLeases()
@@ -998,6 +1068,28 @@ func TestSubscribeJoinsAStreamErrorRacingLeaseLoss(t *testing.T) {
 	}
 }
 
+// The stream runs under a child of the caller's ctx, so a caller deadline is
+// echoed by the stream's own context error. Joining both would report the
+// same deadline twice.
+func TestSubscribeJoinsDeadlineExceededOnce(t *testing.T) {
+	leases := newMemLeases()
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+		Waiter: &blockingWaiter{},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := srv.Subscribe(ctx, testRequest("live"), newMemSink())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if n := strings.Count(err.Error(), "deadline exceeded"); n != 1 {
+		t.Fatalf("error mentions the deadline %d times, want exactly once: %q", n, err)
+	}
+	waitHeld(t, leases, feed.LeaseKey("tenant", "counter.view", "live"), false)
+}
+
 // A store may report an error after it took the lease. (true, err) means the
 // key was acquired, so Subscribe must release it before returning.
 func TestSubscribeReleasesALeaseAcquiredWithAnError(t *testing.T) {
@@ -1102,6 +1194,50 @@ func TestSubscribeBatchSizeDefaultsAndClamps(t *testing.T) {
 			_ = await(t, done)
 		})
 	}
+}
+
+// Negative size/budget values have deliberate, opposite semantics: a negative
+// MaxPayloadBytes disables the payload check entirely, while a negative
+// MaxBatchBytes falls back to the default budget — the log always receives a
+// positive budget.
+func TestConfigNegativeValueSemantics(t *testing.T) {
+	t.Run("negative MaxPayloadBytes disables the size check", func(t *testing.T) {
+		// One byte past the documented 8 MiB default: the default would
+		// reject this event, the disabled check must deliver it.
+		const overDefault = 8<<20 + 1
+		logs := newMemLogs(ev(1, "counter.v1.Incremented", strings.Repeat("x", overDefault)))
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+			Waiter:          &blockingWaiter{},
+			MaxPayloadBytes: -1,
+		})
+		sink := newMemSink()
+		cancel, done := start(t, srv, testRequest("live"), sink)
+
+		got := sink.waitFor(t, 1)
+		if len(got[0].Payload) != overDefault {
+			t.Fatalf("payload sent = %d bytes, want %d (the negative limit must not reject)", len(got[0].Payload), overDefault)
+		}
+		cancel()
+		_ = await(t, done)
+	})
+
+	t.Run("negative MaxBatchBytes uses the default budget", func(t *testing.T) {
+		logs := newMemLogs()
+		srv := newServer(t, feed.Config{
+			Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+			Waiter:        &blockingWaiter{},
+			MaxBatchBytes: -1,
+		})
+		cancel, done := start(t, srv, testRequest("live"), newMemSink())
+
+		calls := waitCalls(t, logs, 1)
+		if calls[0].maxBytes != 16<<20 {
+			t.Fatalf("ReadAllBounded maxBytes = %d, want the documented 16 MiB default", calls[0].maxBytes)
+		}
+		cancel()
+		_ = await(t, done)
+	})
 }
 
 func TestCheckpointSavesThePosition(t *testing.T) {

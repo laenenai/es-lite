@@ -2,6 +2,7 @@ package feed
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -77,5 +78,49 @@ func TestNewServerRejectsAnUnrenewableLeaseTTL(t *testing.T) {
 	}
 	if _, err := NewServer(cfg); err == nil {
 		t.Fatal("NewServer accepted a 1ns lease TTL it cannot renew")
+	}
+}
+
+// Without entropy no safe owner can be minted: a constant prefix would
+// collide across processes. NewServer must propagate the failure, not mask it.
+func TestNewPrefixPropagatesEntropyError(t *testing.T) {
+	cause := errors.New("entropy source failed")
+	orig := randRead
+	randRead = func([]byte) (int, error) { return 0, cause }
+	t.Cleanup(func() { randRead = orig })
+
+	_, err := NewServer(Config{Checkpoints: stubCheckpoints{}, Leases: stubLeases{}, Logs: stubLogs{}})
+	if err == nil {
+		t.Fatal("NewServer minted a prefix without entropy; want an error")
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want the entropy cause", err)
+	}
+}
+
+// Negative MaxPayloadBytes is kept as-is (the stream treats it as "check
+// disabled"); negative MaxBatchBytes is replaced by the default, because the
+// Log contract requires a positive budget.
+func TestNewServerNegativeConfigSemantics(t *testing.T) {
+	base := Config{Checkpoints: stubCheckpoints{}, Leases: stubLeases{}, Logs: stubLogs{}}
+
+	cfg := base
+	cfg.MaxPayloadBytes = -1
+	srv, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if srv.cfg.MaxPayloadBytes != -1 {
+		t.Fatalf("MaxPayloadBytes = %d, want -1 kept (negative disables the check)", srv.cfg.MaxPayloadBytes)
+	}
+
+	cfg = base
+	cfg.MaxBatchBytes = -1
+	srv, err = NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if srv.cfg.MaxBatchBytes != defaultMaxBatchBytes {
+		t.Fatalf("MaxBatchBytes = %d, want the default %d", srv.cfg.MaxBatchBytes, defaultMaxBatchBytes)
 	}
 }

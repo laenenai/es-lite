@@ -47,10 +47,12 @@ type Config struct {
 	// MaxBatch caps Request.BatchSize. Default 1000; Batch is clamped to it.
 	MaxBatch int
 	// MaxPayloadBytes rejects a single stored payload larger than this before
-	// it is sent. Default 8 MiB; a negative value disables the check.
+	// it is sent. Default 8 MiB; zero takes the default and a negative value
+	// disables the check.
 	MaxPayloadBytes int
-	// MaxBatchBytes is the byte budget passed to Log.ReadAllBounded.
-	// Default 16 MiB.
+	// MaxBatchBytes is the byte budget passed to Log.ReadAllBounded, which
+	// requires a positive budget. Default 16 MiB; zero and negative values
+	// take the default, so the log never receives a non-positive budget.
 	MaxBatchBytes int
 	// Poll is the idle wait between short pages. Default 250ms.
 	Poll time.Duration
@@ -117,21 +119,31 @@ func NewServer(cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("feed: Config.LeaseTTL %v is too small to renew safely", cfg.LeaseTTL)
 		}
 	}
-	return &Server{cfg: cfg, prefix: newPrefix()}, nil
+	prefix, err := newPrefix()
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, prefix: prefix}, nil
 }
 
 type systemClock struct{}
 
 func (systemClock) Now() time.Time { return time.Now() }
 
+// randRead supplies newPrefix's entropy. It is a variable so the internal
+// test can force an entropy failure.
+var randRead = rand.Read
+
 // newPrefix returns a per-Server random identifier so lease owners are unique
-// across processes without another dependency.
-func newPrefix() string {
+// across processes without another dependency. Without entropy no safe owner
+// can be minted — a constant prefix would collide across processes — so the
+// error is propagated instead of masked.
+func newPrefix() (string, error) {
 	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "feed"
+	if _, err := randRead(b[:]); err != nil {
+		return "", fmt.Errorf("feed: generate lease owner prefix: %w", err)
 	}
-	return hex.EncodeToString(b[:])
+	return hex.EncodeToString(b[:]), nil
 }
 
 // newOwner returns a process-unique lease owner. The sequence keeps owners
@@ -204,9 +216,10 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	streamErr := s.stream(runCtx, req, sink, s.batchSize(req.BatchSize))
 
 	// Collect the independent causes instead of letting one silently replace
-	// another. A stream error caused by our own cancellation is derived, not a
-	// diagnosis, and is dropped; a real send/read error that races a lease loss
-	// is joined so both remain visible.
+	// another. A stream error caused by our own cancellation, or by the
+	// caller's own deadline arriving, is derived, not a diagnosis, and is
+	// dropped; a real send/read error that races a lease loss is joined so
+	// both remain visible.
 	var leaseErr error
 	select {
 	case leaseErr = <-lost:
@@ -216,11 +229,18 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	if leaseErr != nil {
 		causes = append(causes, leaseErr)
 	}
+	callerExpired := false
 	if callerErr := ctx.Err(); callerErr != nil {
+		callerExpired = true
 		causes = append(causes, callerErr)
 	}
 	if len(causes) > 0 {
-		if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
+		// The stream runs under a child of ctx, so a caller deadline reaches
+		// it too: the stream's own deadline error is the caller's error echoed
+		// back, and joining it would report the same deadline twice.
+		derived := errors.Is(streamErr, context.Canceled) ||
+			(callerExpired && errors.Is(streamErr, context.DeadlineExceeded))
+		if streamErr != nil && !derived {
 			causes = append(causes, streamErr)
 		}
 		if len(causes) == 1 {
@@ -362,7 +382,7 @@ func (s *Server) batchSize(requested int) int {
 // Checkpoint records the consumer's acknowledged position. The consumer calls
 // this through the transport adapter; Subscribe itself never saves.
 func (s *Server) Checkpoint(ctx context.Context, scope, projection, instance string, position uint64) error {
-	if err := validateKey(scope, projection); err != nil {
+	if err := validateKey(scope, projection, instance); err != nil {
 		return err
 	}
 	if err := s.cfg.Checkpoints.Save(ctx, scope, projection, instance, position); err != nil {
@@ -375,7 +395,7 @@ func (s *Server) Checkpoint(ctx context.Context, scope, projection, instance str
 // refuses while a lease is held. Authorizing force is the caller's job: the
 // core only enforces the lease.
 func (s *Server) ResetCheckpoint(ctx context.Context, scope, projection, instance string, position uint64, force bool) error {
-	if err := validateKey(scope, projection); err != nil {
+	if err := validateKey(scope, projection, instance); err != nil {
 		return err
 	}
 	if !force {
@@ -392,7 +412,7 @@ func (s *Server) ResetCheckpoint(ctx context.Context, scope, projection, instanc
 // DeleteSubscription removes the checkpoint. It refuses while a lease is held;
 // releasing leases (including expired ones) is the store adapter's job.
 func (s *Server) DeleteSubscription(ctx context.Context, scope, projection, instance string) error {
-	if err := validateKey(scope, projection); err != nil {
+	if err := validateKey(scope, projection, instance); err != nil {
 		return err
 	}
 	if err := s.refuseIfHeld(ctx, scope, projection, instance); err != nil {
@@ -408,7 +428,7 @@ func (s *Server) DeleteSubscription(ctx context.Context, scope, projection, inst
 // active lease holder. Lag is head - position, and is negative when the
 // checkpoint is ahead of a restored log.
 func (s *Server) Status(ctx context.Context, scope, projection, instance string) (Status, error) {
-	if err := validateKey(scope, projection); err != nil {
+	if err := validateKey(scope, projection, instance); err != nil {
 		return Status{}, err
 	}
 	pos, err := s.cfg.Checkpoints.Load(ctx, scope, projection, instance)
@@ -460,13 +480,19 @@ func (s *Server) refuseIfHeld(ctx context.Context, scope, projection, instance s
 // validateRequest checks the fields Subscribe cannot infer. Definition must
 // carry a name and at least one consumed type: the caller resolves and
 // authorizes it before subscribing, and an empty definition would seal the
-// stream silently.
+// stream silently. Projection must equal Definition.Name — they name the same
+// projection, and a mismatch would stream one projection's type set but file
+// its checkpoints under another projection's name.
 func validateRequest(req Request, sink Sink) error {
-	if err := validateKey(req.Scope, req.Projection); err != nil {
+	if err := validateKey(req.Scope, req.Projection, req.Instance); err != nil {
 		return err
 	}
 	if req.Definition.Name == "" {
 		return fmt.Errorf("%w: definition name is required", ErrInvalidRequest)
+	}
+	if req.Definition.Name != req.Projection {
+		return fmt.Errorf("%w: projection %q does not match definition name %q",
+			ErrInvalidRequest, req.Projection, req.Definition.Name)
 	}
 	if len(req.Definition.Consumes) == 0 {
 		return fmt.Errorf("%w: definition consumes is required", ErrInvalidRequest)
@@ -477,12 +503,34 @@ func validateRequest(req Request, sink Sink) error {
 	return nil
 }
 
-func validateKey(scope, projection string) error {
-	if scope == "" {
-		return fmt.Errorf("%w: scope is required", ErrInvalidRequest)
+// containsControl reports whether s contains an ASCII control byte (C0
+// controls or DEL). LeaseKey joins the key parts with NUL, so a control byte
+// inside any part would let distinct triples collide into one key.
+func containsControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return true
+		}
 	}
-	if projection == "" {
+	return false
+}
+
+// validateKey checks one subscription identity. Scope and projection are
+// required; instance may be empty (the documented default instance). Control
+// bytes are refused in every part: LeaseKey joins the parts with NUL, so a
+// NUL inside a part would make distinct triples collide.
+func validateKey(scope, projection, instance string) error {
+	switch {
+	case scope == "":
+		return fmt.Errorf("%w: scope is required", ErrInvalidRequest)
+	case projection == "":
 		return fmt.Errorf("%w: projection is required", ErrInvalidRequest)
+	case containsControl(scope):
+		return fmt.Errorf("%w: scope contains a control byte", ErrInvalidRequest)
+	case containsControl(projection):
+		return fmt.Errorf("%w: projection contains a control byte", ErrInvalidRequest)
+	case containsControl(instance):
+		return fmt.Errorf("%w: instance contains a control byte", ErrInvalidRequest)
 	}
 	return nil
 }
