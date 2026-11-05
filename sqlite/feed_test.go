@@ -841,6 +841,39 @@ func TestLeaseDistinctTriplesNeverCollide(t *testing.T) {
 	}
 }
 
+// TestLeaseStoreKeyCompositionIsPinned pins the persisted storage contract:
+// feed_leases.key holds the NUL-joined triple, byte-exactly. Lease rows are
+// durable state an upgrade must keep reading — a composition change
+// (different separator, different part order) would pass the collision test
+// above yet orphan every existing row, splitting the lease domain and
+// admitting duplicate subscribers. This is a regression pin, green-on-arrival
+// by design: it pins current storage behavior so a future composition change
+// fails loudly here. It reads the stored row directly, after
+// insertFeedRowDirect's raw-SQL pattern, because the public API never
+// exposes the composed key.
+func TestLeaseStoreKeyCompositionIsPinned(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+	leases := sqlite.NewLeaseStore(s)
+
+	// "/" inside a part is the byte most likely to betray a composition
+	// change (a naive separator swap); the surrounding parts make every
+	// byte position assertable.
+	if ok, err := leases.Acquire(ctx, "ws", "a/b", "c", "owner-a", "consumer-a", time.Minute); err != nil || !ok {
+		t.Fatalf("acquire = %v err=%v, want true/nil", ok, err)
+	}
+
+	var key string
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT key FROM feed_leases WHERE owner = ?`, "owner-a",
+	).Scan(&key); err != nil {
+		t.Fatalf("read stored lease row: %v", err)
+	}
+	if want := "ws\x00a/b\x00c"; key != want {
+		t.Fatalf("stored feed_leases.key = %q, want %q (the NUL-joined triple, byte-exact)", key, want)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // End to end: Store + feed.Server
 // ---------------------------------------------------------------------------
