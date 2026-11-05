@@ -21,6 +21,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -95,6 +96,21 @@ type Store struct {
 	// (WithMaxPayloadBytes): appends holding a larger payload are rejected
 	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
 	maxPayloadBytes int
+
+	// relayRoleOnce runs Drain's es_relay startup check (checkRelayRole)
+	// at most once per Store. Migration 0005 gates the RLS bypass on that
+	// membership. The verdict is cached on the Store rather than the
+	// package: a process is expected to hold one Store (see Store's doc),
+	// so this is once per process, and a Store opened later — a different
+	// principal, or after the runbook's GRANT — re-verifies instead of
+	// inheriting another pool's verdict.
+	relayRoleOnce sync.Once
+
+	// relayRoleErr is the cached verdict of checkRelayRole:
+	// ErrRelayRoleMissing (wrapped, runbook in the message) when the
+	// session user is not an es_relay member, or the probe's own error.
+	// Nil means the check passed.
+	relayRoleErr error
 }
 
 // Open connects to Postgres and applies migrations (unless WithoutAutoMigrate).

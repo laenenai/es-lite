@@ -88,6 +88,12 @@ tasks:
       - docker rm -f es-lite-pg 2>/dev/null || true
       - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
       - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      # Test-setup roles (spec §5.7): migrations never create roles (migrator
+      # privileges vary), so the container setup owns them, granted to the
+      # test user. es_relay gates Drain's RLS bypass (migration 0005) and
+      # es_rls_probe is the non-superuser the RLS policy probes SET ROLE into.
+      # The container is fresh (rm -f + run above), so CREATE ROLE cannot collide.
+      - docker exec es-lite-pg psql -U postgres -d eslite -v ON_ERROR_STOP=1 -c "CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS; CREATE ROLE es_rls_probe NOLOGIN NOSUPERUSER NOBYPASSRLS; GRANT es_relay, es_rls_probe TO postgres"
       - defer: docker rm -f es-lite-pg
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -count=1 ./postgres/...
 

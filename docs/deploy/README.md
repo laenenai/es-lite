@@ -76,3 +76,33 @@ Once this runbook step is done, migration 0003 is a **no-op**: its
 `CREATE INDEX IF NOT EXISTS` statements find the parent indexes already in
 place. Databases that skip the manual step pay a blocking build inside the
 migration — acceptable only for small databases.
+
+## Relay role and RLS bypass (migration 0005)
+
+`Drain` — the delivery relay — is the only reader that works across
+workspaces, through the `app.bypass_rls` arm of the `events` and
+`unique_claims` policies. Migration 0005 role-gates that arm: it
+additionally requires `pg_has_role(current_user, 'es_relay', 'member')`,
+so the GUC alone — settable by any session — no longer lifts workspace
+isolation. `Store.Drain` verifies the membership once at startup and fails
+fast with `postgres.ErrRelayRoleMissing` instead of silently claiming zero
+rows, which would look exactly like an idle backlog.
+
+**Create the role and grant it before upgrading** — the create-role-then-
+migrate ordering is part of the migration. The moment 0005 applies, the
+bypass stops working for every session outside `es_relay`: with the grant
+already in place the relay keeps draining; without it, the relay fails fast
+on its next `Drain`:
+
+```sql
+-- before the upgrade that carries migration 0005:
+CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS;
+GRANT es_relay TO <the relay's login role>;
+```
+
+The membership verdict is checked once per `Store` and stands for its
+lifetime: after granting a missed role, restart the relay (a freshly
+opened `Store` re-verifies). Superusers are implicitly members of every
+role, so migrations and psql/admin tooling are unaffected; and ordinary
+workspace-pinned traffic takes the policies' workspace arm and never
+depends on `es_relay` existing.
