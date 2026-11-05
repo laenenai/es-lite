@@ -353,7 +353,8 @@ func (s *Server) Skip(ctx context.Context, sr SkipRequest) error
 - Produces: `feedtest.RunLog(t, newLog)`, `feedtest.RunCheckpoints(t, newStore)`, `feedtest.RunLeases(t, newStore)`, `feedtest.RunAll(t, fixture)` where the constructors are `func(ctx context.Context, t testing.TB) (T, func())` (the `func()` is the cleanup) and `fixture` carries optional backend capabilities (e.g. `MultiWorkspace bool` for the RLS test). Platform adapters must pass the same suite.
 
 - [ ] **Step 1: Extract** the contract behaviors (spec §5.6 list) from `sqlite/feed_test.go` into `feedtest`: monotonic-vs-rewinding Save, expiry boundaries, owner-guarded renew/release, empty types, first-row-over-budget, `truncated` at exact budget, `*EventTooLargeError` without payload, definition-hash round-trip + preserve-on-empty, and the cross-workspace refusal when `MultiWorkspace`.
-- [ ] **Step 2: Rewire** the sqlite and postgres adapter tests to the suite, keeping only backend-specific tests local.
+- [ ] **Step 2: Rewire** the sqlite and postgres adapter tests to the suite, keeping only backend-specific tests local. Normalize cross-backend divergences deliberately: `CreatedAt` is DB-clock on Postgres (`clock_timestamp()`) and caller-supplied on sqlite — assert presence/reasonableness, not exact equality.
+- [ ] **Step 2b: Swap the feedgate consumer stores from the in-memory fakes to the real Postgres adapters** (`postgres.NewCheckpointStore`/`NewLeaseStore`/`NewLogs` from Task 13; the DeadLetterStore stays nil — the gate has no poison path), completing Task 7's stand-in note: the chaos gate's store close/reopen now exercises real durable checkpoints. Verify the feedgate still passes under `-race -shuffle=on` (docker commands; the controller re-runs it too).
 - [ ] **Step 3: Run both suites** — green.
 - [ ] **Step 4: Commit** — `test: shared feedtest conformance suite`
 
