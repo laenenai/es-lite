@@ -112,7 +112,8 @@ way, and the returned `Envelope` reflects the truncated values.
   server returns `prev_hash`/`hash` and the client recomputes from the sealed
   bytes it holds. No new `Store` method.
 - `cmd/es-verify` wraps it for operators: `es-verify stream <ws> <type:id>`,
-  `es-verify all` (Postgres under `app.bypass_rls`, like `Drain`), and
+  `es-verify all` (Postgres under the role-gated `app.bypass_rls` bypass —
+  `es_relay` membership required, migration 0005 — like `Drain`), and
   `es-verify anchor …` (§4). Exit status is the audit result.
 - `ChainReport` carries `ChainedFrom` (the first version with a hash — see §5),
   `Head`, `HeadHash`, and the first broken version, if any.
@@ -134,9 +135,13 @@ periodically fixing the heads **outside** the database:
   `global_position <= upto_global_position`. (A flat hash, not a Merkle tree:
   a membership proof for one stream is not a requirement yet; a tree can
   replace the root later without changing the row shape.)
-- Produced by `es-verify anchor` (cron/job) or by `es-lited` on
-  `ANCHOR_INTERVAL` under the existing `leader` election, exactly as the
-  in-process relay runs. Computation runs under `app.bypass_rls`.
+- Produced by `es-verify anchor` from the operator's own CronJob or
+  scheduler (historical: the `es-lited` `ANCHOR_INTERVAL` scheduling this
+  section originally described was removed with the daemon by ADR 0036 —
+  the deploy runbook records the replacement). Computation runs under the
+  role-gated `app.bypass_rls` bypass: `es_relay` membership is required
+  (migration 0005) and the anchor path verifies it at startup instead of
+  silently anchoring zero heads.
 - **Export is the point**: the anchor row is printed/JSON-exported and the
   operator publishes it somewhere the database operator cannot rewrite (a
   signed git commit, a transparency log, a timestamping authority). es-lite
@@ -255,10 +260,14 @@ verifier must be in Go anyway. One encoding, one implementation.
   expose `ChainedSince(ctx)` and `es-verify` passes it through.
 - **Anchors** are behind `es.Anchorer` (`Anchor`, `ListAnchors`,
   `CheckAnchor`, `ListStreams`), implemented by `sqlite.Store` and
-  `postgres.Store` (the latter under `app.bypass_rls`; the `anchors` table's
-  RLS policy admits only that setting). `es-lited` takes anchors on
-  `ANCHOR_INTERVAL` under its own leader key (`anchor.<prefix>`), reusing the
-  relay's election wiring.
+  `postgres.Store` (the latter under the role-gated `app.bypass_rls`
+  bypass: the `anchors` table's RLS policy admits that setting, and
+  migration 0005 additionally requires `es_relay` membership — verified
+  once per `Store` at startup so a non-member fails fast instead of
+  recording an anchor over zero heads; see the deploy runbook). The
+  operator's CronJob schedules `es-verify anchor`; the `es-lited`
+  `ANCHOR_INTERVAL` scheduler this section originally described was
+  removed with the daemon by ADR 0036.
 - **Postgres `Append`** now sets `Envelope.Workspace` on the returned
   envelopes (it did not before) — the hash covers the workspace, and a
   verifier reads it back from the row. Both adapters truncate timestamps to

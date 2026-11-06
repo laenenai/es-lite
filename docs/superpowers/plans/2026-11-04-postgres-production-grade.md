@@ -4,7 +4,7 @@
 
 **Goal:** Make the Postgres feed path production-grade — commit-safe reads with zero skipped events, lease-fenced acknowledgements, a bounded and audited poison path, index-served pages, fail-closed definition drift, in-repo Postgres feed adapters plus the `eventfeed` consumer adapter, and observable stalls.
 
-**Architecture:** Replace the naive position cursor with a *settled ceiling* (each page bounds delivery by the sequence value recorded one round earlier, delivered only once the snapshot horizon has passed that round's xmax — design §5.1). Fence acks through a caller-supplied lease owner carried in `feed.Ack`. Record skipped poison events in a dead-letter table next to the immutable log. Ship the Postgres `CheckpointStore`/`LeaseStore`/`Logs` adapters and the `eventfeed` consumer adapter behind one shared `feedtest` conformance suite.
+**Architecture:** Replace the naive position cursor with a *horizon fence* (each page records the sequence value L, draws the reader's own transaction id R immediately after reading it, and delivers below L only once every snapshot reports `xmin ≥ R`; appends draw their xid in their existing first statement — design §5.1 rev 3, chosen after the Task 1 spike falsified the original settled ceiling). Fence acks through a caller-supplied lease owner carried in `feed.Ack`. Record skipped poison events in a dead-letter table next to the immutable log. Ship the Postgres `CheckpointStore`/`LeaseStore`/`Logs` adapters and the `eventfeed` consumer adapter behind one shared `feedtest` conformance suite.
 
 **Tech Stack:** Go 1.27.3, pgx v5, modernc.org/sqlite. No new dependencies.
 
@@ -12,15 +12,15 @@
 
 ## Global Constraints
 
-- No write-path change: appends take no new locks, commits, or extra round trips (spec §3 anti-goal).
+- No write-path regression: appends take no new locks and no extra commits; the append issues one bare read-only `SELECT pg_current_xact_id()` statement before `readHead` — one extra round trip per append, the accepted price of commit-safe reads (spec §3 anti-goal, §5.1 fact P1; Task 1b falsified the zero-cost `readHead` fold on empty streams: no row means the target list never evaluates).
 - Payloads are opaque (ADR 0025): never logged, never copied; errors carry positions, type URLs and sizes only.
 - Migrations are append-only and transactional (ADR 0010) — no `CREATE INDEX CONCURRENTLY` inside migrations; heavy indexes are built runbook-first. Numbering by landing order: **postgres 0003** (indexes), **0004** (feed tables), **0005** (RLS role policies); **sqlite 0004** (definition hash column + dead letters, lands with Task 11 and 12 together).
 - New Postgres feed tables get RLS policies with **no bypass arm** (spec §5.6).
 - Breaking changes to `feed` ports and `Server` methods are allowed (pre-1.0). Error style: `es:` prefix sentinels in `es/errors.go`, `feed:` prefix in `feed/errors.go`.
 - Postgres tests require `PG_DSN` — run via `task test:pg` (Docker `postgres:17`). Plain `GOWORK=off go test ./...` must stay green without it (PG tests skip).
 - Conventional commits matching history (`feat(postgres): ...`, `test(feed): ...`).
-- The settled-ceiling losslessness argument (spec §5.1.3) is reproduced as a comment on the implementation.
-- `Workspace` instances are per-stream (`feed.Logs.Open` runs once per stream); ceiling state on the instance is correct without sharing.
+- The horizon-fence losslessness argument (spec §5.1.3) is reproduced as a comment on the implementation.
+- `Workspace` instances are per-stream (`feed.Logs.Open` runs once per stream); fence state on the instance is correct without sharing.
 
 ## Review Focus
 
@@ -54,36 +54,54 @@ The failure modes the spec's §8 says must not be reintroduced, and the test tha
 - [ ] **Step 3: Record findings in the PR description** (observed snapshot semantics, surprises, measured idle fast-path). If falsified: STOP and escalate.
 - [ ] **Step 4: Delete the spike file** (`rm postgres/spike_ceiling_test.go`). No commit — throwaway by design; the straddle PoC returns as a red test in Task 2.
 
+**Outcome (2026-11-04): assumption (a) FALSIFIED** on PostgreSQL 17.11 — snapshot xmax is the commit horizon and skips in-flight xids at or above it, so a lone in-flight append looks "idle" to every snapshot; at the straddle gap step the spike recorded `789:789` with tx2 provably in flight. The §5.1 mechanism (rev 2) is dead. The human chose the horizon fence (spec §5.1 rev 3); this task is superseded by Task 1b. Full report: `.superpowers/sdd/2026-11-04-postgres-production-grade/task-1-report.md`.
+
+### Task 1b: Re-spike the horizon-fence assumptions (throwaway)
+
+**Files:**
+- Create: `postgres/spike_fence_test.go` — deleted before the task ends.
+
+**Interfaces:**
+- Produces: a go/no-go per spec §5.1.4. Assumption (1) failing → apply the documented open-tx fallback shape and record it; (3) failing → apply the extra-statement fallback; anything else — STOP and escalate.
+
+- [ ] **Step 1: Write the spike test** (PG_DSN-gated, `t.Skip` without it), subtests per spec §5.1.4:
+  (a) *Abort advances the horizon:* draw `R` via `SELECT pg_current_xact_id()` in a tx on connection A; roll back; from connection B, a fresh statement observes `pg_snapshot_xmin(pg_current_snapshot()) >= R`.
+  (b) *Fence engages on the straddle:* replay the Task 1 straddle (tx1: gp=1 then gp=3; tx2: gp=2; commit tx1 only). Reader: read `L` (`last_value`), draw `R`, roll back, fence-check — assert `xmin < R` while tx2 is in flight; after tx2 commits, assert `xmin >= R` and that reading rows ≤ L yields positions `[1 2 3]`.
+  (c) *readHead fold assigns the xid:* on an open append tx, `pg_stat_activity.backend_xid` (read from a second connection) is NULL before the readHead query runs and non-NULL after it.
+  (d) *Lone in-flight append:* one uncommitted `AppendTx`; the reader fences — `xmin < R`; after commit, `xmin >= R` and rows ≤ L deliver.
+- [ ] **Step 2: Run** `task test:pg` (direct docker commands per the Task 1 environment note) — expected: all subtests PASS.
+- [ ] **Step 3: Record observed values in the report file.** If any assumption fails: apply the documented fallback for (1)/(3) and note it; otherwise STOP and escalate.
+- [ ] **Step 4: Delete the spike file** (`rm postgres/spike_fence_test.go`). No commit — throwaway by design.
+
 ---
 
 ## Phase 1 — Gate 0
 
-### Task 2: Red ordering tests + the settled ceiling in `ReadAllBounded`
+### Task 2: Red ordering tests + the horizon fence in `ReadAllBounded`
 
 **Files:**
-- Modify: `postgres/wsstore.go` (Workspace state, `ReadAllBounded`)
+- Modify: `postgres/wsstore.go` (Workspace state, `ReadAllBounded`, and the append path's bare xid-draw statement)
 - Test: `postgres/feed_test.go` (new, PG_DSN-gated); `sqlite/feed_test.go` (one new test)
 
 **Interfaces:**
 - Consumes: `Workspace.AppendTx(ctx, db DBTX, p es.AppendParams)` (existing, `wsstore.go:83`), `Store.Pool()`.
-- Produces: `ReadAllBounded` with the same signature, now ceiling-bounded; unexported `roundMeta{xmin, xmax, lastPos uint64}` and `readRoundMeta` on `Workspace`; used by Task 3 (Head/RawHead) and Task 16.
+- Produces: `ReadAllBounded` with the same signature, now fence-bounded; unexported helpers on `Workspace` — `readLastPosition(ctx) (uint64, error)` (statement 1), `drawFence(ctx) (uint64, error)` (statement 2: draw R, roll back), `fenceCleared(ctx, r uint64) (bool, error)` (statement 3: `pg_snapshot_xmin(pg_current_snapshot()) >= R`) — used by Task 3 (Head/RawHead) and Task 16.
 
 - [ ] **Step 1: Write the failing test** `TestReadAllBoundedWaitsForOutOfOrderCommit`:
-  tx1 Begin + AppendTx batch A (gp=1); tx2 Begin + AppendTx batch B (gp=2); commit tx2 **first**. `ws.ReadAllBounded(ctx, 0, 100, 0, allTypes)` must return an empty page (ceiling establishment — never `[2]` alone). Commit tx1; poll until non-empty; assert the page is `[1, 2]` in order.
+  tx1 Begin + AppendTx batch A (gp=1); tx2 Begin + AppendTx batch B (gp=2); commit tx2 **first**. `ws.ReadAllBounded(ctx, 0, 100, 0, allTypes)` must return an empty page (fence establishment — never `[2]` alone). Commit tx1; poll until non-empty; assert the page is `[1, 2]` in order.
 - [ ] **Step 2: Write the failing test** `TestReadAllBoundedWaitsForStraddledCommit` (Review Focus 1):
   tx1 appends gp=1; tx2 appends gp=2; tx1 appends gp=3 (same tx as its first append — positions 1 and 3 belong to tx1, 2 to tx2); commit tx1 only. `ReadAllBounded(ctx, 0, ...)` must NOT deliver `[1, 3]` — it returns empty. Commit tx2; poll; assert `[1, 2, 3]`.
 - [ ] **Step 3: Write the failing test** `TestReadAllBoundedPassesAbortedHole`:
   tx1 gp=1 committed; tx2 gp=2 rolled back; tx3 gp=3 committed. `ReadAllBounded(ctx, 0, ...)` returns `[1, 3]`; a read from 3 returns empty (no stall).
 - [ ] **Step 4: Run** `task test:pg` — expected: the three tests **FAIL** against current code (red proof of the P0; `[2]`-alone, `[1,3]`, and the hole stall are the failure signatures).
-- [ ] **Step 5: Implement the ceiling** in `postgres/wsstore.go`:
-  - Add state to `Workspace`: `mu sync.Mutex; ceiling uint64; ceilingXmax uint64` (0 = none), with the §5.1.3 losslessness argument as the doc comment.
-  - `readRoundMeta(ctx, db DBTX) (roundMeta, error)` — one statement: `SELECT pg_snapshot_xmin(pg_current_snapshot()), pg_snapshot_xmax(pg_current_snapshot()), last_value FROM events_global_position_seq`.
-  - In `ReadAllBounded`'s existing tx, after `setWorkspace`: read meta; under `mu` compute the bound —
-    fast path `meta.xmin >= meta.xmax` → bound = `meta.lastPos`; store `(ceiling=meta.lastPos, ceilingXmax=meta.xmax)`;
-    slow path `ceiling > 0 && meta.xmin >= ceilingXmax` → bound = `ceiling`; then roll the stored ceiling to `(meta.lastPos, meta.xmax)`;
-    otherwise → store `(meta.lastPos, meta.xmax)` and return `nil, false, nil` (empty page; the feed's existing wait cycle retries).
-  - Add `AND global_position <= $5` (the bound) to the page query; when `bound <= from`, return an empty page without querying rows.
-  - Budget/type/truncated logic unchanged.
+- [ ] **Step 5: Implement the fence** in `postgres/wsstore.go` (spec §5.1.1 rev 3, round shape):
+  - Add state to `Workspace`: `mu sync.Mutex; boundL uint64; fenceR uint64` (0 = none), with the §5.1.3 losslessness argument (P1/P2 plus the two spike-verified facts) as the doc comment.
+  - `readLastPosition(ctx)` — `SELECT last_value FROM events_global_position_seq` (no tx).
+  - `drawFence(ctx)` — in a short tx: `SELECT pg_current_xact_id()`, then roll back (the abort settles R immediately — Task 1b assumption (1)).
+  - `fenceCleared(ctx, r)` — `SELECT pg_snapshot_xmin(pg_current_snapshot()) >= $1`.
+  - In `ReadAllBounded`, before the existing page tx: under `mu` — stored state exists → run `fenceCleared(fenceR)`: cleared → bound = `boundL`, drop the state; blocked → return `nil, false, nil` (empty page). No stored state → `L := readLastPosition`; if `L <= from` → empty page, no fence drawn (idle streams burn no xids); else `R := drawFence` and check: cleared → bound = `L`; blocked → store `(boundL=L, fenceR=R)`, return empty.
+  - The page query gains `AND global_position <= $5` (the bound); when `bound <= from`, return an empty page without querying rows. Budget/type/truncated logic unchanged.
+  - In `Workspace.append`, issue one bare read-only `SELECT pg_current_xact_id()` statement as the transaction's first statement, before `readHead` (P1: the xid is assigned before the position draw, unconditionally — including a stream's first append; one extra round trip per append, cost recorded at the Task 7 benchmark gate). The xid is stable for the whole transaction (Task 1b verified).
 - [ ] **Step 6: Run** `task test:pg` — expected: the three tests PASS, full PG suite green.
 - [ ] **Step 7: Add the SQLite regression guard** (spec §5.10.1.4): `TestConcurrentAppendsKeepPositionsGapFree` in `sqlite/feed_test.go` — 8 goroutines × 50 single-event appends to distinct streams; assert positions are exactly `1..400` (contiguous) and an interleaved `ReadAll` reader never observes gp N+1 before gp N. (Guards the `SetMaxOpenConns(1)` invariant the whole SQLite safety argument rests on.)
 - [ ] **Step 8: Run** `GOWORK=off go test -race ./...` — expected: green (PG skipped).
@@ -96,10 +114,10 @@ The failure modes the spec's §8 says must not be reintroduced, and the test tha
 - Test: `postgres/wsstore_test.go` (extend; the existing head test keeps passing once idle)
 
 **Interfaces:**
-- Produces: `Workspace.RawHead(ctx) (uint64, error)` (unbounded — for stall detection only); `Workspace.Head(ctx)` now ceiling-bounded. Task 16's `MatchingHead` reuses the same bound logic.
+- Produces: `Workspace.RawHead(ctx) (uint64, error)` (unbounded — for stall detection only); `Workspace.Head(ctx)` now fence-bounded. Task 16's `MatchingHead` reuses the same fence logic.
 
 - [ ] **Step 1: Write the failing test** `TestHeadIsSettledWhileAppendInFlight`: tx1 appends gp=1 and commits; tx2 appends gp=2 uncommitted → `RawHead()==2`, and `Head()` returns ≤ 1 on some poll while tx2 is in flight (eventually-consistent; document the transient in the method doc). Commit tx2 → `Head()==2`.
-- [ ] **Step 2: Implement**: move the current `Head` body to `RawHead`; new `Head` = the ceiling logic from Task 2 + `SELECT COALESCE(MAX(global_position), 0) ... AND global_position <= $2`.
+- [ ] **Step 2: Implement**: move the current `Head` body to `RawHead`; new `Head` = the fence from Task 2 (establish/check, bounded by the fence's `L`) + `SELECT COALESCE(MAX(global_position), 0) ... AND global_position <= $2`.
 - [ ] **Step 3: Run** `task test:pg` — green.
 - [ ] **Step 4: Commit** — `feat(postgres): settled Head plus RawHead for stall detection`
 
@@ -164,7 +182,7 @@ The failure modes the spec's §8 says must not be reintroduced, and the test tha
 - [ ] **Step 2: Write** `TestFeedGateNoLoss` (spec §5.10.2): 8 appenders × ≥12.5k events each (batches of 20), every batch `Begin → AppendTx → sleep rand(0–500ms) → Commit` (decoupled insert/commit); 3 `feed.Server` consumers with disjoint type filters, `LeaseTTL=100ms`; kill windows per consumer: cancel mid-page after send/before checkpoint, and full store close/reopen. Oracle: **set equality** — each consumer's delivered-position set equals the appended positions filtered by its type set (duplicates allowed, deduplicated for comparison; invention or omission both fail). Hash-chain oracle: per stream, delivered envelopes are version-contiguous and `PrevHash` links (use the existing `es` chain helpers).
 - [ ] **Step 3: Write** `TestFeedGatePageQueryPlan`: seed ≥1M rows via direct batched inserts (512-byte payloads); `EXPLAIN (FORMAT JSON)` the exact page query; assert `events_ws_type_pos_idx` appears and no `Seq Scan` on events partitions.
 - [ ] **Step 4: Write** `TestFeedGateHundredIdleSubscribers` (Review Focus 7): pool `MaxConns=50`; 100 subscriptions (separate instances); after a quiet start, append one matching event; all 100 deliver within 1s; pool stats healthy. Task 18 adds jitter-spread assertions here.
-- [ ] **Step 5: Write** `BenchmarkWorkspaceAppend` (batch of 20) and record the baseline numbers in the PR — the write-path-unchanged evidence (Task 2's mechanism must not move it).
+- [ ] **Step 5: Write** `BenchmarkWorkspaceAppend` (batch of 20) and record the baseline numbers in the PR — the write-path evidence. The only append-path change is the extra bare xid-draw statement (Task 1b), so record its measured cost explicitly for the Gate 0 exit review.
 - [ ] **Step 6: Run** `task test:feedgate` — expected: green. Record the output in the PR (this run is Phase 1's exit evidence).
 - [ ] **Step 7: Wire the nightly CI job** (cron) running `task test:feedgate`.
 - [ ] **Step 8: Commit** — `test(postgres): feedgate chaos, plan and fleet scenarios`
@@ -335,7 +353,8 @@ func (s *Server) Skip(ctx context.Context, sr SkipRequest) error
 - Produces: `feedtest.RunLog(t, newLog)`, `feedtest.RunCheckpoints(t, newStore)`, `feedtest.RunLeases(t, newStore)`, `feedtest.RunAll(t, fixture)` where the constructors are `func(ctx context.Context, t testing.TB) (T, func())` (the `func()` is the cleanup) and `fixture` carries optional backend capabilities (e.g. `MultiWorkspace bool` for the RLS test). Platform adapters must pass the same suite.
 
 - [ ] **Step 1: Extract** the contract behaviors (spec §5.6 list) from `sqlite/feed_test.go` into `feedtest`: monotonic-vs-rewinding Save, expiry boundaries, owner-guarded renew/release, empty types, first-row-over-budget, `truncated` at exact budget, `*EventTooLargeError` without payload, definition-hash round-trip + preserve-on-empty, and the cross-workspace refusal when `MultiWorkspace`.
-- [ ] **Step 2: Rewire** the sqlite and postgres adapter tests to the suite, keeping only backend-specific tests local.
+- [ ] **Step 2: Rewire** the sqlite and postgres adapter tests to the suite, keeping only backend-specific tests local. Normalize cross-backend divergences deliberately: `CreatedAt` is DB-clock on Postgres (`clock_timestamp()`) and caller-supplied on sqlite — assert presence/reasonableness, not exact equality.
+- [ ] **Step 2b: Swap the feedgate consumer stores from the in-memory fakes to the real Postgres adapters** (`postgres.NewCheckpointStore`/`NewLeaseStore`/`NewLogs` from Task 13; the DeadLetterStore stays nil — the gate has no poison path), completing Task 7's stand-in note: the chaos gate's store close/reopen now exercises real durable checkpoints. Verify the feedgate still passes under `-race -shuffle=on` (docker commands; the controller re-runs it too).
 - [ ] **Step 3: Run both suites** — green.
 - [ ] **Step 4: Commit** — `test: shared feedtest conformance suite`
 
@@ -375,13 +394,14 @@ type Observer interface {
 }
 ```
 
-`Config.Observer Observer` + `feed.NoopObserver`; `feed.Log` gains `MatchingHead(ctx context.Context, types []string) (uint64, error)` (ceiling-bounded on Postgres); `func (s *Server) Status(ctx context.Context, req Request) (Status, error)` replaces the type-blind `Status` (old signature removed; the duplicate checkpoint read dies with it). `Status.Lag` becomes `matchingHead − position`.
+`Config.Observer Observer` + `feed.NoopObserver`; `feed.Log` gains `RawHead(ctx context.Context) (uint64, error)` (already implemented on `*Workspace` in Task 3) and `MatchingHead(ctx context.Context, types []string) (uint64, error)` (fence-bounded on Postgres); `func (s *Server) Status(ctx context.Context, req Request) (Status, error)` replaces the type-blind `Status` (old signature removed; the duplicate checkpoint read dies with it). `Status.Lag` becomes `matchingHead − position`.
 
-- [ ] **Step 1: Failing test** `TestObserverReportsStall`: an in-flight append holds the ceiling; two consecutive empty pages → exactly one `OnStall` (rate limit: ≥1 probe per stream per few seconds) with `raw > settled`; after commit, no further stalls.
+- [ ] **Step 1: Failing test** `TestObserverReportsStall`: an in-flight append holds the fence; two consecutive empty pages → exactly one `OnStall` (rate limit: ≥1 probe per stream per few seconds) with `raw > settled`; after commit, no further stalls.
 - [ ] **Step 2: Failing test** `TestStatusLagIsFilterAware`: matching head 100, all-type head 500, checkpoint 100 → `Lag == 0` (the old code reported 400).
-- [ ] **Step 3: Implement**: `Observer`/`NoopObserver`; wire `OnPage`, `OnCheckpoint` (fenced acks), `OnLeaseLost` (renewal failure), `OnPoison` (oversized first row, both server check and adapter path), `OnStall` (rate-limited `RawHead` probe in the empty-page branch); `MatchingHead` on both backends; `Status(ctx, req)`.
-- [ ] **Step 4: Run** `GOWORK=off go test -race ./...` and `task test:pg` — green.
-- [ ] **Step 5: Commit** — `feat(feed): observer, matching head, filter-aware lag`
+- [ ] **Step 3: Failing test** `TestSubscribeResumeClampIsFenceAware` (carried ruling from Task 3's review — Important finding): a fake `Log` whose `Head()` returns 0 (fence-blocked) while `RawHead()` returns ≥ the checkpoint; `Subscribe` resuming at checkpoint 5000 must NOT clamp `pos` to 0 and must NOT read any page below 5000; once the fake's `Head` unblocks, delivery resumes from 5000. The clamp (feed/server.go, `pos > head`) is for restored/empty logs only.
+- [ ] **Step 4: Implement**: `Observer`/`NoopObserver`; wire `OnPage`, `OnCheckpoint` (fenced acks), `OnLeaseLost` (renewal failure), `OnPoison` (oversized first row, both server check and adapter path), `OnStall` (rate-limited `RawHead` probe in the empty-page branch); `MatchingHead` on both backends; `Status(ctx, req)`; and the fence-aware clamp: in `stream()`, when `pos > head`, consult `RawHead` — `raw >= pos` means the fence is transiently blocked, so do not clamp, wait and re-head; only clamp when `raw < pos` (restored or empty log).
+- [ ] **Step 5: Run** `GOWORK=off go test -race ./...` and `task test:pg` — green.
+- [ ] **Step 6: Commit** — `feat(feed): observer, matching head, filter-aware lag, fence-aware resume clamp`
 
 ### Task 17: `eventfeed` consumer adapter
 
@@ -431,7 +451,7 @@ func New(cfg Config) *Feed // implements projection.Feed
 - Create: `.golangci.yml`, `docs/adr/0037-commit-safe-feed-reads.md`
 
 - [ ] **Step 1: Taskfile/CI**: `test:pg` gains `-race -shuffle=on`; add `lint:go` (golangci-lint) with `.golangci.yml` (errcheck, govet, staticcheck) as a CI job; add `coverage` writing `coverage.out` with a `COVERAGE_FLOOR` Taskfile var set to the first green measurement (ratchet).
-- [ ] **Step 2: ADR 0037** per spec §5.11: the settled-ceiling mechanism and its losslessness argument, the rejected per-row `xmin` filter and pre-reserved watermark **with the killer interleavings**, stall semantics, the fallback gate, index build order, RLS rollout.
+- [ ] **Step 2: ADR 0037** per spec §5.11: the horizon-fence mechanism and its losslessness argument, the spike record (falsified settled ceiling: commit-horizon xmax, skipped in-flight xids), the rejected per-row `xmin` filter, pre-reserved watermark and settled ceiling **with the killer interleavings for each**, stall semantics, the fallback gates, index build order, RLS rollout.
 - [ ] **Step 3: Update** ADR 0001 §5 (cross-ref 0037), ADR 0010 (index-build caveat), ADR 0036 + README delivery section (settled-head semantics + a guarantees block).
 - [ ] **Step 4: Runbook** (`docs/deploy/README.md`): `es_relay` creation/grant ordering, index build ordering, poison/Skip triage (spec §5.3 lifecycle), stall alert + analytics-on-replica, pool sizing guidance (spec §5.12), lease RTO ≤ `LeaseTTL`.
 - [ ] **Step 5: Full local gates**: `GOWORK=off go test ./...`, `task test:pg`, `task lint:go`, `task test:feedgate` — all green.

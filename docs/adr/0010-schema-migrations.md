@@ -77,6 +77,18 @@ DDL-free replicas).
 - **RLS/partition setup lives in migrations now** — 0001 carries the RLS
   policies and hash partitions (ADR 0004) and the `unique_claims` objects
   (ADR 0008); later migrations must preserve them.
+- **Migrations run in one transaction, so they cannot build indexes
+  concurrently** (this ADR's own rule). This stopped being hypothetical with
+  migration 0003's feed indexes: `CREATE INDEX CONCURRENTLY` is forbidden
+  inside a migration's transaction, and Postgres (through at least 18)
+  rejects it on a partitioned parent outright — while a plain build on a
+  ≥10M-row `events` table blocks appends for the whole build, and
+  auto-migrate would take that lock at boot. The operational answer is
+  runbook-first: build the partition child indexes `CONCURRENTLY` before
+  the migration runs, attach them to `ON ONLY` parents, and let the
+  migration's `CREATE INDEX IF NOT EXISTS` be the instant no-op that
+  enforces it. ADR 0037 records the full pattern; the runbook
+  (`docs/deploy/README.md`) carries the commands.
 
 ## Alternatives Considered
 

@@ -4,20 +4,28 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Nightly feed gate (Gate 0): the chaos/plan/fleet scenarios are too slow
+    # for the PR path, so they run on a cron and stay separate from the PR
+    # jobs (the other jobs below skip schedule events).
+    - cron: "0 3 * * *"
 
 jobs:
   check:
-    name: build · vet · unit · race · vuln · codegen-drift
+    name: build · vet · lint · unit · coverage · race · vuln · codegen-drift
     runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # buf breaking needs main history
-      - uses: jdx/mise-action@v2 # installs go/buf/task/govulncheck pinned in .mise.toml
+      - uses: jdx/mise-action@v2 # installs go/buf/task/golangci-lint/govulncheck pinned in .mise.toml
       - run: task generate:check # buf lint + regenerate, fail on drift
       - run: task lint:proto   # buf lint + breaking against main
       - run: task vet
+      - run: task lint:go     # golangci-lint (errcheck, govet, staticcheck)
       - run: task test           # unit tests (integration suites skip without env)
+      - run: task coverage    # unit suite with profile + COVERAGE_FLOOR ratchet
       - run: task test:race
       - run: task vuln
 
@@ -41,14 +49,28 @@ jobs:
           if-no-files-found: error
 
   integration:
-    name: integration (postgres)
+    name: integration (postgres · race · shuffle)
     runs-on: ubuntu-latest
     needs: check
+    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: jdx/mise-action@v2
-      # The target spins up a throwaway container (Docker is preinstalled on the
-      # runner) and tears it down via `defer`.
+      # The target spins up a throwaway container (Docker is preinstalled on
+      # the runner), tears it down via `defer`, and runs the suite under
+      # -race -shuffle=on (production review A4).
       - run: task test:pg
+
+  # The nightly feed gate: chaos no-loss, 1M-row page-query plan and the
+  # 100-subscriber fleet scenario, plus nothing else — the schedule event
+  # skips every PR-path job above and only this one runs.
+  feedgate:
+    name: feed gate (chaos · plan · fleet) — nightly
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      # task test:feedgate starts its own throwaway Postgres and tears it
+      # down via `defer`; expect ~10-15 minutes under -race.
+      - run: task test:feedgate

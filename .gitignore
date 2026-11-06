@@ -9,6 +9,9 @@
 # Exported proto distributions (`task buf:export`).
 /dist/
 
+# Coverage profile written by `task coverage` (CI gate).
+/coverage.out
+
 # Local SQLite databases created by examples / manual runs.
 *.db
 *.db-wal

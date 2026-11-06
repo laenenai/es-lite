@@ -88,14 +88,57 @@ tasks:
       - docker rm -f es-lite-pg 2>/dev/null || true
       - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
       - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      # Test-setup roles (spec §5.7): migrations never create roles (migrator
+      # privileges vary), so the container setup owns them, granted to the
+      # test user. es_relay gates Drain's RLS bypass (migration 0005) and
+      # es_rls_probe is the non-superuser the RLS policy probes SET ROLE into.
+      # The container is fresh (rm -f + run above), so CREATE ROLE cannot collide.
+      - docker exec es-lite-pg psql -U postgres -d eslite -v ON_ERROR_STOP=1 -c "CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS; CREATE ROLE es_rls_probe NOLOGIN NOSUPERUSER NOBYPASSRLS; GRANT es_relay, es_rls_probe TO postgres"
       - defer: docker rm -f es-lite-pg
-      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -count=1 ./postgres/...
+      # -race -shuffle=on since the production review (A4): the Postgres
+      # suite is where the ordering/fence races would surface.
+      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -race -shuffle=on -count=1 ./postgres/...
+
+  test:feedgate:
+    desc: >
+      Feed gate (Phase 1 / Gate 0): chaos no-loss, page-query plan and fleet
+      scenarios against a throwaway Docker Postgres. Too slow for the PR path;
+      CI runs it nightly. Benchmarks are run separately (-bench) for the
+      write-path baseline.
+    cmds:
+      - docker rm -f es-lite-pg 2>/dev/null || true
+      - docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
+      - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      - defer: docker rm -f es-lite-pg
+      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -race -shuffle=on -tags feedgate -count=1 -timeout 45m ./postgres/ -run TestFeedGate
 
   vet:
     desc: go vet across the module and the cmdsvc nested module.
     cmds:
       - go vet ./...
       - cd cmdsvc && go vet ./...
+
+  lint:go:
+    desc: golangci-lint (errcheck, govet, staticcheck) across the module and the cmdsvc nested module (CI gate).
+    cmds:
+      - golangci-lint run
+      - cd cmdsvc && golangci-lint run -c ../.golangci.yml
+
+  coverage:
+    desc: >
+      Core-module unit suite with a coverage profile (coverage.out), gated
+      on the COVERAGE_FLOOR ratchet: raise the floor as coverage improves,
+      never lower it. Integration suites skip without their DSNs, exactly
+      like `task test`, so local and CI measure the same thing.
+    vars:
+      # First green measurement (2026-11-05). Ratchet only upwards.
+      COVERAGE_FLOOR: "42.7"
+    cmds:
+      - go test -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - |
+        total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub(/%/, "", $3); print $3 }')
+        echo "coverage: ${total}% (floor {{.COVERAGE_FLOOR}}%)"
+        awk -v t="$total" -v f="{{.COVERAGE_FLOOR}}" 'BEGIN { if (t + 0 < f + 0) { printf "coverage %s%% is below the floor %s%%\n", t, f; exit 1 } }'
 
   lint:proto:
     desc: buf lint + breaking-change check against main, per module.

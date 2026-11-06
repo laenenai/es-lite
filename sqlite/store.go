@@ -37,17 +37,38 @@ var migrationsFS embed.FS
 // Option configures Open/NewWithDB.
 type Option func(*openConfig)
 
-type openConfig struct{ autoMigrate bool }
+// defaultMaxPayloadBytes is the payload cap a Store enforces at append
+// time when WithMaxPayloadBytes is not given (or given as 0): 8 MiB, big
+// enough for any sane domain event and small enough that no single event
+// can wedge a feed subscription that would otherwise materialize it.
+const defaultMaxPayloadBytes = 8 << 20
+
+type openConfig struct {
+	autoMigrate     bool
+	maxPayloadBytes int
+}
 
 // WithoutAutoMigrate skips applying migrations on Open. Application replicas
 // use this and rely on a separate Migrate step (ADR 0010); the default is to
 // auto-migrate (dev/SQLite/tests stay zero-config).
 func WithoutAutoMigrate() Option { return func(c *openConfig) { c.autoMigrate = false } }
 
+// WithMaxPayloadBytes caps the payload size Append may write: a batch
+// holding an event whose payload exceeds n bytes is rejected whole with
+// es.ErrPayloadTooLarge before anything is inserted, so writers learn at
+// write time instead of wedging feed subscriptions later. n == 0 selects
+// the default (8 MiB); n < 0 lifts the cap entirely.
+func WithMaxPayloadBytes(n int) Option { return func(c *openConfig) { c.maxPayloadBytes = n } }
+
 func newOpenConfig(opts []Option) openConfig {
-	c := openConfig{autoMigrate: true}
+	c := openConfig{autoMigrate: true, maxPayloadBytes: defaultMaxPayloadBytes}
 	for _, o := range opts {
 		o(&c)
+	}
+	// 0 selects the default; a negative value means unlimited. The stored
+	// field is the effective cap.
+	if c.maxPayloadBytes == 0 {
+		c.maxPayloadBytes = defaultMaxPayloadBytes
 	}
 	return c
 }
@@ -65,6 +86,11 @@ func parseTS(s string) (time.Time, error) { return time.Parse(tsLayout, s) }
 // Store is the SQLite-backed es.Store.
 type Store struct {
 	db *sql.DB
+
+	// maxPayloadBytes is the effective append-time payload cap
+	// (WithMaxPayloadBytes): appends holding a larger payload are rejected
+	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
+	maxPayloadBytes int
 }
 
 var _ es.Store = (*Store)(nil)
@@ -83,8 +109,9 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	// and commit-ordered, and so an in-memory shared-cache DB stays alive.
 	db.SetMaxOpenConns(1)
 
-	s := &Store{db: db}
-	if newOpenConfig(opts).autoMigrate {
+	cfg := newOpenConfig(opts)
+	s := &Store{db: db, maxPayloadBytes: cfg.maxPayloadBytes}
+	if cfg.autoMigrate {
 		if err := s.Migrate(ctx); err != nil {
 			db.Close()
 			return nil, err
@@ -96,8 +123,9 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 // NewWithDB wraps an already-open *sql.DB. Useful for tests that manage the
 // handle themselves. Applies migrations unless WithoutAutoMigrate is passed.
 func NewWithDB(ctx context.Context, db *sql.DB, opts ...Option) (*Store, error) {
-	s := &Store{db: db}
-	if newOpenConfig(opts).autoMigrate {
+	cfg := newOpenConfig(opts)
+	s := &Store{db: db, maxPayloadBytes: cfg.maxPayloadBytes}
+	if cfg.autoMigrate {
 		if err := s.Migrate(ctx); err != nil {
 			return nil, err
 		}
@@ -171,6 +199,19 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	for _, op := range p.Constraints {
 		if err := op.Validate(); err != nil {
 			return zero, err
+		}
+	}
+
+	// Payload cap (production review): reject the whole batch before the
+	// transaction is even opened — nothing is inserted, no position drawn.
+	// A single oversized event otherwise wedges every feed subscription
+	// consuming its type. The error carries stream, version, type URL and
+	// size only — never the payload bytes.
+	for i, ev := range p.Events {
+		if s.maxPayloadBytes > 0 && len(ev.Payload) > s.maxPayloadBytes {
+			version := p.ExpectedVersion + uint64(i) + 1
+			return zero, fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
+				es.ErrPayloadTooLarge, p.StreamID, version, ev.TypeURL, len(ev.Payload), s.maxPayloadBytes)
 		}
 	}
 

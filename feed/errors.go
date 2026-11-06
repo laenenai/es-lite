@@ -11,9 +11,18 @@ var (
 	// ErrLeaseHeld reports a subscription key owned by another live stream.
 	// ResetCheckpoint returns it (unless forced) while a stream is active.
 	ErrLeaseHeld = errors.New("feed: subscription is held")
-	// ErrLeaseLost reports that the lease could not be renewed: the stream is
-	// cancelled because another subscriber may now own the key.
+	// ErrLeaseLost reports a lost lease: a renewal failed (the stream is
+	// cancelled because another subscriber may now own the key), or an
+	// ack's owner no longer holds the key (Checkpoint rejects it with
+	// the same sentinel instead of advancing a stale consumer's cursor).
 	ErrLeaseLost = errors.New("feed: lease lost")
+	// ErrDefinitionChanged reports a subscription whose checkpoint was
+	// last acknowledged under a different definition than the request's.
+	// Subscribe fails with it instead of resuming below the checkpoint
+	// and silently skipping the history of newly consumed types;
+	// transport layers map it to FailedPrecondition. Recovery is
+	// explicit: ResetCheckpoint under the new definition.
+	ErrDefinitionChanged = errors.New("feed: projection definition changed")
 )
 
 // errLeaseExpired is the cause when Renew reports false without an error.
@@ -38,8 +47,9 @@ func (e *LeaseHeldError) Error() string {
 // Is reports ErrLeaseHeld.
 func (e *LeaseHeldError) Is(target error) bool { return target == ErrLeaseHeld }
 
-// LeaseLostError reports a failed renewal and its cause. It matches
-// ErrLeaseLost, and its cause, with errors.Is.
+// LeaseLostError reports a failed renewal and its cause, or an ack whose
+// owner no longer holds the key. It matches ErrLeaseLost, and its cause,
+// with errors.Is.
 type LeaseLostError struct {
 	Key   string
 	Owner string
@@ -76,4 +86,31 @@ type EventTooLargeError struct {
 func (e *EventTooLargeError) Error() string {
 	return fmt.Sprintf("feed: event at position %d of type %q is %d bytes, exceeding the %d-byte limit",
 		e.Position, e.TypeURL, e.Size, e.Limit)
+}
+
+// DefinitionChangedError reports a checkpoint that was last acknowledged
+// under a different definition than the request's: the stored fingerprint
+// no longer matches the code's consumed-type set. It matches
+// ErrDefinitionChanged with errors.Is.
+type DefinitionChangedError struct {
+	// Projection is the definition name whose fingerprint drifted.
+	Projection string
+	// StoredHash is the fingerprint the checkpoint was acked under.
+	StoredHash string
+	// RequestHash is the request definition's fingerprint.
+	RequestHash string
+}
+
+// Error implements error. It names the projection and the recovery:
+// ResetCheckpoint under the new definition is what re-identifies the
+// checkpoint and replays. The hashes are fingerprints of public type
+// sets, never event data.
+func (e *DefinitionChangedError) Error() string {
+	return fmt.Sprintf("feed: projection %q changed definition (checkpoint %s, request %s): resume would skip the new types' history below the checkpoint; call ResetCheckpoint with the new definition to re-subscribe",
+		e.Projection, e.StoredHash, e.RequestHash)
+}
+
+// Is reports ErrDefinitionChanged.
+func (e *DefinitionChangedError) Is(target error) bool {
+	return target == ErrDefinitionChanged
 }

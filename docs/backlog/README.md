@@ -12,3 +12,4 @@ graduates into an ADR.
 ## Open
 
 - [2026-08-02 — Schema migration strategy](./2026-08-02_migrations.md)
+- [2026-11-05 — Reconnect-swallowed feed errors are unobservable](./2026-11-05_reconnect-swallowed-errors.md)

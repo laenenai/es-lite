@@ -83,7 +83,10 @@ T7 docs/CI closes every task.
   envelopeCols`/`scanEnvelope` scan the two columns (fold the review's CLN-02
   duplication while here if cheap).
 - `postgres/anchor.go`, `sqlite/anchor.go`: `Anchor(ctx, uptoGP) (Anchor, error)`
-  and `ListAnchors`; Postgres under `app.bypass_rls`.
+  and `ListAnchors`; Postgres under `app.bypass_rls`. *(Status note, added
+  2026-11-05: the bypass has since been role-gated — migration 0005 requires
+  `es_relay` membership alongside `app.bypass_rls`; see ADR 0029's
+  implementation notes and `docs/deploy/README.md`.)*
 - Tests: `sqlite/chain_test.go` (chain across batches, race loser leaves no
   fork, `recorded_at` monotonic across two interleaved transactions — the
   ES-03 regression), `postgres/chain_test.go` (same via `task test:pg`),

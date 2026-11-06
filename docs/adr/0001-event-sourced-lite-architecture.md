@@ -127,13 +127,12 @@ is the single most important implementation subtlety:
   *visible* at commit time, and commit order ≠ assignment order. A
   cursor poller can read past a row whose id was assigned in an
   as-yet-uncommitted transaction and never return for it — the classic
-  outbox gap. The Postgres adapter must therefore not rely on a naive
-  monotonic cursor. It will use one of: a `published_at IS NULL` claim
-  column drained with `FOR UPDATE SKIP LOCKED` (true outbox-style), or a
-  visibility low-watermark (only read rows older than the oldest
-  in-flight transaction). This is deferred with the Postgres adapter,
-  but the `Store` interface is designed so it can be added without
-  touching SQLite or the poller's public contract.
+  outbox gap. This is no longer deferred: ADR 0037 specifies the
+  **horizon fence** that bounds every feed-facing read, and the feed
+  reads (`ReadAllBounded`, `Head`, `MatchingHead`) implement it. The
+  raw `ReadAll` cursor and the in-process `delivery.Poller` remain
+  unfenced — single-writer or quiescent-log use only, as ADR 0037's
+  scope section states.
 
 ### What we cut from the parent (and why it's safe here)
 

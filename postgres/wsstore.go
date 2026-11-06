@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/laenenai/es-lite/es"
+	"github.com/laenenai/es-lite/feed"
 )
 
 // DBTX is the narrow database handle the transaction-aware methods need:
@@ -35,6 +37,47 @@ type DBTX interface {
 type Workspace struct {
 	store *Store
 	ws    string
+
+	// Horizon-fence state (spec §5.1): boundL is the sequence value L a
+	// round recorded, fenceR the transaction id R the reader drew
+	// immediately after reading it. fenceR == 0 means no fence is stored.
+	// Two integers on this per-scope instance — the feed opens one
+	// Workspace per stream — guarded because Status may touch the same
+	// instance concurrently.
+	//
+	// Why bounding pages this way is lossless (spec §5.1.3):
+	//
+	//   - P1 — the append draws its xid before its position. append issues
+	//     one bare read-only statement, SELECT pg_current_xact_id(), as the
+	//     transaction's first statement, before readHead and before any
+	//     nextval position draw. Hence every event row's insert-xid was
+	//     assigned before its position was drawn. (Folding the xid draw
+	//     into readHead's SELECT was tried and falsified on empty streams
+	//     by the Task 1b spike: readHead returns no row on an empty
+	//     stream, so the target list never evaluates and no xid is
+	//     assigned — every stream's first append would lose P1. The bare
+	//     statement assigns unconditionally; the xid is stable across the
+	//     whole append transaction.)
+	//   - P2 — positions are monotonic. Any row at a position <= L drew
+	//     that position before the reader read L, and therefore (by P1)
+	//     has an insert-xid assigned before R was drawn, i.e. an xid < R.
+	//
+	// While any xid < R is still in flight, pg_snapshot_xmin stays below
+	// R — the Task 1b spike verified both halves: an in-flight xid below
+	// the commit horizon appears in the snapshot's in-flight list and
+	// lowers xmin, and an in-flight xid at or above the horizon pins the
+	// horizon itself, which is xmin's floor when nothing older runs. The
+	// reader's own R-abort is what raises the horizon past the appenders'
+	// xids and makes them snapshot-visible in the first place. So xmin >= R
+	// implies every xid < R is committed or aborted. Combined with P2:
+	// when the fence clears, every row at a position <= L is either
+	// already visible or was aborted — nothing inside the delivered range
+	// can appear later. Aborted appends leave permanent holes above the
+	// cursor, which the type filter already treats as ordinary
+	// cross-workspace gaps.
+	mu     sync.Mutex
+	boundL uint64
+	fenceR uint64
 }
 
 var _ es.Store = (*Workspace)(nil)
@@ -107,6 +150,35 @@ func validateAppend(p es.AppendParams) error {
 // workspace RLS context and owns the transaction boundary.
 func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
 	var zero es.AppendResult
+
+	// Payload cap (production review): reject the whole batch before any
+	// statement runs — before the xid is drawn, before any insert — so a
+	// caller-owned transaction (AppendTx) is refused too and nothing
+	// reaches the log. A single oversized event otherwise wedges every
+	// feed subscription consuming its type. The error carries stream,
+	// version, type URL and size only — never the payload bytes.
+	for i, ev := range p.Events {
+		if w.store.maxPayloadBytes > 0 && len(ev.Payload) > w.store.maxPayloadBytes {
+			version := p.ExpectedVersion + uint64(i) + 1
+			return zero, fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
+				es.ErrPayloadTooLarge, p.StreamID, version, ev.TypeURL, len(ev.Payload), w.store.maxPayloadBytes)
+		}
+	}
+
+	// P1 (spec §5.1.3): assign this transaction's xid before any position
+	// is drawn. One bare read-only statement, before readHead: the xid is
+	// assigned here unconditionally — including on a stream's first
+	// append — and is stable for the rest of the transaction, so every
+	// event row inserted below carries an insert-xid drawn strictly
+	// before its nextval() position. (Never fold this into readHead: on an
+	// empty stream readHead returns no row, its target list never
+	// evaluates, and no xid is assigned — the Task 1b spike falsified the
+	// fold and verified this shape. One extra round trip per append, the
+	// accepted price of commit-safe reads.)
+	var xid uint64
+	if err := db.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&xid); err != nil {
+		return zero, fmt.Errorf("assign append xid: %w", err)
+	}
 
 	// Timestamps are truncated to microseconds — timestamptz precision and
 	// what the hash chain attests (ADR 0029 §2).
@@ -327,6 +399,100 @@ func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int)
 	return w.query(ctx, q, w.ws, fromPosition, limit)
 }
 
+// readLastPosition is fence statement 1 (spec §5.1.1): the position
+// sequence's last_value, read outside any transaction. It reflects every
+// position drawn so far, committed or not — conservative and safe, because
+// delivery waits on the fence, not on L. A fresh sequence reports
+// last_value=1 before any draw; L can exceed the highest drawn position.
+func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
+	var last uint64
+	err := w.store.pool.QueryRow(ctx,
+		`SELECT last_value FROM events_global_position_seq`,
+	).Scan(&last)
+	if err != nil {
+		return 0, fmt.Errorf("read last position: %w", err)
+	}
+	return last, nil
+}
+
+// drawFence is fence statement 2 (spec §5.1.1): draw the reader's own
+// transaction id in a short transaction, then roll back. The abort settles R
+// immediately — the commit horizon advances to R itself, which is what
+// makes in-flight appenders snapshot-visible to the next statement (Task 1b
+// verified; without it a lone in-flight append looks idle to every
+// snapshot).
+func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin fence: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var r uint64
+	if err := tx.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&r); err != nil {
+		return 0, fmt.Errorf("draw fence xid: %w", err)
+	}
+	return r, nil
+}
+
+// fenceCleared is fence statement 3 (spec §5.1.1): true once no transaction
+// that already existed when R was drawn is still in flight, observed as
+// the snapshot horizon having reached R.
+func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
+	var cleared bool
+	err := w.store.pool.QueryRow(ctx,
+		`SELECT pg_snapshot_xmin(pg_current_snapshot()) >= $1`, r,
+	).Scan(&cleared)
+	if err != nil {
+		return false, fmt.Errorf("check fence: %w", err)
+	}
+	return cleared, nil
+}
+
+// fenceBound runs one horizon-fence round (spec §5.1.1) and returns the
+// position bound a page may deliver up to. Zero means deliver nothing now:
+// either an established fence is still blocked (the state stays stored and
+// the caller's wait cycle retries), or the log is idle at from (no fence
+// drawn — idle streams burn no transaction ids). A cleared fence drops the
+// state; the next delivered page re-establishes a fresh fence.
+func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.fenceR != 0 {
+		cleared, err := w.fenceCleared(ctx, w.fenceR)
+		if err != nil {
+			return 0, err
+		}
+		if !cleared {
+			return 0, nil
+		}
+		bound := w.boundL
+		w.boundL, w.fenceR = 0, 0
+		return bound, nil
+	}
+
+	last, err := w.readLastPosition(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if last <= from {
+		return 0, nil
+	}
+	r, err := w.drawFence(ctx)
+	if err != nil {
+		return 0, err
+	}
+	cleared, err := w.fenceCleared(ctx, r)
+	if err != nil {
+		return 0, err
+	}
+	if cleared {
+		return last, nil
+	}
+	w.boundL, w.fenceR = last, r
+	return 0, nil
+}
+
 // ReadAllBounded is ReadAll restricted to the given type URLs and bounded by
 // a payload-byte budget: the page a live feed or rebuild reads next. types is
 // the server-side filter — only rows whose type_url is in types are returned
@@ -337,6 +503,27 @@ func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int)
 // caller continues immediately instead of waiting out a poll. The first
 // event of a page is always included, even alone over budget: an oversized
 // event must be visible to the caller, not forever skipped.
+//
+// The page is fetched in two steps so a payload over the store's cap
+// (WithMaxPayloadBytes) is never materialized (production review): step 1
+// selects positions, type URLs and octet_length(payload) — sizes only,
+// never the bytes — under the filter and applies the count/budget/cap
+// selection; step 2 fetches full rows for the chosen positions alone. A
+// first row over the cap is a poison event: the page refuses to carry it
+// and returns *feed.EventTooLargeError naming position, type URL, size and
+// limit — never the payload. A later row over the cap stops the page
+// before it with truncated=true, so the next page makes it the first row
+// and surfaces the error.
+//
+// The page is also bounded by the horizon fence (spec §5.1): positions are
+// only delivered up to the L recorded at the start of the round, and only
+// once every transaction that existed when the round drew its R has
+// settled — the horizon check is transaction-global, not append-specific.
+// While such a transaction is in flight the page is empty
+// (truncated=false) and the fence stays stored on this Workspace; the
+// feed's wait cycle retries. A delivered page therefore never has a live
+// hole inside it — nothing in the delivered range can appear later — and
+// an aborted append's permanent hole is passed like any other gap.
 //
 // The budget counts the payload bytes this store returns, opaquely (ADR
 // 0025): for a sealed workspace these are the stored ciphertext bytes, and a
@@ -349,6 +536,13 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	if limit <= 0 {
 		limit = 100
 	}
+	bound, err := w.fenceBound(ctx, from)
+	if err != nil {
+		return nil, false, err
+	}
+	if bound <= from {
+		return nil, false, nil
+	}
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
 		return nil, false, err
@@ -357,38 +551,81 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	if err := setWorkspace(ctx, tx, w.ws); err != nil {
 		return nil, false, err
 	}
+	// Step 1: positions, type URLs and payload sizes under the filter and
+	// the fence bound — never the payload bytes. octet_length measures in
+	// the database, so an over-cap row costs one integer, not its payload.
 	rows, err := tx.Query(ctx,
-		`SELECT `+envelopeCols+` FROM events
+		`SELECT global_position, type_url, octet_length(payload) FROM events
 	      WHERE workspace_id = $1 AND global_position > $2 AND type_url = ANY($4)
+	          AND global_position <= $5
 	      ORDER BY global_position ASC LIMIT $3`,
-		w.ws, from, limit, types)
+		w.ws, from, limit, types, bound)
 	if err != nil {
 		return nil, false, err
 	}
 	var (
-		out       []es.Envelope
+		positions []uint64
 		total     int
 		truncated bool
 	)
 	for rows.Next() {
-		e, err := scanEnvelope(rows)
-		if err != nil {
+		var (
+			pos     uint64
+			typeURL string
+			size    int
+		)
+		if err := rows.Scan(&pos, &typeURL, &size); err != nil {
 			rows.Close()
 			return nil, false, err
 		}
-		// len(out) == 0 carries the first row whatever its size; after
-		// that, stop before a row that would push the total past the
-		// budget. The row that stopped the page was read, so truncated is
-		// certain — more rows remain for the next call.
-		if len(out) > 0 && maxBytes > 0 && total+len(e.Payload) > maxBytes {
+		if len(positions) == 0 && w.store.maxPayloadBytes > 0 && size > w.store.maxPayloadBytes {
+			// The first row of the page is over the store's cap: a poison
+			// event. Refuse to materialize it; the typed error names it
+			// without the payload bytes ever leaving the database.
+			rows.Close()
+			return nil, false, &feed.EventTooLargeError{
+				Position: pos,
+				TypeURL:  typeURL,
+				Size:     size,
+				Limit:    w.store.maxPayloadBytes,
+			}
+		}
+		// A later row over the cap stops the page before it — the next
+		// page makes it the first row and surfaces the error — and so does
+		// a row that would push the total past the budget. The stopping
+		// row was seen, so truncated is certain: more rows remain for the
+		// next call.
+		if len(positions) > 0 &&
+			((w.store.maxPayloadBytes > 0 && size > w.store.maxPayloadBytes) ||
+				(maxBytes > 0 && total+size > maxBytes)) {
 			truncated = true
 			break
 		}
-		total += len(e.Payload)
-		out = append(out, e)
+		total += size
+		positions = append(positions, pos)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(positions) == 0 {
+		return nil, false, nil
+	}
+	// Step 2: fetch full rows for the chosen positions only, in the same
+	// transaction and therefore the same snapshot — the page cannot change
+	// under the fetch, and no payload the selection did not clear is ever
+	// selected. global_position is bigint, so positions always fit int64
+	// (pgx sends []uint64 as numeric[], which would force a cast).
+	positions64 := make([]int64, len(positions))
+	for i, p := range positions {
+		positions64[i] = int64(p)
+	}
+	out, err := queryDB(ctx, tx,
+		`SELECT `+envelopeCols+` FROM events
+		  WHERE workspace_id = $1 AND global_position = ANY($2)
+		  ORDER BY global_position ASC`,
+		w.ws, positions64)
+	if err != nil {
 		return nil, false, err
 	}
 	return out, truncated, nil
@@ -414,12 +651,101 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 	return v, err
 }
 
-// Head returns the workspace's current log head: the highest
-// global_position in the workspace, or 0 when it has no events. It is the
-// position a live feed resumes from and the checkpoint a reset rewinds to.
-// It is deliberately not on es.Store: it exists for feed plumbing, not for
-// the append/read contract.
+// Head returns the workspace's settled log head: the highest
+// global_position whose append is known to have settled — never a position
+// at or above one still in flight. It is the position a live feed resumes
+// from and the checkpoint a reset rewinds to: a value a caller may ack to
+// without skipping an event that commits later. It is deliberately not on
+// es.Store: it exists for feed plumbing, not for the append/read contract.
+//
+// Head is eventually consistent. It shares this Workspace's horizon fence
+// with ReadAllBounded (spec §5.1) — the same (boundL, fenceR) round — so
+// while that fence is blocked by an in-flight transaction, Head reports a
+// value below the raw max: 0 until a fence clears, then whatever has
+// settled up to the clearing round's L. It converges to the full settled
+// max once the blocking transaction commits or aborts. Callers that need
+// the immediate committed maximum — for stall detection — use RawHead.
 func (w *Workspace) Head(ctx context.Context) (uint64, error) {
+	// One fence round (spec §5.1.1), from 0: Head reads the whole log, so
+	// any drawn position is new and the idle shortcut never fires — every
+	// call either checks the stored fence or draws a fresh one. A zero
+	// bound means no settled range yet — a transaction is in flight that
+	// blocks the fence — and Head reports 0 rather than a position it
+	// would have to take back.
+	bound, err := w.fenceBound(ctx, 0)
+	if err != nil {
+		return 0, err
+	}
+	if bound == 0 {
+		return 0, nil
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events
+		  WHERE workspace_id = $1 AND global_position <= $2`,
+		w.ws, bound,
+	).Scan(&head)
+	return head, err
+}
+
+// MatchingHead returns the highest settled position among events of the
+// given types — the subscription's own head, what Status reports and
+// measures lag against. It is fence-bounded exactly like Head (spec
+// §5.1): it shares this Workspace's (boundL, fenceR) round, so while the
+// fence is blocked it reports 0, and a probe while blocked reuses the
+// stored round — one horizon check, no fresh fence, no transaction id
+// burned. An empty types set matches nothing: 0. Deliberately not on
+// es.Store.
+func (w *Workspace) MatchingHead(ctx context.Context, types []string) (uint64, error) {
+	if len(types) == 0 {
+		return 0, nil
+	}
+	// One fence round from 0, like Head: MatchingHead reads the whole
+	// log's matching maximum, so any drawn position is new and the idle
+	// shortcut never fires. A zero bound means the fence is blocked —
+	// report 0 rather than a position above the unsettled horizon.
+	bound, err := w.fenceBound(ctx, 0)
+	if err != nil {
+		return 0, err
+	}
+	if bound == 0 {
+		return 0, nil
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events
+		  WHERE workspace_id = $1 AND global_position <= $2 AND type_url = ANY($3)`,
+		w.ws, bound, types,
+	).Scan(&head)
+	return head, err
+}
+
+// RawHead returns the workspace's raw log head: the highest
+// global_position among the workspace's committed events, read immediately
+// with no fence and no bounding. It can jump past positions whose appends
+// are still in flight — the raw max is not a settle point — so it is not a
+// resume position: a feed that acked to RawHead would skip an in-flight
+// event when it commits. It exists for stall detection only (spec §5.8):
+// RawHead above the feed's position is committed backlog the settled reads
+// have not delivered, the signal to report OnStall; probe it rate-limited.
+// Deliberately not on es.Store.
+func (w *Workspace) RawHead(ctx context.Context) (uint64, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
 		return 0, err

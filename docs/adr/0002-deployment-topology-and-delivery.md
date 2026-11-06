@@ -62,15 +62,18 @@ an accidental double-run is *safe*, merely wasteful. The rule of thumb:
 **fan the write side out across all pods; keep the read/relay side as one
 logical consumer per subscriber.**
 
-### Push wake-up: LISTEN/NOTIFY without coupling
+### Push wake-up: the `Signal` seam (no push source ships)
 
-Polling alone bounds delivery latency to the poll interval. To eliminate
-that lag, the `delivery.Poller` drains on either a fallback tick **or** a
-`Wake` channel (`delivery.Signal`). This is the seam for push delivery:
+Polling alone bounds delivery latency to the poll interval. To let a
+deployment remove that lag later without changing the poller, it drains on
+either a fallback tick **or** a `Wake` channel (`delivery.Signal`):
 
-- **Postgres** — a listener goroutine issues `LISTEN es_events`; the
-  append path (or a trigger) issues `NOTIFY es_events`; each `NOTIFY`
-  calls `Signal.Notify()`, waking the relay immediately.
+- **Postgres** — a deployment that wants push runs its own listener
+  goroutine (`LISTEN es_events`) and calls `Signal.Notify()` on every
+  notification. es-lite ships no listener and, deliberately, no
+  append-time `NOTIFY`: it would be a write-path cost ADR 0037's
+  anti-goals forbid, so a LISTEN/NOTIFY source stays the operator's to
+  wire (or a future ADR's to add).
 - **SQLite** — the application calls `Signal.Notify()` itself after a
   successful append (same process, so no transport needed).
 
@@ -79,7 +82,9 @@ depends on a wake arriving**: `NOTIFY` is best-effort and non-durable (a
 notification fired while no session is listening is simply lost), so the
 fallback poll remains as a safety net and the durable checkpoint
 guarantees no event is ever skipped. The wake only reduces latency; it is
-never load-bearing for completeness.
+never load-bearing for completeness. The `feed` package exposes the same
+seam one level up (`feed.Waiter`, consumed by the subscribe loop's idle
+wait) — see ADR 0037 for the deferred LISTEN/NOTIFY question there.
 
 ## Consequences
 
@@ -88,10 +93,11 @@ never load-bearing for completeness.
 - **Delivery is a deliberate singleton (or a deliberate shard).** The one
   operational decision an adopter must make consciously, called out here
   so it is not discovered in production as duplicate publishes.
-- **Latency is tunable independently of correctness.** Wire LISTEN/NOTIFY
-  for near-instant delivery; rely on the poll interval alone for
-  simplicity. Either way, the checkpoint is the source of truth for
-  progress.
+- **Latency is tunable independently of correctness.** Wire a LISTEN/NOTIFY
+  listener into the `Signal`/`Waiter` seam for near-instant delivery
+  (es-lite ships no push source — no append-time `NOTIFY`, by ADR 0037's
+  write-path rule); rely on the poll interval alone for simplicity. Either
+  way, the checkpoint is the source of truth for progress.
 - **SQLite and Postgres are genuinely different deployment shapes**, not
   just different drivers — single-writer-local vs. shared-multi-writer.
   Choosing a backend is choosing a topology.

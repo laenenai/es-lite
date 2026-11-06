@@ -39,6 +39,15 @@ es-lite ships no broker integration and no daemon.
   platform's service) or `projection.LogFeed` (in-process). There is no
   JetStream publisher, consumer, stream provisioning or gap detector in this
   module.
+- **The Postgres feed path is commit-safe (ADR 0037).** On Postgres the
+  feed-facing reads (`feed.Log`'s `ReadAllBounded`, `Head`, `MatchingHead`)
+  are bounded by the horizon fence, so a page never advances past a
+  position whose append is still in flight; delivery under concurrent
+  appenders is at-least-once with no skips, and a stalled fence is
+  observable (`Observer.OnStall`) rather than silent. The in-process
+  `projection.LogFeed`/`Replay` tail the raw, unfenced `ReadAll` cursor —
+  single-writer or quiescent-log use on Postgres; the README's guarantees
+  block states the boundary.
 - **Snapshots use the `snapshot.Cache` interface.** The interface stays; the
   NATS KV implementation is removed. The platform implements the cache over
   its database (for example the same Postgres store that holds events and
