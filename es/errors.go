@@ -54,12 +54,6 @@ var (
 	// no further events may be appended.
 	ErrTerminal = errors.New("es-lite: stream is terminal")
 
-	// ErrDecidedAtMismatch is retained for callers compiled against ADR 0032.
-	// The runtime no longer returns it: Meta.OccurredAt is always stamped from
-	// the server clock and the client value is checked against that clock
-	// (ADR 0034). Use ErrDecidedAtSkew for the trust-boundary rejection.
-	ErrDecidedAtMismatch = errors.New("es-lite: meta.OccurredAt differs from the command's decided_at")
-
 	// ErrDecidedAtSkew reports that a command carrying (es.v1.decided_at)
 	// supplied a decision time further than MaxDecisionSkew from the server
 	// clock. Nothing was appended (ADR 0034).
@@ -68,6 +62,15 @@ var (
 	// ErrDecidedAtMissing reports that a command carrying (es.v1.decided_at)
 	// left the field unset. Nothing was appended (ADR 0032).
 	ErrDecidedAtMissing = errors.New("es-lite: command's decided_at is unset")
+
+	// ErrDecidedAtUnstampable reports that a command implements
+	// es.DecidedAt — it can report a decision time — but
+	// es.StampDecisionTime could not replace that time with the server
+	// clock: the command is neither an es.DecisionTimeSetter nor a proto
+	// message with a tagged (es.v1.decided_at) field. Decide would read
+	// the client's clock, so aggregate.Runtime refuses to run it; the
+	// error aggregate.Runtime returns names the command type.
+	ErrDecidedAtUnstampable = errors.New("es-lite: command's decided_at cannot be stamped")
 
 	// ErrChainBroken reports that a stream's hash chain (ADR 0029) failed
 	// verification: a recomputed hash differs from the stored one, a

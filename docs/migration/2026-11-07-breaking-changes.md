@@ -5,6 +5,61 @@ This file collects every breaking change as it lands — one entry per
 change, each stating what changed, who is affected, and what to do.
 Entries are grouped by the change date and never rewritten after landing.
 
+## 2026-11-07 — `es.ErrDecidedAtMismatch` is removed; an unstampable `decided_at` command fails loudly
+
+**What changes.** `es.ErrDecidedAtMismatch` — exported "for callers
+compiled against ADR 0032" but returned by nothing since ADR 0034 made
+the server clock the only authority for event time — is gone, together
+with the `cmdsvc.MapError` arm that mapped it to `invalid_argument`. The
+decided_at family keeps its two live rejection sentinels —
+`es.ErrDecidedAtMissing` (field unset), `es.ErrDecidedAtSkew` /
+`*es.DecidedAtSkewError` (outside the trust window) — and gains the one
+case the runtime used to swallow: `es.ErrDecidedAtUnstampable`.
+`aggregate.Runtime.Handle`/`HandleAt` now return it — the error names the
+command type — when a command implements `es.DecidedAt` but
+`es.StampDecisionTime` cannot replace its decision time with the server
+clock: the command is neither an `es.DecisionTimeSetter` nor a proto
+message with a tagged `(es.v1.decided_at)` field. Such a command was
+previously accepted silently and ran Decide against the client's clock
+value; generated proto commands are unaffected (their tagged Timestamp
+field is always settable).
+
+**Who is affected.** Code that references `es.ErrDecidedAtMismatch` — a
+compile break; nothing returned it, so no runtime behavior changes.
+Callers of `cmdsvc.MapError`: the `invalid_argument` arm for it is gone
+(no error can carry it anyway). Hand-written command types that implement
+`DecisionTime()` without a `SetDecisionTime` method (and are not proto
+messages): a `Handle` that silently succeeded now fails loudly —
+`errors.Is(err, es.ErrDecidedAtUnstampable)` — before anything is loaded
+or appended.
+
+**What to do.** Delete references to the removed sentinel; use
+`errors.Is(err, es.ErrDecidedAtSkew)` for the trust-boundary rejection
+and `es.ErrDecidedAtMissing` for the unset case. Give a hand-written
+`es.DecidedAt` command a `SetDecisionTime(time.Time)` method so the
+runtime can stamp it — a command that only reports a decision time it can
+never have replaced is a broken command, and the runtime now says so.
+
+## 2026-11-07 — `es.Meta.OccurredAt` is removed
+
+**What changes.** `es.Meta.OccurredAt` — documented as "ignored by
+Runtime" since ADR 0034 made the server clock the only source of event
+time — is gone; `es.Meta` carries identity and audit fields only
+(`CommandID`, `CorrelationID`, `CausationID`, `Actor`). The runtime takes
+its one server-clock reading straight onto each event's
+`Envelope.OccurredAt` (`es.AppendParams.OccurredAt` is unchanged), so
+the field was a dead end: a caller could set it, and the runtime
+discarded it.
+
+**Who is affected.** Code that sets or reads `meta.OccurredAt` — a
+compile break, and the only behavior change is that the code now matches
+the truth: the value was already ignored. No recorded event changes,
+because the runtime never took the field's value.
+
+**What to do.** Delete the field references. There is nothing to migrate
+to: event time is the server's by design (ADR 0034) — a caller setting
+`Meta.OccurredAt` to steer event time was already having no effect.
+
 ## 2026-11-07 — Generated command-service handlers gain draft-compliant `Idempotency-Key` dedup
 
 **What changes.** The `<Name>Deps` struct protoc-gen-es-lite emits for an

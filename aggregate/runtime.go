@@ -197,12 +197,15 @@ type Result[S, E any] struct {
 // is set, in which case Handle retries a bounded number of times itself.
 //
 // The runtime, unlike the Decider, may touch the clock and generate IDs.
-// Meta.OccurredAt is ALWAYS stamped from the server clock; a caller-supplied
-// value is ignored (ADR 0034). A command implementing es.DecidedAt supplies
-// intent only: an unset decided_at is rejected with es.ErrDecidedAtMissing,
-// one further than es.MaxDecisionSkew from server time is rejected with
-// *es.DecidedAtSkewError, and an in-window value is replaced by server time
-// before Decide runs so expiry windows validate against the server clock.
+// Each event's Envelope.OccurredAt is ALWAYS stamped from the server clock;
+// es.Meta carries no time of its own (ADR 0034). A command implementing
+// es.DecidedAt supplies intent only: an unset decided_at is rejected with
+// es.ErrDecidedAtMissing, one further than es.MaxDecisionSkew from server
+// time is rejected with *es.DecidedAtSkewError, an in-window value is
+// replaced by server time before Decide runs so expiry windows validate
+// against the server clock, and a command whose decision time cannot be
+// replaced (es.StampDecisionTime returns false) is rejected with
+// es.ErrDecidedAtUnstampable, naming the command type.
 // AppendFunc performs the append for one Handle call.
 //
 // It exists so a caller can own the transaction: an audited store, an outbox
@@ -272,26 +275,31 @@ func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C,
 		}
 		// The command is normalized to the server reading before Decide, so a
 		// decider that reads cmd.DecisionTime() for an expiry window is
-		// validating against server time, never the client value.
-		es.StampDecisionTime(cmd, now)
+		// validating against server time, never the client value. A command
+		// whose decision time cannot be replaced would leave the decider
+		// reading the client's clock, so it is rejected loudly — naming the
+		// type — instead of run on a value the server never stamped.
+		if !es.StampDecisionTime(cmd, now) {
+			return zero, fmt.Errorf("%w: %T", es.ErrDecidedAtUnstampable, cmd)
+		}
 	}
 
 	// Fill audit defaults once, outside the retry loop, so every attempt
 	// carries the same command id and domain time. CorrelationID defaults
 	// to the command id so a single command still forms a one-event
-	// correlation group. OccurredAt is never taken from meta or the command.
+	// correlation group. The domain time is the server reading above —
+	// never taken from the command.
 	if meta.CommandID == uuid.Nil {
 		meta.CommandID = newV7()
 	}
 	if meta.CorrelationID == uuid.Nil {
 		meta.CorrelationID = meta.CommandID
 	}
-	meta.OccurredAt = now
 
 	ho := newHandleOptions(opts)
 
 	for attempt := 0; ; attempt++ {
-		res, err := r.handleOnce(ctx, sid, cmd, meta, expected, ho)
+		res, err := r.handleOnce(ctx, sid, cmd, meta, expected, now, ho)
 		var stale *es.ConflictError
 		if err == nil || !errors.Is(err, es.ErrConflict) || errors.As(err, &stale) || attempt >= r.retries {
 			if err != nil && attempt > 0 {
@@ -322,8 +330,9 @@ func (r *Runtime[S, C, E]) sleep(ctx context.Context, d time.Duration) error {
 
 // handleOnce is a single load → IsTerminal → Decide → Append pass. Decide is
 // pure and load re-reads the stream, so re-running it after a conflict is
-// safe by construction.
-func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, ho handleOptions) (Result[S, E], error) {
+// safe by construction. now is the server-clock reading HandleAt took once
+// per call: the domain time every appended event carries.
+func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, now time.Time, ho handleOptions) (Result[S, E], error) {
 	var zero Result[S, E]
 
 	state, version, err := r.load(ctx, sid, 0, time.Time{})
@@ -383,7 +392,7 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 		CorrelationID:   meta.CorrelationID,
 		CausationID:     meta.CausationID,
 		Actor:           meta.Actor,
-		OccurredAt:      meta.OccurredAt,
+		OccurredAt:      now,
 	})
 	if err != nil {
 		return zero, err // includes es.ErrConflict

@@ -191,8 +191,8 @@ extend google.protobuf.FieldOptions {
   // struct field of that name for a field called decided_at).
   //
   // The client value is intent, not authority. aggregate.Runtime always
-  // stamps Envelope.OccurredAt from the server clock (Meta.OccurredAt is
-  // ignored), rejects a tagged-but-unset field with es.ErrDecidedAtMissing,
+  // stamps Envelope.OccurredAt from the server clock, rejects a
+  // tagged-but-unset field with es.ErrDecidedAtMissing,
   // rejects a value further than es.MaxDecisionSkew (five minutes) from
   // server time with *es.DecidedAtSkewError, and replaces the command's
   // decided_at with server time before Decide runs so a decider checking an

@@ -61,7 +61,6 @@ func TestMapErrorTable(t *testing.T) {
 			{es.ErrInvalidStreamID.Error(), es.ErrInvalidStreamID, connect.CodeInvalidArgument, 0},
 			{es.ErrDecidedAtMissing.Error(), es.ErrDecidedAtMissing, connect.CodeInvalidArgument, 0},
 			{es.ErrDecidedAtSkew.Error(), es.ErrDecidedAtSkew, connect.CodeInvalidArgument, 0},
-			{es.ErrDecidedAtMismatch.Error(), es.ErrDecidedAtMismatch, connect.CodeInvalidArgument, 0},
 			{"context.Canceled", context.Canceled, connect.CodeCanceled, 0},
 			{"context.DeadlineExceeded", context.DeadlineExceeded, connect.CodeDeadlineExceeded, 0},
 		} {

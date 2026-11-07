@@ -76,8 +76,9 @@ type Reload func(ctx context.Context) (version uint64, state proto.Message, err 
 // same treatment non-UUID Idempotency-Keys get — so a client's free-text
 // correlation id still reaches the audit trail and stays stable across
 // retries instead of being dropped. Idempotency-Key is a UUID, or any string
-// hashed to a UUIDv5 so retries share a CommandID. OccurredAt is left zero
-// because the runtime always stamps it from the server clock (ADR 0034).
+// hashed to a UUIDv5 so retries share a CommandID. es.Meta carries no event
+// time: the runtime stamps every event's OccurredAt from the server clock
+// (ADR 0034).
 func MetaFrom(h http.Header, actor es.Actor) es.Meta {
 	m := es.Meta{Actor: actor}
 	if v := h.Get(HdrCorrelationID); v != "" {
@@ -181,8 +182,7 @@ func passOr(code connect.Code, err error) *connect.Error {
 //	es.ErrDuplicateEventID    aborted (IdempotencyConcurrent, HTTP 409 semantics)
 //	es.ErrInvalidStreamID,
 //	es.ErrDecidedAtMissing,
-//	es.ErrDecidedAtSkew,
-//	es.ErrDecidedAtMismatch   invalid_argument
+//	es.ErrDecidedAtSkew       invalid_argument
 //	context.Canceled          canceled
 //	context.DeadlineExceeded  deadline_exceeded
 //	anything else             mapper(err) if it returns non-nil, else failed_precondition
@@ -226,7 +226,7 @@ func MapError(ctx context.Context, err error, mapper ErrorMapper, reload Reload,
 		// cue — the concurrent duplicate of draft §2.6.
 		return IdempotencyConcurrent()
 	case errors.Is(err, es.ErrInvalidStreamID), errors.Is(err, es.ErrDecidedAtMissing),
-		errors.Is(err, es.ErrDecidedAtSkew), errors.Is(err, es.ErrDecidedAtMismatch):
+		errors.Is(err, es.ErrDecidedAtSkew):
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, err)

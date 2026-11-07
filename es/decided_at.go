@@ -22,7 +22,9 @@ const MaxDecisionSkew = 5 * time.Minute
 // decided_at is the caller's intent, not authority. aggregate.Runtime
 // validates it against the server clock and then stamps it with server
 // time before Decide runs, so a decider that checks an expiry window reads
-// the server's decision time (ADR 0034).
+// the server's decision time (ADR 0034). A command whose decision time
+// cannot be stamped — see StampDecisionTime — is rejected with
+// ErrDecidedAtUnstampable rather than run on the client's value.
 //
 // The method is DecisionTime rather than DecidedAt because protoc-gen-go
 // already emits a struct field named DecidedAt for a proto field called
@@ -42,7 +44,9 @@ type DecisionTimeSetter interface {
 // StampDecisionTime replaces a command's tagged (es.v1.decided_at) field with
 // at. It reports whether the command had a settable decision-time field. It is
 // the mechanism aggregate.Runtime uses so Decide sees server time even when a
-// decider reads the command's decided_at directly (ADR 0034).
+// decider reads the command's decided_at directly (ADR 0034). The runtime
+// treats a false report as fatal: a command that reports a decision time it
+// cannot have replaced is rejected with ErrDecidedAtUnstampable, never run.
 func StampDecisionTime(cmd any, at time.Time) bool {
 	if setter, ok := cmd.(DecisionTimeSetter); ok {
 		setter.SetDecisionTime(at)
