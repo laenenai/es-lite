@@ -145,9 +145,13 @@ func (s *Store) Drain(ctx context.Context, limit int, publish func(context.Conte
 			return 0, fmt.Errorf("publish: %w", err)
 		}
 	}
+	// published_at is the database's own clock (clock_timestamp() in
+	// SQL, F33), never the relay process's: a relay skewed against the
+	// database cannot stamp deliveries outside the server's timeline,
+	// and every replica draining this store shares one monotone clock.
 	if _, err := tx.Exec(ctx,
-		`UPDATE events SET published_at = $1 WHERE global_position = ANY($2)`,
-		time.Now().UTC(), positions,
+		`UPDATE events SET published_at = clock_timestamp() WHERE global_position = ANY($1)`,
+		positions,
 	); err != nil {
 		return 0, fmt.Errorf("mark published: %w", err)
 	}

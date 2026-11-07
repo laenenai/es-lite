@@ -801,10 +801,15 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	if len(positions) == 0 {
 		return nil, false, nil
 	}
-	// Step 2: fetch full rows for the chosen positions only, in the same
-	// transaction and therefore the same snapshot — the page cannot change
-	// under the fetch, and no payload the selection did not clear is ever
-	// selected. global_position is bigint, so positions always fit int64
+	// Step 2: fetch full rows for the chosen positions only. The safety
+	// here is position immutability, not snapshot identity: under READ
+	// COMMITTED each statement takes its own snapshot (sharing a
+	// transaction does not make the two reads share one), but a row's
+	// global_position never changes, and inside the fence-settled bound
+	// nothing at or below it can appear later — so fetching by exactly
+	// the positions step 1 cleared returns exactly those rows, and no
+	// payload the selection did not clear is ever selected.
+	// global_position is bigint, so positions always fit int64
 	// (pgx sends []uint64 as numeric[], which would force a cast).
 	positions64 := make([]int64, len(positions))
 	for i, p := range positions {

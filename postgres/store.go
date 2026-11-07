@@ -174,56 +174,129 @@ func (s *Store) migrateIfConfigured(ctx context.Context, cfg openConfig) error {
 	return s.Migrate(ctx)
 }
 
-// Migrate applies pending versioned migrations under a session advisory lock,
-// so concurrent migrators are safe (ADR 0010). Each migration runs in its own
-// transaction and is recorded in schema_migrations. Idempotent.
+// Migrate applies pending versioned migrations (ADR 0010). Each pending
+// migration runs in exactly one transaction — BEGIN; SELECT
+// pg_advisory_xact_lock($1); re-check the recorded version; apply;
+// record; COMMIT — and the schema_migrations bootstrap runs inside a
+// transaction of the same shape.
+//
+// The lock is transaction-scoped on purpose (F10): the session-scoped
+// pg_advisory_lock this path used to take stayed latched on a pooled
+// connection whenever the run was cancelled or failed (the deferred
+// unlock never ran on a dead context), blocking every later migration
+// that landed on another connection. A transaction-level advisory lock
+// works "the same as pg_advisory_lock, except that the lock is
+// automatically released at the end of the current transaction and
+// cannot be released explicitly" (PostgreSQL docs, System Administration
+// Functions: Advisory Lock Functions), so commit, rollback, cancellation
+// and connection loss all release it — there is no unlock statement to
+// skip.
+//
+// Concurrency: two migrators may both see a version pending, but the
+// second to acquire the lock re-checks the recorded version inside the
+// transaction and skips what the first applied, so every migrator
+// observes a consistent, monotone history. Idempotent.
 func (s *Store) Migrate(ctx context.Context) error {
 	migs, err := migrate.Load(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("postgres: acquire: %w", err)
-	}
-	defer conn.Release()
-
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrateLockKey); err != nil {
-		return fmt.Errorf("postgres: advisory lock: %w", err)
-	}
-	defer conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrateLockKey)
-
-	if _, err := conn.Exec(ctx,
-		`CREATE TABLE IF NOT EXISTS schema_migrations (
-			version    int         PRIMARY KEY,
-			applied_at timestamptz NOT NULL DEFAULT now()
-		)`); err != nil {
+	// Bootstrap the history table in its own xact-locked transaction,
+	// shaped exactly like a migration's: concurrent migrators may all
+	// reach this on a fresh database, and CREATE TABLE IF NOT EXISTS is
+	// idempotent under the lock.
+	if err := s.migrateInLock(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`CREATE TABLE IF NOT EXISTS schema_migrations (
+				version    int         PRIMARY KEY,
+				applied_at timestamptz NOT NULL DEFAULT now()
+			)`)
+		return err
+	}); err != nil {
 		return fmt.Errorf("postgres: schema_migrations: %w", err)
 	}
-	for _, m := range migs {
-		var exists bool
-		if err := conn.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&exists); err != nil {
-			return fmt.Errorf("postgres: check migration %d: %w", m.Version, err)
+	// The recorded versions, read once as a fast path: a version listed
+	// here is applied, and a version missing here may since have been
+	// applied by a concurrent migrator — which is why every version the
+	// read marks pending is re-checked under the lock below. The read
+	// can be stale only towards "pending", and a stale miss costs an
+	// empty locked skip, never a double apply.
+	rows, err := s.pool.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("postgres: read schema_migrations: %w", err)
+	}
+	defer rows.Close()
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return fmt.Errorf("postgres: read schema_migrations: %w", err)
 		}
-		if exists {
+		applied[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: read schema_migrations: %w", err)
+	}
+
+	for _, m := range migs {
+		if applied[m.Version] {
 			continue
 		}
-		tx, err := conn.Begin(ctx)
-		if err != nil {
+		if err := s.migrateInLock(ctx, func(tx pgx.Tx) error {
+			// The re-check under the lock: a concurrent migrator may
+			// have applied and recorded this version since the read
+			// above; the lock serializes the two, so this verdict is
+			// authoritative.
+			var exists bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&exists); err != nil {
+				return fmt.Errorf("postgres: check migration %d: %w", m.Version, err)
+			}
+			if exists {
+				return nil
+			}
+			if _, err := tx.Exec(ctx, m.SQL); err != nil {
+				return fmt.Errorf("postgres: migration %04d_%s: %w", m.Version, m.Name, err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
+				return fmt.Errorf("postgres: record migration %d: %w", m.Version, err)
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, m.SQL); err != nil {
-			tx.Rollback(ctx)
-			return fmt.Errorf("postgres: migration %04d_%s: %w", m.Version, m.Name, err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
-			tx.Rollback(ctx)
-			return fmt.Errorf("postgres: record migration %d: %w", m.Version, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("postgres: commit migration %d: %w", m.Version, err)
-		}
+	}
+	return nil
+}
+
+// migrateInLock runs fn inside one transaction that holds the migration
+// advisory lock for its whole duration: BEGIN; SELECT
+// pg_advisory_xact_lock($1); fn; COMMIT. The lock is transaction-level,
+// so it is "automatically released at the end of the current
+// transaction" (PostgreSQL docs, System Administration Functions:
+// Advisory Lock Functions) — commit and rollback both end it, and a
+// cancelled run cannot leave it latched on a pooled connection (F10).
+//
+// The rollback runs on a context detached from the caller's on purpose:
+// a ctx cancelled mid-migration must still send its ROLLBACK, so the
+// transaction — and with it the lock — ends at a definite point instead
+// of whenever the server notices a dying connection, and the pooled
+// connection survives the cancellation.
+func (s *Store) migrateInLock(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: begin: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		return fmt.Errorf("postgres: advisory lock: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit: %w", err)
 	}
 	return nil
 }

@@ -173,7 +173,6 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 	orderRoot := es.OrderRoot(rows)
 	a := es.Anchor{
 		ID:                 newV7().String(),
-		CreatedAt:          es.TruncateMicros(time.Now()),
 		UptoGlobalPosition: upto,
 		StreamCount:        uint64(len(heads)),
 		RootHash:           root[:],
@@ -189,10 +188,17 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 	if len(rows) > 0 {
 		a.OrderFromPosition = rows[0].From
 	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO anchors (anchor_id, created_at, upto_global_position, stream_count, root_hash) VALUES ($1,$2,$3,$4,$5)`,
-		a.ID, a.CreatedAt, a.UptoGlobalPosition, a.StreamCount, a.RootHash,
-	); err != nil {
+	// created_at is the database's own clock (clock_timestamp() in SQL,
+	// F33), never this process's: every replica anchoring against the
+	// store shares one monotone timeline, however skewed its own clock.
+	// RETURNING reads the database's stamp back into the anchor this
+	// returns, so callers see exactly what was recorded.
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO anchors (anchor_id, created_at, upto_global_position, stream_count, root_hash)
+		 VALUES ($1, clock_timestamp(), $2, $3, $4)
+		 RETURNING created_at`,
+		a.ID, a.UptoGlobalPosition, a.StreamCount, a.RootHash,
+	).Scan(&a.CreatedAt); err != nil {
 		return es.Anchor{}, fmt.Errorf("insert anchor: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

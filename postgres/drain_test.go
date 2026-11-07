@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -461,5 +462,71 @@ func TestRelayRoleGatesTheBypassArm(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestDrainPublishedAtIsDBClock pins the delivery relay's clock contract
+// (F33): Drain stamps published_at with the database's own clock
+// (clock_timestamp() in SQL), never the relay process's — a relay whose
+// clock skews against the database can never place the stamp outside the
+// DB-clock window. The window is taken from feedDBClock around the
+// drain, so the assertion holds whatever skew exists between the test
+// process and the database.
+func TestDrainPublishedAtIsDBClock(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	appendUnpublishedEvent(t, ctx, s, "ws_drain_clock")
+
+	dbBefore := feedDBClock(t, ctx, s)
+	n, err := s.Drain(ctx, 10, func(context.Context, []es.Envelope) error { return nil })
+	if err != nil || n != 1 {
+		t.Fatalf("drain: n=%d err=%v, want 1/nil", n, err)
+	}
+	dbAfter := feedDBClock(t, ctx, s)
+
+	var publishedAt time.Time
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT published_at FROM events WHERE workspace_id = $1`, "ws_drain_clock",
+	).Scan(&publishedAt); err != nil {
+		t.Fatalf("read published_at: %v", err)
+	}
+	if publishedAt.Before(dbBefore) || publishedAt.After(dbAfter) {
+		t.Fatalf("published_at = %v, want the DB clock between %v and %v (not the relay process's clock)",
+			publishedAt, dbBefore, dbAfter)
+	}
+}
+
+// TestAnchorCreatedAtIsDBClock pins the anchor path's clock contract
+// (F33): Anchor records created_at from the database's own clock
+// (clock_timestamp() in SQL), never the anchoring process's, and the
+// anchor it returns carries exactly the stamp the database wrote.
+func TestAnchorCreatedAtIsDBClock(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	for _, ws := range []string{"ws_anchor_clock_a", "ws_anchor_clock_b"} {
+		appendUnpublishedEvent(t, ctx, s, ws)
+	}
+
+	dbBefore := feedDBClock(t, ctx, s)
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("anchor: %v", err)
+	}
+	dbAfter := feedDBClock(t, ctx, s)
+
+	if a.CreatedAt.Before(dbBefore) || a.CreatedAt.After(dbAfter) {
+		t.Fatalf("anchor created_at = %v, want the DB clock between %v and %v (not the anchoring process's clock)",
+			a.CreatedAt, dbBefore, dbAfter)
+	}
+	// The returned anchor and the recorded row are the same stamp.
+	var stored time.Time
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT created_at FROM anchors WHERE anchor_id = $1`, a.ID,
+	).Scan(&stored); err != nil {
+		t.Fatalf("read anchor row: %v", err)
+	}
+	if !stored.Equal(a.CreatedAt) {
+		t.Fatalf("stored created_at %v != returned %v — the anchor must carry the stamp the database wrote",
+			stored, a.CreatedAt)
 	}
 }
