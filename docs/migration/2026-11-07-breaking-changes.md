@@ -204,3 +204,42 @@ stall detection is a liveness signal, not a correctness boundary — a
 torn read can only mis-time a stall report, never corrupt data.
 `OnStall` consumers must treat the raw parameter as the subscription's
 own backlog, not the log's.
+
+## 2026-11-07 — `feed.Waiter.Wait` reports whether the stream was genuinely woken
+
+**What changes.** `feed.Waiter.Wait` now returns
+`Wait(ctx context.Context, timeout time.Duration) (woke bool, err error)`.
+`woke` is true only when the waiter observed a genuine wakeup — an
+append notification or another wake source firing — and is the signal
+the feed uses to let the woken stream read its next page immediately:
+the idle poll floor now applies only when `woke` is false, so a
+genuine wake no longer pays up to `Config.Poll` on top of the wait,
+while a timed-out wait is still floored (a Waiter that returns
+instantly must not spin the read loop against the log). The error
+result is unchanged: a timeout that ends without a wakeup returns
+`(false, nil)` — the same nil the method returned before — and ctx
+ending or a real failure returns `(false, err)` with the same error
+the method returned before. Two accompanying caller-visible fixes land
+with it: `Subscribe` now stops and joins its renewer before assembling
+the returned error, so a renewal failure observed just before the
+stream ended is joined into it instead of silently dropped; and a
+woken idle wait reaches the next page read without waiting out the
+poll.
+
+**Who is affected.** Third-party `feed.Waiter` implementations:
+changing the method's result list is a compile-time break — their
+types no longer satisfy `feed.Waiter` until `Wait` grows the `bool`
+result (the in-repo test fakes hit exactly this). `Subscribe` callers
+that match the returned error exactly (rather than with `errors.Is`/`As`)
+may see additional joined causes where a racing lease loss used to be
+dropped, and subscribers with a wakeup source now see pages arrive
+sooner.
+
+**What to do.** Return whether the call is a genuine wake: `true` from
+the wake path (`(true, nil)`), `false` from the timeout path
+(`(false, nil)`), and `(false, err)` when ctx ends or the wakeup source
+fails. An implementation that cannot tell a wake from a timeout — a
+pure sleep or poll-style waiter — must return `false` on every
+non-error path and it keeps exactly its old pacing, since only
+non-wakes are floored. Prefer `errors.Is`/`errors.As` over exact error
+comparisons when inspecting `Subscribe`'s result.

@@ -181,10 +181,16 @@ type DeadLetterStore interface {
 
 // Waiter is an optional wakeup source. Subscribe calls Wait after a short page
 // instead of sleeping; Wait returns when new events may exist, after timeout,
-// or when ctx ends. A normal timeout is a nil return: only ctx ending or a real
-// failure returns an error, which stops the stream. A nil Waiter means polling.
+// or when ctx ends. woke reports whether the waiter observed a genuine
+// wakeup — an append notification or another wake source firing — and is
+// false on a timeout: a normal timeout is a (false, nil) return, and only ctx
+// ending or a real failure returns an error, which stops the stream. The
+// server floors the idle wait only when woke is false, so a genuine wake
+// reaches the next page read without waiting out the poll; an implementation
+// that cannot distinguish a wake from a timeout must always return false. A
+// nil Waiter means polling.
 type Waiter interface {
-	Wait(ctx context.Context, timeout time.Duration) error
+	Wait(ctx context.Context, timeout time.Duration) (woke bool, err error)
 }
 
 // Clock supplies wall time where the server needs it (lease owner

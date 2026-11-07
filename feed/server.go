@@ -247,7 +247,10 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	// Release ordering: stop the stream, wait for the renewer to exit, then
 	// release. A Renew can therefore never race the Release and resurrect the
 	// lease. The release uses a context detached from the caller's, because
-	// cancellation must not leak the lease.
+	// cancellation must not leak the lease. The tail below already ran the
+	// same cancel-and-join once the stream ended; both are idempotent, so
+	// this defer reads as a no-op on that path and stays self-contained on
+	// every other one.
 	defer func() {
 		cancel()
 		renewals.Wait()
@@ -258,18 +261,35 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 
 	streamErr := s.stream(runCtx, req, sink, s.batchSize(req.BatchSize))
 
+	// Stop the renewer and wait for it to exit before assembling the causes
+	// (review F35): a renewal failure observed just before the stream ended
+	// may still be on its way to lost — the renewer can be anywhere between
+	// the store's failed Renew and the channel send — and a drain that runs
+	// before the renewer exits drops that diagnosis from the returned error.
+	// cancel() unblocks a renewer parked on its ticker or inside a Renew
+	// call; renewals.Wait() then guarantees every loss it recorded is in
+	// lost before the drain below. Both are idempotent, so the deferred
+	// cancel-and-join below still reads; and neither can wait on anything
+	// un-cancelable — the renewer's own waits are on ctx (already cancelled)
+	// or its ticker, the same waits the deferred join always made.
+	cancel()
+	renewals.Wait()
+
 	// Collect the independent causes instead of letting one silently replace
 	// another. A stream error caused by our own cancellation, or by the
 	// caller's own deadline arriving, is derived, not a diagnosis, and is
 	// dropped; a real send/read error that races a lease loss is joined so
 	// both remain visible.
-	var leaseErr error
-	select {
-	case leaseErr = <-lost:
-	default:
+	drainLost := func() error {
+		select {
+		case err := <-lost:
+			return err
+		default:
+			return nil
+		}
 	}
 	var causes []error
-	if leaseErr != nil {
+	if leaseErr := drainLost(); leaseErr != nil {
 		causes = append(causes, leaseErr)
 	}
 	callerExpired := false
@@ -277,6 +297,7 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 		callerExpired = true
 		causes = append(causes, callerErr)
 	}
+	joined := streamErr
 	if len(causes) > 0 {
 		// The stream runs under a child of ctx, so a caller deadline reaches
 		// it too: the stream's own deadline error is the caller's error echoed
@@ -287,11 +308,19 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 			causes = append(causes, streamErr)
 		}
 		if len(causes) == 1 {
-			return causes[0]
+			joined = causes[0]
+		} else {
+			joined = errors.Join(causes...)
 		}
-		return errors.Join(causes...)
 	}
-	return streamErr
+	// A second receive after the join: nothing can deliver to lost once the
+	// renewer has exited — it is the only writer — but the invariant "every
+	// observed loss is in the returned error" must not depend on that. Any
+	// error that did appear joins instead of vanishing.
+	if leaseErr := drainLost(); leaseErr != nil {
+		joined = errors.Join(joined, leaseErr)
+	}
+	return joined
 }
 
 // releaseLease releases the subscription key for owner on a context detached
@@ -550,10 +579,12 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 // wait idles until the next poll, or until the Waiter reports new events.
 // The fence-clamp loop's re-head retry uses it: an unjittered, unfloored
 // pause is the right shape there — a bounded retry cadence, not the idle
-// poll. The read loop's idle branch uses idleWait instead.
+// poll. The read loop's idle branch uses idleWait instead. There is no
+// floor to bypass here, so whether the Waiter genuinely woke is discarded.
 func (s *Server) wait(ctx context.Context) error {
 	if s.cfg.Waiter != nil {
-		return s.cfg.Waiter.Wait(ctx, s.cfg.Poll)
+		_, err := s.cfg.Waiter.Wait(ctx, s.cfg.Poll)
+		return err
 	}
 	t := time.NewTimer(s.cfg.Poll)
 	defer t.Stop()
@@ -572,14 +603,16 @@ func (s *Server) wait(ctx context.Context) error {
 // connection pool. The factor is drawn per idle wait, so each stream's phase
 // random-walks away from the fleet's.
 //
-// The Waiter path is floored: Wait returning nil means "timeout" by the
-// Waiter contract, so a Waiter whose implementation returns nil immediately
-// must not turn the loop into a spin against the log. Whatever the Waiter
-// did, the loop iteration that began at iterStart has spent at least Poll by
-// the time idleWait returns — the server sleeps the remainder. The timer
-// path needs no floor: the timer itself waits the jittered poll out, and
-// sleeping a remainder on top would both double-sleep and cancel the
-// sub-Poll half of the jitter.
+// The Waiter path is floored only when the Waiter did not genuinely wake:
+// (false, nil) means "timeout" by the Waiter contract, so a Waiter whose
+// implementation returns immediately must not turn the loop into a spin
+// against the log — a non-wake spends at least Poll from iterStart before
+// idleWait returns. A genuine wake (woke true) bypasses the floor: the wake
+// source already proved new events may exist, so the next page read happens
+// immediately instead of paying the poll on top of the wait (review F35).
+// The timer path needs no floor: the timer itself waits the jittered poll
+// out, and sleeping a remainder on top would both double-sleep and cancel
+// the sub-Poll half of the jitter.
 func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
 	d := s.cfg.Poll
 	if s.jitter != nil {
@@ -595,18 +628,21 @@ func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
 			return nil
 		}
 	}
-	if err := s.cfg.Waiter.Wait(ctx, d); err != nil {
+	woke, err := s.cfg.Waiter.Wait(ctx, d)
+	if err != nil {
 		return err
 	}
-	// The floor: at least Poll since the iteration began. Cancellation
-	// still ends the stream promptly — the floor never blocks shutdown.
-	if rem := s.cfg.Poll - time.Since(iterStart); rem > 0 {
-		t := time.NewTimer(rem)
-		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
+	if !woke {
+		// The floor: at least Poll since the iteration began. Cancellation
+		// still ends the stream promptly — the floor never blocks shutdown.
+		if rem := s.cfg.Poll - time.Since(iterStart); rem > 0 {
+			t := time.NewTimer(rem)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+			}
 		}
 	}
 	return nil

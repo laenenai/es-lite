@@ -176,19 +176,20 @@ func (l *idlePageLog) snapshot() []time.Time {
 }
 
 // instantWaiter is the degenerate Waiter the floor defends against: Wait
-// records its timeout and returns nil immediately. Nil means "timeout" by the
-// Waiter contract, so a stream that trusts it alone would spin the read loop
+// records its timeout and returns immediately, never reporting a genuine
+// wake. (false, nil) means "timed out without a wakeup" by the Waiter
+// contract, so a stream that trusts it alone would spin the read loop
 // against the log as fast as pages can be read.
 type instantWaiter struct {
 	mu   sync.Mutex
 	args []time.Duration
 }
 
-func (w *instantWaiter) Wait(_ context.Context, timeout time.Duration) error {
+func (w *instantWaiter) Wait(_ context.Context, timeout time.Duration) (bool, error) {
 	w.mu.Lock()
 	w.args = append(w.args, timeout)
 	w.mu.Unlock()
-	return nil
+	return false, nil
 }
 
 func (w *instantWaiter) snapshot() []time.Duration {

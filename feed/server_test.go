@@ -484,10 +484,19 @@ type blockingSendSink struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+
+	// ctxMu guards the context Send observed — the stream's own run
+	// context, whose cancellation is one of the few externally visible
+	// events in Subscribe's tail.
+	ctxMu sync.Mutex
+	ctx   context.Context
 }
 
 func (s *blockingSendSink) Send(ctx context.Context, _ es.Envelope) error {
 	s.once.Do(func() { close(s.started) })
+	s.ctxMu.Lock()
+	s.ctx = ctx
+	s.ctxMu.Unlock()
 	select {
 	case <-s.release:
 	case <-ctx.Done():
@@ -498,7 +507,17 @@ func (s *blockingSendSink) Send(ctx context.Context, _ es.Envelope) error {
 	return s.sendErr
 }
 
-// blockingWaiter blocks until the stream is cancelled; it never busy-polls.
+// streamContext returns the context Send observed: the stream's run
+// context. Its Done channel closes when Subscribe cancels it, so a test can
+// order the renewer's delivery against the tail without sleeping.
+func (s *blockingSendSink) streamContext() context.Context {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+	return s.ctx
+}
+
+// blockingWaiter blocks until the stream is cancelled; it never genuinely
+// wakes, so Wait always reports (false, …) and the poll floor still paces it.
 type blockingWaiter struct {
 	mu      sync.Mutex
 	waits   int
@@ -506,30 +525,47 @@ type blockingWaiter struct {
 	release chan struct{}
 }
 
-func (w *blockingWaiter) Wait(ctx context.Context, _ time.Duration) error {
+func (w *blockingWaiter) Wait(ctx context.Context, _ time.Duration) (bool, error) {
 	w.mu.Lock()
 	w.waits++
 	err := w.err
 	w.mu.Unlock()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if w.release != nil {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-w.release:
-			return nil
+			return false, nil
 		}
 	}
 	<-ctx.Done()
-	return ctx.Err()
+	return false, ctx.Err()
 }
 
 func (w *blockingWaiter) count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.waits
+}
+
+// wakingWaiter genuinely wakes: Wait reports (true, nil) once its delay
+// passes, claiming new events may exist without waiting out the poll.
+type wakingWaiter struct {
+	delay time.Duration
+}
+
+func (w *wakingWaiter) Wait(ctx context.Context, _ time.Duration) (bool, error) {
+	t := time.NewTimer(w.delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-t.C:
+		return true, nil
+	}
 }
 
 // recordingObserver captures every Observer signal so tests can pin what
@@ -608,6 +644,24 @@ func (o *recordingObserver) stallsSnapshot() []obsStall {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]obsStall(nil), o.stalls...)
+}
+
+// slowLeaseLostObserver parks the renewer inside OnLeaseLost: entered closes
+// when the call arrives; the call returns only once hold closes. It lets a
+// test hold the renewer between the store's failed renewal and the loss
+// reaching Subscribe — the loss is decided and observed, but not yet
+// delivered. The embedded recordingObserver keeps every other signal.
+type slowLeaseLostObserver struct {
+	recordingObserver
+	once    sync.Once
+	entered chan struct{}
+	hold    chan struct{}
+}
+
+func (o *slowLeaseLostObserver) OnLeaseLost(scope, projection, instance, owner string) {
+	o.once.Do(func() { close(o.entered) })
+	<-o.hold
+	o.recordingObserver.OnLeaseLost(scope, projection, instance, owner)
 }
 
 // fenceBlockedLog is the fence-bounded Log the clamp and stall tests run
@@ -1436,6 +1490,32 @@ func TestSubscribeWaitsOnAZeroRowTruncatedPage(t *testing.T) {
 	}
 }
 
+// A genuine wake must reach the next page read immediately. The poll floor
+// exists to stop a Waiter that never observes wakeups from spinning the
+// loop, so it must apply only to non-wakes: with Poll 250ms and a Waiter
+// that genuinely wakes after 10ms, the second page read happens within
+// 100ms — a floored wake would wait out the whole poll first.
+func TestWaiterWakeBypassesFloor(t *testing.T) {
+	logs := newMemLogs() // empty log: every page is an idle wait
+	waiter := &wakingWaiter{delay: 10 * time.Millisecond}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+		Waiter: waiter,
+		Poll:   250 * time.Millisecond,
+	})
+	cancel, done := start(t, srv, testRequest("live"), newMemSink())
+
+	started := time.Now()
+	waitCalls(t, logs, 2)
+	elapsed := time.Since(started)
+	cancel()
+	_ = await(t, done)
+
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("second page read after %v, want within 100ms: a genuine wake must bypass the 250ms poll floor", elapsed)
+	}
+}
+
 func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
 	checkpoints := newMemCheckpoints(at)
@@ -1881,6 +1961,75 @@ func TestSubscribeJoinsAStreamErrorRacingLeaseLoss(t *testing.T) {
 	if !errors.As(err, &lost) {
 		t.Fatalf("error = %v (%T), want *LeaseLostError", err, err)
 	}
+}
+
+// The reverse race of the test above (review F35): the renewal failure is
+// decided and observed — OnLeaseLost has fired — but its delivery to lost
+// races the stream's own end. A send failure that ends the stream while the
+// renewer is still reporting the loss must not drop the lease-loss
+// diagnosis from the returned error.
+func TestSubscribeKeepsLeaseLossRacingStreamError(t *testing.T) {
+	leases := newMemLeases()
+	sendErr := errors.New("client write failed")
+	obs := &slowLeaseLostObserver{entered: make(chan struct{}), hold: make(chan struct{})}
+	sink := &blockingSendSink{
+		sendErr: sendErr,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases,
+		Logs:       newMemLogs(ev(1, "counter.v1.Incremented", "one")),
+		Observer:   obs,
+		LeaseTTL:   50 * time.Millisecond,
+		RenewEvery: 5 * time.Millisecond,
+	})
+	_, done := start(t, srv, testRequest("live"), sink)
+
+	select {
+	case <-sink.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Send was not called")
+	}
+	// Fail the next renewal and wait for the renewer to park inside
+	// OnLeaseLost: the store has decided the loss and the renewer has
+	// observed it, but the *LeaseLostError has not reached lost yet.
+	target := leases.failRenewalsFromNow()
+	waitRenewals(t, leases, target)
+	select {
+	case <-obs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnLeaseLost was not called")
+	}
+	// End the stream with a send failure concurrent with the loss delivery.
+	close(sink.release)
+	// The stream's run context is cancelled inside Subscribe's tail. Wait
+	// for that cancellation before releasing the renewer: it pins the
+	// interleaving in both directions — against the bug, whose drain has
+	// already run by then, so the late loss is provably absent from the
+	// assembled error; and against the fix, whose drain runs only after the
+	// renewer is joined, so the released loss is guaranteed to be seen.
+	streamCtx := sink.streamContext()
+	select {
+	case <-streamCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stream context was never cancelled")
+	}
+	// Only now let the renewer deliver the loss.
+	close(obs.hold)
+
+	err := await(t, done)
+	if !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("error = %v, want ErrLeaseLost (a renewal failure observed before the stream ended must keep its diagnosis)", err)
+	}
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("error = %v, want the racing send error preserved", err)
+	}
+	var lost *feed.LeaseLostError
+	if !errors.As(err, &lost) {
+		t.Fatalf("error = %v (%T), want *LeaseLostError", err, err)
+	}
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
 }
 
 // The stream runs under a child of the caller's ctx, so a caller deadline is
