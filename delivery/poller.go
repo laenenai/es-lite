@@ -60,8 +60,9 @@ type Config struct {
 
 	// MaxRetries bounds how often a failing drain is retried (waiting
 	// RetryBackoff between attempts) before Run gives up and returns
-	// the error. 0 → DefaultDrainRetries (3); negative → never give
-	// up: the drain is retried for as long as ctx lives. Optional.
+	// the error. 0 → DefaultDrainRetries (3); positive → exactly that
+	// many retries; negative → fail fast: the first drain error is
+	// returned immediately, with no retries (design D10). Optional.
 	MaxRetries int
 
 	// RetryBackoff returns how long to wait before retry attempt n
@@ -169,7 +170,8 @@ type loopConfig struct {
 	// closed receive.
 	Wake <-chan struct{}
 	// MaxRetries bounds drain retries: 0 → DefaultDrainRetries,
-	// negative → never give up.
+	// positive → exactly that many, negative → fail fast (zero
+	// retries — design D10).
 	MaxRetries int
 	// RetryBackoff returns the wait before retry attempt n (1-based).
 	RetryBackoff func(attempt int) time.Duration
@@ -215,9 +217,13 @@ func runUntilCancelled(ctx context.Context, cfg loopConfig, drain func(context.C
 	}
 }
 
-// drainWithRetries runs one drain pass, retrying a failure with backoff
-// until it succeeds, ctx ends, or the retry budget is spent. A failure
-// after ctx is done reports ctx.Err() — cancellation always wins.
+// drainWithRetries runs one drain pass under the retry budget implied by
+// cfg.MaxRetries: 0 (unset) → DefaultDrainRetries, positive → exactly
+// that many retries, negative → fail fast — zero retries, the first
+// error is returned immediately (design D10). Between attempts it waits
+// cfg.RetryBackoff. Cancellation always wins: a failure after ctx is
+// done reports ctx.Err(), and a backoff sleep is abandoned on
+// cancellation.
 func drainWithRetries(ctx context.Context, cfg loopConfig, drain func(context.Context) error) error {
 	err := drain(ctx)
 	if err == nil {
@@ -227,13 +233,13 @@ func drainWithRetries(ctx context.Context, cfg loopConfig, drain func(context.Co
 	if budget == 0 {
 		budget = DefaultDrainRetries
 	} else if budget < 0 {
-		budget = 0 // never give up
+		budget = 0 // fail fast: the first error is final, no retries
 	}
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if budget > 0 && attempt > budget {
+		if attempt > budget {
 			return err
 		}
 		if serr := sleepCtx(ctx, backoffFor(cfg, attempt)); serr != nil {
@@ -246,8 +252,8 @@ func drainWithRetries(ctx context.Context, cfg loopConfig, drain func(context.Co
 }
 
 // backoffFor picks the configured backoff for retry attempt n, or the
-// linear default: 100ms per attempt, capped at 5s so a never-give-up
-// budget still probes periodically instead of sleeping forever.
+// linear default: 100ms per attempt, capped at 5s so a large explicit
+// budget keeps its waits bounded.
 func backoffFor(cfg loopConfig, attempt int) time.Duration {
 	if cfg.RetryBackoff != nil {
 		return cfg.RetryBackoff(attempt)

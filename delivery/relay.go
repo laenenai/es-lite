@@ -29,8 +29,9 @@ type RelayConfig struct {
 	Wake <-chan struct{}
 	// MaxRetries bounds how often a failing drain is retried (waiting
 	// RetryBackoff between attempts) before Run gives up and returns
-	// the error. 0 → DefaultDrainRetries (3); negative → never give
-	// up: the drain is retried for as long as ctx lives. Optional.
+	// the error. 0 → DefaultDrainRetries (3); positive → exactly that
+	// many retries; negative → fail fast: the first drain error is
+	// returned immediately, with no retries (design D10). Optional.
 	MaxRetries int
 	// RetryBackoff returns how long to wait before retry attempt n
 	// (1-based). Default: 100ms per attempt, capped at 5s. Optional.

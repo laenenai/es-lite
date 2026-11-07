@@ -57,7 +57,9 @@ func noopPublish(context.Context, []es.Envelope) error { return nil }
 // TestRelayMaxRetriesThenReturns pins the retry half of F22 for the
 // relay: a failing drain is retried with the configured budget before
 // Run gives up and returns the error — it must not exit on the first
-// error, and it must not retry forever once the budget is spent.
+// error, and it must not retry forever once the budget is spent. The
+// sanctioned exception is a negative MaxRetries, which fails fast
+// (design D10: zero retries, the first error is final).
 func TestRelayMaxRetriesThenReturns(t *testing.T) {
 	boom := errors.New("drain is down")
 
@@ -114,42 +116,34 @@ func TestRelayMaxRetriesThenReturns(t *testing.T) {
 		}
 	})
 
-	t.Run("negative budget never gives up", func(t *testing.T) {
-		// Fails 4 times — one more than the default budget tolerates
-		// (1 + 3 retries) — so only a never-give-up policy survives.
-		fd := &recoveringDrainer{err: boom, fail: 4}
+	t.Run("negative budget fails fast", func(t *testing.T) {
+		// The drainer would recover on a second call, so only a retry
+		// can save Run — fail fast must not take it. The hour-long
+		// backoff would also hang any attempted retry past the
+		// timeout, so the test stays bounded either way.
+		fd := &recoveringDrainer{err: boom, fail: 1}
 		relay := delivery.NewRelay(fd, noopPublish, delivery.RelayConfig{
 			BatchSize:    10,
 			PollInterval: time.Hour,
-			MaxRetries:   -1, // retry for as long as ctx lives
-			RetryBackoff: func(int) time.Duration { return time.Millisecond },
+			MaxRetries:   -1, // zero retries: the first error is final
+			RetryBackoff: func(int) time.Duration { return time.Hour },
 		})
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- relay.Run(ctx) }()
+		go func() { done <- relay.Run(context.Background()) }()
 
-		// The fifth attempt recovers (empty backlog); a bounded budget
-		// would have returned the error after the fourth failure.
-		deadline := time.After(2 * time.Second)
-		for fd.count() < 5 {
-			select {
-			case err := <-done:
-				t.Fatalf("Run returned %v before the drain recovered", err)
-			case <-deadline:
-				t.Fatalf("drain attempts = %d, want 5", fd.count())
-			case <-time.After(time.Millisecond):
-			}
-		}
-		cancel()
 		select {
 		case err := <-done:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("Run = %v, want context.Canceled", err)
+			if !errors.Is(err, boom) {
+				t.Fatalf("Run = %v, want the drain error", err)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("Run did not return after cancellation")
+			t.Fatal("Run did not return the first drain error")
+		}
+		// Zero retries: exactly one attempt, even though a retry would
+		// have recovered.
+		if got := fd.count(); got != 1 {
+			t.Fatalf("drain attempts = %d, want 1 (fail fast, no retries)", got)
 		}
 	})
 }
