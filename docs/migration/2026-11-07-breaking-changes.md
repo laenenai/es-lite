@@ -5,6 +5,60 @@ This file collects every breaking change as it lands — one entry per
 change, each stating what changed, who is affected, and what to do.
 Entries are grouped by the change date and never rewritten after landing.
 
+## 2026-11-07 — Generated command-service handlers gain draft-compliant `Idempotency-Key` dedup
+
+**What changes.** The `<Name>Deps` struct protoc-gen-es-lite emits for an
+`(es.v1.command_service)` grows `Dedup es.Deduplicator` — the storage port
+behind draft-ietf-httpapi-idempotency-key-header-07's stored-response
+flow (design D6). `Dedup` is nil by default, and a nil `Dedup` — or a
+request carrying no `Idempotency-Key` — keeps today's handler behavior
+byte for byte: no lookup, no fingerprint, no save. Wired, a key-carrying
+request runs the draft flow after `Authorize` (an unauthorized replay
+must leak nothing: no stored response, no fingerprint oracle): the
+handler fingerprints the request (`cmdsvc.Fingerprint`, SHA-256 hex of
+the marshaled request — the draft §2.4 checksum-of-payload option) and
+looks the command up under `es.DedupKey{StreamID, CommandID}` (the
+header's UUID as `cmdsvc.MetaFrom` maps it). A hit with a matching
+fingerprint returns the stored response without handling (draft §2.6); a
+hit with a different fingerprint is key reuse, rejected with
+`cmdsvc.IdempotencyKeyReused()` — Connect `aborted`, the message naming
+HTTP 422 semantics (draft §2.7); a miss handles the command and saves
+the marshaled response for the next retry. `cmdsvc.MapError` now maps
+`es.ErrDuplicateEventID` to `cmdsvc.IdempotencyConcurrent()` — Connect
+`aborted`, the message naming HTTP 409 semantics — so the concurrent
+duplicate that loses on the event-id constraint is reported per draft
+§2.6's concurrent window; that arm fires only when the runtime derives
+event ids from the command id, so wire
+`Runtime.WithDeterministicEventIDs()` alongside `Dedup`. The composite
+key of draft §5 is complete in the adapter: the record is scoped to the
+workspace (the client-attribute component — sqlite by being
+single-workspace, postgres through the `command_dedup` table's RLS)
+plus the stream plus the key's UUID. A `Dedup.Save` failure after a
+committed command returns `internal`: the response was produced but not
+stored, so the client's retry with the same key re-handles the command,
+collides on the derived event ids and is reported `aborted` until it
+picks a fresh key or the record is recovered by hand — never a silent
+success and never a second append.
+
+**Who is affected.** Applications wiring a generated handler's `Dedup`:
+requests carrying an `Idempotency-Key` stop double-appending on retry,
+and a concurrent duplicate is reported `aborted` — a service that wires
+no conflict retry can still surface a bare version conflict for a
+duplicate whose load interleaved the winner's commit (the runtime's
+optimistic check fires before the event-id insert), which is one more
+reason to wire `WithConflictRetry` on a machine-facing edge (ADR 0032):
+the retry re-loads and then loses on the event-id collision. Callers of
+`cmdsvc.MapError` that classified `es.ErrDuplicateEventID` themselves —
+it used to fall through to the app's mapper or `failed_precondition`:
+the new arm claims it first.
+
+**What to do.** Nothing without a wired `Dedup`. To adopt: wire
+`sqlite.NewDedupStore(store)` (or `postgres.NewDedupStore` on the
+workspace), construct the runtime with `.WithDeterministicEventIDs()`
+and its conflict-retry budget, and treat an `aborted` error naming HTTP
+409 as "this key's command already committed — use a fresh key", never
+as a retry cue.
+
 ## 2026-11-07 — `aggregate.Runtime` gains opt-in deterministic event ids derived from the command id
 
 **What changes.** `aggregate.Runtime` gains `WithDeterministicEventIDs()`,

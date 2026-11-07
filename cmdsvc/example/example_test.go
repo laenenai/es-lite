@@ -13,10 +13,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/laenenai/es-lite/aggregate"
@@ -295,3 +298,271 @@ func TestSetWriteResultRejectsWrongShape(t *testing.T) {
 
 // storeOf reaches the harness' store through the runtime's SQLite handle.
 func storeOf(h harness) es.Store { return h.store() }
+
+// ---- Idempotency-Key dedup (draft-ietf-httpapi-idempotency-key-header-07,
+// design D6, finding F6) ----------------------------------------------------
+//
+// The dedup harness wires both pieces the draft flow needs: a
+// sqlite-backed es.Deduplicator in Deps.Dedup and a runtime with
+// deterministic event ids, so a retried or concurrent duplicate derives
+// the event ids the first run stored and collides on the event-id
+// constraint instead of double-appending. Conflict retry is wired the
+// way a machine-facing edge wires it (ADR 0032): a concurrent duplicate
+// that first loses the optimistic version race re-loads and then loses
+// on the event-id constraint — the draft's 409 shape — instead of
+// surfacing a bare version conflict. For the sequential tests the
+// retry budget is inert (no conflict ever happens).
+
+// newDedupHarness is newHarness plus the D6 wiring. wrap, when non-nil,
+// wraps the sqlite dedup store — the concurrent test stages its race
+// through one.
+func newDedupHarness(t *testing.T, wrap func(inner es.Deduplicator) es.Deduplicator) harness {
+	t.Helper()
+	store, err := sqlite.Open(context.Background(), "file:"+t.Name()+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{}).
+		WithDeterministicEventIDs().
+		WithConflictRetry(2, func(int) time.Duration { return time.Millisecond })
+	dedup := es.Deduplicator(sqlite.NewDedupStore(store))
+	if wrap != nil {
+		dedup = wrap(dedup)
+	}
+	handler := countersvcv1es.NewCounterCommandServiceHandler(countersvcv1es.CounterCommandServiceDeps{
+		Runtime:   rt,
+		Authorize: authorizer{},
+		Identity:  identity{subject: "alice"},
+		Dedup:     dedup,
+		Errors: func(err error) *connect.Error {
+			if errors.Is(err, counter.ErrOutOfRange) {
+				return connect.NewError(connect.CodeOutOfRange, err)
+			}
+			return nil
+		},
+	})
+	mux := http.NewServeMux()
+	mux.Handle(countersvcv1connect.NewCounterCommandServiceHandler(handler))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return harness{
+		client: countersvcv1connect.NewCounterCommandServiceClient(srv.Client(), srv.URL),
+		rt:     rt,
+		st:     store,
+	}
+}
+
+// lookupBarrier makes the "both in-flight requests missed the lookup"
+// precondition of the concurrent race deterministic instead of sleep
+// roulette: each Lookup completes its inner lookup first, then waits
+// until every participant has, so neither request reaches HandleAt
+// before both lookups returned a miss. The wait honors ctx, so a broken
+// flow surfaces as an error rather than a hang. One barrier, one round.
+type lookupBarrier struct {
+	inner es.Deduplicator
+	n     int32
+	seen  atomic.Int32
+	done  chan struct{}
+}
+
+func newLookupBarrier(n int, inner es.Deduplicator) *lookupBarrier {
+	return &lookupBarrier{inner: inner, n: int32(n), done: make(chan struct{})}
+}
+
+func (b *lookupBarrier) Lookup(ctx context.Context, key es.DedupKey) (es.DedupRecord, bool, error) {
+	rec, found, err := b.inner.Lookup(ctx, key)
+	if err != nil {
+		return rec, found, err
+	}
+	if b.seen.Add(1) == b.n {
+		close(b.done) // the last participant arrives; everyone may proceed
+	}
+	select {
+	case <-b.done:
+		return rec, found, err
+	case <-ctx.Done():
+		return es.DedupRecord{}, false, ctx.Err()
+	}
+}
+
+func (b *lookupBarrier) Save(ctx context.Context, key es.DedupKey, rec es.DedupRecord) error {
+	return b.inner.Save(ctx, key, rec)
+}
+
+// TestIdempotencyReplay (draft §2.6): the same key and the same payload
+// replay the STORED response — identical bytes, no second append, the
+// log still holds exactly one event. The replay provably is not a
+// re-handle: a re-handled Init would be rejected "already initialized".
+// A keyless request with the same payload is NOT replayed — the flow
+// engages only for key-carrying requests — so it re-handles and gets
+// exactly that rejection.
+func TestIdempotencyReplay(t *testing.T) {
+	ctx := context.Background()
+	h := newDedupHarness(t, nil)
+
+	send := func() *connect.Request[countersvcv1.InitRequest] {
+		req := connect.NewRequest(&countersvcv1.InitRequest{
+			CounterId: "main", Command: &counterv1.Init{Min: 0, Max: 100, Initial: 5},
+		})
+		req.Header().Set(cmdsvc.HdrIdempotencyKey, "replay-1")
+		return req
+	}
+	first, err := h.client.Init(ctx, send())
+	if err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+	if first.Msg.GetResult().GetVersion() != 1 || first.Msg.GetState().GetCount() != 5 {
+		t.Fatalf("first result = %+v state = %+v, want v1 count 5", first.Msg.GetResult(), first.Msg.GetState())
+	}
+
+	// Same key, same payload: the stored response, verbatim.
+	replay, err := h.client.Init(ctx, send())
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !proto.Equal(first.Msg, replay.Msg) {
+		t.Fatalf("replay = %+v, want the stored response %+v", replay.Msg, first.Msg)
+	}
+
+	// The replay appended nothing: the log still holds exactly one event.
+	sid, _ := es.NewStreamID("counter", "main")
+	rows, err := storeOf(h).ReadStream(ctx, sid, 0, 0)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("stream rows after replay = %d (err %v), want 1 — a replay must not append", len(rows), err)
+	}
+
+	// The same payload WITHOUT the key is not replayed: it re-handles and
+	// the decider rejects the second Init — proof the flow engages only
+	// for key-carrying requests.
+	_, err = h.client.Init(ctx, connect.NewRequest(&countersvcv1.InitRequest{
+		CounterId: "main", Command: &counterv1.Init{Min: 0, Max: 100, Initial: 5},
+	}))
+	var ce *connect.Error
+	if !errors.As(err, &ce) || ce.Code() != connect.CodeFailedPrecondition {
+		t.Fatalf("keyless request = %v, want failed_precondition (re-handled, not replayed)", err)
+	}
+}
+
+// TestIdempotencyFingerprintMismatch (draft §2.7): the same key with a
+// different payload is key reuse — aborted, the message naming HTTP 422
+// semantics — and the original record survives it intact: replaying the
+// FIRST payload still returns the original stored response, and the log
+// still holds exactly one event.
+func TestIdempotencyFingerprintMismatch(t *testing.T) {
+	ctx := context.Background()
+	h := newDedupHarness(t, nil)
+
+	orig := connect.NewRequest(&countersvcv1.InitRequest{
+		CounterId: "main", Command: &counterv1.Init{Min: 0, Max: 100, Initial: 5},
+	})
+	orig.Header().Set(cmdsvc.HdrIdempotencyKey, "reuse-1")
+	first, err := h.client.Init(ctx, orig)
+	if err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+
+	// Same key, different payload: key reuse, HTTP 422 semantics.
+	reuse := connect.NewRequest(&countersvcv1.InitRequest{
+		CounterId: "main", Command: &counterv1.Init{Min: 0, Max: 50, Initial: 5},
+	})
+	reuse.Header().Set(cmdsvc.HdrIdempotencyKey, "reuse-1")
+	_, err = h.client.Init(ctx, reuse)
+	var ce *connect.Error
+	if !errors.As(err, &ce) || ce.Code() != connect.CodeAborted {
+		t.Fatalf("key reuse error = %v, want aborted", err)
+	}
+	if !strings.Contains(ce.Message(), "422") {
+		t.Fatalf("key reuse message = %q, want it to name HTTP 422 semantics", ce.Message())
+	}
+
+	// The record is intact: the first payload still replays the original
+	// response, and the rejected request appended nothing.
+	again := connect.NewRequest(&countersvcv1.InitRequest{
+		CounterId: "main", Command: &counterv1.Init{Min: 0, Max: 100, Initial: 5},
+	})
+	again.Header().Set(cmdsvc.HdrIdempotencyKey, "reuse-1")
+	replay, err := h.client.Init(ctx, again)
+	if err != nil {
+		t.Fatalf("replay after reuse: %v", err)
+	}
+	if !proto.Equal(first.Msg, replay.Msg) {
+		t.Fatalf("replay after reuse = %+v, want the original response %+v", replay.Msg, first.Msg)
+	}
+	sid, _ := es.NewStreamID("counter", "main")
+	rows, err := storeOf(h).ReadStream(ctx, sid, 0, 0)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("stream rows = %d (err %v), want 1 — the reused key must not append", len(rows), err)
+	}
+}
+
+// TestIdempotencyConcurrentConflict (draft §2.6's concurrent window):
+// two requests with the same key in flight at once both miss the dedup
+// lookup — the barrier in the wrapped Dedup holds each lookup until both
+// completed, deterministic staging, not sleep roulette — so both reach
+// HandleAt with the same derived CommandID and deterministic event ids:
+// one insert wins, the loser collides on the event-id constraint and is
+// reported aborted, the message naming HTTP 409 semantics. The loser
+// appended nothing: the stream holds Init plus exactly one Incremented.
+func TestIdempotencyConcurrentConflict(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h := newDedupHarness(t, func(inner es.Deduplicator) es.Deduplicator {
+		return newLookupBarrier(2, inner)
+	})
+
+	if _, err := h.client.Init(ctx, connect.NewRequest(&countersvcv1.InitRequest{
+		CounterId: "main", Command: &counterv1.Init{Min: 0, Max: 100, Initial: 5},
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 2
+	var wg sync.WaitGroup
+	results := make([]*connect.Response[countersvcv1.IncrementResponse], goroutines)
+	errs := make([]error, goroutines)
+	for i := range goroutines {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := connect.NewRequest(&countersvcv1.IncrementRequest{
+				CounterId: "main", Command: &counterv1.Increment{By: 1},
+			})
+			req.Header().Set(cmdsvc.HdrIdempotencyKey, "concurrent-1")
+			results[i], errs[i] = h.client.Increment(ctx, req)
+		}(i)
+	}
+	wg.Wait()
+
+	var wins int
+	for i, err := range errs {
+		if err == nil {
+			wins++
+			if results[i].Msg.GetResult().GetVersion() != 2 || results[i].Msg.GetState().GetCount() != 6 {
+				t.Fatalf("winner result = %+v state = %+v, want v2 count 6", results[i].Msg.GetResult(), results[i].Msg.GetState())
+			}
+			continue
+		}
+		var ce *connect.Error
+		if !errors.As(err, &ce) || ce.Code() != connect.CodeAborted {
+			t.Fatalf("goroutine %d error = %v, want aborted (HTTP 409 semantics)", i, err)
+		}
+		if !strings.Contains(ce.Message(), "409") {
+			t.Fatalf("loser message = %q, want it to name HTTP 409 semantics", ce.Message())
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("wins = %d, want exactly one — the loser must be aborted", wins)
+	}
+
+	// The loser appended nothing: the stream is at v2 with exactly two
+	// events (Initialized + the winner's Incremented).
+	sid, _ := es.NewStreamID("counter", "main")
+	rows, err := storeOf(h).ReadStream(ctx, sid, 0, 0)
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("stream rows after the race = %d (err %v), want 2 — the loser must not append", len(rows), err)
+	}
+	if _, v, _ := h.rt.Load(ctx, sid); v != 2 {
+		t.Fatalf("version after the race = %d, want 2", v)
+	}
+}

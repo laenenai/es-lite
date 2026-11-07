@@ -40,8 +40,10 @@ func headerOf(hdr, val string) http.Header {
 
 // TestMapErrorTable is the full sentinel -> connect code table MapError
 // implements today, matched through wrapping (so it must go via errors.Is,
-// never ==), plus the mapper and pass-through edges. es.ErrDuplicateEventID
-// is deliberately absent: MapError does not map it yet — a later task does.
+// never ==), plus the mapper and pass-through edges.
+// es.ErrDuplicateEventID lands on aborted — IdempotencyConcurrent, HTTP
+// 409 semantics — the concurrent duplicate of the Idempotency-Key flow
+// (draft-ietf-httpapi-idempotency-key-header-07 §2.6, design D6).
 func TestMapErrorTable(t *testing.T) {
 	ctx := context.Background()
 
@@ -55,6 +57,7 @@ func TestMapErrorTable(t *testing.T) {
 			{es.ErrConflict.Error(), es.ErrConflict, connect.CodeFailedPrecondition, 1},
 			{es.ErrTerminal.Error(), es.ErrTerminal, connect.CodeFailedPrecondition, 0},
 			{es.ErrConstraintViolated.Error(), es.ErrConstraintViolated, connect.CodeAlreadyExists, 0},
+			{es.ErrDuplicateEventID.Error(), es.ErrDuplicateEventID, connect.CodeAborted, 0},
 			{es.ErrInvalidStreamID.Error(), es.ErrInvalidStreamID, connect.CodeInvalidArgument, 0},
 			{es.ErrDecidedAtMissing.Error(), es.ErrDecidedAtMissing, connect.CodeInvalidArgument, 0},
 			{es.ErrDecidedAtSkew.Error(), es.ErrDecidedAtSkew, connect.CodeInvalidArgument, 0},

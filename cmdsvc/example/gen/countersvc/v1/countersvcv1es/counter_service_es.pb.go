@@ -47,6 +47,20 @@ type CounterCommandServiceDeps struct {
 	// Errors maps domain errors (decider rejections) to Connect errors; nil
 	// maps them to failed_precondition.
 	Errors cmdsvc.ErrorMapper
+	// Dedup stores and replays the responses of completed commands for
+	// requests carrying an Idempotency-Key
+	// (draft-ietf-httpapi-idempotency-key-header-07 §2.6, design D6).
+	// nil (the default) is no dedup — today's behavior; a request without
+	// the header never enters the flow either. Wired, the flow runs after
+	// Authorize: a replay with the same payload gets the stored response
+	// back; the same key with a different payload is rejected as key reuse
+	// (aborted, HTTP 422 semantics); a concurrent duplicate loses on the
+	// event-id constraint — wire Runtime.WithDeterministicEventIDs for
+	// that arm — and is reported aborted (HTTP 409 semantics). The
+	// adapter's workspace scoping is the draft §5 composite key's
+	// client-attribute component; the fingerprint covers the request as
+	// the handler sees it, after principal injection.
+	Dedup es.Deduplicator
 }
 
 type counterCommandServiceHandler struct {
@@ -114,6 +128,55 @@ func (h *counterCommandServiceHandler) Init(ctx context.Context, req *connect.Re
 	}
 	meta := cmdsvc.MetaFrom(req.Header(), actor)
 	expected := uint64(0)
+	// Idempotency-Key dedup (draft-ietf-httpapi-idempotency-key-header-07):
+	// one guarded block after Authorize, so an unauthorized replay leaks
+	// nothing — no stored response, no fingerprint oracle. A nil Dedup, or
+	// a request carrying no Idempotency-Key, falls through to the plain
+	// path below, unchanged.
+	if h.d.Dedup != nil && req.Header().Get(cmdsvc.HdrIdempotencyKey) != "" {
+		key := es.DedupKey{StreamID: sid.Canonical(), CommandID: meta.CommandID.String()}
+		fp := cmdsvc.Fingerprint(req.Msg)
+		rec, found, err := h.d.Dedup.Lookup(ctx, key)
+		if err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		if found {
+			if rec.Fingerprint != fp {
+				// Draft §2.7: the key already names a different payload.
+				return nil, cmdsvc.IdempotencyKeyReused()
+			}
+			// Draft §2.6: replay the stored response — no Handle, no append.
+			replay := &v11.InitResponse{}
+			if err := proto.Unmarshal(rec.Response, replay); err != nil {
+				return nil, cmdsvc.Internal(err)
+			}
+			return connect.NewResponse(replay), nil
+		}
+		res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)
+		if err != nil {
+			// es.ErrDuplicateEventID (deterministic event ids) is the
+			// concurrent duplicate: MapError reports it aborted, HTTP 409.
+			return nil, cmdsvc.MapError(ctx, err, h.d.Errors, h.reload(sid), expected)
+		}
+		resp := &v11.InitResponse{}
+		resp.Result = &v11.WriteResult{}
+		if err := cmdsvc.SetWriteResult(resp.Result, sid, res.ToVersion, cmdsvc.LastGlobalPosition(res.Envelopes)); err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		resp.State = h.filter(ctx, res.State)
+		stored, err := proto.Marshal(resp)
+		if err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		if err := h.d.Dedup.Save(ctx, key, es.DedupRecord{Fingerprint: fp, Response: stored}); err != nil {
+			// The command committed but its response was not stored. The
+			// client's retry with this key re-handles, collides on the
+			// event ids and is aborted until it uses a fresh key. Internal,
+			// never a silent success.
+			return nil, cmdsvc.Internal(err)
+		}
+		return connect.NewResponse(resp), nil
+	}
 	res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)
 	if err != nil {
 		return nil, cmdsvc.MapError(ctx, err, h.d.Errors, h.reload(sid), expected)
@@ -150,6 +213,55 @@ func (h *counterCommandServiceHandler) Increment(ctx context.Context, req *conne
 	}
 	meta := cmdsvc.MetaFrom(req.Header(), actor)
 	expected := cmd.GetExpectedVersion()
+	// Idempotency-Key dedup (draft-ietf-httpapi-idempotency-key-header-07):
+	// one guarded block after Authorize, so an unauthorized replay leaks
+	// nothing — no stored response, no fingerprint oracle. A nil Dedup, or
+	// a request carrying no Idempotency-Key, falls through to the plain
+	// path below, unchanged.
+	if h.d.Dedup != nil && req.Header().Get(cmdsvc.HdrIdempotencyKey) != "" {
+		key := es.DedupKey{StreamID: sid.Canonical(), CommandID: meta.CommandID.String()}
+		fp := cmdsvc.Fingerprint(req.Msg)
+		rec, found, err := h.d.Dedup.Lookup(ctx, key)
+		if err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		if found {
+			if rec.Fingerprint != fp {
+				// Draft §2.7: the key already names a different payload.
+				return nil, cmdsvc.IdempotencyKeyReused()
+			}
+			// Draft §2.6: replay the stored response — no Handle, no append.
+			replay := &v11.IncrementResponse{}
+			if err := proto.Unmarshal(rec.Response, replay); err != nil {
+				return nil, cmdsvc.Internal(err)
+			}
+			return connect.NewResponse(replay), nil
+		}
+		res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)
+		if err != nil {
+			// es.ErrDuplicateEventID (deterministic event ids) is the
+			// concurrent duplicate: MapError reports it aborted, HTTP 409.
+			return nil, cmdsvc.MapError(ctx, err, h.d.Errors, h.reload(sid), expected)
+		}
+		resp := &v11.IncrementResponse{}
+		resp.Result = &v11.WriteResult{}
+		if err := cmdsvc.SetWriteResult(resp.Result, sid, res.ToVersion, cmdsvc.LastGlobalPosition(res.Envelopes)); err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		resp.State = h.filter(ctx, res.State)
+		stored, err := proto.Marshal(resp)
+		if err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		if err := h.d.Dedup.Save(ctx, key, es.DedupRecord{Fingerprint: fp, Response: stored}); err != nil {
+			// The command committed but its response was not stored. The
+			// client's retry with this key re-handles, collides on the
+			// event ids and is aborted until it uses a fresh key. Internal,
+			// never a silent success.
+			return nil, cmdsvc.Internal(err)
+		}
+		return connect.NewResponse(resp), nil
+	}
 	res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)
 	if err != nil {
 		return nil, cmdsvc.MapError(ctx, err, h.d.Errors, h.reload(sid), expected)
@@ -186,6 +298,55 @@ func (h *counterCommandServiceHandler) Close(ctx context.Context, req *connect.R
 	}
 	meta := cmdsvc.MetaFrom(req.Header(), actor)
 	expected := uint64(0)
+	// Idempotency-Key dedup (draft-ietf-httpapi-idempotency-key-header-07):
+	// one guarded block after Authorize, so an unauthorized replay leaks
+	// nothing — no stored response, no fingerprint oracle. A nil Dedup, or
+	// a request carrying no Idempotency-Key, falls through to the plain
+	// path below, unchanged.
+	if h.d.Dedup != nil && req.Header().Get(cmdsvc.HdrIdempotencyKey) != "" {
+		key := es.DedupKey{StreamID: sid.Canonical(), CommandID: meta.CommandID.String()}
+		fp := cmdsvc.Fingerprint(req.Msg)
+		rec, found, err := h.d.Dedup.Lookup(ctx, key)
+		if err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		if found {
+			if rec.Fingerprint != fp {
+				// Draft §2.7: the key already names a different payload.
+				return nil, cmdsvc.IdempotencyKeyReused()
+			}
+			// Draft §2.6: replay the stored response — no Handle, no append.
+			replay := &v11.CloseResponse{}
+			if err := proto.Unmarshal(rec.Response, replay); err != nil {
+				return nil, cmdsvc.Internal(err)
+			}
+			return connect.NewResponse(replay), nil
+		}
+		res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)
+		if err != nil {
+			// es.ErrDuplicateEventID (deterministic event ids) is the
+			// concurrent duplicate: MapError reports it aborted, HTTP 409.
+			return nil, cmdsvc.MapError(ctx, err, h.d.Errors, h.reload(sid), expected)
+		}
+		resp := &v11.CloseResponse{}
+		resp.Result = &v11.WriteResult{}
+		if err := cmdsvc.SetWriteResult(resp.Result, sid, res.ToVersion, cmdsvc.LastGlobalPosition(res.Envelopes)); err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		resp.State = h.filter(ctx, res.State)
+		stored, err := proto.Marshal(resp)
+		if err != nil {
+			return nil, cmdsvc.Internal(err)
+		}
+		if err := h.d.Dedup.Save(ctx, key, es.DedupRecord{Fingerprint: fp, Response: stored}); err != nil {
+			// The command committed but its response was not stored. The
+			// client's retry with this key re-handles, collides on the
+			// event ids and is aborted until it uses a fresh key. Internal,
+			// never a silent success.
+			return nil, cmdsvc.Internal(err)
+		}
+		return connect.NewResponse(resp), nil
+	}
 	res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)
 	if err != nil {
 		return nil, cmdsvc.MapError(ctx, err, h.d.Errors, h.reload(sid), expected)

@@ -7,6 +7,8 @@ package cmdsvc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -98,6 +100,44 @@ func MetaFrom(h http.Header, actor es.Actor) es.Meta {
 // idempotencyNamespace is the fixed UUIDv5 namespace for non-UUID keys.
 var idempotencyNamespace = uuid.MustParse("3b5a0c2e-7f5d-4b1a-9c3e-2d6f8a1b4c7e")
 
+// Fingerprint returns the SHA-256 hex digest of msg's wire form — the
+// checksum-of-payload option of draft-ietf-httpapi-idempotency-key-header-07
+// §2.4, which the handler flow matches a stored dedup record against: the
+// same request fingerprints identically across retries, a different
+// payload under the same key fingerprints differently. Marshaling uses
+// the deterministic option so a map field's entry order cannot turn a
+// retry into a false mismatch. A message proto.Marshal rejects (invalid
+// UTF-8 in a proto3 string field, for instance) has no fingerprint: the
+// empty string, which never matches the digest of a marshalable
+// request, so the flow fails closed as key reuse rather than replaying
+// an unrelated response.
+func Fingerprint(msg proto.Message) string {
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(msg)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// IdempotencyConcurrent maps es.ErrDuplicateEventID: the Idempotency-Key
+// names a command whose events are already in the log — the concurrent
+// duplicate that lost the insert race, or a retry of a command that
+// committed without its response being stored. Connect code aborted, the
+// message naming HTTP 409 semantics (draft §2.6): the client must not
+// retry with the same key.
+func IdempotencyConcurrent() *connect.Error {
+	return connect.NewError(connect.CodeAborted, errors.New("cmdsvc: idempotency-key conflict: a command with this key already committed (HTTP 409); use a fresh key"))
+}
+
+// IdempotencyKeyReused reports a request whose Idempotency-Key names a
+// completed command but whose payload differs — key reuse. Connect code
+// aborted, the message naming HTTP 422 semantics (draft §2.7): the key
+// is spent on a different request; the client must pick a fresh one.
+func IdempotencyKeyReused() *connect.Error {
+	return connect.NewError(connect.CodeAborted, errors.New("cmdsvc: idempotency-key reuse: this key already names a different request payload (HTTP 422); use a fresh key"))
+}
+
 // InvalidArgument maps a validation or parse failure. A protovalidate
 // ValidationError attaches its violations as an error detail.
 func InvalidArgument(err error) *connect.Error {
@@ -138,6 +178,7 @@ func passOr(code connect.Code, err error) *connect.Error {
 //	es.ErrConflict            failed_precondition + VersionConflict detail (via reload)
 //	es.ErrTerminal            failed_precondition
 //	es.ErrConstraintViolated  already_exists
+//	es.ErrDuplicateEventID    aborted (IdempotencyConcurrent, HTTP 409 semantics)
 //	es.ErrInvalidStreamID,
 //	es.ErrDecidedAtMissing,
 //	es.ErrDecidedAtSkew,
@@ -179,6 +220,11 @@ func MapError(ctx context.Context, err error, mapper ErrorMapper, reload Reload,
 		return connect.NewError(connect.CodeFailedPrecondition, err)
 	case errors.Is(err, es.ErrConstraintViolated):
 		return connect.NewError(connect.CodeAlreadyExists, err)
+	case errors.Is(err, es.ErrDuplicateEventID):
+		// The event-id collision of a command re-run under the same key
+		// (deterministic event ids): an idempotency signal, never a retry
+		// cue — the concurrent duplicate of draft §2.6.
+		return IdempotencyConcurrent()
 	case errors.Is(err, es.ErrInvalidStreamID), errors.Is(err, es.ErrDecidedAtMissing),
 		errors.Is(err, es.ErrDecidedAtSkew), errors.Is(err, es.ErrDecidedAtMismatch):
 		return connect.NewError(connect.CodeInvalidArgument, err)

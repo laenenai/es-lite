@@ -641,6 +641,41 @@ func TestServiceGeneratesHandlerInSiblingPackage(t *testing.T) {
 	}
 }
 
+// The emitted handler carries the draft-compliant Idempotency-Key flow
+// (design D6, finding F6; draft-ietf-httpapi-idempotency-key-header-07):
+// Deps gains an optional Dedup, and a wired Dedup makes every RPC look the
+// command up after Authorize — replay the stored response, reject key
+// reuse, save fresh responses — inside one guarded block, so a nil Dedup
+// (or a request without the header) runs today's plain path unchanged.
+func TestServiceEmitsDedupFlow(t *testing.T) {
+	gen := fixture(t, serviceFile(nil))
+	if err := run(gen, ""); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var svc string
+	for _, out := range gen.Response().File {
+		if strings.HasSuffix(out.GetName(), "tv1es/t_es.pb.go") {
+			svc = out.GetContent()
+		}
+	}
+	if svc == "" {
+		t.Fatalf("service handler not generated; files: %v", names(gen))
+	}
+	for _, want := range []string{
+		"Dedup es.Deduplicator",
+		`if h.d.Dedup != nil && req.Header().Get(cmdsvc.HdrIdempotencyKey) != "" {`,
+		"fp := cmdsvc.Fingerprint(req.Msg)",
+		"rec, found, err := h.d.Dedup.Lookup(ctx, key)",
+		"return nil, cmdsvc.IdempotencyKeyReused()",
+		"if err := h.d.Dedup.Save(ctx, key, es.DedupRecord{Fingerprint: fp, Response: stored}); err != nil {",
+	} {
+		if !strings.Contains(svc, want) {
+			t.Errorf("generated handler lacks %q:\n%s", want, svc)
+		}
+	}
+	assertAllImportsUsed(t, svc)
+}
+
 func names(gen *protogen.Plugin) []string {
 	var out []string
 	for _, f := range gen.Response().File {
