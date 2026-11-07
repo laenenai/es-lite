@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/laenenai/es-lite/aggregate"
 	"github.com/laenenai/es-lite/es"
@@ -171,5 +172,178 @@ func TestAnchorsPostgres(t *testing.T) {
 	var n int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM anchors`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("anchors visible under RLS: n=%d err=%v", n, err)
+	}
+}
+
+// TestAnchorStableUnderConcurrentAppend pins F1: an anchor recorded under
+// live concurrent appends must verify forever after. Postgres assigns
+// global_position at INSERT, not at COMMIT, so the committed max can sit
+// above an in-flight lower position — and Anchor reads the head and the
+// stream heads as two READ COMMITTED statements, i.e. two snapshots. The
+// unfenced Anchor saw max=pC but heads without the in-flight pB and
+// recorded a root over the torn head; once pB committed, CheckAnchor
+// disputed its own anchor with a false ErrAnchorMismatch (the live repro
+// from the review).
+//
+// The shape: A commits at pA, B is held in flight at pB via AppendTx, C
+// commits at pC > pB, then Anchor(0) runs while B is still uncommitted.
+// The fenced Anchor draws the horizon fence (spec §5.1.1) and cannot
+// record until B settles — while the unfenced one records immediately —
+// so the anchor call must overlap B's commit. The test settles B once the
+// unfenced Anchor has recorded (a committed anchor row means the torn
+// root is already set) or once no anchor can appear (only the fenced
+// Anchor can be waiting on B, which only the test can settle). Either
+// world is then deterministic on committed state, not on timing: a torn
+// root is torn before B commits, and a fenced Anchor only records after
+// B settles. CheckAnchor must report nil — nothing was tampered.
+func TestAnchorStableUnderConcurrentAppend(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_anchor_race")
+
+	// A commits first: pA is the settled head when the race starts.
+	tx0, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx0: %v", err)
+	}
+	pA := feedAppendTx(t, ctx, ws, tx0, feedStream(t, "anchor-stable-a"), 0, "anchortest.v1.A")
+	if err := tx0.Commit(ctx); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+
+	// B draws pB and stays open: the append in flight below the head.
+	tx1, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	pB := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "anchor-stable-b"), 0, "anchortest.v1.B")
+
+	// C commits at pC above the in-flight pB: the committed max now sits
+	// above an uncommitted position — the torn head.
+	tx2, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	pC := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "anchor-stable-c"), 0, "anchortest.v1.C")
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit C: %v", err)
+	}
+	if !(pA < pB && pB < pC) {
+		t.Fatalf("insert order: pA=%d pB=%d pC=%d, want pA < pB < pC", pA, pB, pC)
+	}
+
+	// Anchor over the whole log while B is in flight.
+	type anchorResult struct {
+		a   es.Anchor
+		err error
+	}
+	anchorCh := make(chan anchorResult, 1)
+	go func() {
+		a, err := s.Anchor(ctx, 0)
+		anchorCh <- anchorResult{a, err}
+	}()
+
+	// Release B: when a new anchor row is committed the unfenced Anchor
+	// has already recorded its root over heads that miss B (its heads
+	// statement ran before the insert, while B was provably still in
+	// flight); when no row can appear the fenced Anchor is provably
+	// waiting on the fence, which B blocks. Settle B either way — each
+	// world can only record in the order it already recorded in.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		list, err := s.ListAnchors(ctx)
+		if err != nil {
+			t.Fatalf("list anchors: %v", err)
+		}
+		if len(list) > 0 {
+			break // the anchor row is committed; its root is already computed
+		}
+		if time.Now().After(deadline) {
+			break // the fenced anchor is waiting on B; settle it
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit B: %v", err)
+	}
+
+	res := <-anchorCh
+	if res.err != nil {
+		t.Fatalf("Anchor: %v", res.err)
+	}
+	// B committed below the anchored head: the anchor's root must already
+	// account for it, or the bound must have excluded the torn range. A
+	// mismatch here is a false tamper alarm — the bug.
+	if err := s.CheckAnchor(ctx, res.a); err != nil {
+		t.Fatalf("CheckAnchor after concurrent append: %v", err)
+	}
+}
+
+// TestCheckAnchorStableUnderConcurrentAppend pins the recheck side of F1:
+// an anchor stays verifiable while appends race around it. The anchor is
+// taken first, over a quiescent log (its bound is the last drawn position,
+// permanently settled by the fence); then an append is held in flight at
+// pB above that bound, a higher append commits at pC, and the held one
+// commits between the Anchor and CheckAnchor calls — the exact window in
+// which an unfenced recheck could see a head that is not final. Positions
+// above the anchor's bound cannot change its root, and nothing below the
+// bound was still in flight when it was recorded, so CheckAnchor must
+// report nil: the anchor verifies despite the concurrent appends.
+func TestCheckAnchorStableUnderConcurrentAppend(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_anchor_check_race")
+
+	// A commits: the whole settled log at anchor time.
+	tx0, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx0: %v", err)
+	}
+	pA := feedAppendTx(t, ctx, ws, tx0, feedStream(t, "anchor-check-a"), 0, "anchortest.v1.A")
+	if err := tx0.Commit(ctx); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+
+	// Anchor before any concurrency: the bound is pA, the last drawn
+	// position, and the fence has settled it.
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("Anchor: %v", err)
+	}
+	if a.UptoGlobalPosition != pA || a.StreamCount != 1 {
+		t.Fatalf("anchor = %+v, want bound %d over 1 stream", a, pA)
+	}
+
+	// B draws pB above the bound and stays open: the in-flight append.
+	tx1, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	pB := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "anchor-check-b"), 0, "anchortest.v1.B")
+
+	// C commits at pC above the in-flight pB.
+	tx2, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	pC := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "anchor-check-c"), 0, "anchortest.v1.C")
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit C: %v", err)
+	}
+	if !(pA < pB && pB < pC) {
+		t.Fatalf("insert order: pA=%d pB=%d pC=%d, want pA < pB < pC", pA, pB, pC)
+	}
+
+	// B commits between the Anchor and CheckAnchor calls.
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit B: %v", err)
+	}
+
+	// The recheck must still agree: B and C sit above the anchor's bound,
+	// and the bound itself was settled when recorded.
+	if err := s.CheckAnchor(ctx, a); err != nil {
+		t.Fatalf("CheckAnchor after concurrent append: %v", err)
 	}
 }

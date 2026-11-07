@@ -163,6 +163,14 @@ func TestDrainFailsFastWithoutRelayRole(t *testing.T) {
 
 	ensureRelayRole(t, ctx, s)
 	ensureDrainRole(t, ctx, s)
+	// The member half below grants es_relay to the probe and leaves it,
+	// as a production deployment would. On a long-lived shared test
+	// database that leftover grant must not leak into the next run's
+	// outsider half (CI's throwaway containers never see it), so reset it
+	// here: the outsider half always starts as a non-member.
+	if _, err := s.Pool().Exec(ctx, `REVOKE `+relayRole+` FROM `+drainProbe); err != nil {
+		t.Fatalf("revoke %s from %s: %v", relayRole, drainProbe, err)
+	}
 	// Drain's privileges as the probe: the FOR UPDATE SKIP LOCKED claim
 	// and the published_at flip need UPDATE, the claim needs SELECT, and
 	// naming any of them needs schema USAGE. Nothing more — the bypass
@@ -253,14 +261,24 @@ func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
 
 	ensureRelayRole(t, ctx, s)
 	ensureAnchorProbe(t, ctx, s)
+	// Reset the probe's membership: the member half below grants es_relay
+	// and leaves it in place, and on a long-lived shared test database
+	// (unlike CI's throwaway containers) that leftover must not leak into
+	// the next run's outsider half — it must always start as a non-member.
+	if _, err := s.Pool().Exec(ctx, `REVOKE `+relayRole+` FROM `+anchorProbe); err != nil {
+		t.Fatalf("revoke %s from %s: %v", relayRole, anchorProbe, err)
+	}
 	// The anchor path's privileges as the probe: reading events (the log
-	// head, stream heads, the stream list) and reading/writing anchors.
-	// Nothing more — the bypass must stay a policy matter, not a
-	// privilege one.
+	// head, stream heads, the stream list), reading/writing anchors, and
+	// — since the anchor path fences on the horizon (Task 4) — reading
+	// the position sequence the fence's first statement reads (Task 16
+	// will relax this to USAGE via pg_sequences). Nothing more — the
+	// bypass must stay a policy matter, not a privilege one.
 	if _, err := s.Pool().Exec(ctx,
 		`GRANT USAGE ON SCHEMA public TO `+anchorProbe+`;
 		 GRANT SELECT ON events TO `+anchorProbe+`;
-		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe); err != nil {
+		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe+`;
+		 GRANT SELECT ON SEQUENCE events_global_position_seq TO `+anchorProbe); err != nil {
 		t.Fatalf("grant anchor-path privileges: %v", err)
 	}
 

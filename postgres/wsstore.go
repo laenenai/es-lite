@@ -453,14 +453,20 @@ func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int)
 	return w.query(ctx, q, w.ws, fromPosition, limit)
 }
 
+// The fence statements (spec §5.1.1) live at Store level: the fence is
+// transaction-global — it waits out every transaction that existed when R
+// was drawn, whatever workspace appended — so the anchor path
+// (settledBound, anchor.go), which spans workspaces by construction,
+// shares them with the feed through the Workspace delegations below.
+
 // readLastPosition is fence statement 1 (spec §5.1.1): the position
 // sequence's last_value, read outside any transaction. It reflects every
 // position drawn so far, committed or not — conservative and safe, because
 // delivery waits on the fence, not on L. A fresh sequence reports
 // last_value=1 before any draw; L can exceed the highest drawn position.
-func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
+func (s *Store) readLastPosition(ctx context.Context) (uint64, error) {
 	var last uint64
-	err := w.store.pool.QueryRow(ctx,
+	err := s.pool.QueryRow(ctx,
 		`SELECT last_value FROM events_global_position_seq`,
 	).Scan(&last)
 	if err != nil {
@@ -475,8 +481,8 @@ func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
 // makes in-flight appenders snapshot-visible to the next statement (Task 1b
 // verified; without it a lone in-flight append looks idle to every
 // snapshot).
-func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
-	tx, err := w.store.pool.Begin(ctx)
+func (s *Store) drawFence(ctx context.Context) (uint64, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin fence: %w", err)
 	}
@@ -491,15 +497,30 @@ func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
 // fenceCleared is fence statement 3 (spec §5.1.1): true once no transaction
 // that already existed when R was drawn is still in flight, observed as
 // the snapshot horizon having reached R.
-func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
+func (s *Store) fenceCleared(ctx context.Context, r uint64) (bool, error) {
 	var cleared bool
-	err := w.store.pool.QueryRow(ctx,
+	err := s.pool.QueryRow(ctx,
 		`SELECT pg_snapshot_xmin(pg_current_snapshot()) >= $1`, r,
 	).Scan(&cleared)
 	if err != nil {
 		return false, fmt.Errorf("check fence: %w", err)
 	}
 	return cleared, nil
+}
+
+// The Workspace fence round delegates to the Store-level statements above:
+// the workspace scope adds only the (boundL, fenceR) state below.
+
+func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
+	return w.store.readLastPosition(ctx)
+}
+
+func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
+	return w.store.drawFence(ctx)
+}
+
+func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
+	return w.store.fenceCleared(ctx, r)
 }
 
 // fenceBound runs one horizon-fence round (spec §5.1.1) and returns the

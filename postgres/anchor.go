@@ -52,21 +52,90 @@ func (s *Store) bypassTx(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
+// anchorFencePoll is the cadence settledBound rechecks the fence at while
+// an in-flight transaction blocks it.
+const anchorFencePoll = 100 * time.Millisecond
+
+// settledBound returns a global_position bound that is permanently
+// settled: every event row at or below it that will ever exist has
+// committed (or its append aborted, leaving a permanent hole), so heads
+// computed under it can never change again.
+//
+// It is the anchor path's horizon-fence round (spec §5.1.1), over the same
+// fence statements the feed uses. upto == 0 means the whole log and takes
+// the sequence's last_value — the highest position drawn, committed or
+// not; a caller's bound above last_value is clamped to it, since the fence
+// only certifies drawn positions. The round then draws its own xid R in a
+// rolled-back transaction and polls fenceCleared until the snapshot
+// horizon reaches R: at that point every transaction that existed when R
+// was drawn has settled, so — by P1/P2 (spec §5.1.3; see the Workspace
+// fence state's doc) — every position drawn at or below last_value is
+// final, and nothing can ever land at or below the bound again (later
+// appends draw higher positions). The wait holds no transaction open and
+// adds no lock; ctx ending aborts it.
+//
+// Without this round, Anchor's two READ COMMITTED statements tear: the
+// committed max can sit above an in-flight lower position (Postgres
+// assigns global_position at INSERT, not at COMMIT), the heads statement
+// then misses the in-flight row, and the recorded root is disputed by a
+// later CheckAnchor with a false ErrAnchorMismatch once the row commits
+// (F1).
+func (s *Store) settledBound(ctx context.Context, upto uint64) (uint64, error) {
+	last, err := s.readLastPosition(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// 0 = the log head; a bound beyond last_value asks for positions the
+	// fence cannot certify, so it clamps down to the drawn horizon.
+	if upto == 0 || upto > last {
+		upto = last
+	}
+	r, err := s.drawFence(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		cleared, err := s.fenceCleared(ctx, r)
+		if err != nil {
+			return 0, err
+		}
+		if cleared {
+			return upto, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("postgres: anchor fence still blocked: %w", ctx.Err())
+		case <-time.After(anchorFencePoll):
+		}
+	}
+}
+
 // Anchor implements es.Anchorer: it computes the root over every stream's
 // head at or below upto (0 = the log head) across all workspaces, records
 // the row and returns it. Runs under app.bypass_rls.
+//
+// The bound is fenced: settledBound resolves upto to a permanently
+// settled position before any head is read, so a concurrent append below
+// the head cannot tear the root — the anchor is recorded either after
+// that append settled (its row included) or below it (its position
+// excluded), and CheckAnchor agrees forever after.
 func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
+	// The role gate precedes the fence (bypassTx re-verifies for free,
+	// once per Store): a non-member session must fail fast with the typed
+	// error, never wait out a fence round it is not allowed to use.
+	if err := s.checkRelayRole(ctx); err != nil {
+		return es.Anchor{}, err
+	}
+	upto, err := s.settledBound(ctx, upto)
+	if err != nil {
+		return es.Anchor{}, err
+	}
 	tx, err := s.bypassTx(ctx)
 	if err != nil {
 		return es.Anchor{}, err
 	}
 	defer tx.Rollback(ctx)
 
-	if upto == 0 {
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(global_position), 0) FROM events`).Scan(&upto); err != nil {
-			return es.Anchor{}, fmt.Errorf("read log head: %w", err)
-		}
-	}
 	heads, err := heads(ctx, tx, upto)
 	if err != nil {
 		return es.Anchor{}, err
@@ -117,14 +186,26 @@ func (s *Store) ListAnchors(ctx context.Context) ([]es.Anchor, error) {
 }
 
 // CheckAnchor implements es.Anchorer: recomputes the root at the anchor's
-// position and compares.
+// position and compares. The recompute is fenced exactly like Anchor's —
+// settledBound resolves the bound first — so the verdict is taken over
+// permanently settled heads: it cannot miss an append still in flight
+// below the anchor's bound, and an agreement holds.
 func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
+	// The role gate precedes the fence, as in Anchor: a non-member session
+	// fails fast with the typed error, never a spurious verdict.
+	if err := s.checkRelayRole(ctx); err != nil {
+		return err
+	}
+	upto, err := s.settledBound(ctx, a.UptoGlobalPosition)
+	if err != nil {
+		return err
+	}
 	tx, err := s.bypassTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	hs, err := heads(ctx, tx, a.UptoGlobalPosition)
+	hs, err := heads(ctx, tx, upto)
 	if err != nil {
 		return err
 	}
