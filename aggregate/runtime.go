@@ -429,6 +429,25 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 		}
 	}
 
+	// Lineage guard (F24): a snapshot can outlive the log it summarizes —
+	// after a reset or truncation the log no longer contains version
+	// `from`, and a tail fold from there would present the phantom cached
+	// state as the stream's truth. One bounded read of the envelope at
+	// `from` settles it: rows mean the seed's version still exists in this
+	// log and the seed stands; no rows — an empty range, or
+	// es.ErrStreamNotFound when from==1 probes a stream that was wiped
+	// entirely — discard the seed and re-read the full stream instead.
+	if from > 0 {
+		probe, perr := r.store.ReadStream(ctx, sid, from-1, from)
+		if perr != nil && !errors.Is(perr, es.ErrStreamNotFound) {
+			return state, 0, perr
+		}
+		if len(probe) == 0 {
+			state = r.decider.Initial()
+			from = 0
+		}
+	}
+
 	var (
 		envs []es.Envelope
 		err  error

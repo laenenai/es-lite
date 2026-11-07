@@ -1,8 +1,10 @@
 // Package snapshot is the aggregate-state snapshot cache (ADR 0007/0009): a
 // pure, re-derivable optimization that lets the runtime seed folding from a
 // cached state at version N and fold only the tail (events > N) instead of the
-// whole stream. Correctness always comes from the log, so a snapshot may be
-// stale, absent, or wrong — the runtime just folds a longer tail.
+// whole stream. Correctness always comes from the log: before folding from a
+// seed the runtime verifies the log still contains version N — a snapshot can
+// outlive a log reset or truncation — so a snapshot that is stale, absent,
+// wrong, or ahead of the log only costs a longer fold.
 //
 // A Cache is workspace-scoped and stores opaque state bytes. In the
 // client-owned-crypto model (ADR 0025) the caller seals state before Save if it
