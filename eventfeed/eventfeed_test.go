@@ -237,6 +237,35 @@ func (o *poisonObserver) OnPoison(err *feed.EventTooLargeError) {
 	}
 }
 
+// obsSubscribeError is one OnSubscribeError report: the subscription it
+// named and the error that ended the attempt.
+type obsSubscribeError struct {
+	scope, projection, instance string
+	err                         error
+}
+
+// subscribeErrorObserver captures OnSubscribeError reports without
+// blocking: the Observer contract forbids blocking, and the attempt
+// loop — which reports from the feed goroutine — must never wait for
+// the test.
+type subscribeErrorObserver struct {
+	feed.NoopObserver
+	mu    sync.Mutex
+	calls []obsSubscribeError
+}
+
+func (o *subscribeErrorObserver) OnSubscribeError(scope, projection, instance string, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = append(o.calls, obsSubscribeError{scope, projection, instance, err})
+}
+
+func (o *subscribeErrorObserver) subscribeErrorsSnapshot() []obsSubscribeError {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]obsSubscribeError(nil), o.calls...)
+}
+
 // plantOverCap inserts one events row whose payload exceeds the store's
 // cap, bypassing the append-time cap — after it exists, raw SQL is the
 // only way such a row can be stored — and returns its global position.
@@ -801,5 +830,104 @@ func TestEventfeedReportsPoisonThroughObserver(t *testing.T) {
 		if p >= poisonGP {
 			t.Fatalf("position %d was delivered, want only events below the poison row at %d", p, poisonGP)
 		}
+	}
+}
+
+// TestEventfeedStopsOnDefinitionChanged pins the terminal-error contract
+// (review F3): a checkpoint whose definition hash no longer matches the
+// request's definition makes Subscribe fail with ErrDefinitionChanged, and
+// that error is terminal — every reconnect re-fails identically, the
+// recovery is an operator's ResetCheckpoint, not a retry — so the adapter
+// must surface it. Feed returns the error to its caller within the
+// bounded window instead of spinning until ctx ends, OnSubscribeError
+// reports it to the observer, and no lease is left held: the server
+// releases on stream failure and the fatal verdict means no further
+// attempt re-acquires the key.
+//
+// The bounded window keeps the pre-fix failure a timeout, not a hang:
+// before the fix the loop swallows the error and retries forever, so a
+// red run sees the window elapse — Feed returns only the window's own
+// deadline error with zero OnSubscribeError calls.
+func TestEventfeedStopsOnDefinitionChanged(t *testing.T) {
+	store := openStore(t)
+	checkpoints := sqlite.NewCheckpointStore(store)
+	leases := sqlite.NewLeaseStore(store)
+	server := newServer(t, store, checkpoints)
+
+	// A checkpoint acknowledged under a drifted definition: the same
+	// projection name, one more consumed type, so the stored
+	// fingerprint cannot match testDefinition's and Subscribe fails the
+	// stream before it delivers anything.
+	drifted := projection.Definition{
+		Name:     testDefinition.Name,
+		Consumes: []string{typConsumed, "eventfeed.v1.Drifted"},
+	}
+	const driftedPos = uint64(3)
+	if err := checkpoints.Save(context.Background(), testScope, testDefinition.Name, testInstance, drifted.Hash(), driftedPos); err != nil {
+		t.Fatalf("plant the drifted checkpoint: %v", err)
+	}
+
+	obs := &subscribeErrorObserver{}
+	ef := eventfeed.New(eventfeed.Config{
+		Server:     server,
+		Definition: testDefinition,
+		Scope:      testScope,
+		Instance:   testInstance,
+		Consumer:   "eventfeed-definition-changed",
+		BatchSize:  4,
+		// No tick can matter: the subscription never delivers a page.
+		AckInterval: time.Hour,
+		Observer:    obs,
+	})
+
+	// The bounded window, with headroom for a green run that returns in
+	// milliseconds; the backstop bounds even a pathologically wedged
+	// loop so the red failure can never hang.
+	const window = 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), window)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ef.Feed(ctx, func(context.Context, es.Envelope) error { return nil })
+	}()
+
+	var feedErr error
+	select {
+	case feedErr = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Feed never returned — the terminal error wedged the reconnect loop past the bounded window")
+	}
+
+	// The verdict and the signal in one gate: a red run returns only the
+	// window's deadline error and reports nothing.
+	calls := obs.subscribeErrorsSnapshot()
+	if !errors.Is(feedErr, feed.ErrDefinitionChanged) {
+		t.Fatalf("Feed = %v after the %s window with %d OnSubscribeError call(s), want the terminal ErrDefinitionChanged surfaced and reported — the definition drift was swallowed into the reconnect loop",
+			feedErr, window, len(calls))
+	}
+	if len(calls) != 1 {
+		t.Fatalf("OnSubscribeError called %d time(s), want exactly 1 (one attempt-ending error; a fatal verdict is not retried)", len(calls))
+	}
+	if got := calls[0]; got.scope != testScope || got.projection != testDefinition.Name || got.instance != testInstance {
+		t.Fatalf("OnSubscribeError named %s/%s/%s, want %s/%s/%s",
+			got.scope, got.projection, got.instance, testScope, testDefinition.Name, testInstance)
+	}
+	if !errors.Is(calls[0].err, feed.ErrDefinitionChanged) {
+		t.Fatalf("OnSubscribeError err = %v, want an error matching feed.ErrDefinitionChanged", calls[0].err)
+	}
+	var dce *feed.DefinitionChangedError
+	if !errors.As(calls[0].err, &dce) {
+		t.Fatalf("OnSubscribeError err = %T, want *feed.DefinitionChangedError", calls[0].err)
+	}
+
+	// The fatal verdict leaves the key free for whatever the operator
+	// runs next: the server released the lease when the stream failed,
+	// and no further attempt re-acquired it.
+	lease, held, err := leases.Holder(context.Background(), testScope, testDefinition.Name, testInstance)
+	if err != nil {
+		t.Fatalf("read lease holder: %v", err)
+	}
+	if held {
+		t.Fatalf("lease still held by %q after the fatal error, want the key free", lease.Owner)
 	}
 }

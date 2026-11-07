@@ -1297,10 +1297,11 @@ func (c *fleetPollClock) OnPage(events, _ int) {
 	c.mu.Unlock()
 }
 
-func (c *fleetPollClock) OnCheckpoint(uint64)                        {}
-func (c *fleetPollClock) OnLeaseLost(string, string, string, string) {}
-func (c *fleetPollClock) OnPoison(*feed.EventTooLargeError)          {}
-func (c *fleetPollClock) OnStall(uint64, uint64)                     {}
+func (c *fleetPollClock) OnCheckpoint(uint64)                            {}
+func (c *fleetPollClock) OnLeaseLost(string, string, string, string)     {}
+func (c *fleetPollClock) OnPoison(*feed.EventTooLargeError)              {}
+func (c *fleetPollClock) OnStall(uint64, uint64)                         {}
+func (c *fleetPollClock) OnSubscribeError(string, string, string, error) {}
 
 func (c *fleetPollClock) snapshot() []time.Time {
 	c.mu.Lock()

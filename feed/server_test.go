@@ -578,6 +578,10 @@ type recordingObserver struct {
 	leaseLost   []obsLeaseLost
 	poisons     []*feed.EventTooLargeError
 	stalls      []obsStall
+	// subscribeErrs stays empty in this package — the server never
+	// calls OnSubscribeError; the consumer adapter's reconnect loop
+	// does — but the fake must still implement the whole interface.
+	subscribeErrs []obsSubscribeError
 }
 
 type obsPage struct{ events, bytes int }
@@ -585,6 +589,11 @@ type obsPage struct{ events, bytes int }
 type obsLeaseLost struct{ scope, projection, instance, owner string }
 
 type obsStall struct{ settled, matchingRaw uint64 }
+
+type obsSubscribeError struct {
+	scope, projection, instance string
+	err                         error
+}
 
 func (o *recordingObserver) OnPage(events, bytes int) {
 	o.mu.Lock()
@@ -616,6 +625,12 @@ func (o *recordingObserver) OnStall(settled, matchingRaw uint64) {
 	o.stalls = append(o.stalls, obsStall{settled, matchingRaw})
 }
 
+func (o *recordingObserver) OnSubscribeError(scope, projection, instance string, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.subscribeErrs = append(o.subscribeErrs, obsSubscribeError{scope, projection, instance, err})
+}
+
 func (o *recordingObserver) pagesSnapshot() []obsPage {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -644,6 +659,12 @@ func (o *recordingObserver) stallsSnapshot() []obsStall {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]obsStall(nil), o.stalls...)
+}
+
+func (o *recordingObserver) subscribeErrorsSnapshot() []obsSubscribeError {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]obsSubscribeError(nil), o.subscribeErrs...)
 }
 
 // slowLeaseLostObserver parks the renewer inside OnLeaseLost: entered closes

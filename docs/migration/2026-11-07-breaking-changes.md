@@ -243,3 +243,37 @@ pure sleep or poll-style waiter — must return `false` on every
 non-error path and it keeps exactly its old pacing, since only
 non-wakes are floored. Prefer `errors.Is`/`errors.As` over exact error
 comparisons when inspecting `Subscribe`'s result.
+
+## 2026-11-07 — `feed.Observer` gains `OnSubscribeError`; `eventfeed` surfaces terminal Subscribe errors
+
+**What changes.** The `feed.Observer` interface grows
+`OnSubscribeError(scope, projection, instance string, err error)`, and
+the reference consumer adapter reports through it: every `eventfeed`
+attempt whose `Subscribe` call ends in an error — poison included,
+fatal or not — is reported while its caller context is still live,
+before the reconnect loop backs off or gives up. Attempts ended by the
+caller's own cancellation report nothing. Alongside the signal, terminal
+Subscribe errors stopped being retried: `projection.ReconnectingFeed`
+gains `IsFatal func(error) bool` (nil means no error is fatal — the old
+retry-forever behavior), and `eventfeed` classifies
+`*feed.DefinitionChangedError` as fatal, so `Feed` returns the error to
+its caller — the runner exits loudly — instead of spinning behind the
+backoff forever with zero signal and a flapping lease (review F3).
+
+**Who is affected.** Third-party `feed.Observer` implementers: adding
+a method to an interface is a compile-time break — their types no
+longer satisfy `feed.Observer` until they grow an `OnSubscribeError`
+method (the in-repo fakes hit exactly this). Callers of
+`eventfeed.Feed` and `projection.ReconnectingFeed`: `Feed` can now
+return a terminal error before its context ends, so a caller that
+treated any early non-`ctx.Err()` return as impossible must now handle
+it; a deployment whose checkpoint's definition hash drifted stops
+retrying and surfaces the error instead of silently delivering nothing.
+
+**What to do.** Implement `OnSubscribeError` on every custom
+`feed.Observer` — or embed `feed.NoopObserver`, which discards it — and
+wire it to logging/metrics so failed subscribe attempts become
+visible. Callers of `eventfeed.Feed` should treat an
+`errors.Is(err, feed.ErrDefinitionChanged)` return as fatal for the
+subscription: the recovery is an operator's `ResetCheckpoint` under the
+new definition, not a restart.

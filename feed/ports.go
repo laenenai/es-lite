@@ -206,6 +206,9 @@ type Clock interface {
 // calls it from its own goroutines (the stream and its renewer) and from
 // Checkpoint's caller, so implementations must be safe for concurrent use
 // and must not block: the stream never waits for an observer.
+// OnSubscribeError is the one exception to the caller: the consumer
+// adapter's reconnect loop — not the server — reports it (see the
+// method).
 type Observer interface {
 	// OnPage reports one page read from the Log, empty pages included:
 	// events is the page's row count and bytes the sum of its payload
@@ -231,17 +234,29 @@ type Observer interface {
 	// are rate-limited, so a fleet of idle streams cannot stampede the
 	// log.
 	OnStall(settledHead, matchingRawHead uint64)
+	// OnSubscribeError reports one subscription attempt that ended in an
+	// error rather than a drop: the consumer adapter's reconnect loop
+	// (eventfeed) calls it — from the feed's own goroutine, while its
+	// caller context is still live — with the Subscribe error for the
+	// named key, before it backs off and retries or, for the terminal
+	// ones, returns the error to its caller. Fatal or not, poison
+	// included: a wedged subscription that never delivers a page is
+	// otherwise invisible, because the loop's own verdict stays silent.
+	// An attempt ended by the caller's own cancellation is a shutdown,
+	// not a fault, and reports nothing.
+	OnSubscribeError(scope, projection, instance string, err error)
 }
 
 // NoopObserver is the default Observer: it discards every signal. A nil
 // Config.Observer behaves exactly like NoopObserver.
 type NoopObserver struct{}
 
-func (NoopObserver) OnPage(int, int)                            {}
-func (NoopObserver) OnCheckpoint(uint64)                        {}
-func (NoopObserver) OnLeaseLost(string, string, string, string) {}
-func (NoopObserver) OnPoison(*EventTooLargeError)               {}
-func (NoopObserver) OnStall(uint64, uint64)                     {}
+func (NoopObserver) OnPage(int, int)                                {}
+func (NoopObserver) OnCheckpoint(uint64)                            {}
+func (NoopObserver) OnLeaseLost(string, string, string, string)     {}
+func (NoopObserver) OnPoison(*EventTooLargeError)                   {}
+func (NoopObserver) OnStall(uint64, uint64)                         {}
+func (NoopObserver) OnSubscribeError(string, string, string, error) {}
 
 // Request is one subscription. Scope, Projection and Instance identify the
 // checkpoint/lease key. Definition is the projection's generated metadata
