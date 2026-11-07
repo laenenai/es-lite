@@ -50,7 +50,10 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// keeps the shared partitioned tables clean. log_order is truncated
 	// with events — its rows are written by the same appends, and a stale
 	// row would dispute the next test's order roots and deep verifies.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+	// The bare checkpoints table is gone (0008: dead on Postgres — only
+	// SQLite implements delivery.Checkpoints), so it is no longer
+	// truncated here.
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -285,10 +288,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0006 (log-order
-	// attestation) made it six.
-	if v != 6 {
-		t.Fatalf("applied version = %d, want 6", v)
+	// Every embedded migration is applied on Open; 0008 (dropping the
+	// unused checkpoints table) made it eight.
+	if v != 8 {
+		t.Fatalf("applied version = %d, want 8", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.

@@ -95,7 +95,10 @@ func fgOpenStore(ctx context.Context, tb testing.TB, dsn string, maxConns int32,
 		// The feed tables are included now that the Servers run on the
 		// real adapters: stale checkpoint or lease rows would seed a
 		// resume or fence a fresh subscription.
-		if _, err := pool.Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+		// The bare checkpoints table is gone (0008: dead on Postgres —
+		// only SQLite implements delivery.Checkpoints), so it is not
+		// truncated here.
+		if _, err := pool.Exec(ctx, `TRUNCATE events, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
 			s.Close()
 			pool.Close()
 			return nil, nil, fmt.Errorf("feedgate: truncate: %w", err)
