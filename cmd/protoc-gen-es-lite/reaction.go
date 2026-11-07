@@ -28,7 +28,7 @@ type reactSpec struct {
 	routers  *aggregateSet // issuing
 }
 
-func collectReactions(f *protogen.File, r *resolver) ([]reactSpec, error) {
+func collectReactions(f *protogen.File, r *resolver, names *nameRegistry) ([]reactSpec, error) {
 	var out []reactSpec
 	for _, m := range allMessages(f.Messages) {
 		opts := m.Desc.Options()
@@ -42,7 +42,7 @@ func collectReactions(f *protogen.File, r *resolver) ([]reactSpec, error) {
 		where := fmt.Sprintf("%s: (es.v1.reaction)", m.Desc.FullName())
 		rc := reactSpec{msg: m, base: m.GoIdent.GoName, spec: spec, aggs: newAggregateSet(), routers: newAggregateSet()}
 		var err error
-		if rc.consumes, err = resolveConsumes(where, spec.GetName(), spec.GetConsumes(), spec.GetFetch(), r, rc.aggs); err != nil {
+		if rc.consumes, err = resolveConsumes(names, where, spec.GetName(), spec.GetConsumes(), spec.GetFetch(), r, rc.aggs); err != nil {
 			return nil, err
 		}
 		for _, c := range spec.GetIssues() {
@@ -131,7 +131,9 @@ func writeReaction(g *protogen.GeneratedFile, rc reactSpec) {
 	g.P("// New", base, "Runner wires h into a reaction.Runner: marker handling and live")
 	g.P("// consumption (Run over any projection.Feed). There is no Rebuild — replaying")
 	g.P("// a reaction re-issues its commands (ADR 0030 §2).")
+	writeRequiredDepDoc(g, runnerRequiredDeps(rc.fetchesState(), rc.routers))
 	g.P("func New", base, "Runner(h ", base, "Handler, deps ", base, "Deps) *", runner, " {")
+	writeDepGuards(g, base, rc.aggs, rc.fetchesState(), rc.routers)
 	writeDispatch(g, base, rc.consumes, rc.fetchesState(), rc.routers)
 	g.P("	return ", newRunner, "(", base, "Name, deps.Marker, dispatch, ", lowerFirst(base), "Consumes)")
 	g.P("}")

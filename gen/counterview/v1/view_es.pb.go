@@ -100,7 +100,12 @@ type CounterViewDeps struct {
 // NewCounterViewRunner wires h into a projection.Runner: marker handling, live
 // consumption (Run over any projection.Feed) and Rebuild from the log share
 // one dispatch path (ADR 0005, ADR 0030).
+// A nil state loader panics at construction, naming
+// itself; Marker keeps its nil default.
 func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projection.Runner {
+	if deps.Counter == nil {
+		panic("CounterViewDeps.Counter is required")
+	}
 	counterCodec := deps.CounterCodec
 	if counterCodec == nil {
 		counterCodec = v1.EventCodec{}
@@ -357,7 +362,15 @@ type ResetOnClosedDeps struct {
 // NewResetOnClosedRunner wires h into a reaction.Runner: marker handling and live
 // consumption (Run over any projection.Feed). There is no Rebuild — replaying
 // a reaction re-issues its commands (ADR 0030 §2).
+// A nil state loader or issuing router panics at construction, naming
+// itself; Marker keeps its nil default.
 func NewResetOnClosedRunner(h ResetOnClosedHandler, deps ResetOnClosedDeps) *reaction.Runner {
+	if deps.Counter == nil {
+		panic("ResetOnClosedDeps.Counter is required")
+	}
+	if deps.CounterRouter == nil {
+		panic("ResetOnClosedDeps.CounterRouter is required")
+	}
 	counterCodec := deps.CounterCodec
 	if counterCodec == nil {
 		counterCodec = v1.EventCodec{}

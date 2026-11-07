@@ -75,12 +75,13 @@ func run(gen *protogen.Plugin, docs string) error {
 	if err != nil {
 		return err
 	}
+	names := newNameRegistry()
 	var catalogue []catalogueEntry
 	for _, f := range gen.Files {
 		if !f.Generate {
 			continue
 		}
-		entries, err := generateFile(gen, f, r)
+		entries, err := generateFile(gen, f, r, names)
 		if err != nil {
 			return err
 		}
@@ -94,16 +95,17 @@ func run(gen *protogen.Plugin, docs string) error {
 
 // generateFile emits <proto>_es.pb.go for f when it carries any annotated
 // message, and returns the catalogue entries of its projections/reactions.
-func generateFile(gen *protogen.Plugin, f *protogen.File, r *resolver) ([]catalogueEntry, error) {
+// names carries the run's spec-name registry: uniqueness is per run.
+func generateFile(gen *protogen.Plugin, f *protogen.File, r *resolver, names *nameRegistry) ([]catalogueEntry, error) {
 	sums, err := collectSumTypes(f, r.commands)
 	if err != nil {
 		return nil, err
 	}
-	projs, err := collectProjections(f, r)
+	projs, err := collectProjections(f, r, names)
 	if err != nil {
 		return nil, err
 	}
-	reacts, err := collectReactions(f, r)
+	reacts, err := collectReactions(f, r, names)
 	if err != nil {
 		return nil, err
 	}
@@ -165,29 +167,4 @@ var goKeywords = map[string]bool{
 	"func": true, "go": true, "goto": true, "if": true, "import": true,
 	"interface": true, "map": true, "package": true, "range": true, "return": true,
 	"select": true, "struct": true, "switch": true, "type": true, "var": true,
-}
-
-// commandVariants collects, across every file in the request (imports
-// included, so a container may live in another file of the package), the
-// variants of each (es.v1.sum_type) = "Command" container. It is the set a
-// (es.v1.decided_at) field may appear in.
-func commandVariants(gen *protogen.Plugin) (map[string]bool, error) {
-	out := map[string]bool{}
-	for _, f := range gen.Files {
-		for _, m := range f.Messages {
-			name, err := sumTypeName(m)
-			if err != nil {
-				return nil, err
-			}
-			if name != commandSumType || len(m.Oneofs) != 1 {
-				continue
-			}
-			for _, field := range m.Oneofs[0].Fields {
-				if field.Message != nil {
-					out[string(field.Message.Desc.FullName())] = true
-				}
-			}
-		}
-	}
-	return out, nil
 }

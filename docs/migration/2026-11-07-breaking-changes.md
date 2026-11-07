@@ -319,3 +319,35 @@ until its own cleanup runs.
 **What to do.** Close the handle yourself when you are done with it — the
 code that built the `*sql.DB` closes it, exactly as the `OpenWithPool`
 contract has always required on the Postgres side.
+
+## 2026-11-07 — Generated constructors panic on a nil required dep; generation rejects unwritable `result` shapes
+
+**What changes.** The constructors `protoc-gen-es-lite` emits —
+`New<Name>Handler` for a command service, `New<Name>Runner` for a
+projection or reaction — now validate their required deps at
+construction and panic, naming the dep, where they previously accepted
+anything and misbehaved on first use: `Deps.Runtime`, `Deps.Authorize`
+and `Deps.Identity` for a service handler; each per-aggregate state
+loader (`Deps.<Aggregate>`) on a state-fetching spec; each per-aggregate
+issuing router (`Deps.<Aggregate>Router`) on a reaction. The optional
+seams keep their nil defaults: `Validate` (protovalidate), `Filter`,
+`Errors`, `Marker`, `Codec`, `Upcaster`, `Actor`. In the same change,
+generation now fails — instead of emitting a handler that cannot report
+a write — when a command RPC's response `result` message lacks a
+singular `stream_id` (string), `version` (uint64) or `global_position`
+(uint64), or when the `result` or state response field is repeated; the
+error names the offending field.
+
+**Who is affected.** Applications that construct a generated handler or
+runner without one of the required deps: the constructor call now
+panics immediately instead of the first request or consumed event
+failing mysteriously. Protos whose command-service responses carry a
+`result` message of the wrong shape previously generated code that did
+not compile or could not carry a write result; `buf generate` now
+rejects them with a field-naming error.
+
+**What to do.** Wire every required dep at construction; a panic there
+is the loud form of a failure that already existed at first use. Give
+every command RPC's response the `WriteResult` shape (singular
+`stream_id`, `version`, `global_position`) and a singular state field —
+the `counter_service.proto` fixture is the reference.

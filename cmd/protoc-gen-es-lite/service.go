@@ -172,8 +172,14 @@ func resolveMethod(where string, m *protogen.Method, agg *aggregateInfo, cmds *s
 			if fld.Message == nil {
 				return sm, fmt.Errorf("%s: response field `result` must be a message", where)
 			}
+			if fld.Desc.IsList() || fld.Desc.IsMap() {
+				return sm, fmt.Errorf("%s: response field `result` must be a singular message, not a list", where)
+			}
 			sm.result = fld
 		case fld.Message != nil && fld.Message == agg.state:
+			if fld.Desc.IsList() || fld.Desc.IsMap() {
+				return sm, fmt.Errorf("%s: response field %q must be a singular %s, not a list", where, fld.Desc.Name(), agg.state.Desc.FullName())
+			}
 			if sm.state != nil {
 				return sm, fmt.Errorf("%s: response carries two %s fields", where, agg.state.Desc.FullName())
 			}
@@ -183,10 +189,50 @@ func resolveMethod(where string, m *protogen.Method, agg *aggregateInfo, cmds *s
 	if sm.result == nil {
 		return sm, fmt.Errorf("%s: response needs a message field named `result` (with stream_id, version, global_position)", where)
 	}
+	if err := checkWriteResult(where, sm.result.Message); err != nil {
+		return sm, err
+	}
 	if sm.state == nil {
 		return sm, fmt.Errorf("%s: response needs exactly one field of type %s", where, agg.state.Desc.FullName())
 	}
 	return sm, nil
+}
+
+// writeResultShape is what cmdsvc.SetWriteResult writes into the `result`
+// message, so the generated handler can only compile against a response
+// that carries all three — a proto missing or mistyping one of them
+// generates code that cannot report a successful write.
+var writeResultShape = []struct {
+	name string
+	kind protoreflect.Kind
+}{
+	{"stream_id", protoreflect.StringKind},
+	{"version", protoreflect.Uint64Kind},
+	{"global_position", protoreflect.Uint64Kind},
+}
+
+// checkWriteResult rejects a `result` message whose shape cannot carry a
+// write result, naming the offending field.
+func checkWriteResult(where string, m *protogen.Message) error {
+	for _, want := range writeResultShape {
+		var field *protogen.Field
+		for _, fld := range m.Fields {
+			if fld.Desc.Name() == protoreflect.Name(want.name) {
+				field = fld
+				break
+			}
+		}
+		if field == nil {
+			return fmt.Errorf("%s: result message %s lacks a singular %s field named %q", where, m.Desc.FullName(), want.kind, want.name)
+		}
+		if field.Desc.Kind() != want.kind {
+			return fmt.Errorf("%s: result field %s.%s must be a %s field, is a %s", where, m.Desc.FullName(), want.name, want.kind, field.Desc.Kind())
+		}
+		if field.Desc.IsList() || field.Desc.IsMap() {
+			return fmt.Errorf("%s: result field %s.%s must be singular, not a list or map", where, m.Desc.FullName(), want.name)
+		}
+	}
+	return nil
 }
 
 // connectIdent returns an identifier in the protoc-gen-connect-go package
@@ -235,7 +281,6 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	streamID := g.QualifiedGoIdent(esPkgPath.Ident("StreamID"))
 	actor := g.QualifiedGoIdent(esPkgPath.Ident("Actor"))
-	meta := g.QualifiedGoIdent(esPkgPath.Ident("Meta"))
 	newStreamID := g.QualifiedGoIdent(esPkgPath.Ident("NewStreamID"))
 	runtime := g.QualifiedGoIdent(aggregatePkgPath.Ident("Runtime"))
 	validator := g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Validator"))
@@ -291,7 +336,14 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 	g.P()
 	g.P("// New", name, "Handler returns the Connect handler for ", name, ". Mount it with")
 	g.P("// ", string(f.GoPackageName)+"connect", ".New", name, "Handler.")
+	g.P("// A nil required dep (Runtime, Authorize, Identity) panics at construction;")
+	g.P("// Validate, Filter and Errors keep their nil defaults.")
 	g.P("func New", name, "Handler(d ", name, "Deps) ", handlerIface, " {")
+	for _, dep := range []string{"Runtime", "Authorize", "Identity"} {
+		g.P("	if d.", dep, " == nil {")
+		g.P("		panic(", fmt.Sprintf("%q", name+"Deps."+dep+" is required"), ")")
+		g.P("	}")
+	}
 	g.P("	if d.Validate == nil {")
 	g.P("		d.Validate = ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("DefaultValidator")), "()")
 	g.P("	}")
@@ -378,5 +430,4 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 		g.P("}")
 		g.P()
 	}
-	_ = meta
 }

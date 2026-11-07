@@ -55,7 +55,18 @@ type counterCommandServiceHandler struct {
 
 // NewCounterCommandServiceHandler returns the Connect handler for CounterCommandService. Mount it with
 // countersvcv1connect.NewCounterCommandServiceHandler.
+// A nil required dep (Runtime, Authorize, Identity) panics at construction;
+// Validate, Filter and Errors keep their nil defaults.
 func NewCounterCommandServiceHandler(d CounterCommandServiceDeps) countersvcv1connect.CounterCommandServiceHandler {
+	if d.Runtime == nil {
+		panic("CounterCommandServiceDeps.Runtime is required")
+	}
+	if d.Authorize == nil {
+		panic("CounterCommandServiceDeps.Authorize is required")
+	}
+	if d.Identity == nil {
+		panic("CounterCommandServiceDeps.Identity is required")
+	}
 	if d.Validate == nil {
 		d.Validate = cmdsvc.DefaultValidator()
 	}

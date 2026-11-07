@@ -34,10 +34,32 @@ type projSpec struct {
 	aggs     *aggregateSet
 }
 
-// specNames guards name uniqueness across one generation run (§4).
-var specNames = map[string]string{}
+// nameRegistry guards projection/reaction name uniqueness across one
+// generation run (§4). It belongs to the run, not the process: the plugin
+// runs once per protoc invocation, but tests drive `run` many times in
+// one process, and two runs must not see each other's names.
+type nameRegistry struct {
+	used map[string]string // spec name -> the message that declared it
+}
 
-func collectProjections(f *protogen.File, r *resolver) ([]projSpec, error) {
+func newNameRegistry() *nameRegistry {
+	return &nameRegistry{used: map[string]string{}}
+}
+
+// check rejects the empty name and a name already declared by a different
+// message in this run, recording name as declared by where.
+func (r *nameRegistry) check(where, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s: name is required", where)
+	}
+	if prev, dup := r.used[name]; dup && prev != where {
+		return fmt.Errorf("%s: name %q is already used by %s", where, name, prev)
+	}
+	r.used[name] = where
+	return nil
+}
+
+func collectProjections(f *protogen.File, r *resolver, names *nameRegistry) ([]projSpec, error) {
 	var out []projSpec
 	for _, m := range allMessages(f.Messages) {
 		opts := m.Desc.Options()
@@ -58,7 +80,7 @@ func collectProjections(f *protogen.File, r *resolver) ([]projSpec, error) {
 		}
 		p := projSpec{msg: m, base: m.GoIdent.GoName, spec: spec, aggs: newAggregateSet()}
 		var err error
-		if p.consumes, err = resolveConsumes(where, spec.GetName(), spec.GetConsumes(), spec.GetFetch(), r, p.aggs); err != nil {
+		if p.consumes, err = resolveConsumes(names, where, spec.GetName(), spec.GetConsumes(), spec.GetFetch(), r, p.aggs); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -68,14 +90,10 @@ func collectProjections(f *protogen.File, r *resolver) ([]projSpec, error) {
 
 // resolveConsumes validates the shared parts of a projection/reaction spec:
 // a unique name, a set fetch mode, and every consumed type an Event variant.
-func resolveConsumes(where, name string, consumes []string, fetch esv1.FetchMode, r *resolver, aggs *aggregateSet) ([]consumed, error) {
-	if name == "" {
-		return nil, fmt.Errorf("%s: name is required", where)
+func resolveConsumes(names *nameRegistry, where, name string, consumes []string, fetch esv1.FetchMode, r *resolver, aggs *aggregateSet) ([]consumed, error) {
+	if err := names.check(where, name); err != nil {
+		return nil, err
 	}
-	if prev, dup := specNames[name]; dup && prev != where {
-		return nil, fmt.Errorf("%s: name %q is already used by %s", where, name, prev)
-	}
-	specNames[name] = where
 	if fetch == esv1.FetchMode_FETCH_MODE_UNSPECIFIED {
 		return nil, fmt.Errorf("%s: fetch must be set", where)
 	}
@@ -179,7 +197,9 @@ func writeProjection(g *protogen.GeneratedFile, p projSpec) {
 	g.P("// New", base, "Runner wires h into a projection.Runner: marker handling, live")
 	g.P("// consumption (Run over any projection.Feed) and Rebuild from the log share")
 	g.P("// one dispatch path (ADR 0005, ADR 0030).")
+	writeRequiredDepDoc(g, runnerRequiredDeps(p.fetchesState(), nil))
 	g.P("func New", base, "Runner(h ", base, "Handler, deps ", base, "Deps) *", projRunner, " {")
+	writeDepGuards(g, base, p.aggs, p.fetchesState(), nil)
 	writeDispatch(g, base, p.consumes, p.fetchesState(), nil)
 	g.P("	return &", projRunner, "{Name: ", base, "Name, Marker: deps.Marker, Dispatch: dispatch, Filter: ", lowerFirst(base), "Consumes}")
 	g.P("}")
@@ -319,6 +339,55 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 	g.P()
 }
 
+// runnerRequiredDeps names a runner shape's required-dep kinds for its
+// constructor doc: the state loaders of a state-fetching spec, the
+// issuing routers of a reaction. Empty when the shape requires none (a
+// metadata-only projection), in which case there is nothing to document.
+func runnerRequiredDeps(withState bool, routers *aggregateSet) []string {
+	var kinds []string
+	if withState {
+		kinds = append(kinds, "state loader")
+	}
+	if routers != nil && routers.len() > 0 {
+		kinds = append(kinds, "issuing router")
+	}
+	return kinds
+}
+
+// writeRequiredDepDoc documents a runner constructor's dep contract: the
+// required kinds panic when nil, the optional Marker keeps its default.
+func writeRequiredDepDoc(g *protogen.GeneratedFile, kinds []string) {
+	if len(kinds) == 0 {
+		return
+	}
+	g.P("// A nil ", strings.Join(kinds, " or "), " panics at construction, naming")
+	g.P("// itself; Marker keeps its nil default.")
+}
+
+// writeDepGuards emits the construction-time nil checks for a runner's
+// required deps: each per-aggregate loader on a state-fetching spec, each
+// per-aggregate router on a reaction. A missing one panics here, naming
+// itself, instead of misbehaving on first use (F32); the optional seams —
+// Codec, Upcaster, Actor, Marker — keep their nil defaults.
+func writeDepGuards(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withState bool, routers *aggregateSet) {
+	if withState {
+		for _, a := range aggs.sorted() {
+			field := depName(a)
+			g.P("	if deps.", field, " == nil {")
+			g.P("		panic(", fmt.Sprintf("%q", base+"Deps."+field+" is required"), ")")
+			g.P("	}")
+		}
+	}
+	if routers != nil {
+		for _, a := range routers.sorted() {
+			field := depName(a) + "Router"
+			g.P("	if deps.", field, " == nil {")
+			g.P("		panic(", fmt.Sprintf("%q", base+"Deps."+field+" is required"), ")")
+			g.P("	}")
+		}
+	}
+}
+
 // writeDispatch emits `dispatch := func(ctx, env) error { switch env.TypeURL
 // {...} }` inside a runner constructor. Each state-fetching branch decodes
 // with the deps' codec, runs the deps' optional upcaster over the decoded
@@ -390,14 +459,10 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 			g.P("			}")
 		}
 	}
-	if issuer == nil {
-		g.P("		default:")
-		g.P("			return nil // not consumed; filtered before dispatch")
-		g.P("		}")
-	} else {
-		g.P("		default:")
-		g.P("			return nil // not consumed; filtered before dispatch")
-		g.P("		}")
+	g.P("		default:")
+	g.P("			return nil // not consumed; filtered before dispatch")
+	g.P("		}")
+	if issuer != nil {
 		execute := g.QualifiedGoIdent(reactionPkgPath.Ident("Execute"))
 		metaFor := g.QualifiedGoIdent(reactionPkgPath.Ident("MetaFor"))
 		for _, a := range issuer.sorted() {

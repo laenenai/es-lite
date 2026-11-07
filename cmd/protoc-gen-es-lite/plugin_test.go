@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -15,6 +17,9 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/pluginpb"
 
+	es "github.com/laenenai/es-lite/es"
+	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
+	counterviewv1 "github.com/laenenai/es-lite/gen/counterview/v1"
 	esv1 "github.com/laenenai/es-lite/gen/es/v1"
 )
 
@@ -237,7 +242,6 @@ func goodSpec() *esv1.ProjectionSpec {
 // (imports), returning the error and the generated content.
 func runWith(t *testing.T, file *descriptorpb.FileDescriptorProto, extra ...*descriptorpb.FileDescriptorProto) (string, error) {
 	t.Helper()
-	specNames = map[string]string{} // fresh per test: the real plugin runs once per process
 	req := &pluginpb.CodeGeneratorRequest{
 		FileToGenerate: []string{file.GetName()},
 		ProtoFile: append([]*descriptorpb.FileDescriptorProto{
@@ -513,7 +517,6 @@ func TestReactionGeneratesIssuerAndRejectsNonCommand(t *testing.T) {
 func TestDocsCatalogue(t *testing.T) {
 	f := domainFile(true)
 	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(goodSpec())})
-	specNames = map[string]string{}
 	gen := fixture(t, f)
 	if err := run(gen, "PROJECTIONS.md"); err != nil {
 		t.Fatalf("generate: %v", err)
@@ -609,7 +612,6 @@ func serviceFile(mutate func(req, resp *descriptorpb.DescriptorProto, svc *descr
 
 func TestServiceGeneratesHandlerInSiblingPackage(t *testing.T) {
 	f := serviceFile(nil)
-	specNames = map[string]string{}
 	gen := fixture(t, f)
 	if err := run(gen, ""); err != nil {
 		t.Fatalf("generate: %v", err)
@@ -676,7 +678,6 @@ func TestServiceErrors(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			specNames = map[string]string{}
 			err := run(fixture(t, serviceFile(c.mutate)), "")
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("error = %v, want %q", err, c.want)
@@ -750,5 +751,161 @@ func TestHandlerNamesQualifiedAcrossAggregates(t *testing.T) {
 	}
 	if !strings.Contains(content, "OnHappened(ctx") || !strings.Contains(content, "func (i *ReactIssuer) Do(sid") {
 		t.Fatalf("single-aggregate spec must keep short names:\n%s", content)
+	}
+}
+
+// ---- F32: construction-time dep validation, result shape, run state -----
+
+// panicLoader satisfies the generated state-loader seam without touching a
+// store: constructing a runner must not call it.
+type panicLoader struct{}
+
+func (panicLoader) LoadAsOfVersion(context.Context, es.StreamID, uint64) (*counterv1.Counter, error) {
+	return nil, nil
+}
+
+// panicRouter satisfies the generated reaction.Dispatcher seam.
+type panicRouter struct{}
+
+func (panicRouter) Dispatch(context.Context, es.StreamID, counterv1.Command, es.Meta) error {
+	return nil
+}
+
+// assertPanicsNaming runs construct and requires a panic whose message
+// contains want — a missing-dep panic names the dep it wants.
+func assertPanicsNaming(t *testing.T, want string, construct func()) {
+	t.Helper()
+	defer func() {
+		t.Helper()
+		r := recover()
+		if r == nil {
+			t.Errorf("no panic, want one naming %q", want)
+			return
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, want) {
+			t.Errorf("panic = %q, want it to name %q", msg, want)
+		}
+	}()
+	construct()
+}
+
+// The generated constructors must reject a nil required dep at
+// construction, naming it, instead of accepting it and misbehaving on
+// first use (F32). The optional seams — Validate, Filter, Errors, Marker,
+// Codec, Upcaster — keep their nil defaults. The runner guards are proven
+// by constructing the checked-in counterview output (this generator's own
+// product, kept fresh by `task generate:check`); the service handler is
+// generated into the cmdsvc nested module, which this package cannot
+// import (ADR 0031 §4), so its guards are asserted on the emitted source.
+func TestHandlerPanicNamesMissingDeps(t *testing.T) {
+	// Runners: each required dep nil in turn.
+	assertPanicsNaming(t, "CounterViewDeps.Counter is required", func() {
+		counterviewv1.NewCounterViewRunner(nil, counterviewv1.CounterViewDeps{})
+	})
+	assertPanicsNaming(t, "ResetOnClosedDeps.Counter is required", func() {
+		counterviewv1.NewResetOnClosedRunner(nil, counterviewv1.ResetOnClosedDeps{CounterRouter: panicRouter{}})
+	})
+	assertPanicsNaming(t, "ResetOnClosedDeps.CounterRouter is required", func() {
+		counterviewv1.NewResetOnClosedRunner(nil, counterviewv1.ResetOnClosedDeps{Counter: panicLoader{}})
+	})
+	// Fully wired: no panic — Codec, Upcaster, Actor and Marker stay nil.
+	counterviewv1.NewCounterViewRunner(nil, counterviewv1.CounterViewDeps{Counter: panicLoader{}})
+	counterviewv1.NewResetOnClosedRunner(nil, counterviewv1.ResetOnClosedDeps{Counter: panicLoader{}, CounterRouter: panicRouter{}})
+	// A metadata-only runner has no required deps: empty Deps construct.
+	counterviewv1.NewCounterActivityRunner(nil, counterviewv1.CounterActivityDeps{})
+
+	// Service handler: Runtime, Authorize and Identity are required.
+	content, err := runWith(t, serviceFile(nil))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, dep := range []string{"Runtime", "Authorize", "Identity"} {
+		want := fmt.Sprintf("panic(%q)", "ThingCommandServiceDeps."+dep+" is required")
+		if !strings.Contains(content, want) {
+			t.Errorf("generated handler lacks %s:\n%s", want, content)
+		}
+	}
+	for _, dep := range []string{"Validate", "Filter", "Errors"} {
+		if strings.Contains(content, dep+" is required") {
+			t.Errorf("generated handler must keep %s's nil default:\n%s", dep, content)
+		}
+	}
+}
+
+// resolveMethod must reject a `result` message (or response shape) that
+// cannot carry what cmdsvc.SetWriteResult writes, naming the offending
+// field (F32).
+func TestResultShapeValidatedAtGeneration(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(wr, resp *descriptorpb.DescriptorProto)
+		want   string
+	}{
+		"no version": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field = append(wr.Field[:1], wr.Field[2:]...)
+		}, `field named "version"`},
+		"no stream_id": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field = wr.Field[1:]
+		}, `field named "stream_id"`},
+		"stream_id not a string": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field[0] = uint64Field("stream_id", 1)
+		}, "stream_id must be a string field"},
+		"version not uint64": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field[1] = stringField("version", 2, nil)
+		}, "version must be a uint64 field"},
+		"global_position repeated": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field[2].Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+		}, "global_position must be singular"},
+		"result repeated": {func(_, resp *descriptorpb.DescriptorProto) {
+			resp.Field[0].Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+		}, "`result` must be a singular"},
+		"state repeated": {func(_, resp *descriptorpb.DescriptorProto) {
+			resp.Field[1].Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+		}, `"state" must be a singular`},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := serviceFile(nil)
+			var wr, resp *descriptorpb.DescriptorProto
+			for _, m := range f.MessageType {
+				switch m.GetName() {
+				case "WriteResult":
+					wr = m
+				case "DoResponse":
+					resp = m
+				}
+			}
+			if wr == nil || resp == nil {
+				t.Fatal("fixture lacks WriteResult or DoResponse")
+			}
+			c.mutate(wr, resp)
+			err := runPlugin(t, f)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %v, want a generation error naming %s", err, c.want)
+			}
+		})
+	}
+}
+
+// The spec-name uniqueness registry belongs to one generation run, not to
+// the process: the plugin runs once per protoc invocation, but the test
+// suite drives `run` many times in one process, so a fresh run must not
+// see names a previous run declared (F32).
+func TestSpecNamesNotGlobal(t *testing.T) {
+	runOnce := func(msgName string) error {
+		f := domainFile(true)
+		f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{
+			Name:    proto.String(msgName),
+			Options: projectionOpts(goodSpec()),
+		})
+		return runPlugin(t, f)
+	}
+	// Two runs, one process, the same spec name declared by different
+	// messages: a per-run registry accepts both; a process-global one
+	// rejects the second as a duplicate.
+	if err := runOnce("View"); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if err := runOnce("View2"); err != nil {
+		t.Fatalf("second run declaring the same spec name: %v", err)
 	}
 }
