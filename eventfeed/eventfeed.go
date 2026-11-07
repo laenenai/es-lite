@@ -175,20 +175,9 @@ func (f *Feed) Feed(ctx context.Context, handle func(ctx context.Context, e es.E
 
 // newToken mints the stable lease-owner token: 8 random bytes, the same
 // shape as the server's per-process owner prefix, unique across processes
-// so two feed processes can never pass each other's fence.
-//
-// The token is stable for the Feed's whole life (the spec leaves the
-// reconnect token policy to the builder; this is the stable-token
-// choice): a reconnect re-acquires under the same owner, so the adapter
-// self-steals its own lingering lease instead of waiting out the TTL —
-// a same-owner acquire succeeds where a fresh token would loop on
-// LeaseHeld. The trade-off (spec §5.4): because Renew carries no epoch,
-// a zombie stream of this same Feed can keep renewing for a bounded
-// overlap window after a self-steal, so both the old and the new stream
-// deliver — duplicates, never loss: the marker dedups, and the
-// monotonic cursor never advances past a position a holder actually
-// delivered. A foreign owner still fails closed: cross-owner takeover
-// is rejected at acquire, and the loser's next renewal fails.
+// so two feed processes can never pass each other's fence. Why the token
+// is stable for the Feed's whole life — the reconnect token policy and
+// its self-steal/zombie-overlap trade-off — is documented once, on New.
 func newToken() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

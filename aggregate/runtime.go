@@ -191,21 +191,6 @@ type Result[S, E any] struct {
 	Envelopes   []es.Envelope
 }
 
-// Handle loads the stream, applies cmd via Decider.Decide, and appends
-// the resulting events. On an optimistic-concurrency clash it returns
-// es.ErrConflict — the caller reloads and retries, unless WithConflictRetry
-// is set, in which case Handle retries a bounded number of times itself.
-//
-// The runtime, unlike the Decider, may touch the clock and generate IDs.
-// Each event's Envelope.OccurredAt is ALWAYS stamped from the server clock;
-// es.Meta carries no time of its own (ADR 0034). A command implementing
-// es.DecidedAt supplies intent only: an unset decided_at is rejected with
-// es.ErrDecidedAtMissing, one further than es.MaxDecisionSkew from server
-// time is rejected with *es.DecidedAtSkewError, an in-window value is
-// replaced by server time before Decide runs so expiry windows validate
-// against the server clock, and a command whose decision time cannot be
-// replaced (es.StampDecisionTime returns false) is rejected with
-// es.ErrDecidedAtUnstampable, naming the command type.
 // AppendFunc performs the append for one Handle call.
 //
 // It exists so a caller can own the transaction: an audited store, an outbox
@@ -244,6 +229,21 @@ func newHandleOptions(opts []HandleOption) handleOptions {
 	return o
 }
 
+// Handle loads the stream, applies cmd via Decider.Decide, and appends
+// the resulting events. On an optimistic-concurrency clash it returns
+// es.ErrConflict — the caller reloads and retries, unless WithConflictRetry
+// is set, in which case Handle retries a bounded number of times itself.
+//
+// The runtime, unlike the Decider, may touch the clock and generate IDs.
+// Each event's Envelope.OccurredAt is ALWAYS stamped from the server clock;
+// es.Meta carries no time of its own (ADR 0034). A command implementing
+// es.DecidedAt supplies intent only: an unset decided_at is rejected with
+// es.ErrDecidedAtMissing, one further than es.MaxDecisionSkew from server
+// time is rejected with *es.DecidedAtSkewError, an in-window value is
+// replaced by server time before Decide runs so expiry windows validate
+// against the server clock, and a command whose decision time cannot be
+// replaced (es.StampDecisionTime returns false) is rejected with
+// es.ErrDecidedAtUnstampable, naming the command type.
 func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, opts ...HandleOption) (Result[S, E], error) {
 	return r.HandleAt(ctx, sid, cmd, meta, 0, opts...)
 }

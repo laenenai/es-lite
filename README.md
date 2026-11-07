@@ -49,7 +49,7 @@ transport, authentication, encryption and business rules.
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
 | At-least-once delivery, fenced | `feed` core + Postgres adapters; consumer adapter in `eventfeed`; legacy in-process `delivery.Poller`/`Relay`; Postgres feed reads are commit-safe via the horizon fence (ADR 0037) |
 | Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
-| Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes, computed in the append transaction; keyless verification (`es-verify`) and exportable anchors (ADR 0029) |
+| Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes plus per-batch log-order attestation, both computed in the append transaction; keyless verification (`es-verify stream\|order\|all`) and exportable anchors (ADRs 0029 and 0038) |
 | Schema lifecycle | versioned migrations (`es-migrate`) |
 | Aggregate runtime | proto-defined events, the Decider model, generated codecs and sum-types |
 
@@ -118,13 +118,26 @@ transport, authentication, encryption and business rules.
   **RLS** + hash partitioning. `Store.Workspace(id)` scopes reads and writes to
   one workspace; the feed reads are commit-safe (the horizon fence, ADR 0037)
   and the `Drain` claim-relay has its own gap-safe cursor. Requires
-  **PostgreSQL 14+** — the append xid draw and the horizon fence both use
-  `pg_current_xact_id()`, and `Open` probes for it once, failing fast with a
-  clear message on older servers. The per-principal table grants are in the
+  **PostgreSQL 14+** — that floor is the support policy, not a single feature
+  gate: the oldest server the code actually rejects is one without
+  `pg_current_xact_id()` (PostgreSQL 12 and older; the function, and the
+  `pg_current_snapshot`/`pg_snapshot_xmin` pair the fence needs, exist from
+  PostgreSQL 13). Both constructors — `Open` and `OpenWithPool` — probe for
+  it once, before any migration, and fail fast with a clear message on an
+  older server instead of a confusing error inside the first append or fence
+  round. The per-principal table grants are in the
   deployment runbook's
   [Grants section](./docs/deploy/README.md#grants-the-privilege-contract).
 - **SQLite** (single-workspace, dev/edge): single-writer, gap-free cursor,
   zero infrastructure — useful for tests and single-tenant nodes.
+
+One vestige, documented rather than hidden: both `events` tables carry a
+`stream_type` column that nothing reads — the stream id's canonical
+`type:id` prefix is the type source, and the "all streams of type X" query
+a 0001 schema comment promised was never built (confirmed dead by the
+2026-11-07 review, F34). The column stays because dropping it means
+rebuilding the log tables, which is not worth it pre-1.0; new code must not
+depend on it.
 
 Both implement the same `es.Store`. Open the backend and pass the store to the
 aggregate runtime:
@@ -203,7 +216,10 @@ What it does **not** guarantee:
 *settled* head — never a position whose append is still in flight — so
 while a fence is blocked they transiently read 0 and `Status.Lag` can be
 transiently negative; `RawHead` is the unfiltered committed maximum, used
-for stall detection and the fence-aware resume clamp. A wedged long-lived
+by the fence-aware resume clamp. Stall detection compares the stream's
+position against `MatchingRawHead` — the raw backlog of the subscription's
+own consumed types — so a caught-up filtered subscription never reports a
+stall when unrelated event types land above it. A wedged long-lived
 transaction anywhere on the primary delays every feed page until it ends:
 observable, diagnosable, never a loss.
 
@@ -322,14 +338,21 @@ are client responsibilities (ADR 0025).
   path's one mutable column (SQLite tails in-process and has none). Since ADR 0029 every row carries `prev_hash`/`hash`: a
   per-stream SHA-256 chain over the *sealed* bytes, computed inside the append
   transaction, so an auditor with no keys can detect an altered, reordered or
-  missing row (`es.VerifyStream`, `es-verify stream|all`). A chain alone cannot
-  detect a truncated tail or an operator who rewrites every hash after an
-  edit; periodic **anchors** (`es-verify anchor`) fix every stream head under
+  missing row (`es.VerifyStream`, `es-verify stream|all`) — including a stream
+  whose earliest rows were deleted, which the default audit reports as a broken
+  chain. Since ADR 0038 every append transaction also writes one `log_order` row
+  hashing its own events' positions and chain hashes, and every anchor carries
+  an order root over those rows, so cross-stream append order is attested too
+  (`es-verify order` recomputes each batch hash from the events; ADR 0038
+  records the design and the trust split). A chain alone cannot detect a
+  truncated tail or an operator who rewrites every hash after an edit;
+  periodic **anchors** (`es-verify anchor`) fix every stream head under
   one root that you export somewhere the database operator cannot rewrite (a
   signed commit, a transparency log). es-lite does not sign anchors — signing
   is the operator's layer. The chain starts at the first append after
-  migration 0002; rows written before it are never back-filled and stay
-  unattested (`ChainedFrom` in the report).
+  migration 0002 and the order rows at the first append after migration 0006;
+  rows written before those migrations are never back-filled and stay
+  unattested (`ChainedFrom` and `order_from_position` in the reports).
 - **Metadata is visible.** Stream IDs, actors, type URLs and claim scopes are
   not encrypted by the store. Use TLS and authenticate at the application's API
   boundary; the library does not wire transport security for you.
@@ -416,7 +439,14 @@ Each RPC runs validate (protovalidate) → stream id → principal injection →
 authorise → `Runtime.HandleAt` → `WriteResult{stream_id, version,
 global_position}` + state; `es.ErrConflict` becomes `failed_precondition`
 with an `es.v1.VersionConflict` detail carrying the current version and
-state. The runtime for this lives in the nested module
+state. An optional `Dedup` dep adds draft-compliant `Idempotency-Key`
+handling after authorisation (draft-ietf-httpapi-idempotency-key-header-07):
+a replayed key returns the stored response, a concurrent duplicate is
+reported `aborted` with HTTP 409 semantics, and a reused key with a
+different payload is rejected with HTTP 422 semantics — wire
+`Runtime.WithDeterministicEventIDs()` alongside it; the
+[migration notes](./docs/migration/2026-11-07-breaking-changes.md) carry
+the full contract. The runtime for this lives in the nested module
 `github.com/laenenai/es-lite/cmdsvc`, so the core module never imports
 connect-go.
 

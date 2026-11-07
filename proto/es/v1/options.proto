@@ -196,7 +196,13 @@ extend google.protobuf.FieldOptions {
   // rejects a value further than es.MaxDecisionSkew (five minutes) from
   // server time with *es.DecidedAtSkewError, and replaces the command's
   // decided_at with server time before Decide runs so a decider checking an
-  // expiry window validates against the server clock. Generation fails when
+  // expiry window validates against the server clock. A command whose
+  // decision time cannot be replaced — es.StampDecisionTime reports
+  // false: the command is neither an es.DecisionTimeSetter nor a proto
+  // message with a tagged Timestamp field — is rejected with
+  // es.ErrDecidedAtUnstampable, naming the command type, before anything
+  // is loaded or appended; generated variants are always settable, so
+  // only hand-written command types can reach it. Generation fails when
   // the field is not a Timestamp or its message is not a variant of a
   // "Command" sum type.
   //

@@ -42,8 +42,9 @@ var ZeroHash [HashSize]byte
 //	payload                            len-prefixed, the sealed bytes as stored
 //	prev_hash                          32 bytes
 //
-// GlobalPosition is excluded (assigned during the INSERT; attested by anchors
-// instead) and so is the relay's mutable published_at marker. Timestamps are
+// GlobalPosition is excluded (assigned during the INSERT; attested instead by
+// the per-batch log_order rows and the anchor's order root over them —
+// ADR 0038) and so is the relay's mutable published_at marker. Timestamps are
 // truncated to microseconds — the precision every backend returns — so a
 // verifier recomputes from what the database hands back.
 func CanonicalEnvelope(e Envelope) []byte {

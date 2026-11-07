@@ -174,13 +174,17 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 
 // probePostgresFloor is the PostgreSQL 14 floor check both constructors run
 // once, before any migration (F33): the append path's P1 xid draw and the
-// horizon fence both call pg_current_xact_id(), which exists only from
-// PostgreSQL 14 — on an older server every append and every fence round
-// would otherwise fail deep inside with a confusing "function
-// pg_current_xact_id() does not exist". The undefined-function error
-// becomes a clear message naming the minimum; any other failure (a dead
-// DSN, a cancelled context) is a probe failure, not a version verdict, and
-// is wrapped as such.
+// horizon fence both call pg_current_xact_id(), so a server without it
+// would otherwise fail every append and every fence round deep inside with
+// a confusing "function pg_current_xact_id() does not exist". The 14+
+// floor is the support policy, not a single feature gate:
+// pg_current_xact_id() — and the pg_current_snapshot/pg_snapshot_xmin pair
+// the fence reads — exist from PostgreSQL 13, so the probe mechanically
+// rejects only servers older than 13 and a 13 server passes it; the
+// docs state the floor as policy with the probe as the tripwire. The
+// undefined-function error becomes a clear message naming the minimum;
+// any other failure (a dead DSN, a cancelled context) is a probe failure,
+// not a version verdict, and is wrapped as such.
 func probePostgresFloor(ctx context.Context, pool *pgxpool.Pool) error {
 	var xid uint64
 	err := pool.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&xid)

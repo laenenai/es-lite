@@ -314,8 +314,9 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 // failure ("version probe"), never a version verdict — a dead DSN must not
 // be misreported as "this server is older than PostgreSQL 14". The
 // floor branch itself (pg_current_xact_id undefined, SQLSTATE 42883) can
-// only fire on a real pre-PG14 server; the probe's happy path runs on
-// every Open in this suite.
+// only fire on a server older than PostgreSQL 13 — the function exists
+// from 13, so the 14+ floor is support policy and the probe its tripwire;
+// the probe's happy path runs on every Open in this suite.
 func TestOpenProbeDoesNotMaskConnectionErrors(t *testing.T) {
 	// Port 1 on loopback: nothing listens there, so the pool's first
 	// probe statement fails at connect time, bounded by the DSN's

@@ -5,16 +5,129 @@ This file collects every breaking change as it lands — one entry per
 change, each stating what changed, who is affected, and what to do.
 Entries are grouped by the change date and never rewritten after landing.
 
-## 2026-11-07 — `es.ErrDecidedAtMismatch` is removed; an unstampable `decided_at` command fails loudly
+## 2026-11-07 — `feed.Server.Skip` refuses to rewind the checkpoint without `force`
+
+**What changes.** `Skip` used to accept any position: a skip below the
+current checkpoint silently rewound the subscription (Reset semantics)
+and recorded the dead letter. It now refuses such a request with
+`feed.ErrInvalidRequest` — "skip position %d is behind the checkpoint %d;
+pass Force to rewind" — before recording anything, so both the cursor and
+the audit trail stay untouched by the refused call. `force` keeps the
+deliberate rewind semantics exactly.
+
+**Who is affected.** Callers that used a below-checkpoint `Skip` as a
+replay trigger: those calls now fail until they pass `force`.
+Poison-path skips (at or above the checkpoint) are unaffected, and
+re-skipping the event at the cursor stays idempotent.
+
+**What to do.** Pass `force: true` where the rewind is genuinely wanted;
+for deliberate replays prefer `ResetCheckpoint`, which re-identifies the
+checkpoint under its definition hash.
+
+## 2026-11-07 — A duplicate caller-supplied `EventID` is `ErrDuplicateEventID`, not `ErrConflict`; corrupt audit UUIDs fail reads
+
+**What changes.** An append whose `EventID` already exists in the log
+used to surface as `es.ErrConflict`, discarding the underlying database
+error. Both adapters now classify it as `es.ErrDuplicateEventID` —
+Postgres by constraint name (`events_workspace_id_event_id_key` /
+`events_event_id_key`), SQLite by the driver's constraint message — so a
+permanent duplicate is no longer mistaken for a retryable
+optimistic-concurrency clash (which stays `ErrConflict` via the version
+constraint). In the same change both row scanners reject malformed audit
+UUIDs: a row whose `event_id`, `correlation_id`, `causation_id` or
+`command_id` is not a UUID now fails the read with the column named and
+the value's length (never its bytes) instead of silently decoding to a
+zero UUID.
+
+**Who is affected.** Direct store callers that branched on
+`errors.Is(err, es.ErrConflict)` for duplicate event ids: they now see
+the new sentinel (the aggregate runtime never sets `EventID` itself, and
+the deterministic-event-ids option collides on this constraint by
+design). Readers of stores seeded with corrupt audit columns: rows that
+used to scan as zero UUIDs now error.
+
+**What to do.** Match `errors.Is(err, es.ErrDuplicateEventID)` for the
+duplicate case; keep `ErrConflict` for version races. Fix or clean rows
+with malformed audit UUIDs — they were never valid audit facts.
+
+## 2026-11-07 — The fence requires sequence `CACHE 1` and fails loudly otherwise
+
+**What changes.** The position sequence's `cache_size` is asserted on
+every fence round: a sequence configured with `CACHE n > 1` — which
+silently breaks the fence's lossless proof by handing out positions after
+`last_value` has already advanced past them — now fails the feed-facing
+reads and the anchor path with
+`postgres.ErrSequenceCacheMisconfigured`, whose message names the fix
+(`ALTER SEQUENCE events_global_position_seq CACHE 1`). The fence bound is
+read through the `pg_sequences` view, which also means the feed and
+anchor roles need only `USAGE` on the sequence, never `SELECT`.
+
+**Who is affected.** Deployments that had `ALTER SEQUENCE … CACHE n > 1`
+in place: feed pages and anchor calls now error instead of running
+inside the loss window. A deployment that appeared to work with a cached
+sequence was already exposed to permanently skipped events; the error is
+the fix, not a regression.
+
+**What to do.** Keep the sequence at `CACHE 1` — the database default.
+ADR 0038 records why; the deployment runbook carries the invariant.
+
+## 2026-11-07 — `AppendTx`/`ReadStreamTx` reject a connection pool
+
+**What changes.** The Postgres caller-owned-transaction methods
+(`WorkspaceStore`'s `AppendTx` and `ReadStreamTx`) now refuse a
+`*pgxpool.Pool` passed as the `DBTX` argument — "requires an active
+transaction, not a pool" — instead of silently running every statement
+in its own autocommit transaction, which scattered the append's xid
+draw, its inserts and the workspace setting across transactions: no
+error, all guarantees gone.
+
+**Who is affected.** Callers that passed a pool where a transaction was
+required: they now get an immediate, named error instead of a
+compromised append. Genuine transaction handles are unchanged.
+
+**What to do.** Pass the caller's `pgx.Tx` (or another transactional
+`DBTX`); the error names exactly what is missing.
+
+## 2026-11-07 — Feed definitions reject control bytes in consumed types
+
+**What changes.** `Subscribe`'s definition validation now rejects any
+`consumes` entry containing an ASCII control byte with
+`feed.ErrInvalidRequest`, naming the offending type. A control byte is
+never legitimate in a type URL, and adapters join subscription keys and
+type filters with byte-level concatenation (SQLite joins key parts with
+NUL), so such an entry could make distinct definitions or key triples
+collide into one.
+
+**Who is affected.** Callers that subscribed with control bytes inside
+consumed type names — a shape that was already ambiguous — now get an
+immediate validation error instead of a silently colliding subscription.
+
+**What to do.** Nothing for legitimate proto type URLs; the refusal is
+the same byte-level hygiene the subscription key already had.
+
+## 2026-11-07 — `es.ErrDecidedAtMismatch` is removed
 
 **What changes.** `es.ErrDecidedAtMismatch` — exported "for callers
 compiled against ADR 0032" but returned by nothing since ADR 0034 made
 the server clock the only authority for event time — is gone, together
 with the `cmdsvc.MapError` arm that mapped it to `invalid_argument`. The
-decided_at family keeps its two live rejection sentinels —
+decided_at family keeps its live rejection sentinels —
 `es.ErrDecidedAtMissing` (field unset), `es.ErrDecidedAtSkew` /
-`*es.DecidedAtSkewError` (outside the trust window) — and gains the one
-case the runtime used to swallow: `es.ErrDecidedAtUnstampable`.
+`*es.DecidedAtSkewError` (outside the trust window) — and gains
+`es.ErrDecidedAtUnstampable` (its own entry follows).
+
+**Who is affected.** Code that references `es.ErrDecidedAtMismatch` — a
+compile break; nothing returned it, so no runtime behavior changes.
+Callers of `cmdsvc.MapError`: the `invalid_argument` arm for it is gone
+(no error can carry it anyway).
+
+**What to do.** Delete references to the removed sentinel; use
+`errors.Is(err, es.ErrDecidedAtSkew)` for the trust-boundary rejection
+and `es.ErrDecidedAtMissing` for the unset case.
+
+## 2026-11-07 — An unstampable `decided_at` command is rejected loudly
+
+**What changes.** `es.ErrDecidedAtUnstampable` is new, and
 `aggregate.Runtime.Handle`/`HandleAt` now return it — the error names the
 command type — when a command implements `es.DecidedAt` but
 `es.StampDecisionTime` cannot replace its decision time with the server
@@ -24,21 +137,16 @@ previously accepted silently and ran Decide against the client's clock
 value; generated proto commands are unaffected (their tagged Timestamp
 field is always settable).
 
-**Who is affected.** Code that references `es.ErrDecidedAtMismatch` — a
-compile break; nothing returned it, so no runtime behavior changes.
-Callers of `cmdsvc.MapError`: the `invalid_argument` arm for it is gone
-(no error can carry it anyway). Hand-written command types that implement
+**Who is affected.** Hand-written command types that implement
 `DecisionTime()` without a `SetDecisionTime` method (and are not proto
 messages): a `Handle` that silently succeeded now fails loudly —
 `errors.Is(err, es.ErrDecidedAtUnstampable)` — before anything is loaded
 or appended.
 
-**What to do.** Delete references to the removed sentinel; use
-`errors.Is(err, es.ErrDecidedAtSkew)` for the trust-boundary rejection
-and `es.ErrDecidedAtMissing` for the unset case. Give a hand-written
-`es.DecidedAt` command a `SetDecisionTime(time.Time)` method so the
-runtime can stamp it — a command that only reports a decision time it can
-never have replaced is a broken command, and the runtime now says so.
+**What to do.** Give a hand-written `es.DecidedAt` command a
+`SetDecisionTime(time.Time)` method so the runtime can stamp it — a
+command that only reports a decision time it can never have replaced is a
+broken command, and the runtime now says so.
 
 ## 2026-11-07 — `es.Meta.OccurredAt` is removed
 
@@ -156,9 +264,13 @@ stream that has never been written, which made "not found"
 indistinguishable from "empty". Both adapters (`sqlite.Store` and
 `postgres.Workspace`) now return an error wrapping `es.ErrStreamNotFound`,
 with the canonical stream id in the message, when a read starts at the
-beginning of a never-written stream: `fromVersion == 0` and the stream has
-no events at all — whatever `toVersion` is, since from the start of the
-stream an empty result already means no rows exist. Empty ranges are
+beginning (`fromVersion == 0`) of a stream that has no events at all. How
+the adapters know that depends on the bound's shape: an unbounded read
+(`toVersion == 0`) proves it from the empty result itself — from the
+start of the stream with no upper bound, zero rows already means no row
+exists — while a bounded empty result is ambiguous (the stream's first
+rows could sit above the bound), so there the adapters run an existence
+probe and keep `(nil, nil)` when the stream exists. Empty ranges are
 unchanged: reads with `fromVersion > 0`, and bounded reads from 0 of a
 stream that exists, still return `(nil, nil)`.
 

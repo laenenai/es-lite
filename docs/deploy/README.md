@@ -100,9 +100,13 @@ work across workspaces, through the `app.bypass_rls` arm of the `events`
 and `unique_claims` policies. Migration 0005 role-gates that arm: it
 additionally requires `pg_has_role(current_user, 'es_relay', 'member')`,
 so the GUC alone — settable by any session — no longer lifts workspace
-isolation. Both paths verify the membership once per `Store` at startup
-and fail fast with `postgres.ErrRelayRoleMissing` instead of silently
-reading nothing. The silence would look like an idle backlog for `Drain`
+isolation. Both paths verify the membership lazily, on the first bypassed
+call, and cache a definitive verdict for the `Store`'s lifetime, failing
+fast with `postgres.ErrRelayRoleMissing` instead of silently reading
+nothing; a transient probe failure — a cancelled context, a connection
+blip — is returned but not cached and re-probes on the next call, so one
+blip cannot refuse a process forever. The silence would look like an idle
+backlog for `Drain`
 — and be worse on the anchor path: `Anchor` would compute a root over
 zero heads and record it as a real anchor, and `CheckAnchor` would
 report a spurious mismatch.
@@ -121,8 +125,9 @@ CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS;
 GRANT es_relay TO <the relay's login role>, <the anchor scheduler's login role>;
 ```
 
-The membership verdict is checked once per `Store` and stands for its
-lifetime: after granting a missed role, restart the refused processes —
+The membership verdict is probed on the first bypassed call, and a
+definitive one stands for the `Store`'s lifetime: after granting a missed
+role, restart the refused processes —
 the relay, and the `es-verify` anchor job (a freshly opened `Store`
 re-verifies). The reverse direction is quieter: **revoking `es_relay` from a
 running relay is silent until restart.** The policy re-evaluates
@@ -154,10 +159,15 @@ and the code cannot drift apart silently: a grant the code needs but the
 runbook omits fails the test, and so does a code path reaching for an
 undocumented privilege.
 
-es-lite requires **PostgreSQL 14 or newer** — the append xid draw and the
-horizon fence both use `pg_current_xact_id()` — and `Open` probes that
-once, failing fast with a clear message on an older server instead of a
-confusing error deep inside the first append.
+es-lite requires **PostgreSQL 14 or newer**. The floor is the support
+policy, not a single feature gate: `pg_current_xact_id()` — the first
+statement of both the append xid draw and the horizon fence — and the
+`pg_current_snapshot`/`pg_snapshot_xmin` pair the fence reads all exist
+from PostgreSQL 13, so the probe mechanically rejects only PostgreSQL 12
+and older. Both constructors, `Open` and `OpenWithPool`, run the probe
+once, before any migration, failing fast with a clear message on an older
+server instead of a confusing error deep inside the first append or fence
+round.
 
 Every principal needs schema access to name the objects at all:
 
@@ -220,6 +230,59 @@ GRANT USAGE ON SEQUENCE events_global_position_seq TO <anchor job>;
 GRANT es_relay TO <anchor job>;
 ```
 
+### The `CACHE 1` invariant
+
+The position sequence `events_global_position_seq` must stay at
+`CACHE 1` (the database default — nothing in the schema pins it, so the
+fence asserts it instead). The horizon fence's lossless proof needs every
+position at or below its bound to have been *drawn* before the bound was
+read; a sequence with `CACHE n > 1` hands cached positions out only after
+`last_value` has already advanced past them, so a fence can clear and
+deliver past a position that commits later — a permanently skipped event
+on the feed, and on the anchor path a root recorded over a section that
+can still change. Every fence round — feed pages and the anchor path's
+settled bound alike — reads the bound through the documented
+`pg_sequences` view and asserts `cache_size = 1`, so a misconfigured
+sequence fails loudly:
+
+```
+postgres: position sequence events_global_position_seq must use CACHE 1;
+run ALTER SEQUENCE events_global_position_seq CACHE 1
+```
+
+An idle workspace short-circuits on its own committed maximum before the
+sequence read, so the assertion fires on its first active round.
+`ALTER SEQUENCE … CACHE 32` is a reasonable-looking throughput tweak; it
+is exactly the misconfiguration this invariant exists to catch, and it
+was already inside the loss window before the assertion existed. ADR 0038
+records the full argument.
+
+### Shared logins are mutually trusting; DSNs are trust documents
+
+RLS isolates workspaces by the `app.workspace_id` the *application* pins
+on its own session — the database cannot tell two workspaces driven by the
+same login role apart. **Workspaces that share one database login are
+mutually trusting:** any process holding that role's credentials can pin
+any workspace id. Give each tenant — or each group of genuinely mutually
+trusting tenants — its own login role; the grant blocks above are per
+`<role>` precisely so that wall can exist.
+
+The relay and anchor/verify principals sit above every workspace: their
+login roles hold `es_relay`, and the anchor job reads across all
+workspaces under the bypass. Treat their DSNs accordingly:
+
+- Connect over TLS and keep verification on — `sslmode=verify-full` with a
+  pinned root. es-lite does not enforce or parse TLS settings itself; the
+  DSN is the only place transport security is configured, so
+  `sslmode=disable` or verification-less `require` must never leave a
+  local dev network.
+- The DSN names the host, the login role and (if used) the password: keep
+  it out of process dumps, shared logs and shell history, and prefer
+  secret injection over environment files.
+- One login role per principal (relay, anchor job, each appender, each
+  feed process) — a leaked credential then reaches exactly the grants its
+  owner needs and nothing wider.
+
 ## Feed operations (ADR 0037)
 
 The feed's failure modes are *delay*, never *loss* — but only if the
@@ -247,9 +310,12 @@ Recovery is `feed.Server.Skip` with a `feed.SkipRequest`
   advancing — a crash in between leaves an audit row and an unadvanced
   cursor, so the retry is idempotent and no skip is ever unaudited.
 - `Skip` preserves the checkpoint's definition fingerprint: it is a
-  position advance, not a redefinition. (A skip *below* the current
-  checkpoint rewinds — Reset semantics — and records the dead letter; that
-  is sometimes wanted for replay, but not the normal poison path.)
+  position advance, not a redefinition. A skip *below* the current
+  checkpoint is refused — it would silently rewind the subscription and
+  re-deliver history the consumer already acknowledged — unless the
+  request carries `force`, which keeps the deliberate rewind (Reset
+  semantics) and records the dead letter; that is sometimes wanted for
+  replay, but not the normal poison path.
 - Unless `force` is set it refuses while a live lease holds the key. The
   normal flow needs no force: the poison error already killed the stream
   and released its lease.
@@ -271,9 +337,13 @@ with the projection-plan companion work (review A7).
 
 ### Stall alerting
 
-`Observer.OnStall(settledHead, rawHead)` fires — exactly once per stall
-episode, probes rate-limited — when a stream's pages come back empty while
-committed backlog sits above the settled position. Two regimes produce it:
+`Observer.OnStall(settledHead, matchingRawHead)` fires — exactly once per
+stall episode, probes rate-limited — when a stream's pages come back empty
+while committed backlog sits above the settled position. The second
+parameter is the *matching* raw head — the backlog of the subscription's
+own consumed types, not the log-wide maximum — so a caught-up filtered
+subscription does not report a stall when unrelated event types land above
+it. Two regimes produce a genuine stall:
 
 - **A long caller-owned append** — correct waiting; it self-clears on
   commit and needs nothing.

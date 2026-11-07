@@ -52,8 +52,9 @@ func TestWorkspaceHead(t *testing.T) {
 // cursor past the in-flight event and lose it when it commits. The shape is
 // the out-of-order commit: tx1 draws the lower position and stays open while
 // tx2 commits the higher one, so the raw max is above an in-flight position.
-// RawHead sees the committed event immediately (the stall-detection view,
-// §5.8); the settled Head stays at or below the in-flight position until the
+// RawHead sees the committed event immediately (the unfiltered view the
+// fence-aware resume clamp reads, §5.8); the settled Head stays at or below
+// the in-flight position until the
 // fence clears, then converges to the full settled max.
 func TestHeadIsSettledWhileAppendInFlight(t *testing.T) {
 	ctx := context.Background()

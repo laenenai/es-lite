@@ -352,3 +352,55 @@ without reopening the spin hole a misbehaving `Waiter` could create.
 - **One extra round trip on every append** (~3.2% of a batch-20 append,
   measured) — permanent, accepted, and the honest number is recorded here
   rather than in a benchmark nobody re-runs.
+
+## Errata (2026-11-07)
+
+A documentation truth pass (review F37) walked this ADR against the landed
+code. The fence design stands; these claims needed correction, and the
+history above is left as written:
+
+1. **"Idle streams burn no transaction ids" held only when the whole
+   database was idle — as originally written.** Step 1's idle check read the
+   *global* sequence's `last_value`, so a subscriber whose own workspace was
+   quiet still drew a fence whenever any other workspace appended (review
+   F27: at the documented envelope that is ~34M xids/day even with zero
+   relevant events). Since 2026-11-07 the idle check consults the
+   *workspace's* committed maximum first — a RawHead-shaped read, no xid
+   drawn — and only draws a fence when that max passes `from`
+   (`postgres/wsstore.go` `fenceBound`); an idle workspace now burns nothing
+   regardless of other workspaces. Step 1's bound is also no longer read
+   from the sequence directly: it goes through the `pg_sequences` view,
+   which works for a `USAGE`-only role and carries `cache_size` for the
+   `CACHE 1` assertion (below).
+2. **The fence requires `CACHE 1`, and asserts it every round** (review F9).
+   P2 of the lossless proof needs "every position ≤ L was drawn before L
+   was read"; a sequence with `CACHE n > 1` hands positions out *after*
+   `last_value` has already advanced past them, so a later append can land a
+   row at or below a bound the fence already cleared and delivered past —
+   the permanently-skipped-event class this ADR exists to prevent. Every
+   fence round now asserts `cache_size = 1` and fails loudly with
+   `postgres.ErrSequenceCacheMisconfigured` (message names
+   `ALTER SEQUENCE events_global_position_seq CACHE 1`); an idle
+   short-circuit skips the read, so the assertion fires on the first active
+   round. ADR 0038 records the full argument; the runbook carries the
+   operator-side invariant.
+3. **"`RawHead` … for stall detection and the resume clamp only" — stall
+   detection moved.** Since 2026-11-07 the stall probe compares the
+   stream's position against the subscription's `MatchingRawHead` — the raw
+   backlog of *its own consumed types* — instead of the all-type `RawHead`
+   (review F14: a caught-up filtered subscription no longer false-positives
+   when unrelated types land above it, and `Observer.OnStall`'s second
+   parameter is that matching head). `RawHead` remains the unfiltered
+   committed maximum, still used by the fence-aware resume clamp.
+4. **The RLS rollout section's "verify membership once per `Store` at
+   startup" is no longer the mechanism.** The check runs lazily, on the
+   first bypassed call, and only a definitive verdict is cached; a transient
+   probe failure is returned but not cached and re-probes on the next call,
+   so one cancelled context can no longer refuse a process forever (review
+   F4, `postgres/drain.go` `checkRelayRole`). The rollout ordering itself —
+   role and grants before migration 0005 — is unchanged.
+5. **The rollout section names the two policies migration 0001 created;
+   three carried the bypass arm.** The `anchors` policy (from 0002) carried
+   the same ungated arm and was role-gated only by migration 0007
+   (2026-11-07), which recreated all three bypass-carrying policies with
+   the `EXISTS` guard. See ADR 0029's errata and migration 0007's header.

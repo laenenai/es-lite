@@ -282,3 +282,14 @@ express "one method per consumed type".
   `max_lag` 6 in `es.v1.ProjectionSpec` (`ceiling` is gone). Options are
   written by name, so the migration is mechanical
   (`docs/migration/contracts-projection-options.md`).
+
+## Errata (2026-11-07)
+
+The §1 snippet shows `FetchMode` as designed on 2026-10-30, with the two
+fetch modes that existed then. A third value was added on 2026-11-07
+(review F38, maintainer-elected capability): **`FETCH_MODE_EVENT_ONLY = 3`** —
+the handler receives the typed event with no state fetch at all (reactions
+may use it too; the generated `Deps` carries the aggregate's codec and
+upcaster but no loader). The snippet is a historical illustration and stays
+as written; `proto/es/v1/options.proto` is the source of truth for the
+current enum.
