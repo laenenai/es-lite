@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Pre-1.0 breaking changes are allowed (design D9); **every** port/signature/behavior change adds an entry to `docs/migration/2026-11-07-breaking-changes.md` in the same task that changes it.
-- Migrations are append-only and transactional (ADR 0010). Landing numbers: **postgres** `0006_log_order.sql`, `0007_policy_hardening.sql`, `0008_drop_unused_checkpoints.sql`, `0009_command_dedup.sql`; **sqlite** `0006_log_order.sql`, `0007_feed_type_index.sql`, `0008_command_dedup.sql` (numbering follows task order — preflight ruling). No applied migration file's semantics is ever edited; corrections ship as errata in the new migration's header comment.
+- Migrations are append-only and transactional (ADR 0010). Landing numbers: **postgres** `0006_log_order.sql`, `0007_policy_hardening.sql`, `0008_drop_unused_checkpoints.sql`, `0009_log_order_policy_guard.sql` (Task 9 fix round — review found Task 7's 0006 added a fourth bypass-carrying policy the original enumeration predated), `0010_command_dedup.sql`; **sqlite** `0006_log_order.sql`, `0007_feed_type_index.sql`, `0008_command_dedup.sql` (numbering follows task order — preflight + Task 9 rulings). No applied migration file's semantics is ever edited; corrections ship as errata in the new migration's header comment.
 - New Postgres tables: `log_order` = workspace arm + role-gated bypass arm (events parity); `command_dedup` = workspace arm only, **no bypass arm** (feed-tables parity). FORCE ROW LEVEL SECURITY everywhere.
 - Payloads are opaque (ADR 0025): never logged, never in errors; error text carries positions, type URLs, sizes only.
 - No append-path serialization, and no new append-path reads or locks; the single `log_order` INSERT per batch is the accepted cost of order attestation (design D1 — preflight ruling).
@@ -509,7 +509,7 @@ The failure modes the findings say must not survive, and the test that pins each
 ### Task 32: Dedup port, tables, adapters (F6-part, design D6)
 
 **Files:**
-- Create: `es/idempotency.go`, `postgres/migrations/0009_command_dedup.sql`, `sqlite/migrations/0008_command_dedup.sql`, `postgres/dedup.go`, `sqlite/dedup.go`
+- Create: `es/idempotency.go`, `postgres/migrations/0010_command_dedup.sql`, `sqlite/migrations/0008_command_dedup.sql`, `postgres/dedup.go`, `sqlite/dedup.go`
 - Test: `postgres/dedup_test.go`, `sqlite/dedup_test.go`, both `migrations_test.go`
 
 **Interfaces:**
@@ -525,7 +525,7 @@ The failure modes the findings say must not survive, and the test that pins each
   ```
   Tables: `command_dedup(workspace_id, stream_id, command_id, fingerprint, response, created_at)` PK `(workspace_id, stream_id, command_id)` — postgres: RLS workspace arm only, no bypass, FORCE; sqlite: minus workspace. Adapters: `postgres.NewDedupStore(w *Workspace) *DedupStore` and `sqlite.NewDedupStore(s *Store) *DedupStore` implementing `es.Deduplicator`; `Save` uses `INSERT … ON CONFLICT DO NOTHING` (postgres) / `INSERT OR IGNORE` (sqlite); a `Save` that hits the conflict re-`Lookup`s and returns the stored record via a new `Save` return value? No — keep `Save(ctx, key, rec) error`; on conflict the caller re-Lookups (documented).
 
-- [ ] **Step 1:** migrations + version bumps (postgres → 9, sqlite → 8).
+- [ ] **Step 1:** migrations + version bumps (postgres → 10, sqlite → 8).
 - [ ] **Step 2:** adapters + tests: `TestDedupRoundTrip`, `TestDedupWorkspaceIsolation` (postgres: two workspaces, same key, independent), `TestDedupSaveConflictIsNotError`.
 - [ ] **Step 3:** `go test ./sqlite -count=1` + `task test:pg` — PASS. Commit: `feat(store): command dedup tables and adapters`.
 
