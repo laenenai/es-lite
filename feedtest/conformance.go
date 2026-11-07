@@ -447,22 +447,24 @@ func RunLog(t *testing.T, newLog NewStore) {
 		})
 
 		// The matching head views: both filter to the requested types —
-		// the subscription's own head, never the all-type maximum — the
-		// raw one never trails the settled one, and an empty type set
-		// (or one the log never saw) matches nothing.
+		// the subscription's own head, never the all-type maximum —
+		// multi-type lists bind every placeholder, the raw one never
+		// trails the settled one, and an empty type set (or one the log
+		// never saw) matches nothing.
 		t.Run("matching heads are the filtered max; the raw view never trails the settled one", func(t *testing.T) {
 			lg, st := open(t)
 			sid := testStream(t, "heads-matching")
 
 			var appended []es.Envelope
-			for i, typ := range []string{typConsumed, typIgnored, typConsumed, typIgnored} {
+			for i, typ := range []string{typConsumed, typIgnored, typConsumed, typIgnored, typHappened} {
 				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typ, []byte("x")))
 			}
 			lastConsumed := appended[2].GlobalPosition // the last typConsumed event
 			lastIgnored := appended[3].GlobalPosition  // the last typIgnored event
-			if lastConsumed >= lastIgnored {
-				t.Fatalf("feedtest: insert order: the last consumed event %d must sit below the last ignored %d",
-					lastConsumed, lastIgnored)
+			lastHappened := appended[4].GlobalPosition // an event no matching list below requests
+			if lastConsumed >= lastIgnored || lastIgnored >= lastHappened {
+				t.Fatalf("feedtest: insert order: consumed %d, ignored %d, happened %d, want strictly ascending",
+					lastConsumed, lastIgnored, lastHappened)
 			}
 
 			// Both matching views report each type set's own maximum,
@@ -490,6 +492,23 @@ func RunLog(t *testing.T, newLog NewStore) {
 				t.Fatalf("feedtest: matching raw head: %v", err)
 			} else if h != lastIgnored {
 				t.Fatalf("feedtest: MatchingRawHead(%s) = %d, want %d", typIgnored, h, lastIgnored)
+			}
+
+			// A multi-type list — the shape a real subscription's
+			// Consumes has — must bind every placeholder and still
+			// filter: the requested types' own max, never the
+			// all-type maximum (typHappened's event above it is not
+			// in the list) and never a prepare-time error.
+			multi := []string{typConsumed, typIgnored}
+			if h, err := lg.MatchingHead(ctx, multi); err != nil {
+				t.Fatalf("feedtest: matching head: %v", err)
+			} else if h != lastIgnored {
+				t.Fatalf("feedtest: MatchingHead(%v) = %d, want %d (the requested types' max)", multi, h, lastIgnored)
+			}
+			if h, err := lg.MatchingRawHead(ctx, multi); err != nil {
+				t.Fatalf("feedtest: matching raw head: %v", err)
+			} else if h != lastIgnored {
+				t.Fatalf("feedtest: MatchingRawHead(%v) = %d, want %d (the requested types' max)", multi, h, lastIgnored)
 			}
 
 			// The raw matching view never trails the settled one: it

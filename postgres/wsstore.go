@@ -766,7 +766,8 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 // value below the raw max: 0 until a fence clears, then whatever has
 // settled up to the clearing round's L. It converges to the full settled
 // max once the blocking transaction commits or aborts. Callers that need
-// the immediate committed maximum — for stall detection — use RawHead.
+// the immediate committed maximum for stall detection — over the
+// subscription's own consumed types — use MatchingRawHead.
 func (w *Workspace) Head(ctx context.Context) (uint64, error) {
 	// One fence round (spec §5.1.1), from 0: Head reads the whole log, so
 	// any drawn position is new and the idle shortcut never fires — every

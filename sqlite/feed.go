@@ -81,7 +81,8 @@ func (s *Store) MatchingHead(ctx context.Context, types []string) (uint64, error
 // fence (spec §5.1 is Postgres-only — one connection serializes
 // writers, so a reader can never observe a position whose insert
 // committed later), so the raw and settled views cannot diverge and
-// MatchingRawHead is identical in body to MatchingHead. Stall
+// MatchingRawHead runs MatchingHead's exact query — the only difference
+// in its body is the error label, which names this method. Stall
 // detection is a liveness signal, not a correctness boundary — a torn
 // read can only mis-time a stall report, never corrupt data — and on
 // this backend no torn read is even possible. Deliberately not on
@@ -90,7 +91,7 @@ func (s *Store) MatchingRawHead(ctx context.Context, types []string) (uint64, er
 	if len(types) == 0 {
 		return 0, nil
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?", len(types)), ",")
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(types)), ",")
 	q := `SELECT COALESCE(MAX(global_position), 0) FROM events
 	      WHERE type_url IN (` + placeholders + `)`
 	args := make([]any, 0, len(types))
