@@ -335,6 +335,13 @@ func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, o
 }
 
 // ReadStream implements es.Store. It opens and owns a transaction.
+//
+// A read from the beginning of a stream that was never written —
+// fromVersion 0 and no rows for the stream at all, whatever toVersion is —
+// returns an error wrapping es.ErrStreamNotFound (with the canonical
+// stream id in the message) instead of a silent empty slice. An empty
+// range is not "not found": reads with fromVersion > 0, and reads from 0
+// of a stream that exists, return (nil, nil).
 func (w *Workspace) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err
@@ -347,13 +354,60 @@ func (w *Workspace) ReadStream(ctx context.Context, sid es.StreamID, fromVersion
 	if err := setWorkspace(ctx, tx, w.ws); err != nil {
 		return nil, err
 	}
-	return w.readStream(ctx, tx, sid, fromVersion, toVersion)
+	envs, err := w.readStream(ctx, tx, sid, fromVersion, toVersion)
+	if err != nil {
+		return nil, err
+	}
+	if fromVersion == 0 && len(envs) == 0 {
+		// A read from the beginning of the stream matched nothing. With no
+		// upper bound that already proves no row exists — the stream was
+		// never written. A bound makes the empty range ambiguous (rows
+		// deleted out-of-band can survive only above it), so only an
+		// existence probe can tell "never written" from "empty range on
+		// an existing stream" — and only the first is ErrStreamNotFound.
+		if toVersion > 0 {
+			exists, err := w.streamExists(ctx, tx, sid)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				return envs, nil
+			}
+		}
+		return nil, fmt.Errorf("%w: %s", es.ErrStreamNotFound, sid.Canonical())
+	}
+	return envs, nil
+}
+
+// streamExists reports whether the stream has any event row at all — the
+// existence probe behind ReadStream's ErrStreamNotFound: a read from the
+// start that matched nothing is "not found" only when nothing was ever
+// written to the stream. Runs with the workspace RLS variable set, on the
+// same transaction as the read it decides for.
+func (w *Workspace) streamExists(ctx context.Context, db DBTX, sid es.StreamID) (bool, error) {
+	var one int
+	err := db.QueryRow(ctx,
+		`SELECT 1 FROM events WHERE workspace_id = $1 AND stream_id = $2 LIMIT 1`,
+		w.ws, sid.Canonical(),
+	).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReadStreamTx reads inside a transaction the caller already owns. It never
 // commits or rolls back that transaction, and it sets app.workspace_id on db
 // (is_local=true) exactly as AppendTx does. db must be an active transaction;
 // tenancy.TenantTx satisfies it directly.
+//
+// Unlike ReadStream it does not report ErrStreamNotFound: a read of a
+// stream with no events returns (nil, nil), so logic inside a
+// caller-owned transaction always deals in plain ranges, never the
+// not-found sentinel.
 func (w *Workspace) ReadStreamTx(ctx context.Context, db DBTX, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err

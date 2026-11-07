@@ -104,18 +104,16 @@ func TestWorkspaceIsolationRLS(t *testing.T) {
 		t.Fatalf("init in ws_a: %v", err)
 	}
 
-	// A different workspace sees an empty stream for the same StreamID: RLS
-	// blocks cross-workspace reads even with the identical id.
-	evs, err := s.Workspace("ws_b").ReadStream(ctx, sid, 0, 0)
-	if err != nil {
-		t.Fatalf("read ws_b: %v", err)
-	}
-	if len(evs) != 0 {
-		t.Fatalf("ws_b saw %d events for ws_a's stream; RLS leak", len(evs))
+	// A different workspace sees the stream as never-written for the same
+	// StreamID: RLS blocks cross-workspace reads even with the identical
+	// id, so ws_b's read reports ErrStreamNotFound, not ws_a's events.
+	_, err := s.Workspace("ws_b").ReadStream(ctx, sid, 0, 0)
+	if !errors.Is(err, es.ErrStreamNotFound) {
+		t.Fatalf("read ws_b: got %v, want ErrStreamNotFound — RLS must hide ws_a's rows", err)
 	}
 
 	// ws_a still sees its own event.
-	evs, err = s.Workspace("ws_a").ReadStream(ctx, sid, 0, 0)
+	evs, err := s.Workspace("ws_a").ReadStream(ctx, sid, 0, 0)
 	if err != nil || len(evs) != 1 {
 		t.Fatalf("ws_a read: len=%d err=%v, want 1", len(evs), err)
 	}
@@ -488,4 +486,114 @@ func TestAppendRejectsOversizedPayload(t *testing.T) {
 			t.Fatalf("at-cap append: %v", err)
 		}
 	})
+}
+
+// TestReadStreamStreamNotFound pins the ReadStream not-found contract: a
+// read from the beginning of a stream that was never written reports
+// es.ErrStreamNotFound (naming the stream) instead of a silent empty
+// slice — whatever the upper bound, since from the start of the stream an
+// empty result means no rows exist at all.
+func TestReadStreamStreamNotFound(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.Workspace("ws_nf")
+	sid := streamID(t)
+
+	for _, tc := range []struct {
+		name string
+		to   uint64
+	}{
+		{"whole stream", 0},
+		{"bounded prefix", 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ws.ReadStream(ctx, sid, 0, tc.to)
+			if !errors.Is(err, es.ErrStreamNotFound) {
+				t.Fatalf("ReadStream(0, %d) on a never-written stream: got %v, want ErrStreamNotFound", tc.to, err)
+			}
+			if !strings.Contains(err.Error(), sid.Canonical()) {
+				t.Fatalf("error %q does not name the stream %s", err, sid.Canonical())
+			}
+		})
+	}
+
+	// The caller-owned-transaction read keeps the plain empty result: the
+	// not-found contract is ReadStream's, not the Tx join's.
+	t.Run("ReadStreamTx is unaffected", func(t *testing.T) {
+		tx, err := s.Pool().Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		envs, err := s.WorkspaceStore("ws_nf").ReadStreamTx(ctx, narrowTx{tx}, sid, 0, 0)
+		if err != nil || len(envs) != 0 {
+			t.Fatalf("ReadStreamTx on a never-written stream: envs=%d err=%v, want (nil, nil)", len(envs), err)
+		}
+	})
+}
+
+// TestReadStreamEmptyRangeStillNil pins the other half of the contract: an
+// empty range is not "stream not found". Reads with fromVersion > 0, and
+// reads from 0 of a stream that exists, return (nil, nil).
+func TestReadStreamEmptyRangeStillNil(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.Workspace("ws_range")
+	sid := streamID(t)
+
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// An existing stream read from its head: an empty range, not a
+	// missing stream.
+	current, err := ws.CurrentStreamVersion(ctx, sid)
+	if err != nil {
+		t.Fatalf("current version: %v", err)
+	}
+	envs, err := ws.ReadStream(ctx, sid, current, 0)
+	if err != nil || len(envs) != 0 {
+		t.Fatalf("read from head v%d: envs=%d err=%v, want (nil, nil)", current, len(envs), err)
+	}
+
+	// Head truncation staged out-of-band (the F2 threat model), bypassing
+	// RLS the way the raw-payload helpers do: the stream still has rows
+	// above the bound, so a bounded read from 0 that matches nothing is an
+	// empty range, not a missing stream.
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 1,
+		Events:          []es.EventData{{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("y")}},
+	}); err != nil {
+		t.Fatalf("append v2: %v", err)
+	}
+	tx, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.bypass_rls', 'on', true)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM events WHERE workspace_id=$1 AND stream_id=$2 AND version <= 1`, "ws_range", sid.Canonical(),
+	); err != nil {
+		t.Fatalf("stage truncation: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	envs, err = ws.ReadStream(ctx, sid, 0, 1)
+	if err != nil || len(envs) != 0 {
+		t.Fatalf("bounded read of a head-truncated stream: envs=%d err=%v, want (nil, nil)", len(envs), err)
+	}
+	// The whole-stream read still sees the survivor: the stream exists.
+	envs, err = ws.ReadStream(ctx, sid, 0, 0)
+	if err != nil || len(envs) != 1 || envs[0].Version != 2 {
+		t.Fatalf("whole read after truncation: envs=%d err=%v, want the v2 survivor alone", len(envs), err)
+	}
 }

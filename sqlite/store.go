@@ -380,6 +380,13 @@ func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.Cons
 }
 
 // ReadStream implements es.Store.
+//
+// A read from the beginning of a stream that was never written —
+// fromVersion 0 and no rows for the stream at all, whatever toVersion is —
+// returns an error wrapping es.ErrStreamNotFound (with the canonical
+// stream id in the message) instead of a silent empty slice. An empty
+// range is not "not found": reads with fromVersion > 0, and reads from 0
+// of a stream that exists, return (nil, nil).
 func (s *Store) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err
@@ -391,7 +398,47 @@ func (s *Store) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, to
 		args = append(args, toVersion)
 	}
 	q += ` ORDER BY version ASC`
-	return s.queryEnvelopes(ctx, q, args...)
+	envs, err := s.queryEnvelopes(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	if fromVersion == 0 && len(envs) == 0 {
+		// A read from the beginning of the stream matched nothing. With no
+		// upper bound that already proves no row exists — the stream was
+		// never written. A bound makes the empty range ambiguous (rows
+		// deleted out-of-band can survive only above it), so only an
+		// existence probe can tell "never written" from "empty range on
+		// an existing stream" — and only the first is ErrStreamNotFound.
+		if toVersion > 0 {
+			exists, err := s.streamExists(ctx, sid)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				return envs, nil
+			}
+		}
+		return nil, fmt.Errorf("%w: %s", es.ErrStreamNotFound, sid.Canonical())
+	}
+	return envs, nil
+}
+
+// streamExists reports whether the stream has any event row at all — the
+// existence probe behind ReadStream's ErrStreamNotFound: a read from the
+// start that matched nothing is "not found" only when nothing was ever
+// written to the stream.
+func (s *Store) streamExists(ctx context.Context, sid es.StreamID) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM events WHERE stream_id = ? LIMIT 1`, sid.Canonical(),
+	).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReadStreamAsOf implements es.Store.

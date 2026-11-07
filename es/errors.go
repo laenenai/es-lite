@@ -14,8 +14,13 @@ var (
 	// The caller should reload the stream and retry the command.
 	ErrConflict = errors.New("es-lite: append conflict (expected version mismatch)")
 
-	// ErrStreamNotFound is returned when a read targets a stream that
-	// has never been written to.
+	// ErrStreamNotFound is returned by ReadStream when it reads a stream
+	// from its beginning (fromVersion == 0, whatever the upper bound) and
+	// the stream has no events at all — it was never written. An empty
+	// range is not "not found": reads with fromVersion > 0, and reads
+	// from 0 of a stream that exists, return an empty slice and a nil
+	// error. VerifyStream and the aggregate runtime treat it as an empty
+	// stream.
 	ErrStreamNotFound = errors.New("es-lite: stream not found")
 
 	// ErrConstraintViolated reports that a uniqueness Claim collided with an
