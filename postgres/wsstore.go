@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/feed"
@@ -20,11 +21,30 @@ import (
 // statement execution only, with no Commit, Rollback, Begin or pool. It is
 // the shape sqlc uses for pgx/v5 and the shape tenancy.TenantTx exposes, so a
 // tenant-scoped transaction satisfies it without es-lite importing tenancy.
-// *pgxpool.Pool and pgx.Tx also satisfy it.
+// *pgx.Tx also satisfies it. *pgxpool.Pool satisfies it too as a type, but
+// the *Tx methods refuse it at entry (requireTx): a pool runs every
+// statement in its own autocommit transaction, which would silently break
+// the append's one-transaction guarantees (the xid draw and the is_local
+// workspace setting) instead of joining the caller's transaction.
 type DBTX interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// requireTx guards the transaction-aware methods: db must be an active
+// transaction, and a *pgxpool.Pool is the one shape that satisfies DBTX
+// while silently running every statement in its own autocommit
+// transaction (F33). On a pool the append's P1 xid draw and the insert
+// would land in different transactions and the is_local workspace setting
+// would die with its own statement — no error, all guarantees gone (a
+// non-superuser session fails later with a confusing RLS violation
+// instead). The check is a type assertion before any statement runs.
+func requireTx(db DBTX, method string) error {
+	if _, ok := db.(*pgxpool.Pool); ok {
+		return fmt.Errorf("postgres: %s requires an active transaction, not a pool", method)
+	}
+	return nil
 }
 
 // Workspace is an es.Store scoped to one workspace. Every operation sets
@@ -129,11 +149,16 @@ func (w *Workspace) Append(ctx context.Context, p es.AppendParams) (es.AppendRes
 // (is_local=true) so the workspace RLS policy applies for the rest of the
 // transaction; the caller's tenant context is left untouched.
 //
-// db must be an active transaction, not a pool: the local setting lasts only
-// until the transaction ends, and every statement in one append must share
-// it. tenancy.TenantTx satisfies db directly, without a pool or Commit.
+// db must be an active transaction, not a pool — enforced at entry, before
+// any statement runs: a *pgxpool.Pool is rejected with the requireTx error.
+// The local setting lasts only until the transaction ends, and every
+// statement in one append must share it. tenancy.TenantTx satisfies db
+// directly, without a pool or Commit.
 func (w *Workspace) AppendTx(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
 	var zero es.AppendResult
+	if err := requireTx(db, "AppendTx"); err != nil {
+		return zero, err
+	}
 	if err := validateAppend(p); err != nil {
 		return zero, err
 	}
@@ -456,14 +481,18 @@ func (w *Workspace) streamExists(ctx context.Context, db DBTX, sid es.StreamID) 
 
 // ReadStreamTx reads inside a transaction the caller already owns. It never
 // commits or rolls back that transaction, and it sets app.workspace_id on db
-// (is_local=true) exactly as AppendTx does. db must be an active transaction;
-// tenancy.TenantTx satisfies it directly.
+// (is_local=true) exactly as AppendTx does. db must be an active
+// transaction — a *pgxpool.Pool is rejected at entry by requireTx, before
+// any statement runs; tenancy.TenantTx satisfies it directly.
 //
 // Unlike ReadStream it does not report ErrStreamNotFound: a read of a
 // stream with no events returns (nil, nil), so logic inside a
 // caller-owned transaction always deals in plain ranges, never the
 // not-found sentinel.
 func (w *Workspace) ReadStreamTx(ctx context.Context, db DBTX, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
+	if err := requireTx(db, "ReadStreamTx"); err != nil {
+		return nil, err
+	}
 	if err := sid.Validate(); err != nil {
 		return nil, err
 	}

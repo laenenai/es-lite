@@ -173,12 +173,14 @@ func TestDrainFailsFastWithoutRelayRole(t *testing.T) {
 		t.Fatalf("revoke %s from %s: %v", relayRole, drainProbe, err)
 	}
 	// Drain's privileges as the probe: the FOR UPDATE SKIP LOCKED claim
-	// and the published_at flip need UPDATE, the claim needs SELECT, and
-	// naming any of them needs schema USAGE. Nothing more — the bypass
-	// must be a policy matter, not a privilege one.
+	// and the published_at flip need UPDATE on that column alone
+	// (column-level UPDATE also satisfies SELECT ... FOR UPDATE), the
+	// claim needs SELECT, and naming any of them needs schema USAGE — the
+	// runbook's relay line (docs/deploy/README.md, "Grants"). Nothing
+	// more — the bypass must be a policy matter, not a privilege one.
 	if _, err := s.Pool().Exec(ctx,
 		`GRANT USAGE ON SCHEMA public TO `+drainProbe+`;
-		 GRANT SELECT, UPDATE ON events TO `+drainProbe); err != nil {
+		 GRANT SELECT, UPDATE (published_at) ON events TO `+drainProbe); err != nil {
 		t.Fatalf("grant drain privileges: %v", err)
 	}
 
@@ -307,18 +309,21 @@ func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
 		t.Fatalf("revoke %s from %s: %v", relayRole, anchorProbe, err)
 	}
 	// The anchor path's privileges as the probe: reading events (the log
-	// head, stream heads, the stream list), reading/writing anchors,
-	// reading log_order (the order root over the per-batch rows, Task 7)
-	// and — since the anchor path fences on the horizon (Task 4) —
-	// reading the position sequence the fence's first statement reads
-	// (Task 16 will relax this to USAGE via pg_sequences). Nothing more
-	// — the bypass must stay a policy matter, not a privilege one.
+	// head, stream heads, the stream list), reading/writing anchors
+	// (writing through the RETURNING needs SELECT on the column), reading
+	// log_order (the order root over the per-batch rows, Task 7) and —
+	// since the anchor path fences on the horizon (Task 4) — reading the
+	// position sequence the fence's first statement reads through
+	// pg_sequences, which needs USAGE only (Task 16 relaxed the direct
+	// read's SELECT; USAGE is what reveals last_value in the view).
+	// Nothing more — the bypass must stay a policy matter, not a
+	// privilege one.
 	if _, err := s.Pool().Exec(ctx,
 		`GRANT USAGE ON SCHEMA public TO `+anchorProbe+`;
 		 GRANT SELECT ON events TO `+anchorProbe+`;
 		 GRANT SELECT ON log_order TO `+anchorProbe+`;
 		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe+`;
-		 GRANT SELECT ON SEQUENCE events_global_position_seq TO `+anchorProbe); err != nil {
+		 GRANT USAGE ON SEQUENCE events_global_position_seq TO `+anchorProbe); err != nil {
 		t.Fatalf("grant anchor-path privileges: %v", err)
 	}
 

@@ -135,6 +135,91 @@ role, so migrations and psql/admin tooling are unaffected; and ordinary
 workspace-pinned traffic takes the policies' workspace arm and never
 depends on `es_relay` existing.
 
+## Grants: the privilege contract
+
+Every es-lite principal connects as an ordinary non-superuser,
+non-`BYPASSRLS` login role, and the grants below are the complete set it
+needs — nothing more. Two invariants hold across the whole matrix: **no
+role gets `DELETE` or `TRUNCATE` on `events`** (the log is append-only in
+the privilege model too, and `published_at` is the one mutable column,
+which only the relay may write), and no principal holds any `UPDATE` on
+`events` except the relay's `published_at`. The `GRANT es_relay` of the
+section above is role *membership* — the RLS bypass — while the table
+grants below are the other half of the contract.
+
+`TestLeastPrivilegeEndToEnd`, in the Postgres integration suite, drives
+the whole append → feed subscribe/ack → `Drain` → `Anchor`/`CheckAnchor`
+flow through probe roles holding **exactly** these grants, so the runbook
+and the code cannot drift apart silently: a grant the code needs but the
+runbook omits fails the test, and so does a code path reaching for an
+undocumented privilege.
+
+es-lite requires **PostgreSQL 14 or newer** — the append xid draw and the
+horizon fence both use `pg_current_xact_id()` — and `Open` probes that
+once, failing fast with a clear message on an older server instead of a
+confusing error deep inside the first append.
+
+Every principal needs schema access to name the objects at all:
+
+```sql
+GRANT USAGE ON SCHEMA public TO <role>;
+```
+
+**Appender** — the process calling `Workspace.Append` (or `AppendTx`): it
+draws positions, reads the stream head for optimistic concurrency,
+inserts the events and their `log_order` attestation (design D1), and
+applies uniqueness constraints. `Release` is the only `DELETE` es-lite
+ever issues, and it is on the claims index, never on the log:
+
+```sql
+GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;
+GRANT SELECT, INSERT ON events, unique_claims TO <appender>;
+GRANT DELETE ON unique_claims TO <appender>;
+GRANT INSERT ON log_order TO <appender>;
+```
+
+**Feed process** — `feed.Server` over the Postgres adapters: the
+checkpoint/lease/dead-letter state is the feed's own, and the horizon
+fence's first statement reads the position sequence through
+`pg_sequences`, which masks `last_value` for roles without `USAGE` on the
+sequence — the feed never needs `SELECT` on it.
+
+```sql
+GRANT USAGE ON SEQUENCE events_global_position_seq TO <feed process>;
+GRANT SELECT, INSERT, UPDATE, DELETE ON feed_checkpoints, feed_leases, feed_dead_letters TO <feed process>;
+GRANT SELECT ON events TO <feed process>;
+```
+
+**Relay** — the `Drain` delivery relay: it claims unpublished rows and
+stamps `published_at` (the database's own clock), the one column it may
+touch:
+
+```sql
+GRANT SELECT, UPDATE (published_at) ON events TO <relay>;
+GRANT es_relay TO <relay>;
+GRANT SELECT ON unique_claims, log_order TO <relay>;
+```
+
+**Anchor job** — the `es-verify anchor` CronJob (`Anchor`,
+`CheckAnchor`, `ListAnchors`): it reads heads and the per-batch `log_order`
+rows across workspaces under the role-gated bypass, records anchors, and
+reads `schema_migrations` for the chain's `ChainedSince`. The `SELECT` on
+`anchors` is the job's own read path — `es-verify anchor` re-checks every
+stored anchor — and `Anchor`'s `RETURNING created_at` (the database-clock
+stamp it reports) needs it too. The `USAGE` on the sequence is not
+optional: the anchor path fences on the same horizon the feed does
+(`settledBound`), whose first statement reads the position sequence
+through `pg_sequences` — and the view masks `last_value` for roles
+without `USAGE`, which would fold the bound to 0 and make `Anchor`
+silently record a root over zero heads as a real anchor:
+
+```sql
+GRANT SELECT ON events, log_order, schema_migrations TO <anchor job>;
+GRANT SELECT, INSERT ON anchors TO <anchor job>;
+GRANT USAGE ON SEQUENCE events_global_position_seq TO <anchor job>;
+GRANT es_relay TO <anchor job>;
+```
+
 ## Feed operations (ADR 0037)
 
 The feed's failure modes are *delay*, never *loss* — but only if the

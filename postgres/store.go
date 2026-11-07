@@ -129,6 +129,10 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
 	}
+	if err := probePostgresFloor(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
 	cfg := newOpenConfig(opts)
 	s := &Store{pool: pool, ownsPool: true, maxPayloadBytes: cfg.maxPayloadBytes}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
@@ -157,12 +161,37 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 	if pool == nil {
 		return nil, fmt.Errorf("postgres: open with pool: pool is nil")
 	}
+	if err := probePostgresFloor(ctx, pool); err != nil {
+		return nil, err
+	}
 	cfg := newOpenConfig(opts)
 	s := &Store{pool: pool, ownsPool: false, maxPayloadBytes: cfg.maxPayloadBytes}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// probePostgresFloor is the PostgreSQL 14 floor check both constructors run
+// once, before any migration (F33): the append path's P1 xid draw and the
+// horizon fence both call pg_current_xact_id(), which exists only from
+// PostgreSQL 14 — on an older server every append and every fence round
+// would otherwise fail deep inside with a confusing "function
+// pg_current_xact_id() does not exist". The undefined-function error
+// becomes a clear message naming the minimum; any other failure (a dead
+// DSN, a cancelled context) is a probe failure, not a version verdict, and
+// is wrapped as such.
+func probePostgresFloor(ctx context.Context, pool *pgxpool.Pool) error {
+	var xid uint64
+	err := pool.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&xid)
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42883" { // undefined_function
+		return fmt.Errorf("postgres: this server is older than PostgreSQL 14, the minimum es-lite supports (pg_current_xact_id is unavailable: %w)", err)
+	}
+	return fmt.Errorf("postgres: version probe: %w", err)
 }
 
 // migrateIfConfigured applies migrations unless the options disable them. It

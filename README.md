@@ -117,7 +117,12 @@ transport, authentication, encryption and business rules.
 - **Postgres** (multi-workspace, production): shared tables + `workspace_id` +
   **RLS** + hash partitioning. `Store.Workspace(id)` scopes reads and writes to
   one workspace; the feed reads are commit-safe (the horizon fence, ADR 0037)
-  and the `Drain` claim-relay has its own gap-safe cursor.
+  and the `Drain` claim-relay has its own gap-safe cursor. Requires
+  **PostgreSQL 14+** — the append xid draw and the horizon fence both use
+  `pg_current_xact_id()`, and `Open` probes for it once, failing fast with a
+  clear message on older servers. The per-principal table grants are in the
+  deployment runbook's
+  [Grants section](./docs/deploy/README.md#grants-the-privilege-contract).
 - **SQLite** (single-workspace, dev/edge): single-writer, gap-free cursor,
   zero infrastructure — useful for tests and single-tenant nodes.
 
