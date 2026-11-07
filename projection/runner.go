@@ -213,15 +213,41 @@ func (r *Runner) Position(ctx context.Context) (uint64, error) {
 }
 
 // Run consumes feed until ctx ends. Returns ctx.Err() on cancellation.
+// On return it also flushes a marker that buffers saves — any Marker also
+// implementing interface{ Flush(context.Context) error }, e.g.
+// BufferedMarker — so the last window cannot sit pending with no further
+// Save to trigger it. The exit flush runs on context.WithoutCancel(ctx)
+// with a 5s timeout: a cancelled Run still flushes, and the flush cannot
+// hang Run beyond the timeout. A flush error is returned only when the
+// feed itself succeeded; otherwise the feed's error wins and the flush
+// error is dropped (a failed flush keeps its positions pending for the
+// next trigger).
 func (r *Runner) Run(ctx context.Context, feed Feed) error {
 	if err := r.loadMarker(ctx); err != nil {
 		return err
 	}
 	err := feed.Feed(ctx, r.apply)
+	flushErr := r.flushMarker(context.WithoutCancel(ctx))
 	if err != nil && errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if err == nil {
+		return flushErr
+	}
 	return err
+}
+
+// flushMarker flushes r.Marker when it buffers saves. Run calls it on
+// every return: the last window has no later Save to trigger it, so
+// without this flush it would sit pending until the process exits.
+func (r *Runner) flushMarker(ctx context.Context) error {
+	flusher, ok := r.Marker.(interface{ Flush(context.Context) error })
+	if !ok {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return flusher.Flush(ctx)
 }
 
 // Apply handles one ordered batch — the projection.Apply shape, so Replay
@@ -238,7 +264,11 @@ func (r *Runner) Apply(ctx context.Context, batch []es.Envelope) error {
 // Rebuild replays src from position 0 through Apply and returns the last
 // position applied (ADR 0005). Reset the marker and the read model first;
 // otherwise the marker makes every already-applied position a no-op, which
-// is the resume-after-crash behaviour, not a rebuild.
+// is the resume-after-crash behaviour, not a rebuild. With a
+// BufferedMarker, Discard the projection's pending position too (or Close
+// the marker) after resetting the inner marker — a pending pre-reset
+// position would otherwise be flushed after the reset and resurrect the
+// marker above the rebuilt state.
 func (r *Runner) Rebuild(ctx context.Context, src Source, batch int) (uint64, error) {
 	return Replay(ctx, src, 0, batch, r.Apply)
 }
