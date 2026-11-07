@@ -374,27 +374,16 @@ func orderRows(ctx context.Context, tx pgx.Tx, upto uint64) ([]es.OrderRow, erro
 }
 
 // OrderVerifyReport is the verdict of VerifyOrder, the deep log-order
-// verification: whether every covered log_order row's recomputed batch
-// hash matched, how many rows were checked, and — when OK is false —
-// the first mismatching row in from_position order. A broken log order
-// is a verdict, not an error: the report carries it (the ChainReport
-// precedent), and VerifyOrder's error return is reserved for failures
-// to run the verification at all.
-type OrderVerifyReport struct {
-	OK          bool
-	RowsChecked uint64
-	Mismatch    *OrderRowMismatch
-}
+// verification (design D1, F11). The type lives in the core —
+// es.OrderVerifyReport — so both backends report the same shape to
+// `es-verify order`; this alias keeps the postgres name for existing
+// references.
+type OrderVerifyReport = es.OrderVerifyReport
 
 // OrderRowMismatch is the first log_order row whose recomputed
-// es.BatchOrderHash differs from the stored batch_hash: the row's
-// from_position, the hash the append transaction attested (the stored
-// row), and the hash the events actually yield now.
-type OrderRowMismatch struct {
-	From              uint64
-	ExpectedBatchHash []byte
-	ActualBatchHash   []byte
-}
+// es.BatchOrderHash differs from the stored batch_hash; aliased from
+// es alongside the report type, whose Mismatch field carries it.
+type OrderRowMismatch = es.OrderRowMismatch
 
 // orderVerifyPageSize is the event page size VerifyOrder reads positions
 // at: large enough that verifying a big log is a few round trips per

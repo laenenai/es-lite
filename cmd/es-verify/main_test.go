@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -172,28 +173,14 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// TestVerifyOrderTransitionalOnSQLite pins the Task 7 CLI shape on the
-// backend without log-order attestation yet (sqlite's lands in Task 8):
-// the order stage must surface the backend's own OrderRows stub error
-// clearly and exit 2 — never a silent skip, never a vacuous pass — and
-// `all`, which now runs order after the stream chains, must verify the
-// streams first and then surface the same error. Task 8 removes this
-// transitional behavior.
-func TestVerifyOrderTransitionalOnSQLite(t *testing.T) {
-	t.Run("order surfaces the sqlite stub and exits 2", func(t *testing.T) {
-		s := newTestDB(t)
-		closeDB(t, s)
-		var code int
-		_, stderr := captureOutput(t, func() { code = run([]string{"order"}) })
-		if code != exitUsage {
-			t.Errorf("order on sqlite: exit %d, want %d", code, exitUsage)
-		}
-		if !strings.Contains(stderr, "sqlite: order rows not available yet") {
-			t.Errorf("order on sqlite: stderr %q, want the backend's own stub error surfaced", stderr)
-		}
-	})
-
-	t.Run("all verifies streams first, then surfaces the stub and exits 2", func(t *testing.T) {
+// TestVerifyOrderOnSQLite pins the CLI's real sqlite order path (Task 8
+// replaced the transitional stub the earlier test pinned): `order`
+// deep-verifies the seeded batches and exits 0; `all` verifies the
+// streams first and then the log order, exiting 0; and a repositioned
+// event — caught by neither chain nor heads — reports BROKEN at the
+// tampered batch's from_position and exits 1.
+func TestVerifyOrderOnSQLite(t *testing.T) {
+	t.Run("order on a seeded db exits 0", func(t *testing.T) {
 		s := newTestDB(t)
 		sid, err := es.NewStreamID("thing", "a")
 		if err != nil {
@@ -202,9 +189,27 @@ func TestVerifyOrderTransitionalOnSQLite(t *testing.T) {
 		seedStream(t, s, sid, 2)
 		closeDB(t, s)
 		var code int
-		stdout, stderr := captureOutput(t, func() { code = run([]string{"all"}) })
-		if code != exitUsage {
-			t.Errorf("all on sqlite: exit %d, want %d (the order stage must not pass vacuously)", code, exitUsage)
+		stdout, _ := captureOutput(t, func() { code = run([]string{"order"}) })
+		if code != exitIntact {
+			t.Errorf("order on sqlite: exit %d, want %d", code, exitIntact)
+		}
+		if !strings.Contains(stdout, "log order: 1 batches verified") {
+			t.Errorf("order on sqlite: stdout %q, want the one seeded batch verified", stdout)
+		}
+	})
+
+	t.Run("all verifies streams then order and exits 0", func(t *testing.T) {
+		s := newTestDB(t)
+		sid, err := es.NewStreamID("thing", "a")
+		if err != nil {
+			t.Fatalf("stream id: %v", err)
+		}
+		seedStream(t, s, sid, 2)
+		closeDB(t, s)
+		var code int
+		stdout, _ := captureOutput(t, func() { code = run([]string{"all"}) })
+		if code != exitIntact {
+			t.Errorf("all on sqlite: exit %d, want %d", code, exitIntact)
 		}
 		if !strings.Contains(stdout, "ok      thing:a head=v2") {
 			t.Errorf("all on sqlite: stdout %q, want the stream verified ok before the order stage", stdout)
@@ -212,8 +217,70 @@ func TestVerifyOrderTransitionalOnSQLite(t *testing.T) {
 		if !strings.Contains(stdout, "es-verify: 1 streams checked") {
 			t.Errorf("all on sqlite: stdout %q, want the streams-checked summary", stdout)
 		}
-		if !strings.Contains(stderr, "sqlite: order rows not available yet") {
-			t.Errorf("all on sqlite: stderr %q, want the order stage's stub error surfaced", stderr)
+		if !strings.Contains(stdout, "log order: 1 batches verified") {
+			t.Errorf("all on sqlite: stdout %q, want the order stage's ok after the streams", stdout)
 		}
 	})
+
+	t.Run("order reports a repositioned event and exits 1", func(t *testing.T) {
+		s := newTestDB(t)
+		sid, err := es.NewStreamID("thing", "a")
+		if err != nil {
+			t.Fatalf("stream id: %v", err)
+		}
+		// Two single-event batches: their log_order rows attest one
+		// position each, so swapping the events' positions is the F11
+		// tamper — invisible to the chain and the heads.
+		var positions []uint64
+		for i := 0; i < 2; i++ {
+			res, err := s.Append(context.Background(), es.AppendParams{
+				StreamID: sid, ExpectedVersion: uint64(i),
+				Events: []es.EventData{seedEvent(i)},
+			})
+			if err != nil {
+				t.Fatalf("append %d: %v", i, err)
+			}
+			positions = append(positions, res.Envelopes[0].GlobalPosition)
+		}
+		swapPositions(t, s, sid, positions[0], positions[1])
+		closeDB(t, s)
+		var code int
+		stdout, _ := captureOutput(t, func() { code = run([]string{"order"}) })
+		if code != exitBroken {
+			t.Errorf("order on a repositioned log: exit %d, want %d", code, exitBroken)
+		}
+		if !strings.Contains(stdout, fmt.Sprintf("BROKEN  log order at batch from_position %d", positions[0])) {
+			t.Errorf("order on a repositioned log: stdout %q, want BROKEN at from_position %d", stdout, positions[0])
+		}
+	})
+}
+
+// seedEvent is one typed event for the order tests above.
+func seedEvent(i int) es.EventData {
+	return es.EventData{TypeURL: "thing.v1.Happened", SchemaVersion: 1, Payload: []byte{byte(i + 1)}}
+}
+
+// swapPositions exchanges the two events' global positions behind the
+// store's back. SQLite enforces INTEGER PRIMARY KEY (rowid) uniqueness
+// per row inside one UPDATE, so the swap parks both rows on the
+// negative mirror of their positions first (positions are always
+// positive) and then moves each into the other's old spot.
+func swapPositions(t *testing.T, s *sqlite.Store, sid es.StreamID, p1, p2 uint64) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE events SET global_position = -global_position WHERE stream_id = ? AND global_position IN (?, ?)`,
+		sid.Canonical(), p1, p2); err != nil {
+		t.Fatalf("park positions %d/%d: %v", p1, p2, err)
+	}
+	res, err := s.DB().ExecContext(ctx,
+		`UPDATE events SET global_position = CASE global_position WHEN ? THEN ? WHEN ? THEN ? END
+		  WHERE stream_id = ? AND global_position IN (?, ?)`,
+		-int64(p1), int64(p2), -int64(p2), int64(p1), sid.Canonical(), -int64(p1), -int64(p2))
+	if err != nil {
+		t.Fatalf("swap positions %d/%d: %v", p1, p2, err)
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 2 {
+		t.Fatalf("swap positions %d/%d: rows %d (err %v), want 2", p1, p2, n, err)
+	}
 }

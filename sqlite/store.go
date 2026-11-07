@@ -304,6 +304,32 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		envs[i] = env
 	}
 
+	// Log-order attestation (design D1, F11): one log_order row per
+	// non-empty batch, hashed and inserted in THIS transaction from
+	// exactly the (position, hash) pairs the loop above already
+	// collected — no new reads, no new locks, no cross-transaction
+	// dependency, so the append path gains no serialization. The
+	// entries go in loop order, which is position order: the single
+	// writer assigns rowids in insert order. Anchors aggregate these
+	// rows into the order root that attests the global append order,
+	// and `es-verify order` recomputes each row's hash from the events
+	// in its range.
+	if len(p.Events) > 0 {
+		entries := make([]es.OrderEntry, len(envs))
+		for i := range envs {
+			entries[i] = es.OrderEntry{Position: envs[i].GlobalPosition, Hash: envs[i].Hash}
+		}
+		batchHash := es.BatchOrderHash(entries)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO log_order (from_position, to_position, stream_id, event_count, batch_hash)
+			 VALUES (?,?,?,?,?)`,
+			envs[0].GlobalPosition, envs[len(envs)-1].GlobalPosition,
+			canonical, len(envs), batchHash[:],
+		); err != nil {
+			return zero, fmt.Errorf("insert log_order: %w", err)
+		}
+	}
+
 	if err := applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
 		return zero, err
 	}

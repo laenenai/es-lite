@@ -130,3 +130,26 @@ func OrderRoot(rows []OrderRow) [HashSize]byte {
 	}
 	return sha256.Sum256(b)
 }
+
+// OrderVerifyReport is the verdict of VerifyOrder, the deep log-order
+// verification the backends expose: whether every covered log_order
+// row's recomputed batch hash matched, how many rows were checked,
+// and — when OK is false — the first mismatching row in from_position
+// order. A broken log order is a verdict, not an error: the report
+// carries it (the ChainReport precedent), and VerifyOrder's error
+// return is reserved for failures to run the verification at all.
+type OrderVerifyReport struct {
+	OK          bool
+	RowsChecked uint64
+	Mismatch    *OrderRowMismatch
+}
+
+// OrderRowMismatch is the first log_order row whose recomputed
+// es.BatchOrderHash differs from the stored batch_hash: the row's
+// from_position, the hash the append transaction attested (the stored
+// row), and the hash the events actually yield now.
+type OrderRowMismatch struct {
+	From              uint64
+	ExpectedBatchHash []byte
+	ActualBatchHash   []byte
+}

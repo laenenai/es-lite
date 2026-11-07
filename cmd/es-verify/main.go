@@ -52,13 +52,11 @@ type backend struct {
 	es.Anchorer
 	scope        func(workspace string) es.Store
 	chainedSince func(context.Context) (time.Time, error)
-	// verifyOrder is the deep log-order verification, present only on
-	// backends that implement it (Postgres). Nil means the backend
-	// cannot deep-verify order yet: the order stage then surfaces the
-	// backend's own OrderRows error and exits 2 — never a silent skip,
-	// never a vacuous pass (sqlite's log-order attestation lands in a
-	// later task).
-	verifyOrder func(context.Context, uint64) (*postgres.OrderVerifyReport, error)
+	// verifyOrder is the deep log-order verification. Both in-repo
+	// backends provide it; a backend that cannot deep-verify order (nil
+	// here) is surfaced loudly by the order stage — its own OrderRows
+	// error, exit 2 — never a silent skip, never a vacuous pass.
+	verifyOrder func(context.Context, uint64) (*es.OrderVerifyReport, error)
 	multiWS     bool
 	close       func()
 }
@@ -165,7 +163,7 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 	fmt.Printf("es-verify: %d streams checked\n", len(refs))
 	// The order stage runs after the stream chains: first what each
 	// stream contains, then how the batches landed in the global log.
-	// A backend that cannot deep-verify order yet says so loudly here
+	// A backend that cannot deep-verify order says so loudly here
 	// (exit 2, its own OrderRows error) instead of passing vacuously.
 	if c := cmdOrder(ctx, b, nil); c != exitIntact {
 		code = c
@@ -206,9 +204,8 @@ func verifyOne(ctx context.Context, b *backend, ws string, sid es.StreamID, opts
 // shares verifyOne's shape; a mismatch is exit 1 with the offending
 // row's from_position, and an anchor-free log with zero attested rows
 // is EMPTY (exit 2, F13: it certifies nothing). A backend without the
-// deep verify (sqlite until its log-order attestation lands) surfaces
-// its own OrderRows error and exits 2 — no silent skip, no vacuous
-// pass.
+// deep verify surfaces its own OrderRows error and exits 2 — no silent
+// skip, no vacuous pass.
 func cmdOrder(ctx context.Context, b *backend, args []string) int {
 	fs := flag.NewFlagSet("order", flag.ContinueOnError)
 	upto := fs.Uint64("upto", 0, "verify log order at or below this global_position (0 = log head)")
@@ -340,6 +337,7 @@ func openBackend(ctx context.Context) (*backend, error) {
 			Anchorer:     store,
 			scope:        func(string) es.Store { return store },
 			chainedSince: store.ChainedSince,
+			verifyOrder:  store.VerifyOrder,
 			close:        func() { _ = store.Close() },
 		}, nil
 	default:

@@ -139,3 +139,36 @@ deploying this version. No code changes for `es.Anchorer` consumers:
 `OrderRows` is already on the interface, and the three anchor fields
 already serialize (the entry above). Expect `es-verify all` on SQLite
 to exit 2 transitionally until its log-order attestation lands.
+
+## 2026-11-07 — SQLite appends write `log_order`; the `es-verify` sqlite transition ends
+
+**What changes.** SQLite migration `0006` — the mirror of Postgres's;
+SQLite has no `0005` (Postgres's is RLS-role-specific) — adds the same
+`log_order` table minus `workspace_id` (SQLite is single-workspace,
+0001's rule) and minus RLS. From the moment it lands, every SQLite
+append transaction also writes one row to it: the batch's position
+range, stream scope, event count, and `batch_hash`
+(`es.BatchOrderHash`) — computed and inserted inside the append
+transaction itself, no new reads, no new locks. `sqlite.Store`'s
+`Anchor`/`CheckAnchor` compute and compare the order root exactly as
+Postgres does (without a fence round — the single-writer connection
+keeps committed state stable), and `sqlite.Store.VerifyOrder`
+deep-verifies the order, so `es-verify order`/`all` now work on
+SQLite: the transitional exit 2 the previous entry promised is over —
+on an attested log they exit 0, and on a repositioned event `order`
+exits 1 with the tampered batch's `from_position`. The deep-verify
+report type moved to the core as `es.OrderVerifyReport` (with
+`es.OrderRowMismatch`) so both backends share one shape;
+`postgres.OrderVerifyReport`/`postgres.OrderRowMismatch` remain as
+transparent type aliases, so existing references compile unchanged.
+
+**Who is affected.** SQLite deployments: the database migrates to
+version 6 on open, and appends cost one more single-row INSERT per
+batch. `es-verify` users on SQLite: `order`/`all` no longer exit 2 on
+attested logs. Consumers of the report type: new code should import
+`es.OrderVerifyReport`; existing `postgres.OrderVerifyReport`
+references keep working through the alias.
+
+**What to do.** Nothing for SQLite operators (no roles, no grants) and
+no code changes for `es.Anchorer` consumers. Prefer the `es` type in
+new code; the postgres aliases are kept for compatibility.
