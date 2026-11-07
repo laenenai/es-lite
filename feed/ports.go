@@ -292,7 +292,8 @@ type Ack struct {
 // the checkpoint to advance; Position is the event being skipped (resume
 // reads strictly after it); Actor and Reason carry the audit trail that
 // lands in the dead letter; Force authorizes the skip over a live lease,
-// exactly like ResetCheckpoint's force.
+// exactly like ResetCheckpoint's force — and it alone authorizes a rewind,
+// since a Position behind the stored checkpoint is otherwise refused.
 type SkipRequest struct {
 	// Scope, Projection and Instance name the checkpoint to advance.
 	Scope, Projection, Instance string
@@ -303,7 +304,9 @@ type SkipRequest struct {
 	// Reason records why the event is being skipped; it lands in the
 	// dead letter.
 	Reason string
-	// Force allows the skip while a live lease holds the key.
+	// Force allows the skip while a live lease holds the key, and is the
+	// only way to rewind: a Position behind the stored checkpoint fails
+	// with ErrInvalidRequest unless it is set.
 	Force bool
 }
 

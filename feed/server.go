@@ -720,6 +720,15 @@ func (s *Server) ResetCheckpoint(ctx context.Context, req Request, position uint
 // never moved underneath it. The normal flow needs no force: the poison
 // error already killed the stream and released its lease.
 //
+// Skip is also forward-only: a Position behind the stored checkpoint fails
+// with ErrInvalidRequest — accepting it would silently rewind the
+// subscription and re-deliver history the consumer already acknowledged —
+// and the refusal lands before the dead letter, so a refused skip moves no
+// cursor and records no audit row. An equal position is not behind
+// (re-skipping the event at the cursor is idempotent) and a first skip with
+// no stored checkpoint has nothing to be behind; Force is the deliberate
+// rewind, the same escape hatch ResetCheckpoint's force provides.
+//
 // Skip does not require the position to exist or the event to be over-cap;
 // it is a deliberate admin cursor-advance, and validateKey gates the
 // subscription identity.
@@ -745,6 +754,18 @@ func (s *Server) Skip(ctx context.Context, sr SkipRequest) error {
 	cp, _, err := s.cfg.Checkpoints.Checkpoint(ctx, sr.Scope, sr.Projection, sr.Instance)
 	if err != nil {
 		return fmt.Errorf("feed: load checkpoint %s/%s/%s: %w", sr.Scope, sr.Projection, sr.Instance, err)
+	}
+	// Skip is forward-only: a position behind the stored checkpoint would
+	// silently rewind the subscription and re-deliver history the consumer
+	// already acknowledged. Refuse it before recording anything — a refused
+	// skip leaves both the cursor and the audit trail untouched — unless
+	// Force authorizes the deliberate rewind. An equal position is not
+	// behind (re-skipping the event at the cursor is idempotent), and with
+	// no stored checkpoint there is nothing to be behind: the first skip
+	// moves freely.
+	if sr.Position < cp.Position && !sr.Force {
+		return fmt.Errorf("%w: skip position %d is behind the checkpoint %d; pass Force to rewind",
+			ErrInvalidRequest, sr.Position, cp.Position)
 	}
 	// Record the audit row before advancing: a crash between the two
 	// leaves a dead letter and an unadvanced cursor — safe, the skip is

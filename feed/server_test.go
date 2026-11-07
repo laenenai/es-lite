@@ -2679,6 +2679,100 @@ func TestSkipRecordsDeadLetter(t *testing.T) {
 	}
 }
 
+// F16: Skip is forward-only. A position behind the stored checkpoint would
+// silently rewind the subscription and re-deliver history the consumer
+// already acknowledged, so without Force it is refused with
+// ErrInvalidRequest — and the refusal lands before the dead letter, so a
+// refused skip moves no cursor and records no audit row. An equal position
+// is not behind: re-skipping the event at the cursor is allowed.
+func TestSkipRefusesRewind(t *testing.T) {
+	const storedAt = 900
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", storedAt)
+	deadLetters := newMemDeadLetters()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: newMemLogs(),
+		DeadLetters: deadLetters,
+	})
+
+	err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: 5, Actor: "oncall@example.com", Reason: "poison: over cap",
+	})
+	if !errors.Is(err, feed.ErrInvalidRequest) {
+		t.Fatalf("Skip behind the checkpoint = %v, want ErrInvalidRequest", err)
+	}
+	if got, want := err.Error(), "feed: invalid request: skip position 5 is behind the checkpoint 900; pass Force to rewind"; got != want {
+		t.Fatalf("Skip behind the checkpoint = %q, want %q", got, want)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != storedAt {
+		t.Fatalf("checkpoint = %d after the refused skip, want %d (unchanged)", got, storedAt)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 0 {
+		t.Fatalf("dead letters = %+v after the refused skip, want none recorded", rows)
+	}
+
+	// Equal is not behind: skipping the event at the cursor again succeeds
+	// and audits like any other skip.
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: storedAt, Actor: "oncall@example.com", Reason: "poison: over cap",
+	}); err != nil {
+		t.Fatalf("Skip at the checkpoint position: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != storedAt {
+		t.Fatalf("checkpoint = %d after the equal-position skip, want %d", got, storedAt)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 1 || rows[0].Position != storedAt {
+		t.Fatalf("dead letters = %+v, want exactly one at %d", rows, storedAt)
+	}
+}
+
+// Force is the deliberate rewind: the monotonicity guard refuses a position
+// behind the checkpoint, and Force alone authorizes moving past that — the
+// same escape hatch ResetCheckpoint's force provides — while still auditing
+// the decision as a dead letter. With no stored checkpoint there is nothing
+// to be behind: the first skip moves freely without force.
+func TestSkipForceRewinds(t *testing.T) {
+	const storedAt = 900
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", storedAt)
+	deadLetters := newMemDeadLetters()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: newMemLogs(),
+		DeadLetters: deadLetters,
+	})
+
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: 5, Actor: "oncall@example.com", Reason: "poison: over cap", Force: true,
+	}); err != nil {
+		t.Fatalf("forced Skip behind the checkpoint: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 5 {
+		t.Fatalf("checkpoint = %d after the forced rewind, want 5", got)
+	}
+	rows := deadLetters.recorded()
+	if len(rows) != 1 || rows[0].Position != 5 {
+		t.Fatalf("dead letters = %+v, want exactly one at 5 (a forced rewind is still audited)", rows)
+	}
+
+	// No stored checkpoint: there is nothing to be behind, so the first
+	// skip moves freely without force.
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "fresh",
+		Position: 5, Actor: "oncall@example.com", Reason: "poison: over cap",
+	}); err != nil {
+		t.Fatalf("Skip with no stored checkpoint: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "fresh"); got != 5 {
+		t.Fatalf("checkpoint = %d after the first skip, want 5", got)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 2 {
+		t.Fatalf("dead letters = %d after the first skip, want 2", len(rows))
+	}
+}
+
 func TestDeleteSubscriptionRefusesWhileHeld(t *testing.T) {
 	checkpoints := newMemCheckpoints(time.Now())
 	checkpoints.set("tenant", "counter.view", "live", 5)
