@@ -143,6 +143,21 @@ func TestVerifyStreamTruncatedTailIsAnchorDetectableOnly(t *testing.T) {
 	}
 }
 
+func TestVerifyStreamDetectsHeadTruncation(t *testing.T) {
+	// The mirror of tail truncation: an operator deleted v1-v5, so the
+	// oldest surviving row is v6. Versions are 1-based and contiguous, so a
+	// first version above 1 means the head of the chain is gone — the chain
+	// itself still links and must not pass as intact.
+	rows := chain(6, 0)[5:]
+	rep, err := es.VerifyStream(context.Background(), &memStore{rows: rows}, sidMain)
+	if err == nil || rep.Intact() {
+		t.Fatalf("head truncation: err=%v rep=%+v, want a broken chain", err, rep)
+	}
+	if !errors.Is(err, es.ErrChainBroken) || rep.BrokenAt != 6 {
+		t.Fatalf("head truncation: err=%v brokenAt=%d, want ErrChainBroken at 6", err, rep.BrokenAt)
+	}
+}
+
 func TestVerifyStreamPopulatedStore(t *testing.T) {
 	rows := chain(6, 3) // v1–v3 pre-chain, v4 chains to UnchainedHeadHash(sid, 3)
 	rep, err := es.VerifyStream(context.Background(), &memStore{rows: rows}, sidMain)
