@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,17 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/snapshot"
 )
+
+// esLiteCommandNamespace is the fixed namespace uuid.NewSHA1 hashes into
+// when WithDeterministicEventIDs derives an event id from a command id.
+// Hex form: 18054f4d-c5eb-4dc2-bd52-3fba618c3a67.
+//
+// PINNED FOREVER once shipped: the derived event ids are stored in event
+// logs, so changing this value would silently re-key every future
+// derivation — a retried command would stop colliding with the ids its
+// first run stored, and dedup by event id would break for any command
+// whose events were written before the change. Never edit the literal.
+var esLiteCommandNamespace = uuid.MustParse("18054f4d-c5eb-4dc2-bd52-3fba618c3a67")
 
 // Runtime handles commands for one aggregate type.
 type Runtime[S, C, E any] struct {
@@ -46,6 +58,12 @@ type Runtime[S, C, E any] struct {
 	// folds (ADR 0029 §3). Off by default: it doubles hashing on the read
 	// path, and a gate can verify once per fetch instead.
 	verifyChain bool
+
+	// deterministicEventIDs fills each appended event's EventID by deriving
+	// it from the command id and the event's index in the batch
+	// (WithDeterministicEventIDs) instead of leaving it zero for the
+	// adapter to mint. Off by default: today's adapter-minted UUIDv7s.
+	deterministicEventIDs bool
 }
 
 // NewRuntime wires a Runtime against a Store, a Decider, and the generated
@@ -112,6 +130,33 @@ func (r *Runtime[S, C, E]) ConflictRetries() int { return r.retries }
 // (ADR 0029 §3). Returns the runtime for chaining.
 func (r *Runtime[S, C, E]) WithChainVerification() *Runtime[S, C, E] {
 	r.verifyChain = true
+	return r
+}
+
+// WithDeterministicEventIDs makes Handle derive every appended event's
+// EventID from the command's id instead of leaving it zero for the store
+// adapter to mint a fresh UUIDv7: for the event at 0-based index i of the
+// command's batch,
+//
+//	EventID = uuid.NewSHA1(esLiteCommandNamespace,
+//		[]byte(meta.CommandID.String() + ":" + strconv.Itoa(i)))
+//
+// when meta.CommandID is set (a nil command id can't derive one — the
+// runtime keeps minting one per Handle and those events behave exactly as
+// without the option). The option is off by default; without it the same
+// command handled twice appends twice, because each run mints fresh event
+// ids. With it, the two runs derive the same ids and the second append
+// collides on the store's event_id unique constraint, surfacing
+// es.ErrDuplicateEventID — the idempotency signal that a command already
+// ran — instead of silently duplicating events. Callers must treat that
+// error as "already done", never as a retry cue.
+//
+// Derived ids are unique across the whole log, not per stream: the same
+// command id deriving ids on a different stream collides too, which is the
+// intent — one command id appends one batch of events, ever.
+// Returns the runtime for chaining.
+func (r *Runtime[S, C, E]) WithDeterministicEventIDs() *Runtime[S, C, E] {
+	r.deterministicEventIDs = true
 	return r
 }
 
@@ -312,6 +357,15 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 			TypeURL:       enc.TypeURL,
 			SchemaVersion: enc.SchemaVersion,
 			Payload:       enc.Payload,
+		}
+		// Deterministic event ids (WithDeterministicEventIDs): derive the
+		// id from the command id and the event's index in the batch, so a
+		// retried command derives the ids its first run stored and the
+		// store's event_id unique constraint surfaces the rerun as
+		// es.ErrDuplicateEventID instead of duplicating events. A nil
+		// command id can't derive one — leave the adapter's mint in place.
+		if r.deterministicEventIDs && meta.CommandID != uuid.Nil {
+			encoded[i].EventID = uuid.NewSHA1(esLiteCommandNamespace, []byte(meta.CommandID.String()+":"+strconv.Itoa(i)))
 		}
 	}
 

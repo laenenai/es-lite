@@ -5,6 +5,41 @@ This file collects every breaking change as it lands — one entry per
 change, each stating what changed, who is affected, and what to do.
 Entries are grouped by the change date and never rewritten after landing.
 
+## 2026-11-07 — `aggregate.Runtime` gains opt-in deterministic event ids derived from the command id
+
+**What changes.** `aggregate.Runtime` gains `WithDeterministicEventIDs()`,
+an opt-in builder. When set, the runtime fills every appended event's
+`EventID` by deriving it from the command's id instead of leaving it zero
+for the store adapter to mint a fresh UUIDv7:
+`uuid.NewSHA1(esLiteCommandNamespace, []byte(meta.CommandID.String() + ":" + strconv.Itoa(i)))`
+— command id, colon, 0-based index in the command's batch, hashed in a
+fixed namespace. A nil command id never derives (the runtime keeps minting
+one per Handle, and those events behave exactly as before). The option is
+off by default and today's behavior is unchanged without it: the same
+command handled twice still appends twice, under two distinct minted ids.
+With it, the retry derives the same ids as the first run and the second
+append collides on the store's `events.event_id` unique constraint,
+surfacing `es.ErrDuplicateEventID` instead of silently duplicating events.
+`esLiteCommandNamespace` is a fixed package-level UUID, pinned forever
+once shipped — changing it would silently re-key every derivation and
+break dedup against already-stored ids.
+
+**Who is affected.** No one by default — the option is additive and off.
+Callers that retry commands (`WithConflictRetry` users, reaction runners,
+generated command services) and anyone needing at-most-once appends per
+command id benefit: enabling the option turns a duplicated re-append into
+a surfaceable `es.ErrDuplicateEventID`. Note the ids are unique across
+the whole log, not per stream: the same command id deriving ids on a
+different stream collides too, by intent — one command id appends one
+batch of events, ever.
+
+**What to do.** Nothing, unless you want the dedup signal: construct the
+runtime with `.WithDeterministicEventIDs()` and treat a returned
+`errors.Is(err, es.ErrDuplicateEventID)` as "this command already ran" —
+an idempotency signal, never a retry cue. Never re-derive ids under a
+different namespace: `esLiteCommandNamespace` is pinned and must never
+change.
+
 ## 2026-11-07 — `ReadStream` reports `ErrStreamNotFound` for never-written streams
 
 **What changes.** `es.Store.ReadStream` used to return `(nil, nil)` for a
