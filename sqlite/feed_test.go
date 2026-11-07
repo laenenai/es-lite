@@ -254,6 +254,98 @@ func TestMatchingHeadIsTheFilteredMax(t *testing.T) {
 	}
 }
 
+// TestMatchingHeadUsesTypeIndex pins the planner half of review finding
+// F18: the type-filtered head reads — MatchingHead, and MatchingRawHead
+// which runs its exact SQL — must be answered through migration 0007's
+// events_type_pos_idx, not by scanning the events table. Before 0007 the
+// plan was a full scan of events, and on SQLite that scan runs on the
+// store's single shared connection: a rare-type subscription's poll
+// walked the whole log tail and blocked appends behind it, with the walk
+// growing as the log grows. The EXPLAIN runs over 2k+2k seeded events so
+// the plan is production-shaped, and the query text mirrors
+// Store.MatchingHead's SQL (feed.go) with the two bound types — if the
+// adapter's query shape ever changes, this constant must follow it.
+func TestMatchingHeadUsesTypeIndex(t *testing.T) {
+	ctx := context.Background()
+	s := openFeedStore(t)
+
+	// 2k events of the subscribed type plus 2k of another, in batches of
+	// 100 on one stream per type: enough rows that the pre-index full
+	// scan is a real scan, not a toy table.
+	const (
+		perType = 2000
+		batch   = 100
+	)
+	seed := func(sid es.StreamID, typ string) {
+		t.Helper()
+		for base := 0; base < perType; base += batch {
+			events := make([]es.EventData, batch)
+			for i := range events {
+				events[i] = es.EventData{TypeURL: typ, SchemaVersion: 1, Payload: []byte("p")}
+			}
+			if _, err := s.Append(ctx, es.AppendParams{
+				StreamID:        sid,
+				ExpectedVersion: uint64(base),
+				Events:          events,
+			}); err != nil {
+				t.Fatalf("seed %s at v%d: %v", typ, base+1, err)
+			}
+		}
+	}
+	seed(mustStreamID(t, "thing", "type-index-subscribed"), "thing.v1.Happened")
+	seed(mustStreamID(t, "thing", "type-index-other"), "thing.v1.Ignored")
+
+	// Store.MatchingHead's exact SQL (feed.go) with two bound types.
+	const matchingHeadQuery = `SELECT COALESCE(MAX(global_position), 0) FROM events
+	      WHERE type_url IN (?,?)`
+
+	explain := func() string {
+		t.Helper()
+		rows, err := s.DB().QueryContext(ctx,
+			`EXPLAIN QUERY PLAN `+matchingHeadQuery, "thing.v1.Happened", "thing.v1.Ignored")
+		if err != nil {
+			t.Fatalf("explain: %v", err)
+		}
+		defer rows.Close()
+		var lines []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatalf("explain scan: %v", err)
+			}
+			lines = append(lines, detail)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("explain rows: %v", err)
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	if plan := explain(); !strings.Contains(plan, "events_type_pos_idx") {
+		t.Fatalf("MatchingHead plan does not use events_type_pos_idx:\n%s", plan)
+	}
+
+	// The before-state, reproduced in place: 0007's only effect on the
+	// schema is this index, so dropping it restores the pre-0007 planner
+	// exactly. The sqlite_test package cannot cheaply open a partially
+	// migrated handle — the migrations are embedded unexported — so this
+	// test-only DROP INDEX (the store itself never alters its schema)
+	// stands in for a raw handle at schema 0004: the plan must name no
+	// index it cannot have.
+	if _, err := s.DB().ExecContext(ctx, `DROP INDEX IF EXISTS events_type_pos_idx`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	// "USING" appears in an EXPLAIN QUERY PLAN detail line only when an
+	// index serves the step (robust to the scan keyword's wording across
+	// SQLite builds — this one renders the bare full scan as
+	// "SEARCH events"), so the before-plan must carry neither it nor the
+	// index name.
+	if before := explain(); strings.Contains(before, "USING") || strings.Contains(before, "events_type_pos_idx") {
+		t.Fatalf("pre-0007 plan uses an index where today it is the bare full scan:\n%s", before)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Concurrency guard: the single-connection invariant
 // ---------------------------------------------------------------------------

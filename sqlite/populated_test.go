@@ -16,7 +16,7 @@ import (
 // rows under schema 0001, applies 0002, appends, and checks the ADR 0029 §5
 // behaviour: old rows stay unhashed, the first new row chains to
 // UnchainedHeadHash(sid, head), VerifyStream reports ChainedFrom, and the
-// migration version is 6 (0002 through 0006 applied together; sqlite has
+// migration version is 7 (0002 through 0007 applied together; sqlite has
 // no 0005 — Postgres's is RLS-role-specific). It is an
 // internal test so it can apply one migration at a time.
 func TestPopulatedStoreChainsFromMigration(t *testing.T) {
@@ -61,14 +61,14 @@ func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 		}
 	}
 
-	// Now the upgrade: Migrate applies every embedded migration through 0006.
+	// Now the upgrade: Migrate applies every embedded migration through 0007.
 	s, err := NewWithDB(ctx, db)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	var version int
-	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 6 {
-		t.Fatalf("schema version = %d err=%v, want 6", version, err)
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 7 {
+		t.Fatalf("schema version = %d err=%v, want 7", version, err)
 	}
 	since, err := s.ChainedSince(ctx)
 	if err != nil || since.IsZero() {
