@@ -66,3 +66,39 @@ wraps the context's cause. Consumers that read
 `Anchor.UptoGlobalPosition` expecting exactly the committed maximum
 should expect the drawn horizon instead — at or above it whenever an
 append is in flight.
+
+## 2026-11-07 — `es.Anchorer` gains `OrderRows`; `es.Anchor` gains order fields
+
+**What changes.** The `es.Anchorer` interface gains
+`OrderRows(ctx context.Context, upto uint64) ([]es.OrderRow, error)`,
+which returns the log_order rows with `to_position <= upto` (0 = the
+current log head, as for `Anchor`) — the rows an anchor at `upto`
+attests with its order root, which `es-verify order` recomputes each
+batch hash from. `es.Anchor` gains three fields: `OrderRootHash
+[]byte` (`order_root_hash`, omitted when nil — the anchor's order root
+over those rows), `OrderFromPosition uint64` (`order_from_position`,
+the first attested position, 0 when none are) and `OrderCount uint64`
+(`order_count`, how many rows the root aggregates). The accompanying
+types and functions — `es.OrderEntry`, `es.OrderRow`,
+`es.BatchOrderHash`, `es.OrderRoot` — are new and additive. The
+in-repo `sqlite.Store` and `postgres.Store` carry temporary
+`OrderRows` stubs that return an error; the real implementations land
+with log-order attestation (design D1), and nothing in this module
+calls `OrderRows` yet.
+
+**Who is affected.** Third-party `es.Anchorer` implementations: adding
+a method to an interface is a compile-time break — their types no
+longer satisfy `es.Anchorer` until they grow an `OrderRows` method
+(the in-repo adapters hit exactly this). Consumers that serialize
+`es.Anchor` as JSON see the new fields: `order_root_hash` is omitted on
+legacy anchors (recorded before log-order attestation; such anchors
+verify heads-only — order comparison skips the order fields when it is
+nil), while `order_from_position`/`order_count` always serialize, 0 on
+legacy anchors.
+
+**What to do.** Implement `OrderRows` on every custom `Anchorer`. A
+backend without log-order rows yet can mirror the in-repo stubs and
+return an error; one that adopts log-order attestation returns the
+rows with `to_position <= upto` in any order — `es.OrderRoot` sorts.
+JSON consumers must tolerate the three new anchor fields; ones that
+decode into their own structs ignore them by default.

@@ -36,6 +36,22 @@ type Anchor struct {
 	UptoGlobalPosition uint64    `json:"upto_global_position"`
 	StreamCount        uint64    `json:"stream_count"`
 	RootHash           []byte    `json:"root_hash"`
+	// OrderRootHash is the anchor's order root: OrderRoot over the
+	// log_order rows at or below the bound, attesting the global append
+	// order of every batch the anchor covers. Nil for a legacy anchor
+	// recorded before log-order attestation: such an anchor verifies
+	// heads-only — the order comparison skips the order fields when
+	// OrderRootHash is nil.
+	OrderRootHash []byte `json:"order_root_hash,omitempty"`
+	// OrderFromPosition is the first position the order root attests:
+	// the lowest from_position among the covered rows — 0 when the
+	// anchor covers none, because everything at or below its bound
+	// predates log-order attestation (the order analog of the chain's
+	// unattested pre-migration rows).
+	OrderFromPosition uint64 `json:"order_from_position"`
+	// OrderCount is how many log_order rows the order root aggregates —
+	// the order analog of StreamCount.
+	OrderCount uint64 `json:"order_count"`
 }
 
 // StreamRef names a stream across workspaces, for store-wide operations.
@@ -48,13 +64,17 @@ type StreamRef struct {
 // Anchor computes the root over every stream with global_position <= upto
 // (0 = the current log head), records it, and returns it. CheckAnchor
 // recomputes a.UptoGlobalPosition's root and returns ErrAnchorMismatch when
-// it differs from a.RootHash. ListStreams enumerates streams for
-// `es-verify all`.
+// it differs from a.RootHash. OrderRows returns the log_order rows with
+// to_position <= upto (0 = the current log head, as for Anchor): the rows
+// an anchor at upto attests with its OrderRootHash, which `es-verify
+// order` recomputes each batch hash from. ListStreams enumerates streams
+// for `es-verify all`.
 type Anchorer interface {
 	Anchor(ctx context.Context, upto uint64) (Anchor, error)
 	ListAnchors(ctx context.Context) ([]Anchor, error)
 	CheckAnchor(ctx context.Context, a Anchor) error
 	ListStreams(ctx context.Context) ([]StreamRef, error)
+	OrderRows(ctx context.Context, upto uint64) ([]OrderRow, error)
 }
 
 // ErrInvalidStreamHead reports that a StreamHead's Hash is neither empty

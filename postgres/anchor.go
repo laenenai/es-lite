@@ -252,6 +252,14 @@ func (s *Store) ListStreams(ctx context.Context) ([]es.StreamRef, error) {
 	return out, rows.Err()
 }
 
+// OrderRows implements es.Anchorer. Temporary stub: Postgres log-order
+// attestation (design D1) lands in a later task (Task 7), which
+// replaces this with a real query over the log_order table under
+// app.bypass_rls; until then this Store cannot serve order rows.
+func (s *Store) OrderRows(ctx context.Context, upto uint64) ([]es.OrderRow, error) {
+	return nil, fmt.Errorf("postgres: order rows not available yet (log-order attestation lands in a later task)")
+}
+
 // heads returns each (workspace, stream)'s highest version at or below upto
 // with its hash.
 func heads(ctx context.Context, tx pgx.Tx, upto uint64) ([]es.StreamHead, error) {

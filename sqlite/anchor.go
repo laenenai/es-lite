@@ -126,6 +126,14 @@ func (s *Store) ListStreams(ctx context.Context) ([]es.StreamRef, error) {
 	return out, rows.Err()
 }
 
+// OrderRows implements es.Anchorer. Temporary stub: SQLite log-order
+// attestation (design D1) lands in a later task (Task 8), which
+// replaces this with a real query over the log_order table; until then
+// this Store cannot serve order rows.
+func (s *Store) OrderRows(ctx context.Context, upto uint64) ([]es.OrderRow, error) {
+	return nil, fmt.Errorf("sqlite: order rows not available yet (log-order attestation lands in a later task)")
+}
+
 // heads returns each stream's highest version at or below upto with its hash.
 func (s *Store) heads(ctx context.Context, upto uint64) ([]es.StreamHead, error) {
 	rows, err := s.db.QueryContext(ctx,
