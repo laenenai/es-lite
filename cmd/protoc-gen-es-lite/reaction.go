@@ -73,10 +73,6 @@ func collectReactions(f *protogen.File, r *resolver, names *nameRegistry) ([]rea
 	return out, nil
 }
 
-func (rc reactSpec) fetchesState() bool {
-	return rc.spec.GetFetch() == esv1.FetchMode_FETCH_MODE_STATE_AS_OF_EVENT_VERSION
-}
-
 func (rc reactSpec) catalogue() catalogueEntry {
 	e := catalogueEntry{
 		kind: "REACTION", name: rc.spec.GetName(), owner: rc.spec.GetOwnerContext(),
@@ -104,7 +100,8 @@ func writeReaction(g *protogen.GeneratedFile, rc reactSpec) {
 	issue := g.QualifiedGoIdent(reactionPkgPath.Ident("Issue"))
 
 	writeSpecHeader(g, base, "reaction", rc.spec.GetName(), rc.consumes, rc.aggs)
-	writeHandlerIface(g, base, rc.consumes, rc.fetchesState(), issuerName)
+	fetch := rc.spec.GetFetch()
+	writeHandlerIface(g, base, rc.consumes, fetch, issuerName)
 
 	g.P("// ", issuerName, " collects the commands a handler issues for one event; the")
 	g.P("// runner delivers them after the handler returns (reaction.Execute: conflicts")
@@ -124,17 +121,17 @@ func writeReaction(g *protogen.GeneratedFile, rc reactSpec) {
 		g.P()
 	}
 
-	writeDeps(g, base, rc.aggs, rc.fetchesState(), rc.routers)
+	writeDeps(g, base, rc.aggs, fetch, rc.routers)
 
 	runner := g.QualifiedGoIdent(reactionPkgPath.Ident("Runner"))
 	newRunner := g.QualifiedGoIdent(reactionPkgPath.Ident("NewRunner"))
 	g.P("// New", base, "Runner wires h into a reaction.Runner: marker handling and live")
 	g.P("// consumption (Run over any projection.Feed). There is no Rebuild — replaying")
 	g.P("// a reaction re-issues its commands (ADR 0030 §2).")
-	writeRequiredDepDoc(g, runnerRequiredDeps(rc.fetchesState(), rc.routers))
+	writeRequiredDepDoc(g, runnerRequiredDeps(fetch, rc.routers))
 	g.P("func New", base, "Runner(h ", base, "Handler, deps ", base, "Deps) *", runner, " {")
-	writeDepGuards(g, base, rc.aggs, rc.fetchesState(), rc.routers)
-	writeDispatch(g, base, rc.consumes, rc.fetchesState(), rc.routers)
+	writeDepGuards(g, base, rc.aggs, fetch, rc.routers)
+	writeDispatch(g, base, rc.consumes, fetch, rc.routers)
 	g.P("	return ", newRunner, "(", base, "Name, deps.Marker, dispatch, ", lowerFirst(base), "Consumes)")
 	g.P("}")
 	g.P()

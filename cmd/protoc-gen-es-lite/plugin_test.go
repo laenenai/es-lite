@@ -418,6 +418,87 @@ func TestProjectionMetadataOnlyHasNoUnusedImports(t *testing.T) {
 	assertAllImportsUsed(t, content)
 }
 
+// TestProjectionEventOnlyDecodesWithoutState (F38): a FETCH_MODE_EVENT_ONLY
+// spec validates like the other modes — rebuild is still required for a read
+// model — and its handlers receive the typed event, On<Event>(ctx, env,
+// ev *E), while the dispatch decodes and upcasts but never fetches state:
+// Deps carries the Codec and Upcaster seams and no loader, and the runner
+// has no required deps. Reactions share the same emit, with the issuer as
+// the trailing parameter.
+func TestProjectionEventOnlyDecodesWithoutState(t *testing.T) {
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_EVENT_ONLY
+	// Alone in its own file, the metadata-only shape of Task 17: the
+	// decode branch registers fmt, so nothing may be left unused either way.
+	content, err := runWith(t, readModel(spec), domainFile(true))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{
+		"OnHappened(ctx context.Context, env es.Envelope, ev *Happened) error",
+		"StateCodec es.Codec[Event]",
+		"StateUpcaster es.Upcaster[Event]",
+		"stateCodec := deps.StateCodec",
+		"if stateCodec == nil {",
+		"decoded, err = stateUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)",
+		`return fmt.Errorf("View: decode %s v%d: %w", env.StreamID, env.Version, err)`,
+		"return h.OnHappened(ctx, env, ev)",
+		"func NewViewRunner(h ViewHandler, deps ViewDeps) *projection.Runner",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated code lacks %q:\n%s", want, content)
+		}
+	}
+	// Decode-only: no loader seam, no loader field, no state fetch.
+	if strings.Contains(content, "Loader") {
+		t.Fatalf("event-only projection must not emit a state loader:\n%s", content)
+	}
+	if strings.Contains(content, "LoadAsOfVersion") {
+		t.Fatalf("event-only projection must not fetch state:\n%s", content)
+	}
+	// The handler is handed the upgraded event: upcast runs between decode
+	// and the variant assertion (Task 26's ordering, without the state load).
+	if i, j := strings.Index(content, "stateUpcaster.Upcast("), strings.Index(content, "decoded.(*Happened)"); i < 0 || j < 0 || i > j {
+		t.Fatalf("upcast must run between decode and the variant assertion:\n%s", content)
+	}
+	assertAllImportsUsed(t, content)
+
+	// Rebuild is required like the other modes: the kind rule is
+	// fetch-independent, so an EVENT_ONLY read model without FROM_LOG
+	// is rejected.
+	norebuild := goodSpec()
+	norebuild.Fetch = esv1.FetchMode_FETCH_MODE_EVENT_ONLY
+	norebuild.Rebuild = esv1.RebuildMode_REBUILD_MODE_UNSPECIFIED
+	f := domainFile(true)
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(norebuild)})
+	if _, err = runWith(t, f); err == nil || !strings.Contains(err.Error(), "requires rebuild = REBUILD_MODE_FROM_LOG") {
+		t.Fatalf("error = %v, want rebuild-required rejection", err)
+	}
+
+	// Reactions share the emit: the typed event precedes the issuer and
+	// no state fetch is emitted there either.
+	r := domainFile(true)
+	r.MessageType = append(r.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
+		Name: "t.react", Consumes: []string{"t.v1.Happened"}, Issues: []string{"t.v1.Do"},
+		Fetch: esv1.FetchMode_FETCH_MODE_EVENT_ONLY,
+	})})
+	if content, err = runWith(t, r); err != nil {
+		t.Fatalf("generate reaction: %v", err)
+	}
+	for _, want := range []string{
+		"OnHappened(ctx context.Context, env es.Envelope, ev *Happened, issue *ReactIssuer) error",
+		"StateCodec es.Codec[Event]",
+		"StateUpcaster es.Upcaster[Event]",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated reaction lacks %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "LoadAsOfVersion") {
+		t.Fatalf("event-only reaction must not fetch state:\n%s", content)
+	}
+}
+
 // The exported Consumes list preserves the proto option's order, not any
 // sorted order — a catalogue seeds and drift-checks its filter from it.
 func TestSpecExportsConsumesInOptionOrder(t *testing.T) {
@@ -548,6 +629,32 @@ func TestDocsCatalogue(t *testing.T) {
 		}
 		if strings.Contains(content, "FETCH_MODE_") || strings.Contains(content, "| Owner |") {
 			t.Fatalf("catalogue still carries raw enum names or the wide table:\n%s", content)
+		}
+	}
+	if !found {
+		t.Fatal("catalogue file not generated")
+	}
+}
+
+// The catalogue renders the third fetch mode in words, like the other
+// two — never the raw enum (F38).
+func TestDocsCatalogueHumanisesEventOnly(t *testing.T) {
+	f := domainFile(true)
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_EVENT_ONLY
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(spec)})
+	gen := fixture(t, f)
+	if err := run(gen, "PROJECTIONS.md"); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var found bool
+	for _, out := range gen.Response().File {
+		if out.GetName() != "PROJECTIONS.md" {
+			continue
+		}
+		found = true
+		if !strings.Contains(out.GetContent(), "- fetch: typed event only (no state)") {
+			t.Fatalf("catalogue lacks the humanised event-only fetch:\n%s", out.GetContent())
 		}
 	}
 	if !found {

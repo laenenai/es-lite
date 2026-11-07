@@ -151,8 +151,16 @@ func exportSnake(s string) string {
 	return b.String()
 }
 
-func (p projSpec) fetchesState() bool {
-	return p.spec.GetFetch() == esv1.FetchMode_FETCH_MODE_STATE_AS_OF_EVENT_VERSION
+// fetchesState reports whether a spec's fetch mode loads aggregate state.
+func fetchesState(fetch esv1.FetchMode) bool {
+	return fetch == esv1.FetchMode_FETCH_MODE_STATE_AS_OF_EVENT_VERSION
+}
+
+// decodesEvent reports whether a spec's fetch mode hands the handler the
+// typed event: the two event-bearing modes (STATE_AS_OF_EVENT_VERSION,
+// EVENT_ONLY) share the codec and upcaster seams; metadata-only does not.
+func decodesEvent(fetch esv1.FetchMode) bool {
+	return fetchesState(fetch) || fetch == esv1.FetchMode_FETCH_MODE_EVENT_ONLY
 }
 
 func (p projSpec) catalogue() catalogueEntry {
@@ -172,11 +180,14 @@ func (p projSpec) catalogue() catalogueEntry {
 //	const CounterViewName = "counter.view"
 //	func CounterViewSubjects(workspace string) []string
 //	func CounterViewConsumes() []string
-//	type CounterViewHandler interface { On<Event>(ctx, env[, ev, state]) error ... }
+//	type CounterViewHandler interface { On<Event>(ctx, env[, ev[, state]]) error ... }
 //	type CounterView<State>Loader interface { LoadAsOfVersion(...) }   (STATE_AS_OF only)
-//	type CounterViewDeps struct { <State> <Loader>; <State>Codec es.Codec[<Event>];
+//	type CounterViewDeps struct { [<State> <Loader>;] <State>Codec es.Codec[<Event>];
 //	                              <State>Upcaster es.Upcaster[<Event>]; Marker projection.Marker }
 //	func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projection.Runner
+//
+// Codec and Upcaster ride along with the event (STATE_AS_OF and
+// EVENT_ONLY); the loader and its nil guard exist only for STATE_AS_OF.
 func writeProjection(g *protogen.GeneratedFile, p projSpec) {
 	base := p.base
 	writeSpecHeader(g, base, "projection", p.spec.GetName(), p.consumes, p.aggs)
@@ -190,17 +201,18 @@ func writeProjection(g *protogen.GeneratedFile, p projSpec) {
 	g.P("}")
 	g.P()
 
-	writeHandlerIface(g, base, p.consumes, p.fetchesState(), "")
-	writeDeps(g, base, p.aggs, p.fetchesState(), nil)
+	fetch := p.spec.GetFetch()
+	writeHandlerIface(g, base, p.consumes, fetch, "")
+	writeDeps(g, base, p.aggs, fetch, nil)
 
 	projRunner := g.QualifiedGoIdent(projectionPkgPath.Ident("Runner"))
 	g.P("// New", base, "Runner wires h into a projection.Runner: marker handling, live")
 	g.P("// consumption (Run over any projection.Feed) and Rebuild from the log share")
 	g.P("// one dispatch path (ADR 0005, ADR 0030).")
-	writeRequiredDepDoc(g, runnerRequiredDeps(p.fetchesState(), nil))
+	writeRequiredDepDoc(g, runnerRequiredDeps(fetch, nil))
 	g.P("func New", base, "Runner(h ", base, "Handler, deps ", base, "Deps) *", projRunner, " {")
-	writeDepGuards(g, base, p.aggs, p.fetchesState(), nil)
-	writeDispatch(g, base, p.consumes, p.fetchesState(), nil)
+	writeDepGuards(g, base, p.aggs, fetch, nil)
+	writeDispatch(g, base, p.consumes, fetch, nil)
 	g.P("	return &", projRunner, "{Name: ", base, "Name, Marker: deps.Marker, Dispatch: dispatch, Filter: ", lowerFirst(base), "Consumes}")
 	g.P("}")
 	g.P()
@@ -262,9 +274,10 @@ func writeSpecHeader(g *protogen.GeneratedFile, base, kind, name string, consume
 
 // writeHandlerIface emits On<Event> per consumed type. With state fetching
 // the method takes the decoded event and the state as of the event's
-// version; metadata-only takes the envelope alone. issuer, when set, is
-// appended as a final parameter (reactions).
-func writeHandlerIface(g *protogen.GeneratedFile, base string, consumes []consumed, withState bool, issuer string) {
+// version; event-only takes the decoded event; metadata-only takes the
+// envelope alone. issuer, when set, is appended as a final parameter
+// (reactions).
+func writeHandlerIface(g *protogen.GeneratedFile, base string, consumes []consumed, fetch esv1.FetchMode, issuer string) {
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	envelope := g.QualifiedGoIdent(esPkgPath.Ident("Envelope"))
 	g.P("// ", base, "Handler is the application-written part: one method per consumed")
@@ -275,8 +288,10 @@ func writeHandlerIface(g *protogen.GeneratedFile, base string, consumes []consum
 	g.P("type ", base, "Handler interface {")
 	for _, c := range consumes {
 		params := "ctx " + ctx + ", env " + envelope
-		if withState {
+		if fetchesState(fetch) {
 			params += ", ev *" + g.QualifiedGoIdent(c.msg.GoIdent) + ", state *" + g.QualifiedGoIdent(c.agg.state.GoIdent)
+		} else if decodesEvent(fetch) {
+			params += ", ev *" + g.QualifiedGoIdent(c.msg.GoIdent)
 		}
 		if issuer != "" {
 			params += ", issue *" + issuer
@@ -287,15 +302,18 @@ func writeHandlerIface(g *protogen.GeneratedFile, base string, consumes []consum
 	g.P()
 }
 
-// writeDeps emits the loader seams and the Deps struct. routers, when
+// writeDeps emits the loader seams and the Deps struct. A state-fetching
+// spec carries a loader per aggregate plus the codec and upcaster seams;
+// an event-only spec carries the codec and upcaster seams alone (no
+// loader, so no guard); metadata-only carries neither. routers, when
 // non-nil, adds a reaction.Dispatcher per issuing aggregate and the Actor.
-func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withState bool, routers *aggregateSet) {
+func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, fetch esv1.FetchMode, routers *aggregateSet) {
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	streamID := g.QualifiedGoIdent(esPkgPath.Ident("StreamID"))
 	codec := g.QualifiedGoIdent(esPkgPath.Ident("Codec"))
 	upcaster := g.QualifiedGoIdent(esPkgPath.Ident("Upcaster"))
 	marker := g.QualifiedGoIdent(projectionPkgPath.Ident("Marker"))
-	if withState {
+	if fetchesState(fetch) {
 		for _, a := range aggs.sorted() {
 			g.P("// ", base, depName(a), "Loader fetches ", depName(a), " state as of a stream version.")
 			g.P("// *aggregate.Runtime[*", g.QualifiedGoIdent(a.state.GoIdent), ", ...] satisfies it with no adapter.")
@@ -307,13 +325,15 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 	}
 	g.P("// ", base, "Deps is what the application wires into the runner.")
 	g.P("type ", base, "Deps struct {")
-	if withState {
+	if decodesEvent(fetch) {
 		for _, a := range aggs.sorted() {
-			g.P("	// ", depName(a), " loads state as of the event's version (required).")
-			g.P("	// Cost: without snapshots each load re-folds the whole stream,")
-			g.P("	// O(stream length) per consumed event; with a snapshot at or")
-			g.P("	// below the version it folds only the tail, O(tail).")
-			g.P("	", depName(a), " ", base, depName(a), "Loader")
+			if fetchesState(fetch) {
+				g.P("	// ", depName(a), " loads state as of the event's version (required).")
+				g.P("	// Cost: without snapshots each load re-folds the whole stream,")
+				g.P("	// O(stream length) per consumed event; with a snapshot at or")
+				g.P("	// below the version it folds only the tail, O(tail).")
+				g.P("	", depName(a), " ", base, depName(a), "Loader")
+			}
 			g.P("	// ", depName(a), "Codec decodes ", a.pkg, " events; nil selects the generated codec.")
 			g.P("	// Supply an unsealing codec when payloads are sealed (ADR 0025).")
 			g.P("	", depName(a), "Codec ", codec, "[", g.QualifiedGoIdent(a.ifaceIdent()), "]")
@@ -342,10 +362,11 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 // runnerRequiredDeps names a runner shape's required-dep kinds for its
 // constructor doc: the state loaders of a state-fetching spec, the
 // issuing routers of a reaction. Empty when the shape requires none (a
-// metadata-only projection), in which case there is nothing to document.
-func runnerRequiredDeps(withState bool, routers *aggregateSet) []string {
+// metadata-only or event-only projection), in which case there is nothing
+// to document.
+func runnerRequiredDeps(fetch esv1.FetchMode, routers *aggregateSet) []string {
 	var kinds []string
-	if withState {
+	if fetchesState(fetch) {
 		kinds = append(kinds, "state loader")
 	}
 	if routers != nil && routers.len() > 0 {
@@ -369,8 +390,8 @@ func writeRequiredDepDoc(g *protogen.GeneratedFile, kinds []string) {
 // per-aggregate router on a reaction. A missing one panics here, naming
 // itself, instead of misbehaving on first use (F32); the optional seams —
 // Codec, Upcaster, Actor, Marker — keep their nil defaults.
-func writeDepGuards(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withState bool, routers *aggregateSet) {
-	if withState {
+func writeDepGuards(g *protogen.GeneratedFile, base string, aggs *aggregateSet, fetch esv1.FetchMode, routers *aggregateSet) {
+	if fetchesState(fetch) {
 		for _, a := range aggs.sorted() {
 			field := depName(a)
 			g.P("	if deps.", field, " == nil {")
@@ -389,20 +410,22 @@ func writeDepGuards(g *protogen.GeneratedFile, base string, aggs *aggregateSet, 
 }
 
 // writeDispatch emits `dispatch := func(ctx, env) error { switch env.TypeURL
-// {...} }` inside a runner constructor. Each state-fetching branch decodes
-// with the deps' codec, runs the deps' optional upcaster over the decoded
-// event, and then asserts the variant. issuer, when non-nil, is the
-// reaction's issuing set: the handler gets an issuer and its issues are
-// executed after it returns.
-func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, withState bool, issuer *aggregateSet) {
+// {...} }` inside a runner constructor. Each event-decoding branch (state or
+// event-only) decodes with the deps' codec, runs the deps' optional upcaster
+// over the decoded event, and then asserts the variant; a state-fetching
+// branch additionally loads the state as of the event's stream version.
+// issuer, when non-nil, is the reaction's issuing set: the handler gets an
+// issuer and its issues are executed after it returns.
+func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, fetch esv1.FetchMode, issuer *aggregateSet) {
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	envelope := g.QualifiedGoIdent(esPkgPath.Ident("Envelope"))
 	encoded := g.QualifiedGoIdent(esPkgPath.Ident("EncodedEvent"))
-	// fmt is registered only when the dispatch has a state-decoding branch:
-	// a metadata-only spec has no errorf, and an unconditional registration
-	// would leave the import unused — the file would not compile downstream.
+	// fmt is registered only when the dispatch has an event-decoding
+	// branch: a metadata-only spec has no errorf, and an unconditional
+	// registration would leave the import unused — the file would not
+	// compile downstream.
 	var errorf string
-	if withState {
+	if decodesEvent(fetch) {
 		errorf = g.QualifiedGoIdent(fmtPkgPath.Ident("Errorf"))
 		aggs := newAggregateSet()
 		for _, c := range consumes {
@@ -425,7 +448,7 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 	for _, c := range consumes {
 		g.P("		case ", fmt.Sprintf("%q", c.typeURL), ":")
 		args := "ctx, env"
-		if withState {
+		if decodesEvent(fetch) {
 			v := lowerFirst(depName(c.agg)) + "Codec"
 			g.P("			decoded, err := ", v, ".Decode(", encoded, "{TypeURL: env.TypeURL, SchemaVersion: env.SchemaVersion, Payload: env.Payload})")
 			g.P("			if err != nil {")
@@ -442,11 +465,15 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 			g.P("			if !ok {")
 			g.P("				return ", errorf, "(\"", base, ": %s decoded as %T\", env.TypeURL, decoded)")
 			g.P("			}")
-			g.P("			state, err := deps.", depName(c.agg), ".LoadAsOfVersion(ctx, env.StreamID, env.Version)")
-			g.P("			if err != nil {")
-			g.P("				return ", errorf, "(\"", base, ": load %s v%d: %w\", env.StreamID, env.Version, err)")
-			g.P("			}")
-			args += ", ev, state"
+			if fetchesState(fetch) {
+				g.P("			state, err := deps.", depName(c.agg), ".LoadAsOfVersion(ctx, env.StreamID, env.Version)")
+				g.P("			if err != nil {")
+				g.P("				return ", errorf, "(\"", base, ": load %s v%d: %w\", env.StreamID, env.Version, err)")
+				g.P("			}")
+				args += ", ev, state"
+			} else {
+				args += ", ev"
+			}
 		}
 		if issuer != nil {
 			args += ", issue"
