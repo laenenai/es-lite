@@ -97,21 +97,24 @@ type Store struct {
 	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
 	maxPayloadBytes int
 
-	// relayRoleOnce runs the es_relay startup check that every RLS-bypass
-	// path shares — Drain and the anchor path's bypassTx
-	// (checkRelayRole) — at most once per Store. Migration 0005 gates the
-	// RLS bypass on that membership. The verdict is cached on the Store
+	// relayRoleMu guards the es_relay membership verdict below — the
+	// startup check every RLS-bypass path shares — Drain and the anchor
+	// path's bypassTx (checkRelayRole). Migration 0005 gates the RLS
+	// bypass on that membership. The verdict is cached on the Store
 	// rather than the package: a process is expected to hold one Store
 	// (see Store's doc), so this is once per process, and a Store opened
 	// later — a different principal, or after the runbook's GRANT —
 	// re-verifies instead of inheriting another pool's verdict.
-	relayRoleOnce sync.Once
+	relayRoleMu sync.Mutex
 
-	// relayRoleErr is the cached verdict of checkRelayRole:
-	// ErrRelayRoleMissing (wrapped, runbook in the message) when the
-	// session user is not an es_relay member, or the probe's own error.
-	// Nil means the check passed.
-	relayRoleErr error
+	// relayRoleChecked records that the probe reached a definitive
+	// verdict, held in relayRoleMember. Until it does — including after
+	// a transient probe failure such as a cancelled context or a flaky
+	// connection — every bypass call re-probes, so one blip cannot
+	// poison the Store's lifetime (F4). Both fields are read and
+	// written only under relayRoleMu.
+	relayRoleChecked bool
+	relayRoleMember  bool
 }
 
 // Open connects to Postgres and applies migrations (unless WithoutAutoMigrate).

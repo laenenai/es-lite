@@ -246,6 +246,43 @@ func TestDrainFailsFastWithoutRelayRole(t *testing.T) {
 	}
 }
 
+// TestRelayRoleTransientErrorIsNotLatched is F4's regression test: a
+// transient probe failure must not poison the Store. The verdict cache
+// used to latch whatever the first probe returned — including the
+// context.Canceled of a caller's dead ctx — for the Store's lifetime, so
+// one blip failed every later Drain and anchor call even though the role
+// existed. A cancelled first Drain must fail (its ctx is dead), but as a
+// transient: the next Drain re-probes, decoupled from that dead ctx, and
+// succeeds.
+func TestRelayRoleTransientErrorIsNotLatched(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	// The login user is a superuser, hence a trivially es_relay member:
+	// on a live context the probe can only conclude member=true, so the
+	// cancelled ctx stages the transient itself — never a definitive
+	// non-membership.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	n, err := s.Drain(cancelled, 10, func(context.Context, []es.Envelope) error { return nil })
+	if err == nil {
+		t.Fatalf("drain with a cancelled context: n=%d err=nil, want an error", n)
+	}
+	if errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("drain with a cancelled context: err=%v, want a transient failure — the superuser is a member, so this must not be a definitive non-membership", err)
+	}
+
+	// The transient must not be latched: a live-context Drain succeeds,
+	// claiming the 0 unpublished rows the freshly truncated store holds.
+	n, err = s.Drain(ctx, 10, func(context.Context, []es.Envelope) error { return nil })
+	if err != nil {
+		t.Fatalf("drain after a transient probe failure: err=%v, want nil — one transient failure must not poison the Store", err)
+	}
+	if n != 0 {
+		t.Fatalf("drain after a transient probe failure claimed %d rows, want 0", n)
+	}
+}
+
 // TestAnchorPathFailsFastWithoutRelayRole pins the fix round's other half
 // of Review Focus 6: the anchor path reads events under the same bypass
 // Drain uses (bypassTx), so post-0005 a non-member session would not
