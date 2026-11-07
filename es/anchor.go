@@ -83,11 +83,14 @@ func ValidateStreamHead(h StreamHead) error {
 // first and the canonical stream_id ("type:id") second, both compared
 // byte-wise as raw byte strings — never as (type, id) tuples, so an
 // off-box reimplementer sorts identically. The sort is stable: heads with
-// equal (workspace, canonical stream_id) keys keep their input order. Each
-// head is encoded, in sorted order, as a length-prefixed workspace, a
-// length-prefixed canonical stream_id, a big-endian u64 version and 32 hash
-// bytes — the head's stored hash for a chained head, UnchainedHeadHash when
-// the head's hash is empty (unchained, written before migration 0002). A
+// equal (workspace, canonical stream_id) keys keep their input order. The
+// pre-image starts with the length-prefixed "es-lite.anchor.v1" domain
+// separator (a u32 big-endian byte count, as for every length-prefixed
+// field below) and a big-endian u64 head count, then encodes each head, in
+// sorted order, as a length-prefixed workspace, a length-prefixed canonical
+// stream_id, a big-endian u64 version and 32 hash bytes — the head's stored
+// hash for a chained head, UnchainedHeadHash when the head's hash is empty
+// (unchained, written before migration 0002). A
 // hash that is neither empty nor exactly HashSize bytes is a programming
 // error and panics: ValidateStreamHead reports the same condition as an
 // error for callers that would rather reject than crash. A flat hash, not
