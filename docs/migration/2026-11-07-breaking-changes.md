@@ -356,8 +356,9 @@ the `counter_service.proto` fixture is the reference.
 
 **What changes.** `Poller.Run` and `Relay.Run` no longer exit on the first
 drain error: a failing drain is retried with backoff — `Config.MaxRetries`
-/ `RelayConfig.MaxRetries` (0 → 3 retries, negative → retry for as long
-as the context lives) and `Config.RetryBackoff` / `RelayConfig.RetryBackoff`
+/ `RelayConfig.MaxRetries` (0 → 3 retries, positive → exactly that many,
+negative → fail fast: the first drain error is returned immediately with
+no retries, design D10) and `Config.RetryBackoff` / `RelayConfig.RetryBackoff`
 (default 100ms per attempt, capped at 5s) — and only an exhausted budget
 is returned. A closed `Wake` channel no longer spins the loop hot: its
 buffered signal, if any, is drained once and the channel is then ignored.
@@ -369,7 +370,7 @@ after errors, instead of once per batch.
 
 **Who is affected.** Callers that treated any `Run` return as a
 process-fatal store blip: transient errors are now absorbed up to the
-retry budget (or indefinitely with a negative `MaxRetries`), so `Run`
+retry budget (a negative `MaxRetries` fails fast instead), so `Run`
 returns only for exhausted budgets or cancellation. Constructions wiring
 nil for `src`/`cp`/`drainer` now panic at wiring time instead of failing
 on first use. Operators repointing a live subscriber's checkpoint
@@ -379,6 +380,6 @@ on the next tick.
 
 **What to do.** Pick the retry policy per deployment — the defaults
 (3 retries, linear backoff) ride out short blips; a negative `MaxRetries`
-with a bounded `RetryBackoff` is the never-give-up delivery posture.
-Wire real deps at construction. Repoint checkpoints with the poller
-stopped.
+is the fail-fast posture: `Run` surfaces the first drain error
+immediately. Wire real deps at construction. Repoint checkpoints with
+the poller stopped.
