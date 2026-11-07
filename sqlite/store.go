@@ -165,14 +165,28 @@ func NewWithDB(ctx context.Context, db *sql.DB, opts ...Option) (*Store, error) 
 	return s, nil
 }
 
-// Migrate applies pending versioned migrations (ADR 0010). SQLite is
-// single-writer, so no lock is needed; each migration runs in its own
-// transaction and is recorded in schema_migrations. Idempotent.
+// Migrate applies pending versioned migrations (ADR 0010). Each
+// migration is ONE write transaction that INSERTs its schema_migrations
+// row FIRST and applies the DDL second — there is no pre-check SELECT
+// to race on (F34: with check-then-apply, two processes migrating one
+// file DSN can both pass the check and both apply, the loser failing on
+// a duplicate column or a lost version-row insert). The INSERT itself
+// is the lock: SQLite allows one writer per database file, so rival
+// migrators serialize on the write lock the INSERT takes, and a
+// primary-key violation means the winner's row is committed — roll back
+// and skip. SQLite DDL is transactional, so the version row and the
+// schema change commit atomically: a recorded version always has its
+// schema, and a skipped version was fully applied by the rival.
+// Idempotent.
 func (s *Store) Migrate(ctx context.Context) error {
 	migs, err := migrate.Load(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
+	// Bootstrap: schema_migrations must exist before the first
+	// INSERT-first transaction can record anything. CREATE TABLE IF NOT
+	// EXISTS is idempotent — racing bootstraps serialize on the same
+	// write lock and the second is a no-op.
 	if _, err := s.db.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    INTEGER PRIMARY KEY,
@@ -181,24 +195,25 @@ func (s *Store) Migrate(ctx context.Context) error {
 		return fmt.Errorf("sqlite: schema_migrations: %w", err)
 	}
 	for _, m := range migs {
-		var exists int
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT 1 FROM schema_migrations WHERE version = ?`, m.Version).Scan(&exists); err == nil {
-			continue // already applied
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("sqlite: check migration %d: %w", m.Version, err)
-		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
+		// Insert first. This statement takes the file's single write
+		// lock, which serializes rival migrators; a primary-key
+		// violation against a rival's committed row means this
+		// migration is already applied — roll back (releasing the one
+		// connection) and skip.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (?)`, m.Version); err != nil {
+			tx.Rollback()
+			if isConstraintViolation(err) {
+				continue
+			}
+			return fmt.Errorf("sqlite: record migration %d: %w", m.Version, err)
+		}
 		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("sqlite: migration %04d_%s: %w", m.Version, m.Name, err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (?)`, m.Version); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("sqlite: record migration %d: %w", m.Version, err)
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("sqlite: commit migration %d: %w", m.Version, err)
