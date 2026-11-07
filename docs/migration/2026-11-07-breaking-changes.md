@@ -351,3 +351,34 @@ is the loud form of a failure that already existed at first use. Give
 every command RPC's response the `WriteResult` shape (singular
 `stream_id`, `version`, `global_position`) and a singular state field —
 the `counter_service.proto` fixture is the reference.
+
+## 2026-11-07 — `delivery` loops retry transient drain errors; `Poller`/`Relay` constructors validate their deps
+
+**What changes.** `Poller.Run` and `Relay.Run` no longer exit on the first
+drain error: a failing drain is retried with backoff — `Config.MaxRetries`
+/ `RelayConfig.MaxRetries` (0 → 3 retries, negative → retry for as long
+as the context lives) and `Config.RetryBackoff` / `RelayConfig.RetryBackoff`
+(default 100ms per attempt, capped at 5s) — and only an exhausted budget
+is returned. A closed `Wake` channel no longer spins the loop hot: its
+buffered signal, if any, is drained once and the channel is then ignored.
+`NewPoller` now panics on a nil `src` or `cp` and `NewRelay` on a nil
+`drainer`, naming the parameter (alongside the existing `Subscriber`/
+handler checks). `Poller` also caches its checkpoint position after each
+successful save and reloads it from the store only on the first pass and
+after errors, instead of once per batch.
+
+**Who is affected.** Callers that treated any `Run` return as a
+process-fatal store blip: transient errors are now absorbed up to the
+retry budget (or indefinitely with a negative `MaxRetries`), so `Run`
+returns only for exhausted budgets or cancellation. Constructions wiring
+nil for `src`/`cp`/`drainer` now panic at wiring time instead of failing
+on first use. Operators repointing a live subscriber's checkpoint
+externally: a running poller no longer rereads the checkpoint each pass,
+so the change surfaces after the process restarts or a drain error, not
+on the next tick.
+
+**What to do.** Pick the retry policy per deployment — the defaults
+(3 retries, linear backoff) ride out short blips; a negative `MaxRetries`
+with a bounded `RetryBackoff` is the never-give-up delivery posture.
+Wire real deps at construction. Repoint checkpoints with the poller
+stopped.
