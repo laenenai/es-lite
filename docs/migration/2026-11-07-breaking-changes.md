@@ -102,3 +102,40 @@ return an error; one that adopts log-order attestation returns the
 rows with `to_position <= upto` in any order — `es.OrderRoot` sorts.
 JSON consumers must tolerate the three new anchor fields; ones that
 decode into their own structs ignore them by default.
+
+## 2026-11-07 — Postgres appends write `log_order`; the anchor/relay role reads it
+
+**What changes.** Migration `0006` adds the `log_order` table, and from
+the moment it lands every Postgres append transaction also writes one
+row to it: the batch's position range, workspace/stream scope, event
+count, and `batch_hash` — a SHA-256 over exactly that transaction's own
+events (`es.BatchOrderHash`, domain `es-lite.log-order.v1`) — computed
+and inserted inside the append transaction itself, with no new reads,
+locks or serialization (the single extra INSERT per non-empty batch is
+the accepted cost). `postgres.Store.Anchor`/`CheckAnchor` now also
+compute and compare an order root over the rows at or below the fenced,
+settled bound, so every anchor recorded from now on carries
+`order_root_hash` (never nil — a legacy anchor's nil is what marks it
+heads-only). `es-verify` grows the `order` subcommand, and `all` runs
+it after the stream chains: it recomputes every covered batch hash from
+the events and exits 1 on the first mismatch, 2 when zero rows are
+attested or the backend cannot verify order yet (SQLite's log-order
+attestation lands in a later task; `order`/`all` exit 2 with its stub
+error until then).
+
+**Who is affected.** The DB principals running the anchor path and
+`es-verify`: they now need `SELECT` on `log_order` (the anchor's order
+root and the deep verify read it under the role-gated RLS bypass), in
+addition to their existing grants — without it the path fails with a
+permission error where it used to work. Append-heavy workloads see one
+more single-row INSERT per batch. Events appended before migration
+`0006` have no `log_order` row and stay unattested by the order root —
+an anchor covering only those rows reports `order_count` 0 with a real
+`order_root_hash` over the empty row set.
+
+**What to do.** Add `GRANT SELECT ON log_order TO <the anchor job's
+role>` (and to the relay principal's, if it runs `es-verify`) before
+deploying this version. No code changes for `es.Anchorer` consumers:
+`OrderRows` is already on the interface, and the three anchor fields
+already serialize (the entry above). Expect `es-verify all` on SQLite
+to exit 2 transitionally until its log-order attestation lands.

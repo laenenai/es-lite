@@ -10,13 +10,18 @@
 //	  verify one stream (workspace required on Postgres; a never-written
 //	  stream is an error unless --allow-empty)
 //	es-verify all [--strict]
-//	  verify every stream (--strict: every row must be chained)
+//	  verify every stream (--strict: every row must be chained), then the
+//	  global log order (each log_order batch hash, recomputed from the
+//	  events)
 //	es-verify anchor [--upto N]
 //	  take an anchor and print it as JSON (export it off-box)
 //	es-verify anchor --check <anchor.json>
 //	  recompute an exported anchor and compare
 //	es-verify anchor list
 //	  list recorded anchors
+//	es-verify order [--upto N]
+//	  deep-verify the log order: recompute every log_order batch hash
+//	  from the events at or below the bound (0 = the log head)
 //
 // Config (env), as es-migrate: BACKEND (postgres|sqlite), PG_DSN, SQLITE_DSN.
 package main
@@ -47,8 +52,15 @@ type backend struct {
 	es.Anchorer
 	scope        func(workspace string) es.Store
 	chainedSince func(context.Context) (time.Time, error)
-	multiWS      bool
-	close        func()
+	// verifyOrder is the deep log-order verification, present only on
+	// backends that implement it (Postgres). Nil means the backend
+	// cannot deep-verify order yet: the order stage then surfaces the
+	// backend's own OrderRows error and exits 2 — never a silent skip,
+	// never a vacuous pass (sqlite's log-order attestation lands in a
+	// later task).
+	verifyOrder func(context.Context, uint64) (*postgres.OrderVerifyReport, error)
+	multiWS     bool
+	close       func()
 }
 
 func main() {
@@ -75,6 +87,8 @@ func run(args []string) int {
 		return cmdAll(ctx, b, args[1:])
 	case "anchor":
 		return cmdAnchor(ctx, b, args[1:])
+	case "order":
+		return cmdOrder(ctx, b, args[1:])
 	default:
 		usage()
 		return exitUsage
@@ -85,7 +99,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   es-verify stream [--allow-empty] [<workspace>] <type:id>
   es-verify all [--strict]
-  es-verify anchor [--upto N] | --check <anchor.json> | list`)
+  es-verify anchor [--upto N] | --check <anchor.json> | list
+  es-verify order [--upto N]`)
 }
 
 func cmdStream(ctx context.Context, b *backend, args []string) int {
@@ -148,6 +163,13 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 		}
 	}
 	fmt.Printf("es-verify: %d streams checked\n", len(refs))
+	// The order stage runs after the stream chains: first what each
+	// stream contains, then how the batches landed in the global log.
+	// A backend that cannot deep-verify order yet says so loudly here
+	// (exit 2, its own OrderRows error) instead of passing vacuously.
+	if c := cmdOrder(ctx, b, nil); c != exitIntact {
+		code = c
+	}
 	return code
 }
 
@@ -173,6 +195,57 @@ func verifyOne(ctx context.Context, b *backend, ws string, sid es.StreamID, opts
 		return exitUsage
 	default:
 		fmt.Printf("ok      %s head=v%d chained_from=%d head_hash=%s\n", label, rep.Head, rep.ChainedFrom, hex.EncodeToString(rep.HeadHash))
+		return exitIntact
+	}
+}
+
+// cmdOrder runs the deep log-order verification (design D1): for every
+// log_order row at or below the bound, recompute the row's batch hash
+// from the events and compare — the audit that catches a repositioned
+// event, which every stream chain and the heads root survive. Printing
+// shares verifyOne's shape; a mismatch is exit 1 with the offending
+// row's from_position, and an anchor-free log with zero attested rows
+// is EMPTY (exit 2, F13: it certifies nothing). A backend without the
+// deep verify (sqlite until its log-order attestation lands) surfaces
+// its own OrderRows error and exits 2 — no silent skip, no vacuous
+// pass.
+func cmdOrder(ctx context.Context, b *backend, args []string) int {
+	fs := flag.NewFlagSet("order", flag.ContinueOnError)
+	upto := fs.Uint64("upto", 0, "verify log order at or below this global_position (0 = log head)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() > 0 {
+		usage()
+		return exitUsage
+	}
+	if b.verifyOrder == nil {
+		_, err := b.OrderRows(ctx, *upto)
+		if err == nil {
+			err = errors.New("this backend cannot deep-verify log order yet")
+		}
+		fmt.Fprintf(os.Stderr, "es-verify: %v\n", err)
+		return exitUsage
+	}
+	rep, err := b.verifyOrder(ctx, *upto)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "es-verify: %v\n", err)
+		return exitUsage
+	}
+	switch {
+	case !rep.OK:
+		m := rep.Mismatch
+		fmt.Printf("BROKEN  log order at batch from_position %d: batch_hash %s, recomputed %s\n",
+			m.From, hex.EncodeToString(m.ExpectedBatchHash), hex.EncodeToString(m.ActualBatchHash))
+		return exitBroken
+	case rep.RowsChecked == 0:
+		// Zero attested rows certifies nothing about order (F13):
+		// everything at or below the bound predates log-order
+		// attestation.
+		fmt.Println("EMPTY   log order: no attested batches")
+		return exitUsage
+	default:
+		fmt.Printf("ok      log order: %d batches verified\n", rep.RowsChecked)
 		return exitIntact
 	}
 }
@@ -247,6 +320,7 @@ func openBackend(ctx context.Context) (*backend, error) {
 			Anchorer:     store,
 			scope:        store.Workspace,
 			chainedSince: store.ChainedSince,
+			verifyOrder:  store.VerifyOrder,
 			multiWS:      true,
 			close:        store.Close,
 		}, nil

@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/laenenai/es-lite/es"
@@ -112,6 +117,103 @@ func TestVerifyStreamEmptyStreamIsNotIntact(t *testing.T) {
 		closeDB(t, s)
 		if code := run([]string{"stream", sid.Canonical()}); code != exitBroken {
 			t.Errorf("stream on a tampered chain: exit %d, want %d", code, exitBroken)
+		}
+	})
+}
+
+// captureOutput runs fn with os.Stdout and os.Stderr redirected into
+// pipes and returns what each collected. The copiers drain the pipes
+// concurrently, so fn can write freely; the originals are restored even
+// on failure.
+func captureOutput(t *testing.T, fn func()) (stdout, stderr string) {
+	t.Helper()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	rOut, wOut, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stdout: %v", err)
+	}
+	rErr, wErr, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe stderr: %v", err)
+	}
+	os.Stdout, os.Stderr = wOut, wErr
+	defer func() {
+		os.Stdout, os.Stderr = oldOut, oldErr
+		rOut.Close()
+		rErr.Close()
+	}()
+	var outBuf, errBuf syncBuffer
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(&outBuf, rOut); done <- struct{}{} }()
+	go func() { io.Copy(&errBuf, rErr); done <- struct{}{} }()
+	fn()
+	wOut.Close()
+	wErr.Close()
+	<-done
+	<-done
+	return outBuf.String(), errBuf.String()
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent copiers above.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestVerifyOrderTransitionalOnSQLite pins the Task 7 CLI shape on the
+// backend without log-order attestation yet (sqlite's lands in Task 8):
+// the order stage must surface the backend's own OrderRows stub error
+// clearly and exit 2 — never a silent skip, never a vacuous pass — and
+// `all`, which now runs order after the stream chains, must verify the
+// streams first and then surface the same error. Task 8 removes this
+// transitional behavior.
+func TestVerifyOrderTransitionalOnSQLite(t *testing.T) {
+	t.Run("order surfaces the sqlite stub and exits 2", func(t *testing.T) {
+		s := newTestDB(t)
+		closeDB(t, s)
+		var code int
+		_, stderr := captureOutput(t, func() { code = run([]string{"order"}) })
+		if code != exitUsage {
+			t.Errorf("order on sqlite: exit %d, want %d", code, exitUsage)
+		}
+		if !strings.Contains(stderr, "sqlite: order rows not available yet") {
+			t.Errorf("order on sqlite: stderr %q, want the backend's own stub error surfaced", stderr)
+		}
+	})
+
+	t.Run("all verifies streams first, then surfaces the stub and exits 2", func(t *testing.T) {
+		s := newTestDB(t)
+		sid, err := es.NewStreamID("thing", "a")
+		if err != nil {
+			t.Fatalf("stream id: %v", err)
+		}
+		seedStream(t, s, sid, 2)
+		closeDB(t, s)
+		var code int
+		stdout, stderr := captureOutput(t, func() { code = run([]string{"all"}) })
+		if code != exitUsage {
+			t.Errorf("all on sqlite: exit %d, want %d (the order stage must not pass vacuously)", code, exitUsage)
+		}
+		if !strings.Contains(stdout, "ok      thing:a head=v2") {
+			t.Errorf("all on sqlite: stdout %q, want the stream verified ok before the order stage", stdout)
+		}
+		if !strings.Contains(stdout, "es-verify: 1 streams checked") {
+			t.Errorf("all on sqlite: stdout %q, want the streams-checked summary", stdout)
+		}
+		if !strings.Contains(stderr, "sqlite: order rows not available yet") {
+			t.Errorf("all on sqlite: stderr %q, want the order stage's stub error surfaced", stderr)
 		}
 	})
 }

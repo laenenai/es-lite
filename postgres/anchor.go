@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -119,13 +120,18 @@ func (s *Store) settledBound(ctx context.Context, upto uint64) (uint64, error) {
 
 // Anchor implements es.Anchorer: it computes the root over every stream's
 // head at or below upto (0 = the log head) across all workspaces, records
-// the row and returns it. Runs under app.bypass_rls.
+// the row and returns it. It also computes the order root over the
+// log_order rows at or below the same bound (design D1) and returns it
+// in the anchor's three order fields — the recorded row keeps the five
+// legacy columns; the order root travels with the exported anchor, the
+// off-box witness. Runs under app.bypass_rls.
 //
 // The bound is fenced: settledBound resolves upto to a permanently
 // settled position before any head is read, so a concurrent append below
 // the head cannot tear the root — the anchor is recorded either after
 // that append settled (its row included) or below it (its position
-// excluded), and CheckAnchor agrees forever after.
+// excluded), and CheckAnchor agrees forever after. The order rows join
+// the same settled section, so the order root is exactly as permanent.
 func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 	// The role gate precedes the fence (bypassTx re-verifies for free,
 	// once per Store): a non-member session must fail fast with the typed
@@ -148,12 +154,32 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 		return es.Anchor{}, err
 	}
 	root := es.AnchorRoot(heads)
+	// The order rows join the same settled, fenced section: a row and
+	// its events commit in one transaction, so every log_order row at
+	// or below the bound is as permanently final as the heads are —
+	// nothing inside the bound can appear later (spec §5.1.3).
+	rows, err := orderRows(ctx, tx, upto)
+	if err != nil {
+		return es.Anchor{}, err
+	}
+	orderRoot := es.OrderRoot(rows)
 	a := es.Anchor{
 		ID:                 newV7().String(),
 		CreatedAt:          es.TruncateMicros(time.Now()),
 		UptoGlobalPosition: upto,
 		StreamCount:        uint64(len(heads)),
 		RootHash:           root[:],
+		// A new-style anchor always carries an order root — over an
+		// empty row set when the bound covers no batch (a real hash, per
+		// the empty-set contract; nil is exclusively the legacy marker
+		// for anchors recorded before log-order attestation).
+		OrderRootHash: orderRoot[:],
+		OrderCount:    uint64(len(rows)),
+	}
+	// rows is from_position-ascending: the first row's From is the first
+	// position the root attests; 0 (the zero value) when none are.
+	if len(rows) > 0 {
+		a.OrderFromPosition = rows[0].From
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO anchors (anchor_id, created_at, upto_global_position, stream_count, root_hash) VALUES ($1,$2,$3,$4,$5)`,
@@ -196,7 +222,10 @@ func (s *Store) ListAnchors(ctx context.Context) ([]es.Anchor, error) {
 // position and compares. The recompute is fenced exactly like Anchor's —
 // settledBound resolves the bound first — so the verdict is taken over
 // permanently settled heads: it cannot miss an append still in flight
-// below the anchor's bound, and an agreement holds.
+// below the anchor's bound, and an agreement holds. A new-style anchor
+// (non-nil OrderRootHash) has its three order fields compared over the
+// same settled section; a legacy anchor (nil) skips them and verifies
+// heads-only.
 func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	// The role gate precedes the fence, as in Anchor: a non-member session
 	// fails fast with the typed error, never a spurious verdict.
@@ -220,6 +249,26 @@ func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	if uint64(len(hs)) != a.StreamCount || !bytes.Equal(root[:], a.RootHash) {
 		return fmt.Errorf("%w: anchor %s at global_position %d (streams %d, recomputed %d)",
 			es.ErrAnchorMismatch, a.ID, a.UptoGlobalPosition, a.StreamCount, len(hs))
+	}
+	// The order fields compare only on a new-style anchor: nil
+	// OrderRootHash is exclusively the legacy marker for an anchor
+	// recorded before log-order attestation, and such an anchor
+	// verifies heads-only.
+	if a.OrderRootHash == nil {
+		return nil
+	}
+	rows, err := orderRows(ctx, tx, upto)
+	if err != nil {
+		return err
+	}
+	orderRoot := es.OrderRoot(rows)
+	var from uint64
+	if len(rows) > 0 {
+		from = rows[0].From
+	}
+	if !bytes.Equal(orderRoot[:], a.OrderRootHash) || from != a.OrderFromPosition || uint64(len(rows)) != a.OrderCount {
+		return fmt.Errorf("%w: anchor %s at global_position %d (order rows %d, recomputed %d; order from %d, recomputed %d; order root %x, recomputed %x)",
+			es.ErrAnchorMismatch, a.ID, a.UptoGlobalPosition, a.OrderCount, len(rows), a.OrderFromPosition, from, a.OrderRootHash, orderRoot[:])
 	}
 	return nil
 }
@@ -252,12 +301,253 @@ func (s *Store) ListStreams(ctx context.Context) ([]es.StreamRef, error) {
 	return out, rows.Err()
 }
 
-// OrderRows implements es.Anchorer. Temporary stub: Postgres log-order
-// attestation (design D1) lands in a later task (Task 7), which
-// replaces this with a real query over the log_order table under
-// app.bypass_rls; until then this Store cannot serve order rows.
+// OrderRows implements es.Anchorer: the log_order rows with
+// to_position <= upto, under app.bypass_rls (the role-gated admin path,
+// as for every cross-workspace read). upto == 0 reads the whole log —
+// which is exactly "the current log head": every committed row's
+// to_position was drawn from the position sequence, so no committed row
+// can sit above it. The read takes no fence round because it records
+// nothing; the paths that freeze rows into a root (Anchor, CheckAnchor,
+// VerifyOrder) read them inside their own settled, fenced section
+// through the same helper.
 func (s *Store) OrderRows(ctx context.Context, upto uint64) ([]es.OrderRow, error) {
-	return nil, fmt.Errorf("postgres: order rows not available yet (log-order attestation lands in a later task)")
+	tx, err := s.bypassTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	return orderRows(ctx, tx, upto)
+}
+
+// logOrderRow is one log_order row with the scope columns es.OrderRow
+// drops — workspace and canonical stream — which the deep verify needs
+// to group events to their batch.
+type logOrderRow struct {
+	es.OrderRow
+	Workspace string
+	Stream    string // canonical "type:id", as events stores it
+
+	// entries are the events VerifyOrder found in the row's range, in
+	// the position order the pages delivered them (ascending).
+	entries []es.OrderEntry
+}
+
+// readLogOrderRows reads the log_order rows with to_position <= upto
+// (upto == 0: no clamp, the whole log) under tx, in ascending
+// from_position order.
+func readLogOrderRows(ctx context.Context, tx pgx.Tx, upto uint64) ([]logOrderRow, error) {
+	q := `SELECT from_position, to_position, event_count, batch_hash, workspace_id, stream_id FROM log_order`
+	args := []any{}
+	if upto > 0 {
+		q += ` WHERE to_position <= $1`
+		args = append(args, upto)
+	}
+	q += ` ORDER BY from_position`
+	rows, err := tx.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("read log_order: %w", err)
+	}
+	defer rows.Close()
+	var out []logOrderRow
+	for rows.Next() {
+		var r logOrderRow
+		if err := rows.Scan(&r.From, &r.To, &r.Count, &r.BatchHash, &r.Workspace, &r.Stream); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// orderRows adapts readLogOrderRows to the es.OrderRow shape the
+// anchor paths aggregate.
+func orderRows(ctx context.Context, tx pgx.Tx, upto uint64) ([]es.OrderRow, error) {
+	full, err := readLogOrderRows(ctx, tx, upto)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]es.OrderRow, len(full))
+	for i := range full {
+		out[i] = full[i].OrderRow
+	}
+	return out, nil
+}
+
+// OrderVerifyReport is the verdict of VerifyOrder, the deep log-order
+// verification: whether every covered log_order row's recomputed batch
+// hash matched, how many rows were checked, and — when OK is false —
+// the first mismatching row in from_position order. A broken log order
+// is a verdict, not an error: the report carries it (the ChainReport
+// precedent), and VerifyOrder's error return is reserved for failures
+// to run the verification at all.
+type OrderVerifyReport struct {
+	OK          bool
+	RowsChecked uint64
+	Mismatch    *OrderRowMismatch
+}
+
+// OrderRowMismatch is the first log_order row whose recomputed
+// es.BatchOrderHash differs from the stored batch_hash: the row's
+// from_position, the hash the append transaction attested (the stored
+// row), and the hash the events actually yield now.
+type OrderRowMismatch struct {
+	From              uint64
+	ExpectedBatchHash []byte
+	ActualBatchHash   []byte
+}
+
+// orderVerifyPageSize is the event page size VerifyOrder reads positions
+// at: large enough that verifying a big log is a few round trips per
+// thousand events, small enough that no page's payloads stress memory
+// (the cost class is VerifyStream's, which also reads full envelopes).
+const orderVerifyPageSize = 1000
+
+// readPositions pages events by global position under tx (the caller
+// owns the RLS bypass): the envelopes with global_position > from and
+// <= to, ascending, at most limit of them. It reuses envelopeCols — the
+// column shape every envelope read shares — so the deep verify walks
+// exactly what the store returns everywhere else. Positions are bigint:
+// the bounds cross the wire as int64 (pgx sends uint64 as numeric, the
+// ReadAllBounded comment's detour).
+func readPositions(ctx context.Context, tx pgx.Tx, from, to uint64, limit int) ([]es.Envelope, error) {
+	return queryDB(ctx, tx,
+		`SELECT `+envelopeCols+` FROM events
+		  WHERE global_position > $1 AND global_position <= $2
+		  ORDER BY global_position ASC LIMIT $3`,
+		int64(from), int64(to), limit)
+}
+
+// orderScope keys the log_order rows of one (workspace, stream) — the
+// scope a single append writes. Same-stream batches never share
+// positions: a later same-stream append draws its positions only after
+// the earlier one committed (or it loses the version race and writes
+// nothing), so each scope's rows are disjoint and from_position
+// ascending — the invariant coveringRow's binary search relies on.
+type orderScope struct {
+	workspace string
+	stream    string
+}
+
+// coveringRow returns the row of rs whose [From, To] range contains
+// pos, or nil. rs is from_position ascending; the rightmost row
+// starting at or below pos is the only candidate, and if its range does
+// not reach pos, no row does. (A tampered log can break the
+// disjointness — overlapping rows, positions moved across scopes — and
+// then this attribution is merely deterministic: the hash comparison,
+// not the attribution, is what reports the tamper.)
+func coveringRow(rs []*logOrderRow, pos uint64) *logOrderRow {
+	i := sort.Search(len(rs), func(i int) bool { return rs[i].From > pos })
+	if i == 0 {
+		return nil
+	}
+	r := rs[i-1]
+	if r.To >= pos {
+		return r
+	}
+	return nil
+}
+
+// VerifyOrder deep-verifies the log-order attestation (design D1,
+// F11): for every log_order row at or below a settled bound it
+// recomputes the row's es.BatchOrderHash from the events themselves —
+// paged by position under the RLS bypass, grouped to each row by its
+// (workspace, stream) scope and its [from_position, to_position]
+// range — and reports the first row whose recomputed hash disagrees
+// with the stored batch_hash. This is the check that catches a
+// repositioned, inserted or deleted event inside an attested batch,
+// which the per-stream chains and the heads root all survive; the
+// exported anchor's OrderRootHash is the off-box witness that catches
+// a wholesale rewrite (ADR 0029's chain/anchor trust split, applied to
+// order).
+//
+// It is an admin path, gated like the anchor path: the role check
+// precedes the fence, and the bound comes from the same settledBound
+// round — every row and every event at or below it is permanently
+// settled, so the verdict cannot be torn by an append committing
+// mid-verification: a batch's row and its events commit in one
+// transaction, and nothing at or below the bound can appear later.
+//
+// Events appended before migration 0006 have no log_order row; they are
+// unattested and skipped (the order analog of the chain's ChainedFrom).
+func (s *Store) VerifyOrder(ctx context.Context, upto uint64) (*OrderVerifyReport, error) {
+	// The role gate precedes the fence, as in Anchor: a non-member
+	// session fails fast with the typed error, never a verdict it was
+	// not allowed to compute.
+	if err := s.checkRelayRole(ctx); err != nil {
+		return nil, err
+	}
+	bound, err := s.settledBound(ctx, upto)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.bypassTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := readLogOrderRows(ctx, tx, bound)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return &OrderVerifyReport{OK: true}, nil
+	}
+
+	// Index the rows by scope, keeping the global from_position order
+	// per scope; rows are referenced in place so the entries each page
+	// adds land on the row being verified.
+	byScope := make(map[orderScope][]*logOrderRow)
+	for i := range rows {
+		r := &rows[i]
+		k := orderScope{r.Workspace, r.Stream}
+		byScope[k] = append(byScope[k], r)
+	}
+
+	// Page the settled log from the first covered position — nothing
+	// below it can belong to a row — and group each event to its row.
+	// Pages arrive ascending by position, so every row's entries do
+	// too: the order BatchOrderHash attests.
+	cursor := rows[0].From - 1
+	for {
+		page, err := readPositions(ctx, tx, cursor, bound, orderVerifyPageSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for i := range page {
+			e := &page[i]
+			cursor = e.GlobalPosition
+			if r := coveringRow(byScope[orderScope{e.Workspace, e.StreamID.Canonical()}], e.GlobalPosition); r != nil {
+				r.entries = append(r.entries, es.OrderEntry{Position: e.GlobalPosition, Hash: e.Hash})
+			}
+			// An event no row covers is a pre-0006 event (unattested)
+			// or a tampered position: the row it left behind is what
+			// reports the mismatch.
+		}
+		if len(page) < orderVerifyPageSize {
+			break
+		}
+	}
+
+	// Compare every row in from_position order; the first disagreement
+	// is the report's mismatch.
+	rep := &OrderVerifyReport{OK: true, RowsChecked: uint64(len(rows))}
+	for i := range rows {
+		recomputed := es.BatchOrderHash(rows[i].entries)
+		if !bytes.Equal(recomputed[:], rows[i].BatchHash) {
+			rep.OK = false
+			rep.Mismatch = &OrderRowMismatch{
+				From:              rows[i].From,
+				ExpectedBatchHash: append([]byte(nil), rows[i].BatchHash...),
+				ActualBatchHash:   append([]byte(nil), recomputed[:]...),
+			}
+			break
+		}
+	}
+	return rep, nil
 }
 
 // heads returns each (workspace, stream)'s highest version at or below upto

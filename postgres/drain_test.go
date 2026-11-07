@@ -269,14 +269,16 @@ func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
 		t.Fatalf("revoke %s from %s: %v", relayRole, anchorProbe, err)
 	}
 	// The anchor path's privileges as the probe: reading events (the log
-	// head, stream heads, the stream list), reading/writing anchors, and
-	// — since the anchor path fences on the horizon (Task 4) — reading
-	// the position sequence the fence's first statement reads (Task 16
-	// will relax this to USAGE via pg_sequences). Nothing more — the
-	// bypass must stay a policy matter, not a privilege one.
+	// head, stream heads, the stream list), reading/writing anchors,
+	// reading log_order (the order root over the per-batch rows, Task 7)
+	// and — since the anchor path fences on the horizon (Task 4) —
+	// reading the position sequence the fence's first statement reads
+	// (Task 16 will relax this to USAGE via pg_sequences). Nothing more
+	// — the bypass must stay a policy matter, not a privilege one.
 	if _, err := s.Pool().Exec(ctx,
 		`GRANT USAGE ON SCHEMA public TO `+anchorProbe+`;
 		 GRANT SELECT ON events TO `+anchorProbe+`;
+		 GRANT SELECT ON log_order TO `+anchorProbe+`;
 		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe+`;
 		 GRANT SELECT ON SEQUENCE events_global_position_seq TO `+anchorProbe); err != nil {
 		t.Fatalf("grant anchor-path privileges: %v", err)
@@ -312,6 +314,15 @@ func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
 	}
 	if _, err := outsider.ListAnchors(ctx); !errors.Is(err, postgres.ErrRelayRoleMissing) {
 		t.Fatalf("list anchors as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+	// The log-order reads the anchor path grew in Task 7 are gated the
+	// same way: raw order rows and the deep verify both refuse, never a
+	// vacuous root over invisible rows or a verdict over them.
+	if _, err := outsider.OrderRows(ctx, 0); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("order rows as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+	if _, err := outsider.VerifyOrder(ctx, 0); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("verify order as a non-member: err=%v, want ErrRelayRoleMissing", err)
 	}
 	// Mutates nothing: only the superuser's anchor exists — a non-member
 	// session must not have recorded a root over zero heads behind the

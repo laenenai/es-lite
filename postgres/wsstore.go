@@ -262,6 +262,33 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		envs[i] = env
 	}
 
+	// Log-order attestation (design D1, F11): one log_order row per
+	// non-empty batch, hashed and inserted in THIS transaction from
+	// exactly the (position, hash) pairs the loop above already
+	// collected — no new reads, no new locks, no cross-transaction
+	// dependency, so the append path gains no serialization (ADR 0029's
+	// global-chain rejection stands; the single INSERT is the accepted
+	// D1 cost). The entries go in loop order, which is position order:
+	// one transaction draws its positions in event order. Anchors
+	// aggregate these rows into the order root that attests the global
+	// append order, and `es-verify order` recomputes each row's hash
+	// from the events in its range.
+	if len(p.Events) > 0 {
+		entries := make([]es.OrderEntry, len(envs))
+		for i := range envs {
+			entries[i] = es.OrderEntry{Position: envs[i].GlobalPosition, Hash: envs[i].Hash}
+		}
+		batchHash := es.BatchOrderHash(entries)
+		if _, err := db.Exec(ctx,
+			`INSERT INTO log_order (from_position, to_position, workspace_id, stream_id, event_count, batch_hash)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			int64(envs[0].GlobalPosition), int64(envs[len(envs)-1].GlobalPosition),
+			w.ws, canonical, len(envs), batchHash[:],
+		); err != nil {
+			return zero, fmt.Errorf("insert log_order: %w", err)
+		}
+	}
+
 	if err := w.applyClaims(ctx, db, canonical, p.Constraints); err != nil {
 		return zero, err
 	}

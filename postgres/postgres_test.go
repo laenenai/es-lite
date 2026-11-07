@@ -47,8 +47,10 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// anchor tests run before drain_test's own ensure).
 	ensureRelayRole(t, ctx, s)
 	// Isolate each test: tests run sequentially, so a truncate is safe and
-	// keeps the shared partitioned tables clean.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+	// keeps the shared partitioned tables clean. log_order is truncated
+	// with events — its rows are written by the same appends, and a stale
+	// row would dispute the next test's order roots and deep verifies.
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -283,10 +285,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0005 (relay role
-	// policies) made it five.
-	if v != 5 {
-		t.Fatalf("applied version = %d, want 5", v)
+	// Every embedded migration is applied on Open; 0006 (log-order
+	// attestation) made it six.
+	if v != 6 {
+		t.Fatalf("applied version = %d, want 6", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.
