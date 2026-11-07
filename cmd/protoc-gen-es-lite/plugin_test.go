@@ -286,6 +286,67 @@ func TestProjectionGeneratesHandlerAndRunner(t *testing.T) {
 	assertAllImportsUsed(t, content)
 }
 
+// TestProjectionEmitsUpcasterSeam (F20): a state-fetching spec's Deps
+// carries an optional per-aggregate es.Upcaster — nil decodes as stored —
+// and dispatch runs it between decode and the variant assertion, so a
+// stored v1 event can flow through regenerated code. Reactions share the
+// same deps/dispatch emit; metadata-only specs decode nothing and are
+// unchanged.
+func TestProjectionEmitsUpcasterSeam(t *testing.T) {
+	f := domainFile(true)
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(goodSpec())})
+	content, err := runWith(t, f)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{
+		"StateUpcaster upgrades stored event shapes on read; nil decodes as stored.",
+		"StateUpcaster es.Upcaster[Event]",
+		"stateUpcaster := deps.StateUpcaster",
+		"if stateUpcaster != nil {",
+		"decoded, err = stateUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)",
+		`return fmt.Errorf("View: upcast %s v%d: %w", env.StreamID, env.Version, err)`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated code lacks %q:\n%s", want, content)
+		}
+	}
+	// The upcast must run before the variant assertion, so the handler is
+	// handed the upgraded event, not the stored one.
+	if i, j := strings.Index(content, "stateUpcaster.Upcast("), strings.Index(content, "decoded.(*Happened)"); i < 0 || j < 0 || i > j {
+		t.Fatalf("upcast must run between decode and the variant assertion:\n%s", content)
+	}
+	assertAllImportsUsed(t, content)
+
+	// The reaction's deps share the same seam.
+	r := domainFile(true)
+	r.MessageType = append(r.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
+		Name: "t.react", Consumes: []string{"t.v1.Happened"}, Issues: []string{"t.v1.Do"},
+		Fetch: esv1.FetchMode_FETCH_MODE_STATE_AS_OF_EVENT_VERSION,
+	})})
+	if content, err = runWith(t, r); err != nil {
+		t.Fatalf("generate reaction: %v", err)
+	}
+	for _, want := range []string{
+		"StateUpcaster es.Upcaster[Event]",
+		"decoded, err = stateUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated reaction lacks %q:\n%s", want, content)
+		}
+	}
+
+	// Metadata-only specs decode nothing: no seam.
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_METADATA_ONLY
+	if content, err = runWith(t, readModel(spec), domainFile(true)); err != nil {
+		t.Fatalf("generate metadata-only: %v", err)
+	}
+	if strings.Contains(content, "Upcaster") {
+		t.Fatalf("metadata-only projection must not emit an upcaster seam:\n%s", content)
+	}
+}
+
 func TestProjectionErrors(t *testing.T) {
 	cases := map[string]struct {
 		mutate func(*esv1.ProjectionSpec)

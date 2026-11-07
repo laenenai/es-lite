@@ -156,7 +156,8 @@ func (p projSpec) catalogue() catalogueEntry {
 //	func CounterViewConsumes() []string
 //	type CounterViewHandler interface { On<Event>(ctx, env[, ev, state]) error ... }
 //	type CounterView<State>Loader interface { LoadAsOfVersion(...) }   (STATE_AS_OF only)
-//	type CounterViewDeps struct { <State> <Loader>; <State>Codec es.Codec[<Event>]; Marker projection.Marker }
+//	type CounterViewDeps struct { <State> <Loader>; <State>Codec es.Codec[<Event>];
+//	                              <State>Upcaster es.Upcaster[<Event>]; Marker projection.Marker }
 //	func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projection.Runner
 func writeProjection(g *protogen.GeneratedFile, p projSpec) {
 	base := p.base
@@ -272,6 +273,7 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	streamID := g.QualifiedGoIdent(esPkgPath.Ident("StreamID"))
 	codec := g.QualifiedGoIdent(esPkgPath.Ident("Codec"))
+	upcaster := g.QualifiedGoIdent(esPkgPath.Ident("Upcaster"))
 	marker := g.QualifiedGoIdent(projectionPkgPath.Ident("Marker"))
 	if withState {
 		for _, a := range aggs.sorted() {
@@ -292,6 +294,8 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 			g.P("	// ", depName(a), "Codec decodes ", a.pkg, " events; nil selects the generated codec.")
 			g.P("	// Supply an unsealing codec when payloads are sealed (ADR 0025).")
 			g.P("	", depName(a), "Codec ", codec, "[", g.QualifiedGoIdent(a.ifaceIdent()), "]")
+			g.P("	// ", depName(a), "Upcaster upgrades stored event shapes on read; nil decodes as stored.")
+			g.P("	", depName(a), "Upcaster ", upcaster, "[", g.QualifiedGoIdent(a.ifaceIdent()), "]")
 		}
 	}
 	if routers != nil {
@@ -313,7 +317,9 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 }
 
 // writeDispatch emits `dispatch := func(ctx, env) error { switch env.TypeURL
-// {...} }` inside a runner constructor. issuer, when non-nil, is the
+// {...} }` inside a runner constructor. Each state-fetching branch decodes
+// with the deps' codec, runs the deps' optional upcaster over the decoded
+// event, and then asserts the variant. issuer, when non-nil, is the
 // reaction's issuing set: the handler gets an issuer and its issues are
 // executed after it returns.
 func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, withState bool, issuer *aggregateSet) {
@@ -336,6 +342,7 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 			g.P("	if ", v, " == nil {")
 			g.P("		", v, " = ", g.QualifiedGoIdent(a.codecIdent()), "{}")
 			g.P("	}")
+			g.P("	", lowerFirst(depName(a)), "Upcaster := deps.", depName(a), "Upcaster")
 		}
 	}
 	g.P("	dispatch := func(ctx ", ctx, ", env ", envelope, ") error {")
@@ -351,6 +358,13 @@ func writeDispatch(g *protogen.GeneratedFile, base string, consumes []consumed, 
 			g.P("			decoded, err := ", v, ".Decode(", encoded, "{TypeURL: env.TypeURL, SchemaVersion: env.SchemaVersion, Payload: env.Payload})")
 			g.P("			if err != nil {")
 			g.P("				return ", errorf, "(\"", base, ": decode %s v%d: %w\", env.StreamID, env.Version, err)")
+			g.P("			}")
+			u := lowerFirst(depName(c.agg)) + "Upcaster"
+			g.P("			if ", u, " != nil {")
+			g.P("				decoded, err = ", u, ".Upcast(env.TypeURL, env.SchemaVersion, decoded)")
+			g.P("				if err != nil {")
+			g.P("					return ", errorf, "(\"", base, ": upcast %s v%d: %w\", env.StreamID, env.Version, err)")
+			g.P("				}")
 			g.P("			}")
 			g.P("			ev, ok := decoded.(*", g.QualifiedGoIdent(c.msg.GoIdent), ")")
 			g.P("			if !ok {")
