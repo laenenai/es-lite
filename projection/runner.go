@@ -29,14 +29,25 @@ func (f FeedFunc) Feed(ctx context.Context, handle func(ctx context.Context, e e
 
 // LogFeed is a Feed over the event log itself: it pages Source.ReadAll from
 // From (exclusive) in global order and polls every Poll for more. A handler
-// error is retried on the same envelope after Poll, so delivery is
-// at-least-once in order. From is normally the runner's marker; LogFeed itself
-// keeps no checkpoint.
+// error is retried on the same envelope — at-least-once, in order — after a
+// backoff that starts at Poll and doubles per attempt, capped at MaxBackoff;
+// attempts are unbounded, so a poison event blocks the stream forever, but
+// each retry is reported through OnRetry when one is set. From is normally
+// the runner's marker; LogFeed itself keeps no checkpoint.
 type LogFeed struct {
 	Source Source
 	From   uint64
 	Batch  int           // default 500
 	Poll   time.Duration // default 50ms
+	// OnRetry is called before every retry backoff with the envelope that
+	// failed, the error the handler returned for it and the attempt number
+	// (1 = the first retry of the envelope). It is the retry loop's only
+	// signal: without it a poison event blocks the stream silently. Nil
+	// keeps the loop silent.
+	OnRetry func(ctx context.Context, e es.Envelope, err error, attempt int)
+	// MaxBackoff caps the retry backoff. Zero means 5s, so a bare LogFeed
+	// keeps the documented cadence with the doubling bounded.
+	MaxBackoff time.Duration
 }
 
 // Feed implements Feed. It returns ctx.Err() when ctx ends, and a Source
@@ -49,6 +60,10 @@ func (f *LogFeed) Feed(ctx context.Context, handle func(ctx context.Context, e e
 	if poll <= 0 {
 		poll = 50 * time.Millisecond
 	}
+	max := f.MaxBackoff
+	if max <= 0 {
+		max = 5 * time.Second
+	}
 	pos := f.From
 	for {
 		evs, err := f.Source.ReadAll(ctx, pos, batch)
@@ -56,12 +71,31 @@ func (f *LogFeed) Feed(ctx context.Context, handle func(ctx context.Context, e e
 			return err
 		}
 		for _, e := range evs {
+			attempt := 1
+			delay := poll
+			if delay > max {
+				delay = max
+			}
 			for {
-				if err := handle(ctx, e); err == nil {
+				herr := handle(ctx, e)
+				if herr == nil {
 					break
 				}
-				if err := sleep(ctx, poll); err != nil {
-					return err
+				if f.OnRetry != nil {
+					f.OnRetry(ctx, e, herr, attempt)
+				}
+				if serr := sleep(ctx, delay); serr != nil {
+					return serr
+				}
+				attempt++
+				if delay < max {
+					// Double toward the cap; a wrapped product (a
+					// MaxBackoff beyond int64's reach) pins at the cap
+					// instead of sleeping a negative duration.
+					delay *= 2
+					if delay > max || delay <= 0 {
+						delay = max
+					}
 				}
 			}
 			pos = e.GlobalPosition
