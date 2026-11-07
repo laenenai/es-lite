@@ -277,3 +277,45 @@ visible. Callers of `eventfeed.Feed` should treat an
 `errors.Is(err, feed.ErrDefinitionChanged)` return as fatal for the
 subscription: the recovery is an operator's `ResetCheckpoint` under the
 new definition, not a restart.
+
+## 2026-11-07 — `sqlite.NewWithDB` enforces the single-connection contract on the caller's handle
+
+**What changes.** `sqlite.NewWithDB` now calls `db.SetMaxOpenConns(1)` on
+the handle it is given, holding borrowed handles to the same
+single-connection contract `Open` has always enforced. The single Go
+connection is what buys `busy_timeout`/`BUSY_SNAPSHOT` immunity and keeps
+an in-memory (`mode=memory`) database alive for the Store's lifetime;
+file-level single-writer is what keeps positions gap-free — a borrowed
+handle configured for more connections silently forfeited the first two
+guarantees. `NewWithDB` still does not touch the DSN's pragmas: WAL,
+`busy_timeout` and `foreign_keys` remain the caller's, and the driver
+must be `modernc.org/sqlite` (`isConstraintViolation` matches its error
+type only).
+
+**Who is affected.** Callers of `sqlite.NewWithDB` whose handle was
+configured with a higher connection limit: the limit is lowered to 1 as a
+side effect of construction — code that reads the handle's
+`Stats().MaxOpenConnections` after wrapping sees 1, and concurrent users
+of the same handle outside the Store serialize behind it.
+
+**What to do.** Nothing for correctness — the enforced limit is the
+contract the package already documented. A caller that genuinely needs
+more connections for its own work must use a separate handle, not share
+the Store's.
+
+## 2026-11-07 — `sqlite.Store.Close` no longer closes a borrowed handle
+
+**What changes.** `sqlite.Store.Close` now closes the underlying
+`*sql.DB` only when the Store created it (`Open`). A Store built with
+`NewWithDB` borrows the caller's handle, and `Close` leaves it open —
+mirroring `postgres.OpenWithPool`, which has always worked this way.
+Closing is the caller's job.
+
+**Who is affected.** Callers of `sqlite.NewWithDB` that relied on
+`Store.Close` to close their handle: the handle now stays open after
+`Close`, so a program that counted on that side effect holds the handle
+until its own cleanup runs.
+
+**What to do.** Close the handle yourself when you are done with it — the
+code that built the `*sql.DB` closes it, exactly as the `OpenWithPool`
+contract has always required on the Postgres side.

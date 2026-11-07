@@ -3,9 +3,18 @@
 // ports (feed.Log/Logs, feed.CheckpointStore, feed.LeaseStore).
 //
 // SQLite is the first backend precisely because its single-writer model
-// makes the delivery cursor gap-free for free (docs/adr/0001 §5). The
-// store keeps a single database connection so writes are serialized and
-// global_position is assigned in commit order.
+// makes the delivery cursor gap-free for free (docs/adr/0001 §5). It is
+// the file-level single-writer lock that keeps global_position gap-free
+// and commit-ordered.
+//
+// The store also holds a single Go database connection —
+// db.SetMaxOpenConns(1), enforced by Open and re-enforced by NewWithDB on
+// borrowed handles. That one connection is what buys
+// busy_timeout/BUSY_SNAPSHOT immunity (a read-then-write transaction
+// cannot straddle two connections) and keeps a mode=memory database alive
+// for the Store's lifetime. The driver must be modernc.org/sqlite:
+// isConstraintViolation classifies constraint failures by matching that
+// driver's error type only, so no other driver is supported.
 //
 // One database is one workspace. The feed ports accept a scope for parity
 // with multi-tenant backends, but SQLite has no row-level security and no
@@ -84,8 +93,17 @@ func formatTS(t time.Time) string         { return t.UTC().Format(tsLayout) }
 func parseTS(s string) (time.Time, error) { return time.Parse(tsLayout, s) }
 
 // Store is the SQLite-backed es.Store.
+//
+// Handle ownership depends on which constructor was used: Open creates the
+// handle and Close closes it, whereas NewWithDB borrows a caller-provided
+// handle and Close leaves it alone.
 type Store struct {
 	db *sql.DB
+
+	// ownsDB records whether this Store created the *sql.DB and may
+	// therefore close it. False for a handle handed in by NewWithDB,
+	// where the caller may still be using it for other work.
+	ownsDB bool
 
 	// maxPayloadBytes is the effective append-time payload cap
 	// (WithMaxPayloadBytes): appends holding a larger payload are rejected
@@ -99,6 +117,9 @@ var _ es.Store = (*Store)(nil)
 // the schema. dsn is a modernc.org/sqlite DSN, e.g.
 // "file:events.db" or "file:mem?mode=memory&cache=shared". Pragmas for
 // WAL, busy-timeout, and foreign keys are set automatically.
+//
+// The Store owns the handle it creates, so Close closes it. A caller that
+// needs to manage the handle itself should use NewWithDB.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	dsn = withPragmas(dsn)
 	db, err := sql.Open("sqlite", dsn)
@@ -110,7 +131,7 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	cfg := newOpenConfig(opts)
-	s := &Store{db: db, maxPayloadBytes: cfg.maxPayloadBytes}
+	s := &Store{db: db, ownsDB: true, maxPayloadBytes: cfg.maxPayloadBytes}
 	if cfg.autoMigrate {
 		if err := s.Migrate(ctx); err != nil {
 			db.Close()
@@ -120,9 +141,20 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	return s, nil
 }
 
-// NewWithDB wraps an already-open *sql.DB. Useful for tests that manage the
-// handle themselves. Applies migrations unless WithoutAutoMigrate is passed.
+// NewWithDB wraps an already-open *sql.DB. The handle is borrowed, not
+// owned: Close leaves it open and the caller closes it (mirroring
+// postgres.OpenWithPool). NewWithDB does enforce the package's
+// single-connection contract — it calls db.SetMaxOpenConns(1) whatever
+// limit the handle carried — but the DSN's pragmas (WAL, busy_timeout,
+// foreign_keys) remain the caller's, and the driver must be
+// modernc.org/sqlite (see the package doc). Useful for tests that manage
+// the handle themselves. Applies migrations unless WithoutAutoMigrate is
+// passed.
 func NewWithDB(ctx context.Context, db *sql.DB, opts ...Option) (*Store, error) {
+	// Hold borrowed handles to the same contract as Open's (F19): more
+	// than one connection forfeits the busy_timeout/BUSY_SNAPSHOT
+	// immunity and memory-DB lifetime the package guarantees.
+	db.SetMaxOpenConns(1)
 	cfg := newOpenConfig(opts)
 	s := &Store{db: db, maxPayloadBytes: cfg.maxPayloadBytes}
 	if cfg.autoMigrate {
@@ -175,8 +207,15 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the underlying database.
-func (s *Store) Close() error { return s.db.Close() }
+// Close closes the underlying database when the Store owns it — when it
+// came from Open. A Store built with NewWithDB borrowed the caller's
+// handle and leaves it open; the caller closes it.
+func (s *Store) Close() error {
+	if !s.ownsDB {
+		return nil
+	}
+	return s.db.Close()
+}
 
 // DB exposes the underlying handle (for read-model projections that live
 // in the same database as the log).

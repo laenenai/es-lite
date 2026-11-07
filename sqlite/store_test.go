@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -136,4 +137,52 @@ func TestReadStreamEmptyRangeStillNil(t *testing.T) {
 			t.Fatalf("whole read after truncation: envs=%d err=%v, want the v3 survivor alone", len(envs), err)
 		}
 	})
+}
+
+// TestNewWithDBEnforcesSingleConnection pins the single-connection
+// contract (F19): a handle handed to NewWithDB is held to the same
+// SetMaxOpenConns(1) limit Open enforces, whatever limit the caller had
+// configured — the single Go connection is what buys the package's
+// busy_timeout/BUSY_SNAPSHOT immunity and memory-DB lifetime.
+func TestNewWithDBEnforcesSingleConnection(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:"+t.Name()+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(4)
+
+	if _, err := sqlite.NewWithDB(ctx, db); err != nil {
+		t.Fatalf("NewWithDB: %v", err)
+	}
+	if got := db.Stats().MaxOpenConnections; got != 1 {
+		t.Fatalf("MaxOpenConnections = %d after NewWithDB, want 1 (the package's single-connection contract)", got)
+	}
+}
+
+// TestCloseDoesNotCloseBorrowedDB pins the other half of the contract
+// (F19): a Store built with NewWithDB borrows the caller's handle, so
+// Close leaves it open — the caller closes it, exactly as
+// postgres.OpenWithPool has always behaved.
+func TestCloseDoesNotCloseBorrowedDB(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:"+t.Name()+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	s, err := sqlite.NewWithDB(ctx, db)
+	if err != nil {
+		t.Fatalf("NewWithDB: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The handle was borrowed, not owned: the caller's *sql.DB must
+	// still be usable after the Store is closed.
+	if err := db.Ping(); err != nil {
+		t.Fatalf("db.Ping() after Store.Close(): %v (the borrowed handle was closed)", err)
+	}
 }
