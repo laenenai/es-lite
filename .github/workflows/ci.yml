@@ -16,16 +16,16 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0 # buf breaking needs main history
-      - uses: jdx/mise-action@v2 # installs go/buf/task/golangci-lint/govulncheck pinned in .mise.toml
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4 — installs go/buf/task/golangci-lint/govulncheck pinned in .mise.toml
       - run: task generate:check # buf lint + regenerate, fail on drift
       - run: task lint:proto   # buf lint + breaking against main
       - run: task vet
       - run: task lint:go     # golangci-lint (errcheck, govet, staticcheck)
       - run: task test           # unit tests (integration suites skip without env)
-      - run: task coverage    # unit suite with profile + COVERAGE_FLOOR ratchet
+      - run: task coverage    # unit + Postgres union profile, COVERAGE_FLOOR ratchet (finding F28)
       - run: task test:race
       - run: task vuln
 
@@ -37,12 +37,12 @@ jobs:
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
       - run: task buf:export VERSION=main
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: es-lite-proto-main
           path: dist/es-lite-proto-main.tar.gz
@@ -54,12 +54,21 @@ jobs:
     needs: check
     if: github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
       # The target spins up a throwaway container (Docker is preinstalled on
       # the runner), tears it down via `defer`, and runs the suite under
       # -race -shuffle=on (production review A4).
       - run: task test:pg
+      # The suite's coverage profile (pg.cover): the Postgres leg of the
+      # coverage union (finding F28). task coverage re-runs the suite for
+      # the gate; the upload keeps the integration run's own profile
+      # inspectable on each CI build.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pg-coverage-profile
+          path: pg.cover
+          if-no-files-found: error
 
   # The nightly feed gate: chaos no-loss, 1M-row page-query plan and the
   # 100-subscriber fleet scenario, plus nothing else — the schedule event
@@ -69,8 +78,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
       # task test:feedgate starts its own throwaway Postgres and tears it
       # down via `defer`; expect ~10-15 minutes under -race.
       - run: task test:feedgate
