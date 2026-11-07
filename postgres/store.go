@@ -281,6 +281,21 @@ const envelopeCols = `
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, workspace_id, prev_hash, hash`
 
+// parseStoredUUID parses one stored audit-UUID column (event_id,
+// correlation_id, causation_id, command_id). A value that does not parse
+// fails the whole read (F34): the old code zeroed it and handed back an
+// envelope whose audit trail pointed at nothing. The error names the column
+// and the value's LENGTH only — never the value's bytes, which must not
+// leak into logs, and never uuid.Parse's own error, whose message quotes
+// the offending string.
+func parseStoredUUID(column, value string) (uuid.UUID, error) {
+	id, err := uuid.Parse(value)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("stored %s is not a valid uuid: length %d", column, len(value))
+	}
+	return id, nil
+}
+
 // scanEnvelope reads one row (in envelopeCols order). The payload is opaque —
 // stored and returned as-is (ADR 0025); es-lite performs no decryption.
 func scanEnvelope(row pgx.Row) (es.Envelope, error) {
@@ -309,10 +324,21 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	}
 	e.StreamID = sid
 	e.Workspace = workspaceID
-	e.EventID, _ = uuid.Parse(eventID)
-	e.CorrelationID, _ = uuid.Parse(correlationID)
-	e.CausationID, _ = uuid.Parse(causationID)
-	e.CommandID, _ = uuid.Parse(commandID)
+	// The audit UUIDs are load-bearing (F34): a value that does not parse
+	// fails the read rather than being silently zeroed into a forged
+	// envelope.
+	if e.EventID, err = parseStoredUUID("event_id", eventID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CorrelationID, err = parseStoredUUID("correlation_id", correlationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CausationID, err = parseStoredUUID("causation_id", causationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CommandID, err = parseStoredUUID("command_id", commandID); err != nil {
+		return es.Envelope{}, err
+	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	e.Payload = payload
 	return e, nil

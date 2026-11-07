@@ -291,7 +291,15 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		)
 		if err != nil {
 			if isConstraintViolation(err) {
-				// A concurrent writer claimed this version first.
+				// The modernc message names the violated index definition
+				// (F25): events.event_id is the duplicate-EventID case —
+				// the event itself is a rerun, and retrying can never win —
+				// while events.stream_id, events.version is the
+				// version-race backstop and keeps today's ErrConflict. An
+				// unrecognized violation falls back to the conflict arm.
+				if isDuplicateEventIDViolation(err) {
+					return zero, fmt.Errorf("%w: %s at v%d: %v", es.ErrDuplicateEventID, p.StreamID, version, err)
+				}
 				return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
 			}
 			return zero, fmt.Errorf("insert event v%d: %w", version, err)
@@ -553,6 +561,9 @@ func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es
 
 // scanEnvelope scans one row selected with envelopeCols. It is the single
 // column list/scan pairing shared by every read, including the feed page.
+// The audit UUIDs are load-bearing (F34): a stored event_id,
+// correlation_id, causation_id or command_id that does not parse fails the
+// read rather than being silently zeroed into a forged envelope.
 func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	var (
 		e                                     es.Envelope
@@ -570,8 +581,8 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		return es.Envelope{}, err
 	}
 	var err error
-	if e.EventID, err = uuid.Parse(eventID); err != nil {
-		return es.Envelope{}, fmt.Errorf("parse event_id %q: %w", eventID, err)
+	if e.EventID, err = parseStoredUUID("event_id", eventID); err != nil {
+		return es.Envelope{}, err
 	}
 	if e.StreamID, err = es.ParseCanonical(streamID); err != nil {
 		return es.Envelope{}, fmt.Errorf("parse stream_id %q: %w", streamID, err)
@@ -582,11 +593,32 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	if e.RecordedAt, err = parseTS(recordedAt); err != nil {
 		return es.Envelope{}, fmt.Errorf("parse recorded_at %q: %w", recordedAt, err)
 	}
-	e.CorrelationID, _ = uuid.Parse(correlationID)
-	e.CausationID, _ = uuid.Parse(causationID)
-	e.CommandID, _ = uuid.Parse(commandID)
+	if e.CorrelationID, err = parseStoredUUID("correlation_id", correlationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CausationID, err = parseStoredUUID("causation_id", causationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CommandID, err = parseStoredUUID("command_id", commandID); err != nil {
+		return es.Envelope{}, err
+	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	return e, nil
+}
+
+// parseStoredUUID parses one stored audit-UUID column (event_id,
+// correlation_id, causation_id, command_id). A value that does not parse
+// fails the whole read (F34): the old code zeroed it and handed back an
+// envelope whose audit trail pointed at nothing. The error names the
+// column and the value's LENGTH only — never the value's bytes, which
+// must not leak into logs, and never uuid.Parse's own error, whose
+// message quotes the offending string.
+func parseStoredUUID(column, value string) (uuid.UUID, error) {
+	id, err := uuid.Parse(value)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("stored %s is not a valid uuid: length %d", column, len(value))
+	}
+	return id, nil
 }
 
 // LoadCheckpoint returns the last processed global_position for a
@@ -625,6 +657,20 @@ func isConstraintViolation(err error) bool {
 			code == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
 	}
 	return false
+}
+
+// isDuplicateEventIDViolation reports whether a failed events INSERT hit
+// the event_id UNIQUE constraint (F25). modernc.org/sqlite names the
+// violated index definition in its message — "UNIQUE constraint failed:
+// events.event_id" for this one, "UNIQUE constraint failed:
+// events.stream_id, events.version" for the version backstop — so the
+// column list in the message is the only discriminator.
+func isDuplicateEventIDViolation(err error) bool {
+	se, ok := errors.AsType[*msqlite.Error](err)
+	if !ok {
+		return false
+	}
+	return strings.Contains(se.Error(), "events.event_id")
 }
 
 func newV7() uuid.UUID {

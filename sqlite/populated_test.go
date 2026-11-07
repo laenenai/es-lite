@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/migrate"
 )
@@ -43,15 +44,19 @@ func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 	}
 
 	// Two pre-chain rows, as the old Append wrote them (no hash columns).
+	// The audit UUIDs are the canonical nil-UUID strings Append writes for
+	// zero metadata — the scan rejects anything that does not parse (F34),
+	// and the old Append never wrote empty strings there.
 	sid, _ := es.NewStreamID("thing", "old")
 	old := es.TruncateMicros(time.Now().Add(-time.Hour))
+	nilUUID := uuid.Nil.String()
 	for v := 1; v <= 2; v++ {
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO events (event_id, stream_type, stream_id, version, type_url, schema_version, occurred_at, recorded_at,
 			   correlation_id, causation_id, command_id, actor_type, actor_id, actor_principal, payload)
 			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			newV7().String(), sid.Type, sid.Canonical(), v, "thing.v1.Happened", 1, formatTS(old), formatTS(old),
-			"", "", "", "", "", "", []byte{byte(v)}); err != nil {
+			nilUUID, nilUUID, nilUUID, "", "", "", []byte{byte(v)}); err != nil {
 			t.Fatalf("seed v%d: %v", v, err)
 		}
 	}

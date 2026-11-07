@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/laenenai/es-lite/aggregate"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
@@ -143,6 +145,109 @@ func TestOptimisticConcurrency(t *testing.T) {
 	})
 	if !errors.Is(err, es.ErrConflict) {
 		t.Fatalf("stale append: got %v, want ErrConflict", err)
+	}
+}
+
+// TestDuplicateEventIDIsNotConflict pins the F25 classification: appending
+// an EventID the log already stores — on ANOTHER stream, so no version is
+// contested — fails with es.ErrDuplicateEventID, which is not
+// es.ErrConflict. A caller that retried on ErrConflict would loop forever:
+// the event is already in the log and the append can never win.
+func TestDuplicateEventIDIsNotConflict(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_dup")
+	sidA, _ := es.NewStreamID("thing", "a")
+	sidB, _ := es.NewStreamID("thing", "b")
+	id := uuid.MustParse("11111111-1111-7111-8111-111111111111")
+
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sidA,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{EventID: id, TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+
+	// The same EventID on a different stream: both appends expect v0 of a
+	// fresh stream, so no version is contested — this is the
+	// (workspace_id, event_id) unique constraint, not the pkey backstop.
+	_, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sidB,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{EventID: id, TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("y")}},
+	})
+	if !errors.Is(err, es.ErrDuplicateEventID) {
+		t.Fatalf("duplicate event id append: got %v, want ErrDuplicateEventID", err)
+	}
+	if errors.Is(err, es.ErrConflict) {
+		t.Fatalf("duplicate event id append misrouted to ErrConflict: %v", err)
+	}
+
+	// The rejected append wrote nothing: stream B is still unwritten.
+	if v, err := ws.CurrentStreamVersion(ctx, sidB); err != nil || v != 0 {
+		t.Fatalf("stream B version after rejected append = %d (err %v), want 0", v, err)
+	}
+}
+
+// TestScanRejectsCorruptEventID pins the F34 read-side contract: a stored
+// audit-UUID column (event_id, correlation_id, causation_id, command_id)
+// that is not a UUID fails the read instead of being silently zeroed into
+// a forged envelope, and the error names the offending column and the
+// value's LENGTH only — the corrupt bytes themselves must never leak into
+// logs.
+func TestScanRejectsCorruptEventID(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_scan")
+
+	for i, col := range []string{"event_id", "correlation_id", "causation_id", "command_id"} {
+		t.Run(col, func(t *testing.T) {
+			sid, err := es.NewStreamID("thing", "corrupt-"+col)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Each row gets a distinct valid EventID (the unique
+			// constraint would otherwise reject the seed itself) and a
+			// corrupt value in exactly one audit column.
+			good := fmt.Sprintf("11111111-1111-4111-8111-%012d", i)
+			bad := "corrupt-" + col
+			cols := map[string]string{
+				"event_id":       good,
+				"correlation_id": good,
+				"causation_id":   good,
+				"command_id":     good,
+			}
+			cols[col] = bad
+			if _, err := s.Pool().Exec(ctx,
+				`INSERT INTO events (workspace_id, event_id, stream_type, stream_id, version,
+				   type_url, schema_version, occurred_at, recorded_at,
+				   correlation_id, causation_id, command_id,
+				   actor_type, actor_id, actor_principal, payload, prev_hash, hash)
+				 VALUES ('ws_scan', $1, 'thing', $2, 1,
+				   'thing.v1.Corrupt', 1, now(), now(),
+				   $3, $4, $5,
+				   'thing', 'seed', 'thing:seed', 'x', '', '')`,
+				cols["event_id"], sid.Canonical(), cols["correlation_id"], cols["causation_id"], cols["command_id"],
+			); err != nil {
+				t.Fatalf("seed corrupt row: %v", err)
+			}
+
+			_, rerr := ws.ReadStream(ctx, sid, 0, 0)
+			if rerr == nil {
+				t.Fatalf("read of a corrupt %s succeeded: want the read to fail", col)
+			}
+			msg := rerr.Error()
+			if !strings.Contains(msg, col) {
+				t.Fatalf("error %q does not name the offending column %q", msg, col)
+			}
+			if !strings.Contains(msg, fmt.Sprintf("length %d", len(bad))) {
+				t.Fatalf("error %q does not report the corrupt value's length %d", msg, len(bad))
+			}
+			if strings.Contains(msg, bad) {
+				t.Fatalf("error %q leaks the corrupt value's bytes", msg)
+			}
+		})
 	}
 }
 

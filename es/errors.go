@@ -14,6 +14,14 @@ var (
 	// The caller should reload the stream and retry the command.
 	ErrConflict = errors.New("es-lite: append conflict (expected version mismatch)")
 
+	// ErrDuplicateEventID reports that an Append carried an EventID the
+	// log already stores — on this stream or another. It is distinct
+	// from ErrConflict: no version was contested and nothing raced; the
+	// event itself is a rerun. Retrying cannot succeed — the event is
+	// already in the log — so a caller must treat it as an idempotency
+	// signal, never a retry cue.
+	ErrDuplicateEventID = errors.New("es-lite: event id already stored")
+
 	// ErrStreamNotFound is returned by ReadStream when it reads a stream
 	// from its beginning (fromVersion == 0, whatever the upper bound) and
 	// the stream has no events at all — it was never written. An empty

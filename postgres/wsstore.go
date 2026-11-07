@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -261,8 +262,27 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			env.PrevHash, env.Hash,
 		).Scan(&gp)
 		if err != nil {
-			if isUniqueViolation(err) {
-				return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+				// Classify by constraint (F25). Postgres reports the
+				// constraint partition-scoped on the HASH-partitioned
+				// events table: the migration's
+				// events_workspace_id_event_id_key fires as
+				// events_p3_workspace_id_event_id_key on whichever
+				// partition the workspace hashed to (verified against
+				// the running server; likewise events_pkey as
+				// events_p3_pkey), so the names match on what they ARE,
+				// not on the full prefix. The (workspace, event_id)
+				// unique key is the duplicate-EventID case — the event
+				// itself is a rerun; the primary key is the version-race
+				// backstop and keeps today's ErrConflict. Any other
+				// violation takes the original wrap below.
+				switch {
+				case strings.HasSuffix(pgErr.ConstraintName, "event_id_key"):
+					return zero, fmt.Errorf("%w: %s at v%d: %v", es.ErrDuplicateEventID, p.StreamID, version, err)
+				case strings.HasSuffix(pgErr.ConstraintName, "_pkey"):
+					return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
+				}
 			}
 			return zero, fmt.Errorf("insert v%d: %w", version, err)
 		}
