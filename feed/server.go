@@ -337,10 +337,22 @@ func (s *Server) renew(ctx context.Context, scope, projection, instance, owner s
 }
 
 // stallProbeEvery bounds the OnStall probe cadence: a stream idling on
-// empty pages consults Log.MatchingRawHead at most once per window, so a
-// fleet of idle subscribers cannot stampede the log with probes (spec
-// §5.12).
+// empty pages or waiting out a blocked clamp consults
+// Log.MatchingRawHead at most once per window, so a fleet of idle or
+// clamped subscribers cannot stampede the log with probes (spec
+// §5.12). Both probes — the read loop's and the clamp loop's — share
+// one window per stream.
 const stallProbeEvery = 3 * time.Second
+
+// clampProbeThreshold is N, the consecutive-observation count the clamp
+// loop's probe requires before reporting: OnStall fires after N=2
+// consecutive rate-limited probes — spaced by stallProbeEvery — each
+// observed head < pos with matchingRaw >= pos. The cadence starts
+// unarmed, so the first probe runs on the clamp's first re-head and the
+// second after one full window: a block persistent for about one probe
+// window signals, while an ordinary in-flight transaction that settles
+// inside the window stays silent.
+const clampProbeThreshold = 2
 
 // stream is the read/send loop. It runs under runCtx, which the renewer may
 // cancel; Subscribe translates the result. The event type set is the
@@ -378,35 +390,13 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 	if err != nil {
 		return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
 	}
-	// A checkpoint ahead of the settled head is ambiguous (spec §5.1):
-	// either the log was restored to an earlier point or is empty —
-	// clamp locally, never rewriting the consumer's checkpoint — or the
-	// head is only transiently low because a fence-bounded Log (Postgres)
-	// reports 0 while a transaction blocks the fence, and clamping would
-	// replay the whole log below the checkpoint. RawHead separates the
-	// regimes: raw >= pos proves the checkpoint's position is still in
-	// the committed log, so the fence is merely blocked and the stream
-	// waits and re-heads; only raw < pos (the position is gone) clamps.
-	for pos > head {
-		raw, rerr := log.RawHead(ctx)
-		if rerr != nil {
-			return fmt.Errorf("feed: raw head for scope %q: %w", req.Scope, rerr)
-		}
-		if raw < pos {
-			pos = head
-			break
-		}
-		if werr := s.wait(ctx); werr != nil {
-			return werr
-		}
-		if head, err = log.Head(ctx); err != nil {
-			return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
-		}
-	}
-
 	// Stall detection state (spec §5.8): the probe is rate-limited and
-	// one OnStall fires per stall episode, re-armed by the next page that
-	// delivers.
+	// one OnStall fires per stall episode, re-armed by the next page
+	// that delivers. Both probes share this state: the read loop's
+	// empty-page probe and the clamp loop's blocked-clamp probe space
+	// their MatchingRawHead consultations on one cadence, and an
+	// episode — from the first report to the next delivered page —
+	// reports exactly once, whichever loop observed it.
 	var (
 		lastProbe     time.Time
 		stallReported bool
@@ -428,6 +418,68 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 			stallReported = true
 			s.cfg.Observer.OnStall(pos, matchingRaw)
 		}
+	}
+
+	// probeClamp observes the clamp loop's blocked wait (review F15):
+	// the resume checkpoint sits above the settled head while the
+	// committed matching backlog still covers it — the position is
+	// alive, only the fence is wedged. Rate-limited on the shared
+	// cadence, it counts consecutive observations of that regime and
+	// reports OnStall(pos, matchingRaw) after clampProbeThreshold of
+	// them, latching the same stallReported the read loop's probe
+	// re-arms on delivery — one report per episode, not one per re-head.
+	// An observation of anything else — the fence cleared, or the
+	// matching backlog no longer covers the position — breaks the streak.
+	clampStreak := 0
+	probeClamp := func() {
+		if stallReported || time.Since(lastProbe) < stallProbeEvery {
+			return
+		}
+		lastProbe = time.Now()
+		matchingRaw, rerr := log.MatchingRawHead(ctx, req.Definition.Consumes)
+		if rerr != nil {
+			return // observability must never kill the stream
+		}
+		if head >= pos || matchingRaw < pos {
+			clampStreak = 0
+			return
+		}
+		clampStreak++
+		if clampStreak >= clampProbeThreshold {
+			stallReported = true
+			s.cfg.Observer.OnStall(pos, matchingRaw)
+		}
+	}
+
+	// A checkpoint ahead of the settled head is ambiguous (spec §5.1):
+	// either the log was restored to an earlier point or is empty —
+	// clamp locally, never rewriting the consumer's checkpoint — or the
+	// head is only transiently low because a fence-bounded Log (Postgres)
+	// reports 0 while a transaction blocks the fence, and clamping would
+	// replay the whole log below the checkpoint. RawHead separates the
+	// regimes: raw >= pos proves the checkpoint's position is still in
+	// the committed log, so the fence is merely blocked and the stream
+	// waits and re-heads; only raw < pos (the position is gone) clamps.
+	// The wait is not silent: a block that persists across re-heads is
+	// reported through the shared stall signal.
+	for pos > head {
+		raw, rerr := log.RawHead(ctx)
+		if rerr != nil {
+			return fmt.Errorf("feed: raw head for scope %q: %w", req.Scope, rerr)
+		}
+		if raw < pos {
+			pos = head
+			break
+		}
+		if werr := s.wait(ctx); werr != nil {
+			return werr
+		}
+		if head, err = log.Head(ctx); err != nil {
+			return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
+		}
+		// The re-head is the probe point: a clamp that persists here is
+		// a wedged fence, and the wait is observable.
+		probeClamp()
 	}
 
 	for {
@@ -814,10 +866,15 @@ func validateRequest(req Request, sink Sink) error {
 }
 
 // validateDefinition checks the definition every definition-carrying call
-// must pass: a name that matches the projection and at least one consumed
-// type. Subscribe resolves and authorizes the type set before calling the
-// core; an empty definition would seal the stream silently, and a
-// mismatched name would file one projection's checkpoints under another's.
+// must pass: a name that matches the projection, at least one consumed
+// type, and no control byte in any consumed type URL. Subscribe resolves
+// and authorizes the type set before calling the core; an empty definition
+// would seal the stream silently, and a mismatched name would file one
+// projection's checkpoints under another's. The control-byte refusal is
+// the same byte-level hygiene as the subscription key (containsControl):
+// a control byte is never legitimate in a type URL, and one accepted here
+// reaches every adapter's type filter and every matching-head probe the
+// core runs over the type set.
 func validateDefinition(req Request) error {
 	if req.Definition.Name == "" {
 		return fmt.Errorf("%w: definition name is required", ErrInvalidRequest)
@@ -828,6 +885,11 @@ func validateDefinition(req Request) error {
 	}
 	if len(req.Definition.Consumes) == 0 {
 		return fmt.Errorf("%w: definition consumes is required", ErrInvalidRequest)
+	}
+	for _, typ := range req.Definition.Consumes {
+		if containsControl(typ) {
+			return fmt.Errorf("%w: consumed type %q contains a control byte", ErrInvalidRequest, typ)
+		}
 	}
 	return nil
 }

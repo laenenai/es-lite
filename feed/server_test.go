@@ -964,6 +964,53 @@ func TestValidateKeyRejectsControlBytes(t *testing.T) {
 	}
 }
 
+// Control bytes are refused in every consumed type URL — the same
+// byte-level hygiene as the subscription key (containsControl): a
+// control byte is never legitimate in a type URL, and one accepted here
+// reaches every adapter's type filter and every matching-head probe the
+// core runs over the type set. Rejection must fail closed, before the
+// lease store.
+func TestValidateDefinitionRejectsControlBytes(t *testing.T) {
+	leases := newMemLeases()
+	// The waiter fails fast so that, if validation regresses and accepts
+	// the type set, the stream errors out instead of idling and hanging
+	// the test.
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+		Waiter: &blockingWaiter{err: errors.New("wakeup source failed")},
+	})
+	sink := newMemSink()
+
+	cases := []struct {
+		name     string
+		consumes []string
+	}{
+		{"nul inside a type url", []string{"a\x00b"}},
+		{"nul in a later entry", []string{"counter.v1.Incremented", "a\x00b"}},
+		{"soh", []string{"\x01"}},
+		{"del", []string{"\x7f"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := testRequest("live")
+			req.Definition.Consumes = tc.consumes
+			err := srv.Subscribe(context.Background(), req, sink)
+			if !errors.Is(err, feed.ErrInvalidRequest) {
+				t.Fatalf("Subscribe consuming %q: error = %v, want ErrInvalidRequest", tc.consumes, err)
+			}
+		})
+	}
+	if len(leases.acquired) != 0 {
+		t.Fatalf("rejected definitions acquired %d lease(s); validation must fail closed before the lease store", len(leases.acquired))
+	}
+
+	// A clean type set still passes: Status validates the same request
+	// shape through the same validateDefinition and must succeed.
+	if _, err := srv.Status(context.Background(), testRequest("live")); err != nil {
+		t.Fatalf("Status with a clean type set: %v, want nil", err)
+	}
+}
+
 // Request.Projection and Definition.Name name the same projection. A silent
 // mismatch would stream one projection's type set but file its checkpoints
 // under another projection's name.
@@ -1168,6 +1215,88 @@ func TestSubscribeResumeClampIsFenceAware(t *testing.T) {
 		if from < checkpoint {
 			t.Fatalf("read a page from %d, want >= %d on every page (no clamp replay)", from, checkpoint)
 		}
+	}
+
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
+// TestClampLoopReportsStall pins the clamp loop's observability (spec
+// §5.8, review F15): a resume checkpoint above the settled head with the
+// committed matching backlog still covering it — a fence wedged open by
+// an in-flight transaction — waits in the clamp loop, and the wait must
+// not be silent. The loop probes MatchingRawHead on the shared
+// stallProbeEvery cadence and, after clampProbeThreshold consecutive
+// probes observe head < pos with matchingRaw >= pos, reports
+// OnStall(pos, matchingRaw) through the same episode latch as the read
+// loop's stall probe: exactly one report for the clamped wait, no page
+// read below the checkpoint while the fence holds, and no second report
+// once the fence clears.
+func TestClampLoopReportsStall(t *testing.T) {
+	const checkpoint = uint64(5000)
+	obs := &recordingObserver{}
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", checkpoint)
+	// While blocked Head reports 0; the one committed matching event
+	// sits exactly at the checkpoint position, so matchingRaw = pos:
+	// the position is alive and only the fence is wedged — a blocked
+	// clamp, not a missing-types clamp.
+	log := &fenceBlockedLog{
+		events: []es.Envelope{
+			ev(checkpoint, "counter.v1.Incremented", "at-the-checkpoint"),
+		},
+		blocked: true,
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(),
+		Logs:     singleLogs{log},
+		Observer: obs,
+		Poll:     5 * time.Millisecond,
+	})
+	sink := newMemSink()
+	cancel, done := start(t, srv, testRequest("live"), sink)
+
+	// One OnStall within the window. The cadence starts unarmed, so the
+	// first probe observes on the first re-head and the second after
+	// one stallProbeEvery window — the two consecutive observations the
+	// report requires — putting the signal about one window after the
+	// clamp was entered.
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		if stalls := obs.stallsSnapshot(); len(stalls) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("OnStall calls = %d within the window, want 1 (a clamp blocked across two probe windows must report)",
+				len(obs.stallsSnapshot()))
+		}
+		// The probe observes the clamp, it must never perturb it: no
+		// page may be read below the blocked fence.
+		if reads := log.snapshotReads(); len(reads) > 0 {
+			t.Fatalf("read a page from %d while the fence was blocked, want no page below the checkpoint %d",
+				reads[0], checkpoint)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stalls := obs.stallsSnapshot()
+	if len(stalls) != 1 {
+		t.Fatalf("OnStall calls = %d, want exactly 1 for the clamped wait (the episode latch suppresses the rest)",
+			len(stalls))
+	}
+	if stalls[0].settled != checkpoint || stalls[0].matchingRaw != checkpoint {
+		t.Fatalf("OnStall = settled %d, matchingRaw %d, want the clamped position %d and the matching raw head covering it (%d)",
+			stalls[0].settled, stalls[0].matchingRaw, checkpoint, checkpoint)
+	}
+
+	// The fence clears: the clamp ends at the checkpoint and the stream
+	// settles there without a second report — the episode is over.
+	log.unblock()
+	time.Sleep(60 * time.Millisecond) // a few poll cycles, settled at the checkpoint
+	if stalls := obs.stallsSnapshot(); len(stalls) != 1 {
+		t.Fatalf("OnStall calls = %d after the fence cleared, want still 1 (the clamped episode reports exactly once)",
+			len(stalls))
 	}
 
 	cancel()
