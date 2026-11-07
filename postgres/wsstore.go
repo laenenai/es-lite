@@ -843,10 +843,11 @@ func (w *Workspace) MatchingHead(ctx context.Context, types []string) (uint64, e
 // with no fence and no bounding. It can jump past positions whose appends
 // are still in flight — the raw max is not a settle point — so it is not a
 // resume position: a feed that acked to RawHead would skip an in-flight
-// event when it commits. It exists for stall detection only (spec §5.8):
-// RawHead above the feed's position is committed backlog the settled reads
-// have not delivered, the signal to report OnStall; probe it rate-limited.
-// Deliberately not on es.Store.
+// event when it commits. It exists for the feed's fence-aware resume
+// clamp (spec §5.1): raw >= checkpoint proves the checkpoint's events
+// are still in the committed log, so a low Head is a blocked fence, not
+// a restored log. Stall detection reads its filtered counterpart,
+// MatchingRawHead. Deliberately not on es.Store.
 func (w *Workspace) RawHead(ctx context.Context) (uint64, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
@@ -860,6 +861,39 @@ func (w *Workspace) RawHead(ctx context.Context) (uint64, error) {
 	err = tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(global_position), 0) FROM events WHERE workspace_id = $1`,
 		w.ws,
+	).Scan(&head)
+	return head, err
+}
+
+// MatchingRawHead returns the highest raw committed position among
+// events of the given types — the subscription's own backlog, the view
+// stall detection compares against (spec §5.8), so a filtered stream
+// that is caught up on its consumed types never reports a stall while
+// unrelated event types keep landing. It is the MatchingHead query
+// without the fence round, read immediately like RawHead in its own
+// RLS-pinned transaction. Skipping the fence is sound because stall
+// detection is a liveness signal, not a correctness boundary — a torn
+// read can only mis-time a stall report, never corrupt data — so the
+// probe pays no fence round and never waits for in-flight appends to
+// settle. An empty types set matches nothing: 0. Deliberately not on
+// es.Store.
+func (w *Workspace) MatchingRawHead(ctx context.Context, types []string) (uint64, error) {
+	if len(types) == 0 {
+		return 0, nil
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events
+		  WHERE workspace_id = $1 AND type_url = ANY($2)`,
+		w.ws, types,
 	).Scan(&head)
 	return head, err
 }

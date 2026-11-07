@@ -39,8 +39,8 @@ func (s *Store) Head(ctx context.Context) (uint64, error) {
 // none. SQLite has no horizon fence (spec §5.1 is Postgres-only — one
 // connection serializes writers, so a reader can never observe a position
 // whose insert committed later), so RawHead equals Head; it exists because
-// the feed's stall probe and fence-aware resume clamp ask every Log for
-// the unbounded view.
+// the feed's fence-aware resume clamp asks every Log for the unbounded
+// view. Stall detection reads its filtered counterpart, MatchingRawHead.
 func (s *Store) RawHead(ctx context.Context) (uint64, error) {
 	var head uint64
 	err := s.db.QueryRowContext(ctx,
@@ -70,6 +70,36 @@ func (s *Store) MatchingHead(ctx context.Context, types []string) (uint64, error
 	var head uint64
 	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&head); err != nil {
 		return 0, fmt.Errorf("sqlite: matching head: %w", err)
+	}
+	return head, nil
+}
+
+// MatchingRawHead returns the highest raw committed position among
+// events of the given types, or 0 when none match — an empty types set
+// matches nothing. It is the stall-detection view (spec §5.8): the
+// subscription's own backlog with no settle bound. SQLite has no horizon
+// fence (spec §5.1 is Postgres-only — one connection serializes
+// writers, so a reader can never observe a position whose insert
+// committed later), so the raw and settled views cannot diverge and
+// MatchingRawHead is identical in body to MatchingHead. Stall
+// detection is a liveness signal, not a correctness boundary — a torn
+// read can only mis-time a stall report, never corrupt data — and on
+// this backend no torn read is even possible. Deliberately not on
+// es.Store.
+func (s *Store) MatchingRawHead(ctx context.Context, types []string) (uint64, error) {
+	if len(types) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?", len(types)), ",")
+	q := `SELECT COALESCE(MAX(global_position), 0) FROM events
+	      WHERE type_url IN (` + placeholders + `)`
+	args := make([]any, 0, len(types))
+	for _, t := range types {
+		args = append(args, t)
+	}
+	var head uint64
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&head); err != nil {
+		return 0, fmt.Errorf("sqlite: matching raw head: %w", err)
 	}
 	return head, nil
 }

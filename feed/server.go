@@ -337,8 +337,9 @@ func (s *Server) renew(ctx context.Context, scope, projection, instance, owner s
 }
 
 // stallProbeEvery bounds the OnStall probe cadence: a stream idling on
-// empty pages consults Log.RawHead at most once per window, so a fleet of
-// idle subscribers cannot stampede the log with probes (spec §5.12).
+// empty pages consults Log.MatchingRawHead at most once per window, so a
+// fleet of idle subscribers cannot stampede the log with probes (spec
+// §5.12).
 const stallProbeEvery = 3 * time.Second
 
 // stream is the read/send loop. It runs under runCtx, which the renewer may
@@ -415,13 +416,17 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 			return
 		}
 		lastProbe = time.Now()
-		raw, rerr := log.RawHead(ctx)
+		// The probe compares against the subscription's own backlog —
+		// the raw head over its consumed types — never the all-type
+		// raw head: a filtered stream caught up on its types is not
+		// stalled, however many unrelated events land above it.
+		matchingRaw, rerr := log.MatchingRawHead(ctx, req.Definition.Consumes)
 		if rerr != nil {
 			return // observability must never kill the stream
 		}
-		if raw > pos {
+		if matchingRaw > pos {
 			stallReported = true
-			s.cfg.Observer.OnStall(pos, raw)
+			s.cfg.Observer.OnStall(pos, matchingRaw)
 		}
 	}
 

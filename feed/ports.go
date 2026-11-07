@@ -92,10 +92,11 @@ type LeaseStore interface {
 // instead of polling. The first event of a page is included even when it alone
 // exceeds maxBytes, so an oversized event is visible to the caller.
 //
-// Head, RawHead and MatchingHead are the three head views the feed's
-// resume, stall detection and lag reporting need. On a fence-bounded Log
-// (Postgres, spec §5.1) they disagree while a transaction is in flight:
-// Head and MatchingHead settle only past the fence; RawHead never waits.
+// Head, RawHead, MatchingHead and MatchingRawHead are the four head
+// views the feed's resume, stall detection and lag reporting need. On a
+// fence-bounded Log (Postgres, spec §5.1) they disagree while a
+// transaction is in flight: Head and MatchingHead settle only past the
+// fence; RawHead and MatchingRawHead never wait.
 //
 // limit <= 0 and maxBytes <= 0 are adapter-defined defaults; the feed always
 // passes positive values from its Config.
@@ -112,14 +113,25 @@ type Log interface {
 	// flight, so it is never a resume position. It exists for the
 	// fence-aware resume clamp — raw >= checkpoint proves the
 	// checkpoint's events are still in the log, so a low Head is a
-	// blocked fence, not a restored log — and for stall detection
-	// (Observer.OnStall).
+	// blocked fence, not a restored log.
 	RawHead(ctx context.Context) (uint64, error)
 	// MatchingHead returns the highest settled position among events of
 	// types — the subscription's own head, what Status reports and
 	// measures lag against. It is fence-bounded exactly like Head on
 	// backends that fence. An empty types set matches nothing: 0.
 	MatchingHead(ctx context.Context, types []string) (uint64, error)
+	// MatchingRawHead returns the highest raw committed position among
+	// events of types: the subscription's own backlog, with no settle
+	// bound. It is the view stall detection compares against
+	// (Observer.OnStall), measured over the subscription's consumed
+	// types so a filtered stream that is caught up never reports a
+	// stall while unrelated event types keep landing. Like RawHead it
+	// never waits for the fence: it can jump past positions whose
+	// appends are still in flight. Stall detection is a liveness
+	// signal, not a correctness boundary — a torn read can only
+	// mis-time a stall report, never corrupt data. An empty types set
+	// matches nothing: 0.
+	MatchingRawHead(ctx context.Context, types []string) (uint64, error)
 }
 
 // Logs opens the Log for one scope (the platform's tenant/workspace).
@@ -205,12 +217,14 @@ type Observer interface {
 	// leaves the log, and Skip past the position is the recovery.
 	OnPoison(err *EventTooLargeError)
 	// OnStall reports a stalled stream: the page came back empty while
-	// RawHead is above the stream's settled position — committed backlog
-	// the settled reads cannot deliver yet, typically because an
-	// in-flight transaction holds the fence. Exactly one OnStall per
-	// stall episode; the probes behind it are rate-limited, so a fleet
-	// of idle streams cannot stampede the log.
-	OnStall(settledHead, rawHead uint64)
+	// the matching raw head — MatchingRawHead over the subscription's
+	// consumed types — is above the stream's settled position: committed
+	// backlog of the subscription's own events the settled reads cannot
+	// deliver yet, typically because an in-flight transaction holds the
+	// fence. Exactly one OnStall per stall episode; the probes behind it
+	// are rate-limited, so a fleet of idle streams cannot stampede the
+	// log.
+	OnStall(settledHead, matchingRawHead uint64)
 }
 
 // NoopObserver is the default Observer: it discards every signal. A nil

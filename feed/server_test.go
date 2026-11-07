@@ -357,6 +357,26 @@ func (l *memLog) MatchingHead(_ context.Context, types []string) (uint64, error)
 	return h, nil
 }
 
+// MatchingRawHead reports the highest position among events of types,
+// ignoring the Head override, like an unbounded filtered MAX: the raw
+// view the stall probe compares against. The fake has no fence, so it
+// agrees with MatchingHead.
+func (l *memLog) MatchingRawHead(_ context.Context, types []string) (uint64, error) {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var h uint64
+	for _, e := range l.parent.events[l.scope] {
+		if want[e.TypeURL] && e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
 func (l *memLog) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -528,7 +548,7 @@ type obsPage struct{ events, bytes int }
 
 type obsLeaseLost struct{ scope, projection, instance, owner string }
 
-type obsStall struct{ settled, raw uint64 }
+type obsStall struct{ settled, matchingRaw uint64 }
 
 func (o *recordingObserver) OnPage(events, bytes int) {
 	o.mu.Lock()
@@ -554,10 +574,10 @@ func (o *recordingObserver) OnPoison(err *feed.EventTooLargeError) {
 	o.poisons = append(o.poisons, err)
 }
 
-func (o *recordingObserver) OnStall(settled, raw uint64) {
+func (o *recordingObserver) OnStall(settled, matchingRaw uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.stalls = append(o.stalls, obsStall{settled, raw})
+	o.stalls = append(o.stalls, obsStall{settled, matchingRaw})
 }
 
 func (o *recordingObserver) pagesSnapshot() []obsPage {
@@ -641,6 +661,26 @@ func (l *fenceBlockedLog) MatchingHead(_ context.Context, types []string) (uint6
 	if l.blocked {
 		return 0, nil
 	}
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var h uint64
+	for _, e := range l.events {
+		if want[e.TypeURL] && e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
+// MatchingRawHead is the raw view the stall probe compares against: the
+// filtered committed maximum with no settle bound, so a blocked fence
+// never hides it — unlike MatchingHead it ignores l.blocked, exactly as
+// RawHead does.
+func (l *fenceBlockedLog) MatchingRawHead(_ context.Context, types []string) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	want := map[string]bool{}
 	for _, t := range types {
 		want[t] = true
@@ -1381,11 +1421,13 @@ func TestStatusLagIsFilterAware(t *testing.T) {
 // TestObserverReportsStall pins the stall signal (spec §5.8): while an
 // in-flight transaction holds the fence, a fence-bounded Log's settled
 // reads return empty pages even though committed events exist above them
-// — RawHead sees the backlog, Head and the pages do not. The stream must
-// probe RawHead in the empty-page branch, rate-limited, and report
-// exactly one OnStall per stall episode, with raw above the settled head;
-// once the transaction commits and delivery resumes, no further stall is
-// reported for the episode.
+// — the raw views see the backlog, Head and the pages do not. The
+// stream must probe the matching raw head in the empty-page branch,
+// rate-limited, and report exactly one OnStall per stall episode, with
+// the matching raw head above the settled head; once the transaction
+// commits and delivery resumes, no further stall is reported for the
+// episode. Every event here matches the subscription's consumed types,
+// so the matching raw head equals the all-type raw head.
 func TestObserverReportsStall(t *testing.T) {
 	obs := &recordingObserver{}
 	log := &fenceBlockedLog{
@@ -1422,11 +1464,11 @@ func TestObserverReportsStall(t *testing.T) {
 	if len(stalls) != 1 {
 		t.Fatalf("OnStall calls = %d after two consecutive empty pages, want exactly 1 (the rate limit suppresses the second probe)", len(stalls))
 	}
-	if stalls[0].settled != 0 || stalls[0].raw != 3 {
-		t.Fatalf("OnStall = settled %d, raw %d, want settled 0 (the resume head) and raw 3 (the committed backlog)", stalls[0].settled, stalls[0].raw)
+	if stalls[0].settled != 0 || stalls[0].matchingRaw != 3 {
+		t.Fatalf("OnStall = settled %d, matchingRaw %d, want settled 0 (the resume head) and matchingRaw 3 (the committed backlog)", stalls[0].settled, stalls[0].matchingRaw)
 	}
-	if stalls[0].raw <= stalls[0].settled {
-		t.Fatalf("OnStall = settled %d, raw %d, want raw > settled", stalls[0].settled, stalls[0].raw)
+	if stalls[0].matchingRaw <= stalls[0].settled {
+		t.Fatalf("OnStall = settled %d, matchingRaw %d, want matchingRaw > settled", stalls[0].settled, stalls[0].matchingRaw)
 	}
 
 	// The transaction commits: delivery resumes from the backlog and the
@@ -1439,6 +1481,54 @@ func TestObserverReportsStall(t *testing.T) {
 	time.Sleep(60 * time.Millisecond) // a few more poll cycles, caught up
 	if stalls := obs.stallsSnapshot(); len(stalls) != 1 {
 		t.Fatalf("OnStall calls = %d after delivery resumed, want still 1 (a caught-up stream reports no stall)", len(stalls))
+	}
+
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
+// TestObserverStallRequiresMatchingBacklog pins the stall probe's
+// comparison (spec §5.8, review F14/F17): a stall is committed backlog
+// of the subscription's OWN consumed types — the matching raw head —
+// above the stream's settled position, never the all-type raw head. A
+// filtered subscription caught up on its consumed types is not stalled
+// however many events of unrelated types land above it; the probe used
+// to consult the all-type RawHead, so every foreign append above a
+// caught-up stream misfired OnStall — the review's live repro as a
+// unit test.
+func TestObserverStallRequiresMatchingBacklog(t *testing.T) {
+	obs := &recordingObserver{}
+	// The subscription (testRequest) consumes counter.v1.Incremented
+	// only; the position-5 event is a foreign type, so the stream is
+	// caught up at 1 while the all-type raw head sits at 5.
+	logs := newMemLogs(
+		ev(1, "counter.v1.Incremented", "one"),
+		ev(5, "billing.v1.Invoiced", "noise"),
+	)
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+		Observer: obs,
+		Poll:     5 * time.Millisecond,
+	})
+	sink := newMemSink()
+	cancel, done := start(t, srv, testRequest("live"), sink)
+
+	// Caught up: the consumed event is delivered and every later page
+	// comes back empty — the foreign event never matches the filter.
+	got := sink.waitFor(t, 1)
+	if len(got) != 1 || got[0].GlobalPosition != 1 {
+		t.Fatalf("delivered positions = %v, want exactly the event at 1", positionsOf(got))
+	}
+	// Enough empty pages that the stall probe has certainly run: the
+	// rate limiter starts unarmed, so the first empty page always
+	// probes; by the fourth read the comparison happened.
+	waitCalls(t, logs, 4)
+
+	if stalls := obs.stallsSnapshot(); len(stalls) != 0 {
+		t.Fatalf("OnStall = %+v, want zero (the subscription is caught up: position 5 is a non-consumed type, not its backlog)",
+			stalls)
 	}
 
 	cancel()

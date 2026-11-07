@@ -172,3 +172,35 @@ references keep working through the alias.
 **What to do.** Nothing for SQLite operators (no roles, no grants) and
 no code changes for `es.Anchorer` consumers. Prefer the `es` type in
 new code; the postgres aliases are kept for compatibility.
+
+## 2026-11-07 — `feed.Log` gains `MatchingRawHead`; `OnStall` compares against the subscription's own backlog
+
+**What changes.** The `feed.Log` interface grows
+`MatchingRawHead(ctx context.Context, types []string) (uint64, error)`:
+the highest raw committed position among events of `types` — the
+subscription's own backlog, with no settle bound. The feed's stall
+probe now compares the stream's position against `MatchingRawHead` over
+the request's consumed types instead of the all-type `RawHead`, so a
+filtered subscription that is caught up on its own types no longer
+reports a stall when unrelated event types land above it (the misfire
+the review reproduced live). `Observer.OnStall`'s second parameter is
+now that matching raw head — the subscription's own backlog — rather
+than the all-type raw head.
+
+**Who is affected.** Third-party `feed.Log` implementers: adding a
+method to an interface is a compile-time break — their types no longer
+satisfy `feed.Log` until they grow a `MatchingRawHead` method (the
+in-repo adapters and test fakes hit exactly this). Consumers that read
+`OnStall`'s second parameter as the all-type raw head now see the
+matching raw head instead.
+
+**What to do.** Implement `MatchingRawHead` on every custom `feed.Log`.
+A backend without a settle fence returns the same value as
+`MatchingHead` (the SQLite adapter's body is identical); a
+fence-bounded backend returns the filtered committed maximum in its
+own scope-pinned transaction without the fence round — the
+`MatchingHead` query, unfenced. Skipping the fence is sound because
+stall detection is a liveness signal, not a correctness boundary — a
+torn read can only mis-time a stall report, never corrupt data.
+`OnStall` consumers must treat the raw parameter as the subscription's
+own backlog, not the log's.
