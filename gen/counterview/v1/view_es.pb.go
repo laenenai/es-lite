@@ -83,6 +83,9 @@ type CounterViewCounterLoader interface {
 // CounterViewDeps is what the application wires into the runner.
 type CounterViewDeps struct {
 	// Counter loads state as of the event's version (required).
+	// Cost: without snapshots each load re-folds the whole stream,
+	// O(stream length) per consumed event; with a snapshot at or
+	// below the version it folds only the tail, O(tail).
 	Counter CounterViewCounterLoader
 	// CounterCodec decodes counter.v1 events; nil selects the generated codec.
 	// Supply an unsealing codec when payloads are sealed (ADR 0025).
@@ -332,6 +335,9 @@ type ResetOnClosedCounterLoader interface {
 // ResetOnClosedDeps is what the application wires into the runner.
 type ResetOnClosedDeps struct {
 	// Counter loads state as of the event's version (required).
+	// Cost: without snapshots each load re-folds the whole stream,
+	// O(stream length) per consumed event; with a snapshot at or
+	// below the version it folds only the tail, O(tail).
 	Counter ResetOnClosedCounterLoader
 	// CounterCodec decodes counter.v1 events; nil selects the generated codec.
 	// Supply an unsealing codec when payloads are sealed (ADR 0025).

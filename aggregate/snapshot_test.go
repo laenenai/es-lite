@@ -77,6 +77,20 @@ func (s *recordingStore) readFromZero() bool {
 	return false
 }
 
+// countingStore wraps a Store and counts every envelope its ReadStream
+// returns, so a test can bound a load's read cost: a seeded load's reads
+// are the lineage probe plus the tail fold, nothing else.
+type countingStore struct {
+	es.Store
+	rows int
+}
+
+func (s *countingStore) ReadStream(ctx context.Context, sid es.StreamID, from, to uint64) ([]es.Envelope, error) {
+	envs, err := s.Store.ReadStream(ctx, sid, from, to)
+	s.rows += len(envs)
+	return envs, err
+}
+
 // newSnapshotRuntime wires a counter runtime with the test cache over
 // store (fold version 1).
 func newSnapshotRuntime(t *testing.T, store es.Store) (*testCache, *aggregate.Runtime[*counterv1.Counter, counterv1.Command, counterv1.Event]) {
@@ -334,5 +348,90 @@ func TestLoadAsOfVersionExcludesFutureSnapshot(t *testing.T) {
 	}
 	if st.GetCount() != 5 {
 		t.Fatalf("as-of v1 count = %d, want 5 from the v1 fold — not the cached v2 state (15)", st.GetCount())
+	}
+}
+
+// TestLoadAsOfVersionIsTailBoundedWithSnapshots pins the other half of the
+// seed rule (F21): a version-bounded load with a snapshot at or below the
+// bound seeds from it and folds only the (snapshot, version] tail — O(tail)
+// store rows — instead of re-reading the whole stream, which is O(stream
+// length) per event for a FETCH_MODE_STATE_AS_OF projection. The Task 25
+// lineage guard still probes the seed's version, so the counting store
+// sees probe + tail rows: 1 + 2 here, never the 12 of a full re-read.
+func TestLoadAsOfVersionIsTailBoundedWithSnapshots(t *testing.T) {
+	ctx := context.Background()
+	cs := &countingStore{Store: openStore(t)}
+	cache, rt := newSnapshotRuntime(t, cs)
+	sid, _ := es.NewStreamID("counter", "main")
+
+	// A v12 stream: v1 Init (count 5), v2–v12 Increment (10 each). The
+	// snapshot runtime handles v1–v10 and writes the state through at v10;
+	// a snapshot-less runtime appends v11–v12 so the cache keeps v10.
+	mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5})
+	for i := 0; i < 9; i++ {
+		mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+	}
+	raw := aggregate.NewRuntime(cs, counter.Decider, counterv1.EventCodec{})
+	for i := 0; i < 2; i++ {
+		mustHandle(t, raw, ctx, sid, counterv1.Command(&counterv1.Increment{By: 10}))
+	}
+
+	snap, ok, err := cache.Load(ctx, sid.Canonical())
+	if err != nil || !ok || snap.Version != 10 {
+		t.Fatalf("staged snapshot: ok=%v version=%d err=%v, want the write-through v10", ok, snap.Version, err)
+	}
+
+	cs.rows = 0
+	st, err := rt.LoadAsOfVersion(ctx, sid, 12)
+	if err != nil {
+		t.Fatalf("as-of v12 with a v10 snapshot: %v", err)
+	}
+	if st.GetCount() != 115 {
+		t.Fatalf("as-of v12 count = %d, want the full v12 fold's 115 (5 + 11×10)", st.GetCount())
+	}
+	// One lineage-probe row (the envelope at v10) plus the two tail rows
+	// (v11, v12) — 3 rows, not the 12 a seedless load would re-read.
+	if cs.rows != 3 {
+		t.Fatalf("as-of v12 read %d rows, want the lineage probe + tail = 1 + 2 = 3 — not the whole 12-row stream", cs.rows)
+	}
+}
+
+// TestLoadAsOfVersionDiscardsPhantomSnapshot pins the Task 25 lineage guard
+// on the version-bounded path that became seedable above: when the seed's
+// version no longer exists in the log (a reset or truncation outlived the
+// snapshot), the probe discards the seed and the load re-reads the stream
+// from the beginning — the answer is the surviving log's fold, never the
+// phantom cached state.
+func TestLoadAsOfVersionDiscardsPhantomSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	_, rt := newSnapshotRuntime(t, store)
+	sid, _ := es.NewStreamID("counter", "phantom")
+
+	mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5})
+	for i := 0; i < 4; i++ {
+		mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+	}
+	// The cache holds v5 (count 45). Append v6–v8 snapshot-less so the
+	// cache stays at v5, then delete v5 out-of-band, the way an operator's
+	// truncate does: the log's truth is v1–v4 + v6–v8 (count 65), but the
+	// cache still claims v5 — a phantom a seeded bounded load must not
+	// present (it would answer 45 + 30 = 75).
+	raw := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
+	for i := 0; i < 3; i++ {
+		mustHandle(t, raw, ctx, sid, counterv1.Command(&counterv1.Increment{By: 10}))
+	}
+	if _, err := store.DB().ExecContext(ctx,
+		`DELETE FROM events WHERE stream_id = ? AND version = 5`, sid.Canonical(),
+	); err != nil {
+		t.Fatalf("stage v5 truncation: %v", err)
+	}
+
+	st, err := rt.LoadAsOfVersion(ctx, sid, 8)
+	if err != nil {
+		t.Fatalf("as-of v8 over a log that lost the seed's v5: %v", err)
+	}
+	if st.GetCount() != 65 {
+		t.Fatalf("as-of v8 count = %d, want the surviving log's 65 — not the phantom seeded fold (75)", st.GetCount())
 	}
 }

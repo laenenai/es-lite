@@ -290,6 +290,9 @@ func writeDeps(g *protogen.GeneratedFile, base string, aggs *aggregateSet, withS
 	if withState {
 		for _, a := range aggs.sorted() {
 			g.P("	// ", depName(a), " loads state as of the event's version (required).")
+			g.P("	// Cost: without snapshots each load re-folds the whole stream,")
+			g.P("	// O(stream length) per consumed event; with a snapshot at or")
+			g.P("	// below the version it folds only the tail, O(tail).")
 			g.P("	", depName(a), " ", base, depName(a), "Loader")
 			g.P("	// ", depName(a), "Codec decodes ", a.pkg, " events; nil selects the generated codec.")
 			g.P("	// Supply an unsealing codec when payloads are sealed (ADR 0025).")

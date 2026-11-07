@@ -63,9 +63,11 @@ func (r *Runtime[S, C, E]) WithUpcaster(u es.Upcaster[E]) *Runtime[S, C, E] {
 	return r
 }
 
-// WithSnapshots enables the snapshot cache: Load seeds from a cached state and
-// folds only the tail, and Handle writes the new state through after append.
-// stateCodec serializes S; foldVersion is a monotonic counter you bump when a
+// WithSnapshots enables the snapshot cache: Load (and its version-bounded
+// form, LoadAsOfVersion) seeds from a cached state and folds only the tail,
+// and Handle writes the new state through after append. A time-travel-by-
+// time load (LoadAsOfTime) never seeds. stateCodec serializes S;
+// foldVersion is a monotonic counter you bump when a
 // decider/upcaster/state-shape change makes old snapshots wrong (they are then
 // ignored and refolded — snapshots are a pure cache). Returns the runtime for
 // chaining.
@@ -368,7 +370,9 @@ func (r *Runtime[S, C, E]) Load(ctx context.Context, sid es.StreamID) (state S, 
 
 // LoadAsOfVersion returns the state as it stood after exactly version v
 // (time-travel by version). v=0 returns Initial(); v beyond the stream's
-// current version returns es.ErrVersionOutOfRange.
+// current version returns es.ErrVersionOutOfRange. With a snapshot cache
+// configured, the load seeds from a snapshot at or below v and folds only
+// the (snapshot, v] tail; a snapshot newer than v never seeds.
 func (r *Runtime[S, C, E]) LoadAsOfVersion(ctx context.Context, sid es.StreamID, v uint64) (S, error) {
 	if err := sid.Validate(); err != nil {
 		var zero S
@@ -416,12 +420,17 @@ func (r *Runtime[S, C, E]) LoadStale(ctx context.Context, sid es.StreamID, maxAg
 func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersion uint64, asOf time.Time) (S, uint64, error) {
 	state := r.decider.Initial()
 
-	// Snapshot seed — only for current (non-time-travel) loads. Time-travel
-	// must never start from a snapshot newer than the target (ADR 0007). Any
+	// Snapshot seed — never on the time-travel-by-time (asOf) path: a
+	// snapshot newer than the target would swallow the requested past
+	// (ADR 0007). A current load (upToVersion == 0) seeds from any
+	// snapshot; a version-bounded load seeds only when the snapshot is at
+	// or below the bound, so the fold covers just the (snap.Version,
+	// upToVersion] tail instead of the whole stream. Any
 	// miss/mismatch/error falls through to a full fold (pure cache).
 	var from uint64
-	if r.cache != nil && upToVersion == 0 && asOf.IsZero() {
-		if snap, ok, serr := r.cache.Load(ctx, sid.Canonical()); serr == nil && ok && snap.FoldVersion == r.foldVersion {
+	if r.cache != nil && asOf.IsZero() {
+		if snap, ok, serr := r.cache.Load(ctx, sid.Canonical()); serr == nil && ok &&
+			snap.FoldVersion == r.foldVersion && (upToVersion == 0 || snap.Version <= upToVersion) {
 			if s, derr := r.stateCodec.Decode(snap.State); derr == nil {
 				state = s
 				from = snap.Version

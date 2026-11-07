@@ -237,8 +237,10 @@ state, version, fresh, err := rt.LoadStale(ctx, sid, 5*time.Minute)
 
 **Snapshots.** `snapshot.Cache` is a pure, re-derivable optimization: the
 runtime seeds folding from a cached state at version N and folds only the tail.
-The library ships the interface, not a storage implementation; implement it
-over your own database and opt in with:
+Current loads and `LoadAsOfVersion` calls at or above the cached version seed
+from it; `LoadAsOfTime` never seeds, because a snapshot newer than the target
+would swallow the requested past. The library ships the interface, not a
+storage implementation; implement it over your own database and opt in with:
 
 ```go
 rt.WithSnapshots(cache, stateCodec, foldVersion)
@@ -369,6 +371,13 @@ err := runner.Run(ctx, &projection.LogFeed{Source: store, From: 0})
 // Rebuild from position 0 through the same dispatch path:
 pos, err := runner.Rebuild(ctx, store, 500)
 ```
+
+**State-fetch cost.** `fetch: FETCH_MODE_STATE_AS_OF_EVENT_VERSION` asks the
+loader for the state as of each consumed event's version. Without snapshots
+every load re-reads and re-folds the whole stream — O(stream length) per
+event; a runtime wired with `WithSnapshots` seeds a load covered by a
+snapshot and folds only the tail — O(tail). A snapshot newer than the
+requested version never seeds, so time travel stays exact.
 
 `projection.LogFeed` polls `Store.ReadAll` and retries a failed handler on the
 same envelope, so delivery is at-least-once and ordered per stream. On
