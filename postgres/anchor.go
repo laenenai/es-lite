@@ -66,14 +66,19 @@ const anchorFencePoll = 100 * time.Millisecond
 // fence statements the feed uses. upto == 0 means the whole log and takes
 // the sequence's last_value — the highest position drawn, committed or
 // not; a caller's bound above last_value is clamped to it, since the fence
-// only certifies drawn positions. The round then draws its own xid R in a
-// rolled-back transaction and polls fenceCleared until the snapshot
-// horizon reaches R: at that point every transaction that existed when R
-// was drawn has settled, so — by P1/P2 (spec §5.1.3; see the Workspace
-// fence state's doc) — every position drawn at or below last_value is
-// final, and nothing can ever land at or below the bound again (later
-// appends draw higher positions). The wait holds no transaction open and
-// adds no lock; ctx ending aborts it.
+// only certifies drawn positions. The sequence-state read carries the
+// same CACHE 1 assertion the feed's round makes (errSequenceCache, F27):
+// a batched cache could land a position at or below this bound after the
+// fence clears, and the anchor would be disputed by its own CheckAnchor
+// later — so the anchor path fails with the typed error, never silently.
+// The round then draws its own xid R in a rolled-back transaction and
+// polls fenceCleared until the snapshot horizon reaches R: at that point
+// every transaction that existed when R was drawn has settled, so — by
+// P1/P2 (spec §5.1.3; see the Workspace fence state's doc) — every
+// position drawn at or below last_value is final, and nothing can ever
+// land at or below the bound again (later appends draw higher
+// positions). The wait holds no transaction open and adds no lock; ctx
+// ending aborts it.
 //
 // Without this round, Anchor's two READ COMMITTED statements tear: the
 // committed max can sit above an in-flight lower position (Postgres
@@ -82,9 +87,12 @@ const anchorFencePoll = 100 * time.Millisecond
 // later CheckAnchor with a false ErrAnchorMismatch once the row commits
 // (F1).
 func (s *Store) settledBound(ctx context.Context, upto uint64) (uint64, error) {
-	last, err := s.readLastPosition(ctx)
+	last, cache, err := s.readSequenceState(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if cache != 1 {
+		return 0, errSequenceCache
 	}
 	// 0 = the log head; a bound beyond last_value asks for positions the
 	// fence cannot certify, so it clamps down to the drawn horizon.

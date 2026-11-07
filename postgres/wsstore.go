@@ -78,6 +78,14 @@ type Workspace struct {
 	mu     sync.Mutex
 	boundL uint64
 	fenceR uint64
+
+	// draws counts the fence xids this Workspace's round has drawn — the
+	// F9 instrumentation the internal tests assert: an idle workspace's
+	// polls must not advance it, because every draw spends a transaction
+	// id (and burns a slot of the sequence the fence aborts into).
+	// Guarded by mu; incremented only in the drawFence delegation below,
+	// whose single caller (fenceBound) holds mu.
+	draws uint64
 }
 
 var _ es.Store = (*Workspace)(nil)
@@ -486,20 +494,47 @@ func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int)
 // (settledBound, anchor.go), which spans workspaces by construction,
 // shares them with the feed through the Workspace delegations below.
 
-// readLastPosition is fence statement 1 (spec §5.1.1): the position
-// sequence's last_value, read outside any transaction. It reflects every
-// position drawn so far, committed or not — conservative and safe, because
-// delivery waits on the fence, not on L. A fresh sequence reports
-// last_value=1 before any draw; L can exceed the highest drawn position.
-func (s *Store) readLastPosition(ctx context.Context) (uint64, error) {
-	var last uint64
-	err := s.pool.QueryRow(ctx,
-		`SELECT last_value FROM events_global_position_seq`,
-	).Scan(&last)
+// errSequenceCache is the typed error every fence round — the feed's
+// fenceBound and the anchor path's settledBound alike — returns when the
+// position sequence's cache_size is not 1. The CACHE 1 assertion is
+// load-bearing (F27): with cache_size > 1, a session's nextval()
+// batch-fetches values that a LATER transaction can insert — a position
+// ≤ the bound you read can commit after your fence draw R clears,
+// breaking the fence's settledness guarantee and producing false
+// ErrAnchorMismatch. CACHE 1 guarantees draw-time = the only assignment
+// path in the current transaction. The message names the fix.
+var errSequenceCache = errors.New("position sequence events_global_position_seq must use CACHE 1; run ALTER SEQUENCE events_global_position_seq CACHE 1")
+
+// ErrSequenceCacheMisconfigured reports that the position sequence's
+// cache_size is not 1, so no fence round can certify a settled bound —
+// see errSequenceCache for why the fence requires CACHE 1, and the
+// message for the fix.
+var ErrSequenceCacheMisconfigured = errSequenceCache
+
+// readSequenceState is fence statement 1 (spec §5.1.1): the position
+// sequence's last_value and cache_size, read outside any transaction.
+// It reflects every position drawn so far, committed or not —
+// conservative and safe, because delivery waits on the fence, not on
+// L; L can exceed the highest drawn position (uncommitted and aborted
+// draws both count).
+//
+// The read goes through the pg_sequences view rather than the direct
+// sequence read it replaces (F5/F38): the view exposes last_value AND
+// cache_size in one statement, and masks last_value to NULL for roles
+// without USAGE on the sequence — so the fence needs only USAGE, not
+// the SELECT the direct read demanded (the privilege the anchor gate
+// test had to grant). COALESCE folds the two NULL shapes to 0: a
+// sequence never called yet (where the direct read reported the START
+// value; the view's pg_sequence_last_value reports NULL), and a role
+// without privileges, whose fence then simply sees an idle log.
+func (s *Store) readSequenceState(ctx context.Context) (last uint64, cache int, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT COALESCE(last_value, 0), cache_size FROM pg_sequences WHERE sequencename = 'events_global_position_seq'`,
+	).Scan(&last, &cache)
 	if err != nil {
-		return 0, fmt.Errorf("read last position: %w", err)
+		return 0, 0, fmt.Errorf("read sequence state: %w", err)
 	}
-	return last, nil
+	return last, cache, nil
 }
 
 // drawFence is fence statement 2 (spec §5.1.1): draw the reader's own
@@ -538,12 +573,19 @@ func (s *Store) fenceCleared(ctx context.Context, r uint64) (bool, error) {
 // The Workspace fence round delegates to the Store-level statements above:
 // the workspace scope adds only the (boundL, fenceR) state below.
 
-func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
-	return w.store.readLastPosition(ctx)
+func (w *Workspace) readSequenceState(ctx context.Context) (uint64, int, error) {
+	return w.store.readSequenceState(ctx)
 }
 
+// drawFence on the Workspace delegates to the Store statement and
+// counts the draw (F9): fenceBound, its only caller, holds w.mu, so the
+// counter increments under it without a second lock.
 func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
-	return w.store.drawFence(ctx)
+	r, err := w.store.drawFence(ctx)
+	if err == nil {
+		w.draws++
+	}
+	return r, err
 }
 
 func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
@@ -553,9 +595,14 @@ func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
 // fenceBound runs one horizon-fence round (spec §5.1.1) and returns the
 // position bound a page may deliver up to. Zero means deliver nothing now:
 // either an established fence is still blocked (the state stays stored and
-// the caller's wait cycle retries), or the log is idle at from (no fence
-// drawn — idle streams burn no transaction ids). A cleared fence drops the
-// state; the next delivered page re-establishes a fresh fence.
+// the caller's wait cycle retries), or the workspace is idle at from — its
+// committed max is at or below from, so nothing new is visible and no
+// fence is drawn (F9): an idle workspace must not burn a fence xid on
+// every poll. The short-circuit only skips when nothing new is VISIBLE:
+// an append still in flight is invisible to the caller anyway, and the
+// next poll re-checks the committed max, so the round starts the moment
+// new work becomes visible. A cleared fence drops the state; the next
+// delivered page re-establishes a fresh fence.
 func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -573,9 +620,30 @@ func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error)
 		return bound, nil
 	}
 
-	last, err := w.readLastPosition(ctx)
+	// Idle short-circuit (F9): with no fence stored, the workspace's
+	// committed max — a RawHead-shaped read, no xid drawn — decides
+	// whether a round is worth a fence at all. Another workspace
+	// appending moves the global sequence but not this max, so a poll
+	// of an idle workspace costs one cheap read instead of a fence
+	// transaction per poll cycle.
+	max, err := w.RawHead(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if max <= from {
+		return 0, nil
+	}
+
+	last, cache, err := w.readSequenceState(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// Every round certifies a settled bound, so every round asserts the
+	// sequence's CACHE 1 (F27, errSequenceCache): a batched cache could
+	// hand a position at or below this bound to a later transaction,
+	// and the fence would be certifying nothing.
+	if cache != 1 {
+		return 0, errSequenceCache
 	}
 	if last <= from {
 		return 0, nil
@@ -769,12 +837,13 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 // the immediate committed maximum for stall detection — over the
 // subscription's own consumed types — use MatchingRawHead.
 func (w *Workspace) Head(ctx context.Context) (uint64, error) {
-	// One fence round (spec §5.1.1), from 0: Head reads the whole log, so
-	// any drawn position is new and the idle shortcut never fires — every
-	// call either checks the stored fence or draws a fresh one. A zero
-	// bound means no settled range yet — a transaction is in flight that
-	// blocks the fence — and Head reports 0 rather than a position it
-	// would have to take back.
+	// One fence round (spec §5.1.1), from 0: a workspace with zero
+	// committed events short-circuits before the fence — its committed
+	// max is 0, nothing new is visible, and no xid is burned (F9); a
+	// workspace with any committed event draws, since a whole-log read
+	// is new at any drawn position. A zero bound means no settled range
+	// yet — a transaction is in flight that blocks the fence — and Head
+	// reports 0 rather than a position it would have to take back.
 	bound, err := w.fenceBound(ctx, 0)
 	if err != nil {
 		return 0, err
@@ -811,10 +880,12 @@ func (w *Workspace) MatchingHead(ctx context.Context, types []string) (uint64, e
 	if len(types) == 0 {
 		return 0, nil
 	}
-	// One fence round from 0, like Head: MatchingHead reads the whole
-	// log's matching maximum, so any drawn position is new and the idle
-	// shortcut never fires. A zero bound means the fence is blocked —
-	// report 0 rather than a position above the unsettled horizon.
+	// One fence round from 0, like Head: an empty workspace
+	// short-circuits before the fence (F9); any committed event —
+	// matching or not — makes the round draw, since a whole-log read is
+	// new at any drawn position whatever the filter matches. A zero
+	// bound means the fence is blocked — report 0 rather than a
+	// position above the unsettled horizon.
 	bound, err := w.fenceBound(ctx, 0)
 	if err != nil {
 		return 0, err
