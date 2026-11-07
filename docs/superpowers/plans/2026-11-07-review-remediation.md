@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Pre-1.0 breaking changes are allowed (design D9); **every** port/signature/behavior change adds an entry to `docs/migration/2026-11-07-breaking-changes.md` in the same task that changes it.
-- Migrations are append-only and transactional (ADR 0010). Landing numbers: **postgres** `0006_log_order.sql`, `0007_policy_hardening.sql`, `0008_drop_unused_checkpoints.sql`, `0009_command_dedup.sql`; **sqlite** `0005_feed_type_index.sql`, `0006_log_order.sql`, `0007_command_dedup.sql`. No applied migration file's semantics is ever edited; corrections ship as errata in the new migration's header comment.
+- Migrations are append-only and transactional (ADR 0010). Landing numbers: **postgres** `0006_log_order.sql`, `0007_policy_hardening.sql`, `0008_drop_unused_checkpoints.sql`, `0009_command_dedup.sql`; **sqlite** `0006_log_order.sql`, `0007_feed_type_index.sql`, `0008_command_dedup.sql` (numbering follows task order — preflight ruling). No applied migration file's semantics is ever edited; corrections ship as errata in the new migration's header comment.
 - New Postgres tables: `log_order` = workspace arm + role-gated bypass arm (events parity); `command_dedup` = workspace arm only, **no bypass arm** (feed-tables parity). FORCE ROW LEVEL SECURITY everywhere.
 - Payloads are opaque (ADR 0025): never logged, never in errors; error text carries positions, type URLs, sizes only.
 - No append-path serialization and no new append round trips beyond what exists (design D1 anti-goal; `log_order` is computed from data the append already holds).
@@ -337,11 +337,11 @@ The failure modes the findings say must not survive, and the test that pins each
 ### Task 20: Feed type index (F18)
 
 **Files:**
-- Create: `sqlite/migrations/0005_feed_type_index.sql`
+- Create: `sqlite/migrations/0007_feed_type_index.sql`
 - Test: `sqlite/migrate_test.go`, `sqlite/feed_test.go`
 
 **Interfaces:**
-- Produces: `CREATE INDEX IF NOT EXISTS events_type_pos_idx ON events (type_url, global_position);`; `migrate_test.go` version → 5.
+- Produces: `CREATE INDEX IF NOT EXISTS events_type_pos_idx ON events (type_url, global_position);`; `migrate_test.go` latest version → 7.
 
 - [ ] **Step 1 (RED):** `TestMatchingHeadUsesTypeIndex`: seed 2k events of a rare type plus 2k of another; `EXPLAIN QUERY PLAN` the `MatchingHead` query before the migration applies (construct a raw handle at schema 0004) → assert the plan names `events_type_pos_idx` — expect FAIL (today: `SEARCH events`).
 - [ ] **Step 2:** Migration + version bump; `go test ./sqlite -count=1` — PASS (conformance + planner).
@@ -509,7 +509,7 @@ The failure modes the findings say must not survive, and the test that pins each
 ### Task 32: Dedup port, tables, adapters (F6-part, design D6)
 
 **Files:**
-- Create: `es/idempotency.go`, `postgres/migrations/0009_command_dedup.sql`, `sqlite/migrations/0007_command_dedup.sql`, `postgres/dedup.go`, `sqlite/dedup.go`
+- Create: `es/idempotency.go`, `postgres/migrations/0009_command_dedup.sql`, `sqlite/migrations/0008_command_dedup.sql`, `postgres/dedup.go`, `sqlite/dedup.go`
 - Test: `postgres/dedup_test.go`, `sqlite/dedup_test.go`, both `migrations_test.go`
 
 **Interfaces:**
@@ -525,7 +525,7 @@ The failure modes the findings say must not survive, and the test that pins each
   ```
   Tables: `command_dedup(workspace_id, stream_id, command_id, fingerprint, response, created_at)` PK `(workspace_id, stream_id, command_id)` — postgres: RLS workspace arm only, no bypass, FORCE; sqlite: minus workspace. Adapters: `postgres.NewDedupStore(w *Workspace) *DedupStore` and `sqlite.NewDedupStore(s *Store) *DedupStore` implementing `es.Deduplicator`; `Save` uses `INSERT … ON CONFLICT DO NOTHING` (postgres) / `INSERT OR IGNORE` (sqlite); a `Save` that hits the conflict re-`Lookup`s and returns the stored record via a new `Save` return value? No — keep `Save(ctx, key, rec) error`; on conflict the caller re-Lookups (documented).
 
-- [ ] **Step 1:** migrations + version bumps (postgres → 9, sqlite → 7).
+- [ ] **Step 1:** migrations + version bumps (postgres → 9, sqlite → 8).
 - [ ] **Step 2:** adapters + tests: `TestDedupRoundTrip`, `TestDedupWorkspaceIsolation` (postgres: two workspaces, same key, independent), `TestDedupSaveConflictIsNotError`.
 - [ ] **Step 3:** `go test ./sqlite -count=1` + `task test:pg` — PASS. Commit: `feat(store): command dedup tables and adapters`.
 
@@ -587,7 +587,7 @@ The failure modes the findings say must not survive, and the test that pins each
 - Produces: every claim walks against the code per the consolidated review §6; Review A's header gains: "> **Corrected 2026-11-07:** the SQLite anchor-race claim in §1 is wrong (see `docs/review/20261107_consolidated_review.md` §2.1); Postgres half stands." New ADR 0038 records D1's design (approaches rejected: global chain = serialization; anchor-time scan = O(N)), the `CACHE 1` invariant, the `OrderFromPosition` rule, and the `es-verify order` deep-check contract.
 
 - [ ] **Step 1:** Write ADR 0038 and the breaking-changes doc aggregating every entry added by Tasks 2–35 (grep the migration-notes file for completeness).
-- [ ] **Step 2:** Apply every README/ADR/runbook correction; add the retraction banner to Review A.
+- [ ] **Step 2:** Apply every README/ADR/runbook correction; verify the retraction banner on Review A is present (it was applied in the docs commit that seeded this branch).
 - [ ] **Step 3:** Self-check: re-walk the consolidated review §6 list line by line against the edited docs; each line is either fixed or explicitly deferred with a backlog entry.
 - [ ] **Step 4:** Commit: `docs: truth pass for anchors, order attestation, grants and review errata`.
 
