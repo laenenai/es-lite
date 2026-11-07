@@ -52,10 +52,14 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// keeps the shared partitioned tables clean. log_order is truncated
 	// with events — its rows are written by the same appends, and a stale
 	// row would dispute the next test's order roots and deep verifies.
+	// command_dedup joins the list for the same reason: a dedup Save must
+	// be free to create its row, and the dedup tests' first-record-wins
+	// and per-workspace-count verdicts must not inherit a stale row from
+	// a previous run.
 	// The bare checkpoints table is gone (0008: dead on Postgres — only
 	// SQLite implements delivery.Checkpoints), so it is no longer
 	// truncated here.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -393,10 +397,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0009 (the log_order
-	// policy guard) made it nine.
-	if v != 9 {
-		t.Fatalf("applied version = %d, want 9", v)
+	// Every embedded migration is applied on Open; 0010 (command_dedup)
+	// made it ten.
+	if v != 10 {
+		t.Fatalf("applied version = %d, want 10", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.

@@ -22,8 +22,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 7 {
-		t.Fatalf("applied version = %d, want 7 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index; no 0005 — Postgres's is RLS-role-specific)", v)
+	if v != 8 {
+		t.Fatalf("applied version = %d, want 8 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup; no 0005 — Postgres's is RLS-role-specific)", v)
 	}
 	// Re-running is a no-op, not an error.
 	if err := s.Migrate(ctx); err != nil {
@@ -136,7 +136,7 @@ func TestConcurrentMigrateSameFile(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate schema_migrations: %v", err)
 	}
-	want := []int{1, 2, 3, 4, 6, 7}
+	want := []int{1, 2, 3, 4, 6, 7, 8}
 	if !slices.Equal(got, want) {
 		t.Fatalf("recorded versions = %v, want each of %v exactly once", got, want)
 	}
