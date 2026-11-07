@@ -1,15 +1,22 @@
 // Command es-verify audits the tamper-evident hash chain (ADR 0029) and
 // manages anchors. It needs no keys: it recomputes every hash from what the
 // database returns. Exit status is the audit result (0 intact, 1 broken,
-// 2 usage/connection error).
+// 2 usage/connection error). An empty stream or an empty database is an
+// error, not an intact result: it certifies nothing (review F13).
 //
 // Usage:
 //
-//	es-verify stream [<workspace>] <type:id>     verify one stream (workspace required on Postgres)
-//	es-verify all [--strict]                      verify every stream (--strict: every row must be chained)
-//	es-verify anchor [--upto N]                   take an anchor and print it as JSON (export it off-box)
-//	es-verify anchor --check <anchor.json>        recompute an exported anchor and compare
-//	es-verify anchor list                         list recorded anchors
+//	es-verify stream [--allow-empty] [<workspace>] <type:id>
+//	  verify one stream (workspace required on Postgres; a never-written
+//	  stream is an error unless --allow-empty)
+//	es-verify all [--strict]
+//	  verify every stream (--strict: every row must be chained)
+//	es-verify anchor [--upto N]
+//	  take an anchor and print it as JSON (export it off-box)
+//	es-verify anchor --check <anchor.json>
+//	  recompute an exported anchor and compare
+//	es-verify anchor list
+//	  list recorded anchors
 //
 // Config (env), as es-migrate: BACKEND (postgres|sqlite), PG_DSN, SQLITE_DSN.
 package main
@@ -76,18 +83,24 @@ func run(args []string) int {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  es-verify stream [<workspace>] <type:id>
+  es-verify stream [--allow-empty] [<workspace>] <type:id>
   es-verify all [--strict]
   es-verify anchor [--upto N] | --check <anchor.json> | list`)
 }
 
 func cmdStream(ctx context.Context, b *backend, args []string) int {
+	fs := flag.NewFlagSet("stream", flag.ContinueOnError)
+	allowEmpty := fs.Bool("allow-empty", false, "report an empty (never-written) stream as intact instead of an error")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
 	var ws, canonical string
+	rest := fs.Args()
 	switch {
-	case b.multiWS && len(args) == 2:
-		ws, canonical = args[0], args[1]
-	case !b.multiWS && len(args) >= 1:
-		canonical = args[len(args)-1]
+	case b.multiWS && len(rest) == 2:
+		ws, canonical = rest[0], rest[1]
+	case !b.multiWS && len(rest) >= 1:
+		canonical = rest[len(rest)-1]
 	default:
 		usage()
 		return exitUsage
@@ -102,7 +115,7 @@ func cmdStream(ctx context.Context, b *backend, args []string) int {
 		fmt.Fprintf(os.Stderr, "es-verify: %v\n", err)
 		return exitUsage
 	}
-	return verifyOne(ctx, b, ws, sid, es.VerifyOptions{ChainedSince: since})
+	return verifyOne(ctx, b, ws, sid, es.VerifyOptions{ChainedSince: since}, *allowEmpty)
 }
 
 func cmdAll(ctx context.Context, b *backend, args []string) int {
@@ -121,9 +134,16 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 		fmt.Fprintf(os.Stderr, "es-verify: list streams: %v\n", err)
 		return exitUsage
 	}
+	if len(refs) == 0 {
+		// An audit over zero streams certified nothing while reading as a
+		// clean exit (F13) — usually the wrong database or an unmigrated
+		// one, not an intact log.
+		fmt.Fprintln(os.Stderr, "es-verify: no streams found")
+		return exitUsage
+	}
 	code := exitIntact
 	for _, ref := range refs {
-		if c := verifyOne(ctx, b, ref.Workspace, ref.StreamID, es.VerifyOptions{ChainedSince: since, Strict: *strict}); c != exitIntact {
+		if c := verifyOne(ctx, b, ref.Workspace, ref.StreamID, es.VerifyOptions{ChainedSince: since, Strict: *strict}, false); c != exitIntact {
 			code = c
 		}
 	}
@@ -131,7 +151,7 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 	return code
 }
 
-func verifyOne(ctx context.Context, b *backend, ws string, sid es.StreamID, opts es.VerifyOptions) int {
+func verifyOne(ctx context.Context, b *backend, ws string, sid es.StreamID, opts es.VerifyOptions, allowEmpty bool) int {
 	rep, err := es.VerifyStreamWith(ctx, b.scope(ws), sid, opts)
 	label := sid.Canonical()
 	if ws != "" {
@@ -143,6 +163,13 @@ func verifyOne(ctx context.Context, b *backend, ws string, sid es.StreamID, opts
 		return exitBroken
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "es-verify: %s: %v\n", label, err)
+		return exitUsage
+	case rep.Head == 0 && !allowEmpty:
+		// A stream that verifies to head 0 attests nothing: it was never
+		// written (Task 2's sentinel, tolerated by VerifyStreamWith) or
+		// every row is gone. Reading it as `ok` certified an empty audit
+		// (F13).
+		fmt.Printf("EMPTY   %s\n", label)
 		return exitUsage
 	default:
 		fmt.Printf("ok      %s head=v%d chained_from=%d head_hash=%s\n", label, rep.Head, rep.ChainedFrom, hex.EncodeToString(rep.HeadHash))
@@ -226,6 +253,9 @@ func openBackend(ctx context.Context) (*backend, error) {
 	case "sqlite":
 		dsn := os.Getenv("SQLITE_DSN")
 		if dsn == "" {
+			// The default stays — single-box setups rely on it — but it is
+			// the wrong database more often than not: say so loudly (F36).
+			fmt.Fprintln(os.Stderr, "es-verify: using default SQLITE_DSN file:eslite.db in the working directory")
 			dsn = "file:eslite.db"
 		}
 		store, err := sqlite.Open(ctx, dsn, sqlite.WithoutAutoMigrate())
