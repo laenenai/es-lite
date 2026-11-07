@@ -52,19 +52,19 @@ func TestFeedIndexesExist(t *testing.T) {
 	}
 }
 
-// TestAllBypassPoliciesRoleGated pins migration 0007's policy shape
-// (review F8/F12) through pg_policies — not file greps, which would
-// false-positive on comments (the Task 13 review ruling). All three
-// policies that carry a bypass arm — events, unique_claims and
-// anchors — must keep the arm (app.bypass_rls), gate it on es_relay
-// membership (pg_has_role), and guard that test with EXISTS so it
-// cannot hard-fail (pg_has_role errors) on a database where the role
-// has not been created yet.
+// TestAllBypassPoliciesRoleGated pins migrations 0007/0009's policy
+// shape (review F8/F12) through pg_policies — not file greps, which
+// would false-positive on comments (the Task 13 review ruling). All
+// four policies that carry a bypass arm — events, unique_claims,
+// anchors and log_order — must keep the arm (app.bypass_rls), gate it
+// on es_relay membership (pg_has_role), and guard that test with
+// EXISTS so it cannot hard-fail (pg_has_role errors) on a database
+// where the role has not been created yet.
 func TestAllBypassPoliciesRoleGated(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
-	for _, table := range []string{"events", "unique_claims", "anchors"} {
+	for _, table := range []string{"events", "unique_claims", "anchors", "log_order"} {
 		rows, err := s.Pool().Query(ctx, `
 			SELECT policyname, qual FROM pg_policies
 			WHERE schemaname = 'public' AND tablename = $1`, table)
