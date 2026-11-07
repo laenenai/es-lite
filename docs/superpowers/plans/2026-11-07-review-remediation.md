@@ -16,7 +16,7 @@
 - Migrations are append-only and transactional (ADR 0010). Landing numbers: **postgres** `0006_log_order.sql`, `0007_policy_hardening.sql`, `0008_drop_unused_checkpoints.sql`, `0009_command_dedup.sql`; **sqlite** `0006_log_order.sql`, `0007_feed_type_index.sql`, `0008_command_dedup.sql` (numbering follows task order — preflight ruling). No applied migration file's semantics is ever edited; corrections ship as errata in the new migration's header comment.
 - New Postgres tables: `log_order` = workspace arm + role-gated bypass arm (events parity); `command_dedup` = workspace arm only, **no bypass arm** (feed-tables parity). FORCE ROW LEVEL SECURITY everywhere.
 - Payloads are opaque (ADR 0025): never logged, never in errors; error text carries positions, type URLs, sizes only.
-- No append-path serialization and no new append round trips beyond what exists (design D1 anti-goal; `log_order` is computed from data the append already holds).
+- No append-path serialization, and no new append-path reads or locks; the single `log_order` INSERT per batch is the accepted cost of order attestation (design D1 — preflight ruling).
 - Appends keep their first statement `SELECT pg_current_xact_id()` — the fence's P1 (ADR 0037).
 - Postgres tests run via `task test:pg` (Docker postgres:17, `PG_DSN`); plain `GOWORK=off go test ./...` must stay green without it. Postgres integration tests `t.Skip` without `PG_DSN`.
 - Generated code is regenerated with `task generate` in every task that touches `cmd/protoc-gen-es-lite` or `proto/`; `task generate:check` must be green before those tasks commit.
