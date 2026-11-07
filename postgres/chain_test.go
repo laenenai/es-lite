@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -172,6 +173,49 @@ func TestAnchorsPostgres(t *testing.T) {
 	var n int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM anchors`).Scan(&n); err != nil || n != 0 {
 		t.Fatalf("anchors visible under RLS: n=%d err=%v", n, err)
+	}
+}
+
+// TestAnchorFenceBlockedErrorOnCtxEnd pins the operator-facing wording of
+// the anchor fence's ctx-end path (the breaking-changes entry promises
+// `postgres: anchor fence still blocked`): while an append blocks the
+// fence, an Anchor call whose context ends first must fail with that
+// phrase wrapping context.DeadlineExceeded — whichever side of the poll
+// cycle the end lands on. The deadline deliberately fires while a
+// fenceCleared round trip is in flight: that is the poll-error branch,
+// which unfixed code answered with a bare `check fence: … context deadline
+// exceeded`, losing the promised phrase. The parked-select branch always
+// carried it; with the fix both do, so the test is green either way and
+// the tuned deadline only decides how sharp the regression pin is.
+// (102.8ms measured as the center of the mid-poll hit plateau on the dev
+// box — the ~100ms poll tick fires a couple of ms late under go test's
+// timer slack; a machine that parks the deadline in the select instead
+// still passes, just via the other branch.)
+func TestAnchorFenceBlockedErrorOnCtxEnd(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_anchor_ctx")
+
+	// An append held in flight blocks the fence: Anchor cannot resolve a
+	// settled bound until it settles, so the ctx ends first.
+	tx1, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	feedAppendTx(t, ctx, ws, tx1, feedStream(t, "anchor-ctx-block"), 0, "anchortest.v1.B")
+
+	actx, cancel := context.WithTimeout(ctx, 102*time.Millisecond+800*time.Microsecond)
+	defer cancel()
+	_, err = s.Anchor(actx, 0)
+	if err == nil {
+		t.Fatal("Anchor under a blocked fence with an expiring ctx: want an error")
+	}
+	if !strings.Contains(err.Error(), "anchor fence still blocked") {
+		t.Fatalf("Anchor err = %q, want the mandated anchor fence wording", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Anchor err = %v, want context.DeadlineExceeded wrapped", err)
 	}
 }
 

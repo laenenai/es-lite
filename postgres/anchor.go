@@ -97,6 +97,13 @@ func (s *Store) settledBound(ctx context.Context, upto uint64) (uint64, error) {
 	for {
 		cleared, err := s.fenceCleared(ctx, r)
 		if err != nil {
+			// A ctx that ends while the poll's round trip is in
+			// flight must surface the mandated wording, not the
+			// poll's transport error: the operator promise is the
+			// fence's own phrase wrapping the ctx's cause.
+			if e := ctx.Err(); e != nil {
+				return 0, fmt.Errorf("postgres: anchor fence still blocked: %w", e)
+			}
 			return 0, err
 		}
 		if cleared {
