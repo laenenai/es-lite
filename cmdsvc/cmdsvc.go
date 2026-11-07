@@ -44,7 +44,15 @@ func (f ValidatorFunc) Validate(msg proto.Message) error { return f(msg) }
 // Validator that rejects every request with that error rather than one that
 // silently allows.
 func DefaultValidator() Validator {
-	v, err := protovalidate.New()
+	return newValidator(func() (protovalidate.Validator, error) { return protovalidate.New() })
+}
+
+// newValidator is DefaultValidator's body with the constructor behind a
+// function, so the fail-closed branch is testable: when construction fails,
+// the returned Validator rejects every message with that error — never
+// allows one through.
+func newValidator(construct func() (protovalidate.Validator, error)) Validator {
+	v, err := construct()
 	if err != nil {
 		return ValidatorFunc(func(proto.Message) error { return fmt.Errorf("cmdsvc: protovalidate: %w", err) })
 	}
@@ -61,15 +69,20 @@ type ErrorMapper func(err error) *connect.Error
 type Reload func(ctx context.Context) (version uint64, state proto.Message, err error)
 
 // MetaFrom builds the command's audit metadata from the request headers and
-// the authenticated actor: Correlation-Id (a UUID) and Idempotency-Key (a
-// UUID, or any string hashed to a UUIDv5 so retries share a CommandID).
-// OccurredAt is left zero because the runtime always stamps it from the
-// server clock (ADR 0034).
+// the authenticated actor. Correlation-Id passes through when it is a UUID;
+// any other value is hashed to a stable UUIDv5 in idempotencyNamespace — the
+// same treatment non-UUID Idempotency-Keys get — so a client's free-text
+// correlation id still reaches the audit trail and stays stable across
+// retries instead of being dropped. Idempotency-Key is a UUID, or any string
+// hashed to a UUIDv5 so retries share a CommandID. OccurredAt is left zero
+// because the runtime always stamps it from the server clock (ADR 0034).
 func MetaFrom(h http.Header, actor es.Actor) es.Meta {
 	m := es.Meta{Actor: actor}
 	if v := h.Get(HdrCorrelationID); v != "" {
 		if id, err := uuid.Parse(v); err == nil {
 			m.CorrelationID = id
+		} else {
+			m.CorrelationID = uuid.NewSHA1(idempotencyNamespace, []byte(v))
 		}
 	}
 	if v := h.Get(HdrIdempotencyKey); v != "" {
@@ -129,6 +142,8 @@ func passOr(code connect.Code, err error) *connect.Error {
 //	es.ErrDecidedAtMissing,
 //	es.ErrDecidedAtSkew,
 //	es.ErrDecidedAtMismatch   invalid_argument
+//	context.Canceled          canceled
+//	context.DeadlineExceeded  deadline_exceeded
 //	anything else             mapper(err) if it returns non-nil, else failed_precondition
 //
 // expected is the version the command asserted (0 if none); a

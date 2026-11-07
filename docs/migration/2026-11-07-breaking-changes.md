@@ -383,3 +383,27 @@ on the next tick.
 is the fail-fast posture: `Run` surfaces the first drain error
 immediately. Wire real deps at construction. Repoint checkpoints with
 the poller stopped.
+
+## 2026-11-07 — `cmdsvc.MetaFrom` keeps non-UUID `Correlation-Id` values as UUIDv5 instead of dropping them
+
+**What changes.** `cmdsvc.MetaFrom` used to read a `Correlation-Id` header
+only when it parsed as a UUID and silently dropped any other value, leaving
+`es.Meta.CorrelationID` zero — the runtime then defaulted it to the
+command's own `CommandID`, so events from one client-reported flow were
+indistinguishable from unrelated ones. A non-UUID value now hashes to a
+stable UUIDv5 in the same fixed namespace non-UUID `Idempotency-Key`
+values already use (`3b5a0c2e-7f5d-4b1a-9c3e-2d6f8a1b4c7e`), so the
+caller's free-text correlation id reaches the audit trail and stays stable
+across retries. `Correlation-Id` values that parse as a UUID pass through
+unchanged, and every `Idempotency-Key` path is unchanged.
+
+**Who is affected.** Clients that send a non-UUID `Correlation-Id`, and
+anything reading `correlation_id` off recorded events: events from such
+commands now carry the stable hash of the header instead of the command's
+own id. Correlation chains that previously collapsed onto per-command ids
+become traceable. Already-recorded rows are not rewritten.
+
+**What to do.** Nothing required. A consumer that matched events on
+`correlation_id == command_id` (the old fallback shape) for non-UUID
+correlations must match on the header's hash instead — or, better, send a
+UUID `Correlation-Id`, which still passes through byte-for-byte.
