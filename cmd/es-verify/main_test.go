@@ -284,3 +284,76 @@ func swapPositions(t *testing.T, s *sqlite.Store, sid es.StreamID, p1, p2 uint64
 		t.Fatalf("swap positions %d/%d: rows %d (err %v), want 2", p1, p2, n, err)
 	}
 }
+
+// TestAllExitCodePrecedence pins the exit-code merge of `es-verify
+// all` (final review I3): a broken verdict (exit 1) must dominate a
+// usage/EMPTY verdict (exit 2). The order stage's exit code used to
+// overwrite the streams stage's unconditionally, so a tampered stream
+// on a store with zero attested batches — exactly a pre-0006 legacy
+// store — exited 2 (order EMPTY), masking the tamper as a usage error.
+func TestAllExitCodePrecedence(t *testing.T) {
+	t.Run("tampered stream over a store with no attested batches exits 1", func(t *testing.T) {
+		s := newTestDB(t)
+		sid, err := es.NewStreamID("thing", "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedStream(t, s, sid, 2)
+		// Tamper v1's payload behind the store's back: the stored hash
+		// no longer matches what the row's fields hash to.
+		if _, err := s.DB().ExecContext(context.Background(),
+			`UPDATE events SET payload = ? WHERE stream_id = ? AND version = 1`,
+			[]byte("tampered"), sid.Canonical()); err != nil {
+			t.Fatalf("tamper: %v", err)
+		}
+		// A pre-0006-shaped store: no attested batches at all.
+		if _, err := s.DB().ExecContext(context.Background(), `DELETE FROM log_order`); err != nil {
+			t.Fatalf("strip log_order rows: %v", err)
+		}
+		closeDB(t, s)
+		if code := run([]string{"all"}); code != exitBroken {
+			t.Errorf("all over a tampered stream and zero attested batches: exit %d, want %d — broken must dominate the order stage's EMPTY verdict", code, exitBroken)
+		}
+	})
+
+	t.Run("intact streams over a store with no attested batches exits 2", func(t *testing.T) {
+		s := newTestDB(t)
+		sid, err := es.NewStreamID("thing", "a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedStream(t, s, sid, 2)
+		if _, err := s.DB().ExecContext(context.Background(), `DELETE FROM log_order`); err != nil {
+			t.Fatalf("strip log_order rows: %v", err)
+		}
+		closeDB(t, s)
+		if code := run([]string{"all"}); code != exitUsage {
+			t.Errorf("all over intact streams and zero attested batches: exit %d, want %d — EMPTY certifies nothing (F13)", code, exitUsage)
+		}
+	})
+}
+
+// TestMergeExitCombinations pins the merge rule itself, over every
+// verdict pair `es-verify all` can fold: broken (1) dominates usage or
+// EMPTY (2) in both orders, intact (0) never overrides anything, and
+// like verdicts stay themselves.
+func TestMergeExitCombinations(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		code, c, want int
+	}{
+		{"broken+broken stays 1", exitBroken, exitBroken, exitBroken},
+		{"intact+empty stays 2", exitIntact, exitUsage, exitUsage},
+		{"broken+empty becomes 1", exitBroken, exitUsage, exitBroken},
+		{"empty+broken becomes 1", exitUsage, exitBroken, exitBroken},
+		{"intact+broken becomes 1", exitIntact, exitBroken, exitBroken},
+		{"broken+intact stays 1", exitBroken, exitIntact, exitBroken},
+		{"intact+intact stays 0", exitIntact, exitIntact, exitIntact},
+		{"empty+intact stays 2", exitUsage, exitIntact, exitUsage},
+		{"empty+empty stays 2", exitUsage, exitUsage, exitUsage},
+	} {
+		if got := mergeExit(tc.code, tc.c); got != tc.want {
+			t.Errorf("%s: mergeExit(%d, %d) = %d, want %d", tc.name, tc.code, tc.c, got, tc.want)
+		}
+	}
+}

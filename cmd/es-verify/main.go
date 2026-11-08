@@ -156,17 +156,28 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 	}
 	code := exitIntact
 	for _, ref := range refs {
-		if c := verifyOne(ctx, b, ref.Workspace, ref.StreamID, es.VerifyOptions{ChainedSince: since, Strict: *strict}, false); c != exitIntact {
-			code = c
-		}
+		code = mergeExit(code, verifyOne(ctx, b, ref.Workspace, ref.StreamID, es.VerifyOptions{ChainedSince: since, Strict: *strict}, false))
 	}
 	fmt.Printf("es-verify: %d streams checked\n", len(refs))
 	// The order stage runs after the stream chains: first what each
 	// stream contains, then how the batches landed in the global log.
 	// A backend that cannot deep-verify order says so loudly here
 	// (exit 2, its own OrderRows error) instead of passing vacuously.
-	if c := cmdOrder(ctx, b, nil); c != exitIntact {
-		code = c
+	// The merge keeps a broken stream verdict dominant: a tamper must
+	// not be masked by the order stage's EMPTY (a pre-0006 store with
+	// zero attested batches) or usage verdict.
+	return mergeExit(code, cmdOrder(ctx, b, nil))
+}
+
+// mergeExit folds one stage's verdict into the running exit code of
+// `es-verify all`: broken dominates — a tamper must never be masked by
+// a later usage or EMPTY verdict — and intact never overrides anything.
+// Every combination: broken+broken 1, intact+empty 2, broken+empty 1,
+// empty+broken 1, intact+broken 1, broken+intact 1, empty+empty 2,
+// intact+intact 0.
+func mergeExit(code, c int) int {
+	if c == exitBroken || code == exitIntact {
+		return c
 	}
 	return code
 }
