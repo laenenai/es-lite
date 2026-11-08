@@ -702,3 +702,114 @@ func TestAnchorEmptyOrderContract(t *testing.T) {
 		t.Fatalf("verify order = %+v err=%v, want ok over 0 rows", rep, err)
 	}
 }
+
+// TestGenesisAnchorVerifiesForever pins the recorded empty bound's
+// CheckAnchor semantics (final review I1): an anchor recorded over an
+// empty log — the only shape whose resolved bound is 0, positions
+// starting at 1 — carries the literal empty bound, and that bound must
+// never be re-resolved. CheckAnchor used to pass the recorded bound back
+// through settledBound, whose `upto == 0` convention clamps to the
+// current last_value: once any event landed, the recomputed heads (the
+// whole grown log) and the covered order rows (orderRows(0) reads the
+// whole log on both adapters) disputed the anchor with a false
+// ErrAnchorMismatch — the genesis anchor false-alarmed on the very
+// first event.
+func TestGenesisAnchorVerifiesForever(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t) // truncated: no events, no log_order rows
+
+	// The shared review database has drawn positions before, so its
+	// sequence last_value is not 0; RESTART returns the sequence to the
+	// never-drawn state — pg_sequences reports last_value as NULL
+	// there, which the fence folds to 0 — staging exactly what a fresh
+	// deployment's first Anchor(0) resolves. Positions stay unique for
+	// the rest of the suite: every test truncates events before use.
+	if _, err := s.Pool().Exec(ctx, `ALTER SEQUENCE events_global_position_seq RESTART`); err != nil {
+		t.Fatalf("restart the position sequence: %v", err)
+	}
+
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("anchor over an empty log: %v", err)
+	}
+	if a.UptoGlobalPosition != 0 {
+		t.Fatalf("genesis anchor bound = %d, want 0 — the resolved bound of an empty log", a.UptoGlobalPosition)
+	}
+	if a.StreamCount != 0 || a.OrderCount != 0 || a.OrderFromPosition != 0 {
+		t.Fatalf("genesis anchor = %+v, want the empty contract (0 streams, 0 order rows)", a)
+	}
+	emptyRoot := es.OrderRoot(nil)
+	if !bytes.Equal(a.OrderRootHash, emptyRoot[:]) {
+		t.Fatalf("genesis anchor OrderRootHash = %x, want the empty-set root %x", a.OrderRootHash, emptyRoot)
+	}
+
+	// Events land. The recorded bound 0 is the empty bound forever: the
+	// fence is vacuous (nothing at or below 0 can be in flight),
+	// heads(0) is provably empty, and no order row is covered.
+	for _, ws := range []string{"ws_genesis_a", "ws_genesis_b"} {
+		sid := feedStream(t, "genesis-"+ws)
+		if _, err := s.WorkspaceStore(ws).Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: 0,
+			Events:          []es.EventData{{TypeURL: "genesis.v1.E", SchemaVersion: 1, Payload: []byte("x")}},
+		}); err != nil {
+			t.Fatalf("append into %s after the genesis anchor: %v", ws, err)
+		}
+	}
+
+	if err := s.CheckAnchor(ctx, a); err != nil {
+		t.Fatalf("check the genesis anchor over the grown log: %v — the recorded bound 0 is the empty bound, not the log head", err)
+	}
+}
+
+// TestLegacyEmptyAnchorOverGrownLogVerifies pins the regression half of
+// I1: pre-branch anchors over an empty log recorded bound 0 (the
+// committed maximum) and verified at that bound forever. The fence
+// change made CheckAnchor re-resolve the recorded bound through
+// settledBound, clamping 0 to the current last_value — flipping those
+// legacy anchors from pass to a false ErrAnchorMismatch once the log
+// grew. The fix treats the recorded 0 as the literal empty bound again,
+// so the pre-branch shape verifies heads-only as it did before the
+// branch.
+func TestLegacyEmptyAnchorOverGrownLogVerifies(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	// A pre-branch-shaped row: the five legacy columns only (the table
+	// has no order columns), bound 0, zero streams, the root over the
+	// empty heads set — exactly what a pre-branch Anchor recorded over
+	// an empty log.
+	emptyHeads := es.AnchorRoot(nil)
+	if _, err := s.Pool().Exec(ctx,
+		`INSERT INTO anchors (anchor_id, created_at, upto_global_position, stream_count, root_hash)
+		 VALUES ('11111111-1111-7111-8111-111111111111', now(), 0, 0, $1)`,
+		emptyHeads[:]); err != nil {
+		t.Fatalf("seed the pre-branch anchor row: %v", err)
+	}
+
+	// The log grows past it.
+	sid := feedStream(t, "legacy-grown")
+	if _, err := s.WorkspaceStore("ws_legacy_grown").Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{TypeURL: "genesis.v1.E", SchemaVersion: 1, Payload: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("append after the legacy anchor: %v", err)
+	}
+
+	// Read the stored row back — the operator's shape — and verify it.
+	// The read-back anchor carries nil OrderRootHash (the order fields
+	// live only in the exported JSON, ADR 0038), so it verifies
+	// heads-only, at the recorded empty bound.
+	list, err := s.ListAnchors(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list anchors = %+v err=%v, want the seeded legacy row", list, err)
+	}
+	legacy := list[0]
+	if legacy.UptoGlobalPosition != 0 || legacy.OrderRootHash != nil {
+		t.Fatalf("legacy read-back = %+v, want bound 0 with nil OrderRootHash", legacy)
+	}
+	if err := s.CheckAnchor(ctx, legacy); err != nil {
+		t.Fatalf("check the pre-branch empty anchor over the grown log: %v", err)
+	}
+}

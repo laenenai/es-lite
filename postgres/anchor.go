@@ -236,9 +236,13 @@ func (s *Store) ListAnchors(ctx context.Context) ([]es.Anchor, error) {
 // position and compares. The recompute is fenced exactly like Anchor's —
 // settledBound resolves the bound first — so the verdict is taken over
 // permanently settled heads: it cannot miss an append still in flight
-// below the anchor's bound, and an agreement holds. A new-style anchor
-// (non-nil OrderRootHash) has its three order fields compared over the
-// same settled section; a legacy anchor (nil) skips them and verifies
+// below the anchor's bound, and an agreement holds. A recorded bound of
+// 0 is the one exception: it is the literal empty bound — the only
+// resolved bound an anchor over an empty log can carry, positions
+// starting at 1 — and is verified as the empty log forever, never
+// re-resolved to the current head. A new-style anchor (non-nil
+// OrderRootHash) has its three order fields compared over the same
+// settled section; a legacy anchor (nil) skips them and verifies
 // heads-only.
 func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	// The role gate precedes the fence, as in Anchor: a non-member session
@@ -246,9 +250,22 @@ func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	if err := s.checkRelayRole(ctx); err != nil {
 		return err
 	}
-	upto, err := s.settledBound(ctx, a.UptoGlobalPosition)
-	if err != nil {
-		return err
+	// A RECORDED bound of 0 is the literal empty bound, and is never
+	// re-resolved: settledBound's upto == 0 convention means "the current
+	// log head", which would clamp the empty bound up to the grown log
+	// and dispute the anchor with a false ErrAnchorMismatch on the
+	// first appended event — flipping both genesis anchors and
+	// pre-branch empty anchors (which verified heads-only at 0 before
+	// the branch) into false alarms. The fence is vacuous for the
+	// empty bound: nothing at or below 0 can ever be in flight, so it
+	// is permanently settled exactly as recorded.
+	upto := a.UptoGlobalPosition
+	if upto > 0 {
+		resolved, err := s.settledBound(ctx, upto)
+		if err != nil {
+			return err
+		}
+		upto = resolved
 	}
 	tx, err := s.bypassTx(ctx)
 	if err != nil {
@@ -271,9 +288,17 @@ func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	if a.OrderRootHash == nil {
 		return nil
 	}
-	rows, err := orderRows(ctx, tx, upto)
-	if err != nil {
-		return err
+	// The covered order rows are exactly those with to_position <= upto
+	// — and none at the empty bound, a row's from_position being at
+	// least 1. orderRows' own upto == 0 convention is the whole-log
+	// read of OrderRows(0), which the empty bound must not borrow: the
+	// read is skipped and rows stays nil.
+	var rows []es.OrderRow
+	if upto > 0 {
+		rows, err = orderRows(ctx, tx, upto)
+		if err != nil {
+			return err
+		}
 	}
 	orderRoot := es.OrderRoot(rows)
 	var from uint64

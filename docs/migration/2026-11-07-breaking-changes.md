@@ -303,7 +303,12 @@ or fail with `postgres: anchor fence still blocked` when their context
 ends first. The DB principal running the anchor path now also needs
 `SELECT` on `events_global_position_seq` (the fence's first statement
 reads its `last_value`), in addition to the existing `events`/`anchors`
-grants.
+grants. A *recorded* bound of 0 is the one bound `CheckAnchor` never
+re-resolves: it is the literal empty bound — the only resolved bound an
+anchor over an empty log can carry, positions starting at 1 — so legacy
+bound-0 anchors (pre-branch empty anchors on Postgres included) verify
+as empty-bound anchors, heads-only, exactly as they did before this
+change, rather than mismatching once the log grows.
 
 **Who is affected.** Callers of the `es.Anchorer` methods on the Postgres
 backend: scheduled anchor/audit jobs now block for as long as an append

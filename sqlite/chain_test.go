@@ -568,3 +568,49 @@ func TestSQLiteAnchorEmptyOrderContract(t *testing.T) {
 		t.Fatalf("verify order = %+v err=%v, want ok over 0 rows", rep, err)
 	}
 }
+
+// TestSQLiteGenesisAnchorVerifiesForever pins the sqlite half of the
+// recorded empty bound's CheckAnchor semantics (final review I1): an
+// anchor recorded over an empty log — bound 0, the only resolved bound
+// an empty log can have — must verify as the literal empty log forever,
+// however much lands later. SQLite's heads(0) is always empty (no clamp
+// convention), but its order half had the same poison: CheckAnchor read
+// the covered rows with orderRows(0), whose 0-means-whole-log contract
+// returned the grown log's rows against the genesis anchor's
+// OrderCount 0 — a false ErrAnchorMismatch on the first appended batch.
+func TestSQLiteGenesisAnchorVerifiesForever(t *testing.T) {
+	ctx := context.Background()
+	s := openChainStore(t)
+
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("anchor over an empty log: %v", err)
+	}
+	if a.UptoGlobalPosition != 0 {
+		t.Fatalf("genesis anchor bound = %d, want 0", a.UptoGlobalPosition)
+	}
+	if a.StreamCount != 0 || a.OrderCount != 0 || a.OrderFromPosition != 0 {
+		t.Fatalf("genesis anchor = %+v, want the empty contract", a)
+	}
+
+	// Events land: two batches, so the order half has something to be
+	// wrong about once the recorded bound is misread as the log head.
+	sid, _ := es.NewStreamID("thing", "genesis")
+	for i := 0; i < 2; i++ {
+		if _, err := s.Append(ctx, es.AppendParams{StreamID: sid, ExpectedVersion: uint64(i), Events: []es.EventData{ev(byte(i + 1))}}); err != nil {
+			t.Fatalf("append after the genesis anchor: %v", err)
+		}
+	}
+
+	if err := s.CheckAnchor(ctx, a); err != nil {
+		t.Fatalf("check the genesis anchor over the grown log: %v — the recorded bound 0 is the empty bound, not the log head", err)
+	}
+
+	// The legacy shape agrees: the same anchor with nil OrderRootHash
+	// (the pre-attestation marker) verifies heads-only at bound 0.
+	legacy := a
+	legacy.OrderRootHash = nil
+	if err := s.CheckAnchor(ctx, legacy); err != nil {
+		t.Fatalf("check the legacy heads-only anchor over the grown log: %v", err)
+	}
+}

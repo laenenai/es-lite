@@ -118,9 +118,14 @@ func (s *Store) ListAnchors(ctx context.Context) ([]es.Anchor, error) {
 }
 
 // CheckAnchor implements es.Anchorer: recomputes the root at the anchor's
-// position and compares. A new-style anchor (non-nil OrderRootHash) has
-// its three order fields compared over the same bounded section; a
-// legacy anchor (nil) skips them and verifies heads-only.
+// position and compares. A recorded bound of 0 is the literal empty
+// bound — the only resolved bound an anchor over an empty log can
+// carry, positions starting at 1 — and is verified as the empty log
+// forever: heads(0) is provably empty (no re-resolution exists on the
+// single-writer store), and no order row is covered. A new-style anchor
+// (non-nil OrderRootHash) has its three order fields compared over the
+// same bounded section; a legacy anchor (nil) skips them and verifies
+// heads-only.
 func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	heads, err := s.heads(ctx, a.UptoGlobalPosition)
 	if err != nil {
@@ -138,9 +143,17 @@ func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 	if a.OrderRootHash == nil {
 		return nil
 	}
-	rows, err := s.orderRows(ctx, a.UptoGlobalPosition)
-	if err != nil {
-		return err
+	// The covered order rows are exactly those with to_position <= the
+	// recorded bound — and none at the empty bound, a row's
+	// from_position being at least 1. orderRows' own upto == 0
+	// convention is the whole-log read of OrderRows(0), which the empty
+	// bound must not borrow: the read is skipped and rows stays nil.
+	var rows []es.OrderRow
+	if a.UptoGlobalPosition > 0 {
+		rows, err = s.orderRows(ctx, a.UptoGlobalPosition)
+		if err != nil {
+			return err
+		}
 	}
 	orderRoot := es.OrderRoot(rows)
 	var from uint64
