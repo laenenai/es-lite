@@ -29,11 +29,16 @@ checkpoint under its definition hash.
 **What changes.** An append whose `EventID` already exists in the log
 used to surface as `es.ErrConflict`, discarding the underlying database
 error. Both adapters now classify it as `es.ErrDuplicateEventID` —
-Postgres by constraint name (`events_workspace_id_event_id_key` /
-`events_event_id_key`), SQLite by the driver's constraint message — so a
-permanent duplicate is no longer mistaken for a retryable
-optimistic-concurrency clash (which stays `ErrConflict` via the version
-constraint). In the same change both row scanners reject malformed audit
+Postgres by constraint name, matching on the `event_id_key` suffix
+because the `(workspace_id, event_id)` unique key fires under its
+partition-scoped name on the hash-partitioned events table
+(`events_p1_workspace_id_event_id_key` on whichever partition the
+workspace hashed to — no bare `events_event_id_key` constraint exists
+to match), and SQLite by the driver's constraint message (`UNIQUE
+constraint failed: events.event_id` — its `UNIQUE (event_id)`
+constraint is unnamed) — so a permanent duplicate is no longer
+mistaken for a retryable optimistic-concurrency clash (which stays
+`ErrConflict` via the version constraint). In the same change both row scanners reject malformed audit
 UUIDs: a row whose `event_id`, `correlation_id`, `causation_id` or
 `command_id` is not a UUID now fails the read with the column named and
 the value's length (never its bytes) instead of silently decoding to a
@@ -201,7 +206,18 @@ committed command returns `internal`: the response was produced but not
 stored, so the client's retry with the same key re-handles the command,
 collides on the derived event ids and is reported `aborted` until it
 picks a fresh key or the record is recovered by hand — never a silent
-success and never a second append.
+success and never a second append. For a once-only command — one whose
+decider rejects a second application before any append — that retry
+surfaces the decider's rejection as `failed_precondition` (or the
+app's own `Errors` mapping), not `aborted`: the 409 shape arises only
+when the re-handle reaches the insert and collides on the derived
+event ids. A replay returns the stored response without re-applying
+`Deps.Filter` (the stored state was filtered by the first call) and
+the fingerprint covers the marshaled request alone — principal-blind,
+per the draft's own checksum definition (§2.4) — so the same key and
+payload under a different authorized principal replays the first
+caller's stored response: deliberate cross-principal key+payload reuse
+is the draft's own error class (§2.7), not one this layer can detect.
 
 **Who is affected.** Applications wiring a generated handler's `Dedup`:
 requests carrying an `Idempotency-Key` stop double-appending on retry,

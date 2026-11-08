@@ -110,7 +110,9 @@ func NewPoller(src Source, cp Checkpoints, handler Handler, cfg Config) *Poller 
 // Run drains until ctx is cancelled. It drains once immediately (to catch
 // up on anything appended while it was down), then on each wake or tick.
 // A failing drain is retried with backoff up to cfg.MaxRetries before the
-// error is returned. Returns ctx.Err() on cancellation.
+// error is returned. Returns ctx.Err() on cancellation. Call it at most
+// once per Poller: the cached checkpoint position is guarded only by
+// Run's own single-goroutine discipline, so concurrent Runs race on it.
 func (p *Poller) Run(ctx context.Context) error {
 	return runUntilCancelled(ctx, loopConfig{
 		PollInterval: p.cfg.PollInterval,

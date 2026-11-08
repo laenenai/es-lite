@@ -238,7 +238,11 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 	return a, nil
 }
 
-// ListAnchors implements es.Anchorer.
+// ListAnchors implements es.Anchorer. The rows carry the five legacy
+// columns only, so every anchor read back here has a nil
+// OrderRootHash by design — the order fields live only in the exported
+// anchor JSON (ADR 0038) — and an anchor listed here verifies
+// heads-only through CheckAnchor.
 func (s *Store) ListAnchors(ctx context.Context) ([]es.Anchor, error) {
 	tx, err := s.bypassTx(ctx)
 	if err != nil {

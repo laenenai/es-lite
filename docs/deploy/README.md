@@ -249,7 +249,7 @@ settled bound alike — reads the bound through the documented
 sequence fails loudly:
 
 ```
-postgres: position sequence events_global_position_seq must use CACHE 1;
+position sequence events_global_position_seq must use CACHE 1;
 run ALTER SEQUENCE events_global_position_seq CACHE 1
 ```
 
