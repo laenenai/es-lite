@@ -11,6 +11,15 @@ import (
 // Source is the read side Replay pages over. es.Store and the workspace-scoped
 // Postgres store both satisfy it. (For Postgres, use a workspace-scoped store
 // to replay one workspace, or an admin reader for all.)
+//
+// The contract Replay relies on, stated here because the method signature
+// cannot: a page that returns fewer rows than the requested limit means the
+// log is exhausted — no further rows exist to read. The in-repo adapters
+// page over the store's own committed log and always uphold it. A custom
+// Source that can return a short page while more rows exist (a lagging
+// replica, a rate-limited reader) will silently truncate a rebuild at that
+// page — the events exist but are never applied — so it must page until a
+// genuinely empty page or not be used with Replay.
 type Source interface {
 	ReadAll(ctx context.Context, fromPosition uint64, limit int) ([]es.Envelope, error)
 }
@@ -24,7 +33,11 @@ type Apply func(ctx context.Context, batch []es.Envelope) error
 // each batch, and returns the last global_position applied. This is the
 // authoritative rebuild source — the DB log, not an external retention window
 // (ADR 0005). Apply must be idempotent; pair it with a Marker so a rebuild
-// can cut over to live delivery at exactly the returned position.
+// can cut over to live delivery at exactly the returned position. The
+// returned position is the last position a batch actually applied — the
+// rebuild's own log end, not a store-wide head: save it to the Marker (or
+// start the live feed from it) to cut over, and anything appended beyond it
+// while the rebuild ran is the live path's to deliver.
 func Replay(ctx context.Context, src Source, from uint64, batch int, apply Apply) (uint64, error) {
 	if batch <= 0 {
 		batch = 500

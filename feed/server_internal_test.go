@@ -165,6 +165,10 @@ func (l *idlePageLog) RawHead(context.Context) (uint64, error) { return 0, nil }
 
 func (l *idlePageLog) MatchingHead(context.Context, []string) (uint64, error) { return 0, nil }
 
+// MatchingRawHead serves the empty log's matching raw head: 0, like
+// every other head view on this fake — it has no events and no fence.
+func (l *idlePageLog) MatchingRawHead(context.Context, []string) (uint64, error) { return 0, nil }
+
 func (l *idlePageLog) snapshot() []time.Time {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -172,19 +176,20 @@ func (l *idlePageLog) snapshot() []time.Time {
 }
 
 // instantWaiter is the degenerate Waiter the floor defends against: Wait
-// records its timeout and returns nil immediately. Nil means "timeout" by the
-// Waiter contract, so a stream that trusts it alone would spin the read loop
+// records its timeout and returns immediately, never reporting a genuine
+// wake. (false, nil) means "timed out without a wakeup" by the Waiter
+// contract, so a stream that trusts it alone would spin the read loop
 // against the log as fast as pages can be read.
 type instantWaiter struct {
 	mu   sync.Mutex
 	args []time.Duration
 }
 
-func (w *instantWaiter) Wait(_ context.Context, timeout time.Duration) error {
+func (w *instantWaiter) Wait(_ context.Context, timeout time.Duration) (bool, error) {
 	w.mu.Lock()
 	w.args = append(w.args, timeout)
 	w.mu.Unlock()
-	return nil
+	return false, nil
 }
 
 func (w *instantWaiter) snapshot() []time.Duration {

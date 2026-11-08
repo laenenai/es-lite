@@ -76,8 +76,9 @@ message Aggregate {
 }
 
 // FetchMode says how a projector gets content. Payloads on the bus may be
-// sealed, so a projector either works from envelope metadata alone or
-// fetches aggregate state through a loader. Closed.
+// sealed, so a projector either works from envelope metadata alone,
+// decodes the typed event, or additionally fetches aggregate state
+// through a loader. Closed.
 enum FetchMode {
   // Not set; rejected by the generator.
   FETCH_MODE_UNSPECIFIED = 0;
@@ -88,6 +89,11 @@ enum FetchMode {
   // latest, so a rebuild from the log equals the live run. Handlers
   // receive the decoded event and that state.
   FETCH_MODE_STATE_AS_OF_EVENT_VERSION = 2;
+  // Receives the decoded event alone: the dispatch decodes (and upcasts
+  // when the deps carry an Upcaster) and the handler is handed the typed
+  // event, but no state is ever fetched — a projection or reaction that
+  // needs only the event pays no state load per event.
+  FETCH_MODE_EVENT_ONLY = 3;
 }
 
 // RebuildMode says where a projection can be rebuilt from. Closed.
@@ -185,12 +191,18 @@ extend google.protobuf.FieldOptions {
   // struct field of that name for a field called decided_at).
   //
   // The client value is intent, not authority. aggregate.Runtime always
-  // stamps Envelope.OccurredAt from the server clock (Meta.OccurredAt is
-  // ignored), rejects a tagged-but-unset field with es.ErrDecidedAtMissing,
+  // stamps Envelope.OccurredAt from the server clock, rejects a
+  // tagged-but-unset field with es.ErrDecidedAtMissing,
   // rejects a value further than es.MaxDecisionSkew (five minutes) from
   // server time with *es.DecidedAtSkewError, and replaces the command's
   // decided_at with server time before Decide runs so a decider checking an
-  // expiry window validates against the server clock. Generation fails when
+  // expiry window validates against the server clock. A command whose
+  // decision time cannot be replaced — es.StampDecisionTime reports
+  // false: the command is neither an es.DecisionTimeSetter nor a proto
+  // message with a tagged Timestamp field — is rejected with
+  // es.ErrDecidedAtUnstampable, naming the command type, before anything
+  // is loaded or appended; generated variants are always settable, so
+  // only hand-written command types can reach it. Generation fails when
   // the field is not a Timestamp or its message is not a variant of a
   // "Command" sum type.
   //

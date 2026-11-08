@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,17 @@ import (
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/snapshot"
 )
+
+// esLiteCommandNamespace is the fixed namespace uuid.NewSHA1 hashes into
+// when WithDeterministicEventIDs derives an event id from a command id.
+// Hex form: 18054f4d-c5eb-4dc2-bd52-3fba618c3a67.
+//
+// PINNED FOREVER once shipped: the derived event ids are stored in event
+// logs, so changing this value would silently re-key every future
+// derivation — a retried command would stop colliding with the ids its
+// first run stored, and dedup by event id would break for any command
+// whose events were written before the change. Never edit the literal.
+var esLiteCommandNamespace = uuid.MustParse("18054f4d-c5eb-4dc2-bd52-3fba618c3a67")
 
 // Runtime handles commands for one aggregate type.
 type Runtime[S, C, E any] struct {
@@ -46,6 +58,12 @@ type Runtime[S, C, E any] struct {
 	// folds (ADR 0029 §3). Off by default: it doubles hashing on the read
 	// path, and a gate can verify once per fetch instead.
 	verifyChain bool
+
+	// deterministicEventIDs fills each appended event's EventID by deriving
+	// it from the command id and the event's index in the batch
+	// (WithDeterministicEventIDs) instead of leaving it zero for the
+	// adapter to mint. Off by default: today's adapter-minted UUIDv7s.
+	deterministicEventIDs bool
 }
 
 // NewRuntime wires a Runtime against a Store, a Decider, and the generated
@@ -63,9 +81,11 @@ func (r *Runtime[S, C, E]) WithUpcaster(u es.Upcaster[E]) *Runtime[S, C, E] {
 	return r
 }
 
-// WithSnapshots enables the snapshot cache: Load seeds from a cached state and
-// folds only the tail, and Handle writes the new state through after append.
-// stateCodec serializes S; foldVersion is a monotonic counter you bump when a
+// WithSnapshots enables the snapshot cache: Load (and its version-bounded
+// form, LoadAsOfVersion) seeds from a cached state and folds only the tail,
+// and Handle writes the new state through after append. A time-travel-by-
+// time load (LoadAsOfTime) never seeds. stateCodec serializes S;
+// foldVersion is a monotonic counter you bump when a
 // decider/upcaster/state-shape change makes old snapshots wrong (they are then
 // ignored and refolded — snapshots are a pure cache). Returns the runtime for
 // chaining.
@@ -113,6 +133,33 @@ func (r *Runtime[S, C, E]) WithChainVerification() *Runtime[S, C, E] {
 	return r
 }
 
+// WithDeterministicEventIDs makes Handle derive every appended event's
+// EventID from the command's id instead of leaving it zero for the store
+// adapter to mint a fresh UUIDv7: for the event at 0-based index i of the
+// command's batch,
+//
+//	EventID = uuid.NewSHA1(esLiteCommandNamespace,
+//		[]byte(meta.CommandID.String() + ":" + strconv.Itoa(i)))
+//
+// when meta.CommandID is set (a nil command id can't derive one — the
+// runtime keeps minting one per Handle and those events behave exactly as
+// without the option). The option is off by default; without it the same
+// command handled twice appends twice, because each run mints fresh event
+// ids. With it, the two runs derive the same ids and the second append
+// collides on the store's event_id unique constraint, surfacing
+// es.ErrDuplicateEventID — the idempotency signal that a command already
+// ran — instead of silently duplicating events. Callers must treat that
+// error as "already done", never as a retry cue.
+//
+// Derived ids are unique across the whole log, not per stream: the same
+// command id deriving ids on a different stream collides too, which is the
+// intent — one command id appends one batch of events, ever.
+// Returns the runtime for chaining.
+func (r *Runtime[S, C, E]) WithDeterministicEventIDs() *Runtime[S, C, E] {
+	r.deterministicEventIDs = true
+	return r
+}
+
 // DefaultBackoff is the full-jitter exponential schedule WithConflictRetry
 // uses when given a nil backoff: a uniform random pause in [0, base] where
 // base doubles from 10ms per attempt and is capped at 500ms.
@@ -144,18 +191,6 @@ type Result[S, E any] struct {
 	Envelopes   []es.Envelope
 }
 
-// Handle loads the stream, applies cmd via Decider.Decide, and appends
-// the resulting events. On an optimistic-concurrency clash it returns
-// es.ErrConflict — the caller reloads and retries, unless WithConflictRetry
-// is set, in which case Handle retries a bounded number of times itself.
-//
-// The runtime, unlike the Decider, may touch the clock and generate IDs.
-// Meta.OccurredAt is ALWAYS stamped from the server clock; a caller-supplied
-// value is ignored (ADR 0034). A command implementing es.DecidedAt supplies
-// intent only: an unset decided_at is rejected with es.ErrDecidedAtMissing,
-// one further than es.MaxDecisionSkew from server time is rejected with
-// *es.DecidedAtSkewError, and an in-window value is replaced by server time
-// before Decide runs so expiry windows validate against the server clock.
 // AppendFunc performs the append for one Handle call.
 //
 // It exists so a caller can own the transaction: an audited store, an outbox
@@ -194,6 +229,21 @@ func newHandleOptions(opts []HandleOption) handleOptions {
 	return o
 }
 
+// Handle loads the stream, applies cmd via Decider.Decide, and appends
+// the resulting events. On an optimistic-concurrency clash it returns
+// es.ErrConflict — the caller reloads and retries, unless WithConflictRetry
+// is set, in which case Handle retries a bounded number of times itself.
+//
+// The runtime, unlike the Decider, may touch the clock and generate IDs.
+// Each event's Envelope.OccurredAt is ALWAYS stamped from the server clock;
+// es.Meta carries no time of its own (ADR 0034). A command implementing
+// es.DecidedAt supplies intent only: an unset decided_at is rejected with
+// es.ErrDecidedAtMissing, one further than es.MaxDecisionSkew from server
+// time is rejected with *es.DecidedAtSkewError, an in-window value is
+// replaced by server time before Decide runs so expiry windows validate
+// against the server clock, and a command whose decision time cannot be
+// replaced (es.StampDecisionTime returns false) is rejected with
+// es.ErrDecidedAtUnstampable, naming the command type.
 func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, opts ...HandleOption) (Result[S, E], error) {
 	return r.HandleAt(ctx, sid, cmd, meta, 0, opts...)
 }
@@ -225,26 +275,31 @@ func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C,
 		}
 		// The command is normalized to the server reading before Decide, so a
 		// decider that reads cmd.DecisionTime() for an expiry window is
-		// validating against server time, never the client value.
-		es.StampDecisionTime(cmd, now)
+		// validating against server time, never the client value. A command
+		// whose decision time cannot be replaced would leave the decider
+		// reading the client's clock, so it is rejected loudly — naming the
+		// type — instead of run on a value the server never stamped.
+		if !es.StampDecisionTime(cmd, now) {
+			return zero, fmt.Errorf("%w: %T", es.ErrDecidedAtUnstampable, cmd)
+		}
 	}
 
 	// Fill audit defaults once, outside the retry loop, so every attempt
 	// carries the same command id and domain time. CorrelationID defaults
 	// to the command id so a single command still forms a one-event
-	// correlation group. OccurredAt is never taken from meta or the command.
+	// correlation group. The domain time is the server reading above —
+	// never taken from the command.
 	if meta.CommandID == uuid.Nil {
 		meta.CommandID = newV7()
 	}
 	if meta.CorrelationID == uuid.Nil {
 		meta.CorrelationID = meta.CommandID
 	}
-	meta.OccurredAt = now
 
 	ho := newHandleOptions(opts)
 
 	for attempt := 0; ; attempt++ {
-		res, err := r.handleOnce(ctx, sid, cmd, meta, expected, ho)
+		res, err := r.handleOnce(ctx, sid, cmd, meta, expected, now, ho)
 		var stale *es.ConflictError
 		if err == nil || !errors.Is(err, es.ErrConflict) || errors.As(err, &stale) || attempt >= r.retries {
 			if err != nil && attempt > 0 {
@@ -275,8 +330,9 @@ func (r *Runtime[S, C, E]) sleep(ctx context.Context, d time.Duration) error {
 
 // handleOnce is a single load → IsTerminal → Decide → Append pass. Decide is
 // pure and load re-reads the stream, so re-running it after a conflict is
-// safe by construction.
-func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, ho handleOptions) (Result[S, E], error) {
+// safe by construction. now is the server-clock reading HandleAt took once
+// per call: the domain time every appended event carries.
+func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, now time.Time, ho handleOptions) (Result[S, E], error) {
 	var zero Result[S, E]
 
 	state, version, err := r.load(ctx, sid, 0, time.Time{})
@@ -311,6 +367,15 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 			SchemaVersion: enc.SchemaVersion,
 			Payload:       enc.Payload,
 		}
+		// Deterministic event ids (WithDeterministicEventIDs): derive the
+		// id from the command id and the event's index in the batch, so a
+		// retried command derives the ids its first run stored and the
+		// store's event_id unique constraint surfaces the rerun as
+		// es.ErrDuplicateEventID instead of duplicating events. A nil
+		// command id can't derive one — leave the adapter's mint in place.
+		if r.deterministicEventIDs && meta.CommandID != uuid.Nil {
+			encoded[i].EventID = uuid.NewSHA1(esLiteCommandNamespace, []byte(meta.CommandID.String()+":"+strconv.Itoa(i)))
+		}
 	}
 
 	appendFn := r.store.Append
@@ -327,7 +392,7 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 		CorrelationID:   meta.CorrelationID,
 		CausationID:     meta.CausationID,
 		Actor:           meta.Actor,
-		OccurredAt:      meta.OccurredAt,
+		OccurredAt:      now,
 	})
 	if err != nil {
 		return zero, err // includes es.ErrConflict
@@ -368,7 +433,9 @@ func (r *Runtime[S, C, E]) Load(ctx context.Context, sid es.StreamID) (state S, 
 
 // LoadAsOfVersion returns the state as it stood after exactly version v
 // (time-travel by version). v=0 returns Initial(); v beyond the stream's
-// current version returns es.ErrVersionOutOfRange.
+// current version returns es.ErrVersionOutOfRange. With a snapshot cache
+// configured, the load seeds from a snapshot at or below v and folds only
+// the (snapshot, v] tail; a snapshot newer than v never seeds.
 func (r *Runtime[S, C, E]) LoadAsOfVersion(ctx context.Context, sid es.StreamID, v uint64) (S, error) {
 	if err := sid.Validate(); err != nil {
 		var zero S
@@ -416,16 +483,40 @@ func (r *Runtime[S, C, E]) LoadStale(ctx context.Context, sid es.StreamID, maxAg
 func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersion uint64, asOf time.Time) (S, uint64, error) {
 	state := r.decider.Initial()
 
-	// Snapshot seed — only for current (non-time-travel) loads. Time-travel
-	// must never start from a snapshot newer than the target (ADR 0007). Any
+	// Snapshot seed — never on the time-travel-by-time (asOf) path: a
+	// snapshot newer than the target would swallow the requested past
+	// (ADR 0007). A current load (upToVersion == 0) seeds from any
+	// snapshot; a version-bounded load seeds only when the snapshot is at
+	// or below the bound, so the fold covers just the (snap.Version,
+	// upToVersion] tail instead of the whole stream. Any
 	// miss/mismatch/error falls through to a full fold (pure cache).
 	var from uint64
-	if r.cache != nil && upToVersion == 0 && asOf.IsZero() {
-		if snap, ok, serr := r.cache.Load(ctx, sid.Canonical()); serr == nil && ok && snap.FoldVersion == r.foldVersion {
+	if r.cache != nil && asOf.IsZero() {
+		if snap, ok, serr := r.cache.Load(ctx, sid.Canonical()); serr == nil && ok &&
+			snap.FoldVersion == r.foldVersion && (upToVersion == 0 || snap.Version <= upToVersion) {
 			if s, derr := r.stateCodec.Decode(snap.State); derr == nil {
 				state = s
 				from = snap.Version
 			}
+		}
+	}
+
+	// Lineage guard (F24): a snapshot can outlive the log it summarizes —
+	// after a reset or truncation the log no longer contains version
+	// `from`, and a tail fold from there would present the phantom cached
+	// state as the stream's truth. One bounded read of the envelope at
+	// `from` settles it: rows mean the seed's version still exists in this
+	// log and the seed stands; no rows — an empty range, or
+	// es.ErrStreamNotFound when from==1 probes a stream that was wiped
+	// entirely — discard the seed and re-read the full stream instead.
+	if from > 0 {
+		probe, perr := r.store.ReadStream(ctx, sid, from-1, from)
+		if perr != nil && !errors.Is(perr, es.ErrStreamNotFound) {
+			return state, 0, perr
+		}
+		if len(probe) == 0 {
+			state = r.decider.Initial()
+			from = 0
 		}
 	}
 

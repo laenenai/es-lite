@@ -35,6 +35,7 @@ than editing history.
 | 0035 | [Caller-Owned Transactions for Atomic Appends](./0035-caller-owned-transactions.md) | Accepted (implemented; additive to 0008) |
 | 0036 | [No Broker in es-lite; Postgres and SQLite Only](./0036-postgres-only-no-broker.md) | Accepted (implemented); supersedes 0003/0009/0028 |
 | 0037 | [Commit-Safe Feed Reads on Postgres](./0037-commit-safe-feed-reads.md) | Accepted (implemented); closes ADR 0001 §5's deferred Postgres gap |
+| 0038 | [Log-Order Attestation (Per-Batch `log_order` Rows)](./0038-log-order-attestation.md) | Accepted (implemented); makes ADR 0029 §2's ordering claim true |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in
@@ -56,8 +57,13 @@ implemented on this branch; the ordered implementation plan is in
 model, a storage-neutral `Store` — while deliberately **omitting** the
 parent's heavier machinery (durable command-bus workflows, synchronous
 projections, `state_cache`, server-side crypto-shredding, Cedar authz,
-mandatory multi-tenancy). ADR 0001 lists the cuts and the reasoning.
-Cryptography and erasure are client-owned (ADR 0025). The tamper-evident
-hash chain, cut in 0001, was added back by ADR 0029 in a keyless form.
-When a cut later proves necessary, the parent's ADRs are the reference for
-how to add it back.
+mandatory multi-tenancy). ADR 0001 lists the cuts and the reasoning; its
+cut table is the 2026-08-01 record, and two entries it cuts have since
+been reversed — read it with ADR 0001's dated errata. Cryptography and
+erasure are client-owned (ADR 0025). The tamper-evident hash chain, cut
+in 0001, was added back by ADR 0029 in a keyless form, which ADR 0038
+extended to global append order (per-batch `log_order` attestation);
+workspace isolation with RLS, cut with "mandatory multi-tenancy", was
+added back as an optional per-workspace Postgres feature by ADR 0004.
+When a cut later proves necessary, the parent's ADRs are the reference
+for how to add it back.

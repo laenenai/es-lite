@@ -83,10 +83,15 @@ type CounterViewCounterLoader interface {
 // CounterViewDeps is what the application wires into the runner.
 type CounterViewDeps struct {
 	// Counter loads state as of the event's version (required).
+	// Cost: without snapshots each load re-folds the whole stream,
+	// O(stream length) per consumed event; with a snapshot at or
+	// below the version it folds only the tail, O(tail).
 	Counter CounterViewCounterLoader
 	// CounterCodec decodes counter.v1 events; nil selects the generated codec.
 	// Supply an unsealing codec when payloads are sealed (ADR 0025).
 	CounterCodec es.Codec[v1.Event]
+	// CounterUpcaster upgrades stored event shapes on read; nil decodes as stored.
+	CounterUpcaster es.Upcaster[v1.Event]
 	// Marker persists the highest applied global_position (ADR 0005); nil is
 	// an in-memory marker, for tests only.
 	Marker projection.Marker
@@ -95,17 +100,29 @@ type CounterViewDeps struct {
 // NewCounterViewRunner wires h into a projection.Runner: marker handling, live
 // consumption (Run over any projection.Feed) and Rebuild from the log share
 // one dispatch path (ADR 0005, ADR 0030).
+// A nil state loader panics at construction, naming
+// itself; Marker keeps its nil default.
 func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projection.Runner {
+	if deps.Counter == nil {
+		panic("CounterViewDeps.Counter is required")
+	}
 	counterCodec := deps.CounterCodec
 	if counterCodec == nil {
 		counterCodec = v1.EventCodec{}
 	}
+	counterUpcaster := deps.CounterUpcaster
 	dispatch := func(ctx context.Context, env es.Envelope) error {
 		switch env.TypeURL {
 		case "counter.v1.Initialized":
 			decoded, err := counterCodec.Decode(es.EncodedEvent{TypeURL: env.TypeURL, SchemaVersion: env.SchemaVersion, Payload: env.Payload})
 			if err != nil {
 				return fmt.Errorf("CounterView: decode %s v%d: %w", env.StreamID, env.Version, err)
+			}
+			if counterUpcaster != nil {
+				decoded, err = counterUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)
+				if err != nil {
+					return fmt.Errorf("CounterView: upcast %s v%d: %w", env.StreamID, env.Version, err)
+				}
 			}
 			ev, ok := decoded.(*v1.Initialized)
 			if !ok {
@@ -121,6 +138,12 @@ func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projectio
 			if err != nil {
 				return fmt.Errorf("CounterView: decode %s v%d: %w", env.StreamID, env.Version, err)
 			}
+			if counterUpcaster != nil {
+				decoded, err = counterUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)
+				if err != nil {
+					return fmt.Errorf("CounterView: upcast %s v%d: %w", env.StreamID, env.Version, err)
+				}
+			}
 			ev, ok := decoded.(*v1.Incremented)
 			if !ok {
 				return fmt.Errorf("CounterView: %s decoded as %T", env.TypeURL, decoded)
@@ -135,6 +158,12 @@ func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projectio
 			if err != nil {
 				return fmt.Errorf("CounterView: decode %s v%d: %w", env.StreamID, env.Version, err)
 			}
+			if counterUpcaster != nil {
+				decoded, err = counterUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)
+				if err != nil {
+					return fmt.Errorf("CounterView: upcast %s v%d: %w", env.StreamID, env.Version, err)
+				}
+			}
 			ev, ok := decoded.(*v1.Decremented)
 			if !ok {
 				return fmt.Errorf("CounterView: %s decoded as %T", env.TypeURL, decoded)
@@ -148,6 +177,12 @@ func NewCounterViewRunner(h CounterViewHandler, deps CounterViewDeps) *projectio
 			decoded, err := counterCodec.Decode(es.EncodedEvent{TypeURL: env.TypeURL, SchemaVersion: env.SchemaVersion, Payload: env.Payload})
 			if err != nil {
 				return fmt.Errorf("CounterView: decode %s v%d: %w", env.StreamID, env.Version, err)
+			}
+			if counterUpcaster != nil {
+				decoded, err = counterUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)
+				if err != nil {
+					return fmt.Errorf("CounterView: upcast %s v%d: %w", env.StreamID, env.Version, err)
+				}
 			}
 			ev, ok := decoded.(*v1.Closed)
 			if !ok {
@@ -305,10 +340,15 @@ type ResetOnClosedCounterLoader interface {
 // ResetOnClosedDeps is what the application wires into the runner.
 type ResetOnClosedDeps struct {
 	// Counter loads state as of the event's version (required).
+	// Cost: without snapshots each load re-folds the whole stream,
+	// O(stream length) per consumed event; with a snapshot at or
+	// below the version it folds only the tail, O(tail).
 	Counter ResetOnClosedCounterLoader
 	// CounterCodec decodes counter.v1 events; nil selects the generated codec.
 	// Supply an unsealing codec when payloads are sealed (ADR 0025).
 	CounterCodec es.Codec[v1.Event]
+	// CounterUpcaster upgrades stored event shapes on read; nil decodes as stored.
+	CounterUpcaster es.Upcaster[v1.Event]
 	// CounterRouter delivers issued counter.v1 commands (reaction.RuntimeDispatcher
 	// over the embedded runtime, or a command gate client).
 	CounterRouter reaction.Dispatcher[v1.Command]
@@ -322,11 +362,20 @@ type ResetOnClosedDeps struct {
 // NewResetOnClosedRunner wires h into a reaction.Runner: marker handling and live
 // consumption (Run over any projection.Feed). There is no Rebuild — replaying
 // a reaction re-issues its commands (ADR 0030 §2).
+// A nil state loader or issuing router panics at construction, naming
+// itself; Marker keeps its nil default.
 func NewResetOnClosedRunner(h ResetOnClosedHandler, deps ResetOnClosedDeps) *reaction.Runner {
+	if deps.Counter == nil {
+		panic("ResetOnClosedDeps.Counter is required")
+	}
+	if deps.CounterRouter == nil {
+		panic("ResetOnClosedDeps.CounterRouter is required")
+	}
 	counterCodec := deps.CounterCodec
 	if counterCodec == nil {
 		counterCodec = v1.EventCodec{}
 	}
+	counterUpcaster := deps.CounterUpcaster
 	dispatch := func(ctx context.Context, env es.Envelope) error {
 		issue := &ResetOnClosedIssuer{}
 		switch env.TypeURL {
@@ -334,6 +383,12 @@ func NewResetOnClosedRunner(h ResetOnClosedHandler, deps ResetOnClosedDeps) *rea
 			decoded, err := counterCodec.Decode(es.EncodedEvent{TypeURL: env.TypeURL, SchemaVersion: env.SchemaVersion, Payload: env.Payload})
 			if err != nil {
 				return fmt.Errorf("ResetOnClosed: decode %s v%d: %w", env.StreamID, env.Version, err)
+			}
+			if counterUpcaster != nil {
+				decoded, err = counterUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)
+				if err != nil {
+					return fmt.Errorf("ResetOnClosed: upcast %s v%d: %w", env.StreamID, env.Version, err)
+				}
 			}
 			ev, ok := decoded.(*v1.Closed)
 			if !ok {

@@ -19,6 +19,7 @@ import (
 	"github.com/laenenai/es-lite/projection"
 	"github.com/laenenai/es-lite/reaction"
 	"github.com/laenenai/es-lite/sqlite"
+	"github.com/laenenai/es-lite/upcast"
 )
 
 type fixture struct {
@@ -266,4 +267,95 @@ func (r *racingStore) Append(ctx context.Context, p es.AppendParams) (es.AppendR
 		}
 	}
 	return r.Store.Append(ctx, p)
+}
+
+// upcastProbe is a CounterViewHandler that records the Incremented event
+// exactly as dispatch delivered it — decoded, then run through the deps'
+// upcaster seam — alongside the state fetched as of its version.
+type upcastProbe struct {
+	by    int64
+	count int64
+	hits  int
+}
+
+func (p *upcastProbe) OnInitialized(context.Context, es.Envelope, *counterv1.Initialized, *counterv1.Counter) error {
+	return nil
+}
+
+func (p *upcastProbe) OnIncremented(_ context.Context, _ es.Envelope, ev *counterv1.Incremented, state *counterv1.Counter) error {
+	p.by = ev.GetBy()
+	p.count = state.GetCount()
+	p.hits++
+	return nil
+}
+
+func (p *upcastProbe) OnDecremented(context.Context, es.Envelope, *counterv1.Decremented, *counterv1.Counter) error {
+	return nil
+}
+
+func (p *upcastProbe) OnClosed(context.Context, es.Envelope, *counterv1.Closed, *counterv1.Counter) error {
+	return nil
+}
+
+// TestProjectionAppliesUpcaster (F20): a v1 Incremented — the examples/upcast
+// fixture shape, where by was stored in half-units — must reach the handler
+// already upgraded by the generated seam (CounterViewDeps.CounterUpcaster),
+// while the state fetched alongside agrees because the runtime folds the
+// same upgrade through its own upcaster path. Without the seam the handler
+// would see the stored by=3 against a state of 6.
+func TestProjectionAppliesUpcaster(t *testing.T) {
+	f := newFixture(t)
+
+	// History "already on disk" (the examples/upcast fixture): Initialized,
+	// then an Incremented stored under the OLD schema version 1 with by=3.
+	sid, _ := es.NewStreamID("counter", "legacy")
+	encInit, err := counterv1.EventCodec{}.Encode(&counterv1.Initialized{Min: 0, Max: 100, Value: 0})
+	if err != nil {
+		t.Fatalf("encode init: %v", err)
+	}
+	encInc, err := counterv1.EventCodec{}.Encode(&counterv1.Incremented{By: 3})
+	if err != nil {
+		t.Fatalf("encode inc: %v", err)
+	}
+	if _, err := f.store.Append(context.Background(), es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events: []es.EventData{
+			{TypeURL: encInit.TypeURL, SchemaVersion: 1, Payload: encInit.Payload},
+			{TypeURL: encInc.TypeURL, SchemaVersion: 1, Payload: encInc.Payload},
+		},
+	}); err != nil {
+		t.Fatalf("append legacy events: %v", err)
+	}
+
+	// The same upgrade wired twice: into the projection deps (the generated
+	// seam) and into the runtime (its own upcaster path, so the fetched
+	// state folds the upgrade too).
+	legacy := upcast.NewRegistry[counterv1.Event]().Register(
+		"counter.v1.Incremented",
+		func(fromVersion uint32, e counterv1.Event) (counterv1.Event, error) {
+			if inc, ok := e.(*counterv1.Incremented); ok && fromVersion < 2 {
+				return &counterv1.Incremented{By: inc.GetBy() * 2}, nil
+			}
+			return e, nil
+		},
+	)
+	rt := aggregate.NewRuntime(f.store, counter.Decider, counterv1.EventCodec{}).WithUpcaster(legacy)
+
+	probe := &upcastProbe{}
+	runner := counterviewv1.NewCounterViewRunner(probe, counterviewv1.CounterViewDeps{Counter: rt, CounterUpcaster: legacy})
+	runUntil(t, runner.Run, runner.Position, f.store, 2)
+
+	// The handler observed the upcast event: stored by=3, delivered by=6.
+	if probe.hits != 1 || probe.by != 6 {
+		t.Fatalf("handler saw by=%d hits=%d, want the upcast event by=6 (stored v1 by=3)", probe.by, probe.hits)
+	}
+	// ...and the state fetched as of v2 agrees: the runtime folded the same
+	// upgrade on its own upcaster path (0 + 6, not 0 + 3).
+	if probe.count != 6 {
+		t.Fatalf("state as of v2 = %d, want 6", probe.count)
+	}
+	if st, v, err := rt.Load(context.Background(), sid); err != nil || v != 2 || st.GetCount() != 6 {
+		t.Fatalf("load = %+v v%d err=%v, want count 6 at version 2", st, v, err)
+	}
 }

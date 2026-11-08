@@ -110,3 +110,33 @@ Rejected. Simpler, but a failure rolls back everything including successful
 earlier steps, and it forbids statements that cannot run in a transaction
 (e.g. a future `CREATE INDEX CONCURRENTLY`). Per-migration transactions under a
 session lock compose better.
+
+## Errata (2026-11-07)
+
+Both locking claims in this ADR were replaced by the 2026-11-07 review
+remediation; the design's shape (recorded, forward-only, per-migration
+transactions) is unchanged:
+
+1. **Postgres: the lock is transaction-scoped, not session-level.** The
+   "session-level advisory lock (`pg_advisory_lock`) held for the run"
+   described above — and the "session lock" of the One-big-transaction
+   alternative — leak: when a migration run was cancelled or failed, the
+   deferred session unlock never ran on a dead context, and the lock stayed
+   latched on a pooled connection, wedging every later migration that landed
+   on another connection (review F10, found by two reviewers independently).
+   Since 2026-11-07
+   each pending migration runs in exactly one transaction that *begins* with
+   `SELECT pg_advisory_xact_lock($1)` and then re-checks the recorded version
+   before applying — "automatically released at the end of the current
+   transaction and cannot be released explicitly", so commit, rollback,
+   cancellation and connection loss all release it
+   (`postgres/store.go` `Migrate`).
+2. **SQLite: "no lock is needed" overstated.** Single-writer keeps a
+   *running migration* safe, but the old check-then-apply shape let two
+   migrators both see a version pending and both apply it — the loser
+   failing on the DDL instead of skipping. Since 2026-11-07 each pending
+   migration inserts its `schema_migrations` row **first**, inside the
+   transaction: the SQLite write lock the INSERT takes is what serializes
+   rival migrators, and the loser sees the primary-key violation and skips
+   (`sqlite/store.go` `Migrate`) — the lock was always there; the code just
+   wasn't the one taking it.

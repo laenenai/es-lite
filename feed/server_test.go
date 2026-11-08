@@ -357,6 +357,26 @@ func (l *memLog) MatchingHead(_ context.Context, types []string) (uint64, error)
 	return h, nil
 }
 
+// MatchingRawHead reports the highest position among events of types,
+// ignoring the Head override, like an unbounded filtered MAX: the raw
+// view the stall probe compares against. The fake has no fence, so it
+// agrees with MatchingHead.
+func (l *memLog) MatchingRawHead(_ context.Context, types []string) (uint64, error) {
+	l.parent.mu.Lock()
+	defer l.parent.mu.Unlock()
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var h uint64
+	for _, e := range l.parent.events[l.scope] {
+		if want[e.TypeURL] && e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
 func (l *memLog) ReadAllBounded(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
@@ -464,10 +484,19 @@ type blockingSendSink struct {
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once
+
+	// ctxMu guards the context Send observed — the stream's own run
+	// context, whose cancellation is one of the few externally visible
+	// events in Subscribe's tail.
+	ctxMu sync.Mutex
+	ctx   context.Context
 }
 
 func (s *blockingSendSink) Send(ctx context.Context, _ es.Envelope) error {
 	s.once.Do(func() { close(s.started) })
+	s.ctxMu.Lock()
+	s.ctx = ctx
+	s.ctxMu.Unlock()
 	select {
 	case <-s.release:
 	case <-ctx.Done():
@@ -478,7 +507,17 @@ func (s *blockingSendSink) Send(ctx context.Context, _ es.Envelope) error {
 	return s.sendErr
 }
 
-// blockingWaiter blocks until the stream is cancelled; it never busy-polls.
+// streamContext returns the context Send observed: the stream's run
+// context. Its Done channel closes when Subscribe cancels it, so a test can
+// order the renewer's delivery against the tail without sleeping.
+func (s *blockingSendSink) streamContext() context.Context {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+	return s.ctx
+}
+
+// blockingWaiter blocks until the stream is cancelled; it never genuinely
+// wakes, so Wait always reports (false, …) and the poll floor still paces it.
 type blockingWaiter struct {
 	mu      sync.Mutex
 	waits   int
@@ -486,30 +525,47 @@ type blockingWaiter struct {
 	release chan struct{}
 }
 
-func (w *blockingWaiter) Wait(ctx context.Context, _ time.Duration) error {
+func (w *blockingWaiter) Wait(ctx context.Context, _ time.Duration) (bool, error) {
 	w.mu.Lock()
 	w.waits++
 	err := w.err
 	w.mu.Unlock()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if w.release != nil {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-w.release:
-			return nil
+			return false, nil
 		}
 	}
 	<-ctx.Done()
-	return ctx.Err()
+	return false, ctx.Err()
 }
 
 func (w *blockingWaiter) count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.waits
+}
+
+// wakingWaiter genuinely wakes: Wait reports (true, nil) once its delay
+// passes, claiming new events may exist without waiting out the poll.
+type wakingWaiter struct {
+	delay time.Duration
+}
+
+func (w *wakingWaiter) Wait(ctx context.Context, _ time.Duration) (bool, error) {
+	t := time.NewTimer(w.delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-t.C:
+		return true, nil
+	}
 }
 
 // recordingObserver captures every Observer signal so tests can pin what
@@ -522,13 +578,22 @@ type recordingObserver struct {
 	leaseLost   []obsLeaseLost
 	poisons     []*feed.EventTooLargeError
 	stalls      []obsStall
+	// subscribeErrs stays empty in this package — the server never
+	// calls OnSubscribeError; the consumer adapter's reconnect loop
+	// does — but the fake must still implement the whole interface.
+	subscribeErrs []obsSubscribeError
 }
 
 type obsPage struct{ events, bytes int }
 
 type obsLeaseLost struct{ scope, projection, instance, owner string }
 
-type obsStall struct{ settled, raw uint64 }
+type obsStall struct{ settled, matchingRaw uint64 }
+
+type obsSubscribeError struct {
+	scope, projection, instance string
+	err                         error
+}
 
 func (o *recordingObserver) OnPage(events, bytes int) {
 	o.mu.Lock()
@@ -554,10 +619,16 @@ func (o *recordingObserver) OnPoison(err *feed.EventTooLargeError) {
 	o.poisons = append(o.poisons, err)
 }
 
-func (o *recordingObserver) OnStall(settled, raw uint64) {
+func (o *recordingObserver) OnStall(settled, matchingRaw uint64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.stalls = append(o.stalls, obsStall{settled, raw})
+	o.stalls = append(o.stalls, obsStall{settled, matchingRaw})
+}
+
+func (o *recordingObserver) OnSubscribeError(scope, projection, instance string, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.subscribeErrs = append(o.subscribeErrs, obsSubscribeError{scope, projection, instance, err})
 }
 
 func (o *recordingObserver) pagesSnapshot() []obsPage {
@@ -588,6 +659,30 @@ func (o *recordingObserver) stallsSnapshot() []obsStall {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return append([]obsStall(nil), o.stalls...)
+}
+
+func (o *recordingObserver) subscribeErrorsSnapshot() []obsSubscribeError {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]obsSubscribeError(nil), o.subscribeErrs...)
+}
+
+// slowLeaseLostObserver parks the renewer inside OnLeaseLost: entered closes
+// when the call arrives; the call returns only once hold closes. It lets a
+// test hold the renewer between the store's failed renewal and the loss
+// reaching Subscribe — the loss is decided and observed, but not yet
+// delivered. The embedded recordingObserver keeps every other signal.
+type slowLeaseLostObserver struct {
+	recordingObserver
+	once    sync.Once
+	entered chan struct{}
+	hold    chan struct{}
+}
+
+func (o *slowLeaseLostObserver) OnLeaseLost(scope, projection, instance, owner string) {
+	o.once.Do(func() { close(o.entered) })
+	<-o.hold
+	o.recordingObserver.OnLeaseLost(scope, projection, instance, owner)
 }
 
 // fenceBlockedLog is the fence-bounded Log the clamp and stall tests run
@@ -641,6 +736,26 @@ func (l *fenceBlockedLog) MatchingHead(_ context.Context, types []string) (uint6
 	if l.blocked {
 		return 0, nil
 	}
+	want := map[string]bool{}
+	for _, t := range types {
+		want[t] = true
+	}
+	var h uint64
+	for _, e := range l.events {
+		if want[e.TypeURL] && e.GlobalPosition > h {
+			h = e.GlobalPosition
+		}
+	}
+	return h, nil
+}
+
+// MatchingRawHead is the raw view the stall probe compares against: the
+// filtered committed maximum with no settle bound, so a blocked fence
+// never hides it — unlike MatchingHead it ignores l.blocked, exactly as
+// RawHead does.
+func (l *fenceBlockedLog) MatchingRawHead(_ context.Context, types []string) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	want := map[string]bool{}
 	for _, t := range types {
 		want[t] = true
@@ -924,6 +1039,53 @@ func TestValidateKeyRejectsControlBytes(t *testing.T) {
 	}
 }
 
+// Control bytes are refused in every consumed type URL — the same
+// byte-level hygiene as the subscription key (containsControl): a
+// control byte is never legitimate in a type URL, and one accepted here
+// reaches every adapter's type filter and every matching-head probe the
+// core runs over the type set. Rejection must fail closed, before the
+// lease store.
+func TestValidateDefinitionRejectsControlBytes(t *testing.T) {
+	leases := newMemLeases()
+	// The waiter fails fast so that, if validation regresses and accepts
+	// the type set, the stream errors out instead of idling and hanging
+	// the test.
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+		Waiter: &blockingWaiter{err: errors.New("wakeup source failed")},
+	})
+	sink := newMemSink()
+
+	cases := []struct {
+		name     string
+		consumes []string
+	}{
+		{"nul inside a type url", []string{"a\x00b"}},
+		{"nul in a later entry", []string{"counter.v1.Incremented", "a\x00b"}},
+		{"soh", []string{"\x01"}},
+		{"del", []string{"\x7f"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := testRequest("live")
+			req.Definition.Consumes = tc.consumes
+			err := srv.Subscribe(context.Background(), req, sink)
+			if !errors.Is(err, feed.ErrInvalidRequest) {
+				t.Fatalf("Subscribe consuming %q: error = %v, want ErrInvalidRequest", tc.consumes, err)
+			}
+		})
+	}
+	if len(leases.acquired) != 0 {
+		t.Fatalf("rejected definitions acquired %d lease(s); validation must fail closed before the lease store", len(leases.acquired))
+	}
+
+	// A clean type set still passes: Status validates the same request
+	// shape through the same validateDefinition and must succeed.
+	if _, err := srv.Status(context.Background(), testRequest("live")); err != nil {
+		t.Fatalf("Status with a clean type set: %v, want nil", err)
+	}
+}
+
 // Request.Projection and Definition.Name name the same projection. A silent
 // mismatch would stream one projection's type set but file its checkpoints
 // under another projection's name.
@@ -1136,6 +1298,88 @@ func TestSubscribeResumeClampIsFenceAware(t *testing.T) {
 	}
 }
 
+// TestClampLoopReportsStall pins the clamp loop's observability (spec
+// §5.8, review F15): a resume checkpoint above the settled head with the
+// committed matching backlog still covering it — a fence wedged open by
+// an in-flight transaction — waits in the clamp loop, and the wait must
+// not be silent. The loop probes MatchingRawHead on the shared
+// stallProbeEvery cadence and, after clampProbeThreshold consecutive
+// probes observe head < pos with matchingRaw >= pos, reports
+// OnStall(pos, matchingRaw) through the same episode latch as the read
+// loop's stall probe: exactly one report for the clamped wait, no page
+// read below the checkpoint while the fence holds, and no second report
+// once the fence clears.
+func TestClampLoopReportsStall(t *testing.T) {
+	const checkpoint = uint64(5000)
+	obs := &recordingObserver{}
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", checkpoint)
+	// While blocked Head reports 0; the one committed matching event
+	// sits exactly at the checkpoint position, so matchingRaw = pos:
+	// the position is alive and only the fence is wedged — a blocked
+	// clamp, not a missing-types clamp.
+	log := &fenceBlockedLog{
+		events: []es.Envelope{
+			ev(checkpoint, "counter.v1.Incremented", "at-the-checkpoint"),
+		},
+		blocked: true,
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(),
+		Logs:     singleLogs{log},
+		Observer: obs,
+		Poll:     5 * time.Millisecond,
+	})
+	sink := newMemSink()
+	cancel, done := start(t, srv, testRequest("live"), sink)
+
+	// One OnStall within the window. The cadence starts unarmed, so the
+	// first probe observes on the first re-head and the second after
+	// one stallProbeEvery window — the two consecutive observations the
+	// report requires — putting the signal about one window after the
+	// clamp was entered.
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		if stalls := obs.stallsSnapshot(); len(stalls) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("OnStall calls = %d within the window, want 1 (a clamp blocked across two probe windows must report)",
+				len(obs.stallsSnapshot()))
+		}
+		// The probe observes the clamp, it must never perturb it: no
+		// page may be read below the blocked fence.
+		if reads := log.snapshotReads(); len(reads) > 0 {
+			t.Fatalf("read a page from %d while the fence was blocked, want no page below the checkpoint %d",
+				reads[0], checkpoint)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stalls := obs.stallsSnapshot()
+	if len(stalls) != 1 {
+		t.Fatalf("OnStall calls = %d, want exactly 1 for the clamped wait (the episode latch suppresses the rest)",
+			len(stalls))
+	}
+	if stalls[0].settled != checkpoint || stalls[0].matchingRaw != checkpoint {
+		t.Fatalf("OnStall = settled %d, matchingRaw %d, want the clamped position %d and the matching raw head covering it (%d)",
+			stalls[0].settled, stalls[0].matchingRaw, checkpoint, checkpoint)
+	}
+
+	// The fence clears: the clamp ends at the checkpoint and the stream
+	// settles there without a second report — the episode is over.
+	log.unblock()
+	time.Sleep(60 * time.Millisecond) // a few poll cycles, settled at the checkpoint
+	if stalls := obs.stallsSnapshot(); len(stalls) != 1 {
+		t.Fatalf("OnStall calls = %d after the fence cleared, want still 1 (the clamped episode reports exactly once)",
+			len(stalls))
+	}
+
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
 func TestSubscribeRequestsOnlyTheGivenEventTypes(t *testing.T) {
 	logs := newMemLogs(
 		ev(1, "a.v1.One", "a1"),
@@ -1267,6 +1511,32 @@ func TestSubscribeWaitsOnAZeroRowTruncatedPage(t *testing.T) {
 	}
 }
 
+// A genuine wake must reach the next page read immediately. The poll floor
+// exists to stop a Waiter that never observes wakeups from spinning the
+// loop, so it must apply only to non-wakes: with Poll 250ms and a Waiter
+// that genuinely wakes after 10ms, the second page read happens within
+// 100ms — a floored wake would wait out the whole poll first.
+func TestWaiterWakeBypassesFloor(t *testing.T) {
+	logs := newMemLogs() // empty log: every page is an idle wait
+	waiter := &wakingWaiter{delay: 10 * time.Millisecond}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+		Waiter: waiter,
+		Poll:   250 * time.Millisecond,
+	})
+	cancel, done := start(t, srv, testRequest("live"), newMemSink())
+
+	started := time.Now()
+	waitCalls(t, logs, 2)
+	elapsed := time.Since(started)
+	cancel()
+	_ = await(t, done)
+
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("second page read after %v, want within 100ms: a genuine wake must bypass the 250ms poll floor", elapsed)
+	}
+}
+
 func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {
 	at := time.Unix(1_700_000_000, 0)
 	checkpoints := newMemCheckpoints(at)
@@ -1381,11 +1651,13 @@ func TestStatusLagIsFilterAware(t *testing.T) {
 // TestObserverReportsStall pins the stall signal (spec §5.8): while an
 // in-flight transaction holds the fence, a fence-bounded Log's settled
 // reads return empty pages even though committed events exist above them
-// — RawHead sees the backlog, Head and the pages do not. The stream must
-// probe RawHead in the empty-page branch, rate-limited, and report
-// exactly one OnStall per stall episode, with raw above the settled head;
-// once the transaction commits and delivery resumes, no further stall is
-// reported for the episode.
+// — the raw views see the backlog, Head and the pages do not. The
+// stream must probe the matching raw head in the empty-page branch,
+// rate-limited, and report exactly one OnStall per stall episode, with
+// the matching raw head above the settled head; once the transaction
+// commits and delivery resumes, no further stall is reported for the
+// episode. Every event here matches the subscription's consumed types,
+// so the matching raw head equals the all-type raw head.
 func TestObserverReportsStall(t *testing.T) {
 	obs := &recordingObserver{}
 	log := &fenceBlockedLog{
@@ -1422,11 +1694,11 @@ func TestObserverReportsStall(t *testing.T) {
 	if len(stalls) != 1 {
 		t.Fatalf("OnStall calls = %d after two consecutive empty pages, want exactly 1 (the rate limit suppresses the second probe)", len(stalls))
 	}
-	if stalls[0].settled != 0 || stalls[0].raw != 3 {
-		t.Fatalf("OnStall = settled %d, raw %d, want settled 0 (the resume head) and raw 3 (the committed backlog)", stalls[0].settled, stalls[0].raw)
+	if stalls[0].settled != 0 || stalls[0].matchingRaw != 3 {
+		t.Fatalf("OnStall = settled %d, matchingRaw %d, want settled 0 (the resume head) and matchingRaw 3 (the committed backlog)", stalls[0].settled, stalls[0].matchingRaw)
 	}
-	if stalls[0].raw <= stalls[0].settled {
-		t.Fatalf("OnStall = settled %d, raw %d, want raw > settled", stalls[0].settled, stalls[0].raw)
+	if stalls[0].matchingRaw <= stalls[0].settled {
+		t.Fatalf("OnStall = settled %d, matchingRaw %d, want matchingRaw > settled", stalls[0].settled, stalls[0].matchingRaw)
 	}
 
 	// The transaction commits: delivery resumes from the backlog and the
@@ -1439,6 +1711,54 @@ func TestObserverReportsStall(t *testing.T) {
 	time.Sleep(60 * time.Millisecond) // a few more poll cycles, caught up
 	if stalls := obs.stallsSnapshot(); len(stalls) != 1 {
 		t.Fatalf("OnStall calls = %d after delivery resumed, want still 1 (a caught-up stream reports no stall)", len(stalls))
+	}
+
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+}
+
+// TestObserverStallRequiresMatchingBacklog pins the stall probe's
+// comparison (spec §5.8, review F14/F17): a stall is committed backlog
+// of the subscription's OWN consumed types — the matching raw head —
+// above the stream's settled position, never the all-type raw head. A
+// filtered subscription caught up on its consumed types is not stalled
+// however many events of unrelated types land above it; the probe used
+// to consult the all-type RawHead, so every foreign append above a
+// caught-up stream misfired OnStall — the review's live repro as a
+// unit test.
+func TestObserverStallRequiresMatchingBacklog(t *testing.T) {
+	obs := &recordingObserver{}
+	// The subscription (testRequest) consumes counter.v1.Incremented
+	// only; the position-5 event is a foreign type, so the stream is
+	// caught up at 1 while the all-type raw head sits at 5.
+	logs := newMemLogs(
+		ev(1, "counter.v1.Incremented", "one"),
+		ev(5, "billing.v1.Invoiced", "noise"),
+	)
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+		Observer: obs,
+		Poll:     5 * time.Millisecond,
+	})
+	sink := newMemSink()
+	cancel, done := start(t, srv, testRequest("live"), sink)
+
+	// Caught up: the consumed event is delivered and every later page
+	// comes back empty — the foreign event never matches the filter.
+	got := sink.waitFor(t, 1)
+	if len(got) != 1 || got[0].GlobalPosition != 1 {
+		t.Fatalf("delivered positions = %v, want exactly the event at 1", positionsOf(got))
+	}
+	// Enough empty pages that the stall probe has certainly run: the
+	// rate limiter starts unarmed, so the first empty page always
+	// probes; by the fourth read the comparison happened.
+	waitCalls(t, logs, 4)
+
+	if stalls := obs.stallsSnapshot(); len(stalls) != 0 {
+		t.Fatalf("OnStall = %+v, want zero (the subscription is caught up: position 5 is a non-consumed type, not its backlog)",
+			stalls)
 	}
 
 	cancel()
@@ -1662,6 +1982,75 @@ func TestSubscribeJoinsAStreamErrorRacingLeaseLoss(t *testing.T) {
 	if !errors.As(err, &lost) {
 		t.Fatalf("error = %v (%T), want *LeaseLostError", err, err)
 	}
+}
+
+// The reverse race of the test above (review F35): the renewal failure is
+// decided and observed — OnLeaseLost has fired — but its delivery to lost
+// races the stream's own end. A send failure that ends the stream while the
+// renewer is still reporting the loss must not drop the lease-loss
+// diagnosis from the returned error.
+func TestSubscribeKeepsLeaseLossRacingStreamError(t *testing.T) {
+	leases := newMemLeases()
+	sendErr := errors.New("client write failed")
+	obs := &slowLeaseLostObserver{entered: make(chan struct{}), hold: make(chan struct{})}
+	sink := &blockingSendSink{
+		sendErr: sendErr,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases,
+		Logs:       newMemLogs(ev(1, "counter.v1.Incremented", "one")),
+		Observer:   obs,
+		LeaseTTL:   50 * time.Millisecond,
+		RenewEvery: 5 * time.Millisecond,
+	})
+	_, done := start(t, srv, testRequest("live"), sink)
+
+	select {
+	case <-sink.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Send was not called")
+	}
+	// Fail the next renewal and wait for the renewer to park inside
+	// OnLeaseLost: the store has decided the loss and the renewer has
+	// observed it, but the *LeaseLostError has not reached lost yet.
+	target := leases.failRenewalsFromNow()
+	waitRenewals(t, leases, target)
+	select {
+	case <-obs.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnLeaseLost was not called")
+	}
+	// End the stream with a send failure concurrent with the loss delivery.
+	close(sink.release)
+	// The stream's run context is cancelled inside Subscribe's tail. Wait
+	// for that cancellation before releasing the renewer: it pins the
+	// interleaving in both directions — against the bug, whose drain has
+	// already run by then, so the late loss is provably absent from the
+	// assembled error; and against the fix, whose drain runs only after the
+	// renewer is joined, so the released loss is guaranteed to be seen.
+	streamCtx := sink.streamContext()
+	select {
+	case <-streamCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stream context was never cancelled")
+	}
+	// Only now let the renewer deliver the loss.
+	close(obs.hold)
+
+	err := await(t, done)
+	if !errors.Is(err, feed.ErrLeaseLost) {
+		t.Fatalf("error = %v, want ErrLeaseLost (a renewal failure observed before the stream ended must keep its diagnosis)", err)
+	}
+	if !errors.Is(err, sendErr) {
+		t.Fatalf("error = %v, want the racing send error preserved", err)
+	}
+	var lost *feed.LeaseLostError
+	if !errors.As(err, &lost) {
+		t.Fatalf("error = %v (%T), want *LeaseLostError", err, err)
+	}
+	waitHeld(t, leases, "tenant", "counter.view", "live", false)
 }
 
 // The stream runs under a child of the caller's ctx, so a caller deadline is
@@ -2457,6 +2846,100 @@ func TestSkipRecordsDeadLetter(t *testing.T) {
 	}
 	if got := checkpoints.hashOf("tenant", "counter.view", "live"); got != def.Hash() {
 		t.Fatalf("definition hash = %q after the skips, want the stored %q still preserved", got, def.Hash())
+	}
+}
+
+// F16: Skip is forward-only. A position behind the stored checkpoint would
+// silently rewind the subscription and re-deliver history the consumer
+// already acknowledged, so without Force it is refused with
+// ErrInvalidRequest — and the refusal lands before the dead letter, so a
+// refused skip moves no cursor and records no audit row. An equal position
+// is not behind: re-skipping the event at the cursor is allowed.
+func TestSkipRefusesRewind(t *testing.T) {
+	const storedAt = 900
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", storedAt)
+	deadLetters := newMemDeadLetters()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: newMemLogs(),
+		DeadLetters: deadLetters,
+	})
+
+	err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: 5, Actor: "oncall@example.com", Reason: "poison: over cap",
+	})
+	if !errors.Is(err, feed.ErrInvalidRequest) {
+		t.Fatalf("Skip behind the checkpoint = %v, want ErrInvalidRequest", err)
+	}
+	if got, want := err.Error(), "feed: invalid request: skip position 5 is behind the checkpoint 900; pass Force to rewind"; got != want {
+		t.Fatalf("Skip behind the checkpoint = %q, want %q", got, want)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != storedAt {
+		t.Fatalf("checkpoint = %d after the refused skip, want %d (unchanged)", got, storedAt)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 0 {
+		t.Fatalf("dead letters = %+v after the refused skip, want none recorded", rows)
+	}
+
+	// Equal is not behind: skipping the event at the cursor again succeeds
+	// and audits like any other skip.
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: storedAt, Actor: "oncall@example.com", Reason: "poison: over cap",
+	}); err != nil {
+		t.Fatalf("Skip at the checkpoint position: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != storedAt {
+		t.Fatalf("checkpoint = %d after the equal-position skip, want %d", got, storedAt)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 1 || rows[0].Position != storedAt {
+		t.Fatalf("dead letters = %+v, want exactly one at %d", rows, storedAt)
+	}
+}
+
+// Force is the deliberate rewind: the monotonicity guard refuses a position
+// behind the checkpoint, and Force alone authorizes moving past that — the
+// same escape hatch ResetCheckpoint's force provides — while still auditing
+// the decision as a dead letter. With no stored checkpoint there is nothing
+// to be behind: the first skip moves freely without force.
+func TestSkipForceRewinds(t *testing.T) {
+	const storedAt = 900
+	checkpoints := newMemCheckpoints(time.Now())
+	checkpoints.set("tenant", "counter.view", "live", storedAt)
+	deadLetters := newMemDeadLetters()
+	srv := newServer(t, feed.Config{
+		Checkpoints: checkpoints, Leases: newMemLeases(), Logs: newMemLogs(),
+		DeadLetters: deadLetters,
+	})
+
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "live",
+		Position: 5, Actor: "oncall@example.com", Reason: "poison: over cap", Force: true,
+	}); err != nil {
+		t.Fatalf("forced Skip behind the checkpoint: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "live"); got != 5 {
+		t.Fatalf("checkpoint = %d after the forced rewind, want 5", got)
+	}
+	rows := deadLetters.recorded()
+	if len(rows) != 1 || rows[0].Position != 5 {
+		t.Fatalf("dead letters = %+v, want exactly one at 5 (a forced rewind is still audited)", rows)
+	}
+
+	// No stored checkpoint: there is nothing to be behind, so the first
+	// skip moves freely without force.
+	if err := srv.Skip(context.Background(), feed.SkipRequest{
+		Scope: "tenant", Projection: "counter.view", Instance: "fresh",
+		Position: 5, Actor: "oncall@example.com", Reason: "poison: over cap",
+	}); err != nil {
+		t.Fatalf("Skip with no stored checkpoint: %v", err)
+	}
+	if got, _ := checkpoints.Load(context.Background(), "tenant", "counter.view", "fresh"); got != 5 {
+		t.Fatalf("checkpoint = %d after the first skip, want 5", got)
+	}
+	if rows := deadLetters.recorded(); len(rows) != 2 {
+		t.Fatalf("dead letters = %d after the first skip, want 2", len(rows))
 	}
 }
 

@@ -96,8 +96,11 @@ tasks:
       - docker exec es-lite-pg psql -U postgres -d eslite -v ON_ERROR_STOP=1 -c "CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS; CREATE ROLE es_rls_probe NOLOGIN NOSUPERUSER NOBYPASSRLS; GRANT es_relay, es_rls_probe TO postgres"
       - defer: docker rm -f es-lite-pg
       # -race -shuffle=on since the production review (A4): the Postgres
-      # suite is where the ordering/fence races would surface.
-      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -race -shuffle=on -count=1 ./postgres/...
+      # suite is where the ordering/fence races would surface. The profile
+      # (pg.cover) is the Postgres leg of the coverage union: ci.yml's
+      # integration job uploads it and `task coverage` gates on the merged
+      # total (finding F28).
+      - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -race -shuffle=on -count=1 -coverprofile=pg.cover -covermode=atomic ./postgres/...
 
   test:feedgate:
     desc: >
@@ -111,6 +114,18 @@ tasks:
       - until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
       - defer: docker rm -f es-lite-pg
       - PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable' go test -race -shuffle=on -tags feedgate -count=1 -timeout 45m ./postgres/ -run TestFeedGate
+
+  fuzz:
+    desc: >
+      30-second smoke fuzzes of the parser, definition-hash and codec
+      surfaces (finding F28). Not a CI gate: every `go test` already runs
+      each target's seed corpus as regular tests; this exercises the
+      mutation engine beyond the seeds. A crash writes a reproducer under
+      the package's testdata/fuzz and fails the run.
+    cmds:
+      - go test -fuzz=FuzzParseCanonical -fuzztime=30s ./es
+      - go test -fuzz=FuzzDefinitionHashConsumes -fuzztime=30s ./projection
+      - go test -fuzz=FuzzCounterCodecDecode -fuzztime=30s ./examples/counter
 
   vet:
     desc: go vet across the module and the cmdsvc nested module.
@@ -126,15 +141,42 @@ tasks:
 
   coverage:
     desc: >
-      Core-module unit suite with a coverage profile (coverage.out), gated
-      on the COVERAGE_FLOOR ratchet: raise the floor as coverage improves,
-      never lower it. Integration suites skip without their DSNs, exactly
-      like `task test`, so local and CI measure the same thing.
+      Core-module suite with merged coverage profiles — the unit run plus
+      the Postgres integration run — gated on the COVERAGE_FLOOR ratchet:
+      raise the floor as coverage improves, never lower it (finding F28:
+      the Postgres suite used to contribute nothing to the ratchet). The
+      Postgres leg runs against $PG_DSN when set (a live or service
+      Postgres); otherwise it starts the same throwaway Docker container
+      as test:pg, so local and CI measure the same union.
     vars:
-      # First green measurement (2026-11-05). Ratchet only upwards.
-      COVERAGE_FLOOR: "42.7"
+      # First union measurement (2026-11-08): the unit profile alone reads
+      # 48.1%, the union with the Postgres profile 61.3%. Ratchet only
+      # upwards.
+      COVERAGE_FLOOR: "61.3"
     cmds:
+      # Unit profile: integration suites skip without their DSNs, exactly
+      # like `task test`.
       - go test -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      # Postgres profile. One shell block so a container we start is
+      # scoped to the suite — the trap fires on exit, including failures,
+      # mirroring test:pg's defer.
+      - |
+        if [ -z "${PG_DSN:-}" ]; then
+          docker rm -f es-lite-pg 2>/dev/null || true
+          docker run -d --rm --name es-lite-pg -p 5433:5432 -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=eslite postgres:17
+          until docker exec es-lite-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+          # Test-setup roles (spec §5.7), same as test:pg: migrations never
+          # create roles (migrator privileges vary), so the container setup
+          # owns them, granted to the test user. The container is fresh
+          # (rm -f + run above), so CREATE ROLE cannot collide.
+          docker exec es-lite-pg psql -U postgres -d eslite -v ON_ERROR_STOP=1 -c "CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS; CREATE ROLE es_rls_probe NOLOGIN NOSUPERUSER NOBYPASSRLS; GRANT es_relay, es_rls_probe TO postgres"
+          export PG_DSN='postgres://postgres:pw@127.0.0.1:5433/eslite?sslmode=disable'
+          trap 'docker rm -f es-lite-pg' EXIT
+        fi
+        go test -race -shuffle=on -count=1 -coverprofile=pg.cover -covermode=atomic ./postgres/...
+      # Union: append the Postgres rows (header stripped); go tool cover
+      # merges duplicated block entries by summing their counts.
+      - tail -n +2 pg.cover >> coverage.out
       - |
         total=$(go tool cover -func=coverage.out | awk '/^total:/ { sub(/%/, "", $3); print $3 }')
         echo "coverage: ${total}% (floor {{.COVERAGE_FLOOR}}%)"

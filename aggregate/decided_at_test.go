@@ -3,6 +3,7 @@ package aggregate_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,9 +21,8 @@ func TestHandleStampsOccurredAtFromServerClock(t *testing.T) {
 
 	before := time.Now().Add(-time.Second)
 	clientDecided := time.Now().UTC().Add(-2 * time.Minute)
-	clientMeta := time.Now().UTC().Add(-time.Hour)
 	res, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Close{DecidedAt: timestamppb.New(clientDecided)}),
-		es.Meta{OccurredAt: clientMeta})
+		es.Meta{})
 	if err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -32,9 +32,9 @@ func TestHandleStampsOccurredAtFromServerClock(t *testing.T) {
 	}
 	got := res.Envelopes[0].OccurredAt
 	if got.Before(before) || got.After(after) {
-		t.Fatalf("OccurredAt = %v, want server time in [%v,%v], not client decided_at %v or meta %v", got, before, after, clientDecided, clientMeta)
+		t.Fatalf("OccurredAt = %v, want server time in [%v,%v], not client decided_at %v", got, before, after, clientDecided)
 	}
-	if got.Equal(clientDecided) || got.Equal(clientMeta) {
+	if got.Equal(clientDecided) {
 		t.Fatalf("OccurredAt = %v, want server time, never a client-supplied value", got)
 	}
 }
@@ -46,16 +46,15 @@ func TestHandleStampsOccurredAtWithoutDecidedAt(t *testing.T) {
 	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
 
 	before := time.Now().Add(-time.Second)
-	old := time.Now().UTC().Add(-time.Hour)
 	res, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 1}),
-		es.Meta{OccurredAt: old})
+		es.Meta{})
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
 	after := time.Now().Add(time.Second)
 	got := res.Envelopes[0].OccurredAt
 	if got.Before(before) || got.After(after) {
-		t.Fatalf("OccurredAt = %v, want server time in [%v,%v], not caller meta %v", got, before, after, old)
+		t.Fatalf("OccurredAt = %v, want server time in [%v,%v]", got, before, after)
 	}
 }
 
@@ -201,3 +200,45 @@ type settableDecisionTime struct{ at time.Time }
 
 func (c *settableDecisionTime) DecisionTime() time.Time     { return c.at }
 func (c *settableDecisionTime) SetDecisionTime(t time.Time) { c.at = t }
+
+// TestUnstampableDecidedAtFails pins the loud failure: a command that
+// implements es.DecidedAt but cannot have its decision time replaced —
+// hand-written, no SetDecisionTime method, not a proto message — must be
+// rejected by HandleAt, not silently run on the client's clock value.
+func TestUnstampableDecidedAtFails(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	sid, _ := es.NewStreamID("thing", "unstampable")
+
+	decider := es.Decider[noEventState, *unstampableCommand, noEvent]{
+		Initial: func() noEventState { return noEventState{} },
+		Decide: func(_ noEventState, _ *unstampableCommand) ([]noEvent, []es.ConstraintOp, error) {
+			return nil, nil, nil
+		},
+		Evolve: func(s noEventState, _ noEvent) noEventState { return s },
+	}
+	rt := aggregate.NewRuntime(store, decider, noEventCodec{})
+
+	// An in-window decided_at, so the stamp is the only thing that can
+	// fail — and would have, silently, before the runtime checked it.
+	cmd := &unstampableCommand{at: time.Now().UTC().Add(-time.Minute)}
+	_, err := rt.HandleAt(ctx, sid, cmd, es.Meta{}, 0)
+	if !errors.Is(err, es.ErrDecidedAtUnstampable) {
+		t.Fatalf("error = %v, want ErrDecidedAtUnstampable", err)
+	}
+	if !strings.Contains(err.Error(), "unstampableCommand") {
+		t.Fatalf("error = %q, want it to name the command type", err)
+	}
+	// The rejection happens before any load or append: the stream stays empty.
+	if _, v, lerr := rt.Load(ctx, sid); lerr != nil || v != 0 {
+		t.Fatalf("version after rejection = %d (err %v), want 0 (nothing appended)", v, lerr)
+	}
+}
+
+// unstampableCommand is the broken shape the runtime must catch: it
+// reports a decision time but cannot have it replaced — it implements
+// neither es.DecisionTimeSetter nor proto.Message, so
+// es.StampDecisionTime returns false for it.
+type unstampableCommand struct{ at time.Time }
+
+func (c *unstampableCommand) DecisionTime() time.Time { return c.at }

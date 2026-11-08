@@ -13,3 +13,4 @@ graduates into an ADR.
 
 - [2026-08-02 — Schema migration strategy](./2026-08-02_migrations.md)
 - [2026-11-05 — Reconnect-swallowed feed errors are unobservable](./2026-11-05_reconnect-swallowed-errors.md)
+- [2026-11-07 — Postgres transaction-scaffolding duplication](./2026-11-07_postgres-tx-scaffolding.md)

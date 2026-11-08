@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -15,6 +17,9 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/pluginpb"
 
+	es "github.com/laenenai/es-lite/es"
+	counterv1 "github.com/laenenai/es-lite/gen/counter/v1"
+	counterviewv1 "github.com/laenenai/es-lite/gen/counterview/v1"
 	esv1 "github.com/laenenai/es-lite/gen/es/v1"
 )
 
@@ -237,7 +242,6 @@ func goodSpec() *esv1.ProjectionSpec {
 // (imports), returning the error and the generated content.
 func runWith(t *testing.T, file *descriptorpb.FileDescriptorProto, extra ...*descriptorpb.FileDescriptorProto) (string, error) {
 	t.Helper()
-	specNames = map[string]string{} // fresh per test: the real plugin runs once per process
 	req := &pluginpb.CodeGeneratorRequest{
 		FileToGenerate: []string{file.GetName()},
 		ProtoFile: append([]*descriptorpb.FileDescriptorProto{
@@ -284,6 +288,67 @@ func TestProjectionGeneratesHandlerAndRunner(t *testing.T) {
 		}
 	}
 	assertAllImportsUsed(t, content)
+}
+
+// TestProjectionEmitsUpcasterSeam (F20): a state-fetching spec's Deps
+// carries an optional per-aggregate es.Upcaster — nil decodes as stored —
+// and dispatch runs it between decode and the variant assertion, so a
+// stored v1 event can flow through regenerated code. Reactions share the
+// same deps/dispatch emit; metadata-only specs decode nothing and are
+// unchanged.
+func TestProjectionEmitsUpcasterSeam(t *testing.T) {
+	f := domainFile(true)
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(goodSpec())})
+	content, err := runWith(t, f)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{
+		"StateUpcaster upgrades stored event shapes on read; nil decodes as stored.",
+		"StateUpcaster es.Upcaster[Event]",
+		"stateUpcaster := deps.StateUpcaster",
+		"if stateUpcaster != nil {",
+		"decoded, err = stateUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)",
+		`return fmt.Errorf("View: upcast %s v%d: %w", env.StreamID, env.Version, err)`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated code lacks %q:\n%s", want, content)
+		}
+	}
+	// The upcast must run before the variant assertion, so the handler is
+	// handed the upgraded event, not the stored one.
+	if i, j := strings.Index(content, "stateUpcaster.Upcast("), strings.Index(content, "decoded.(*Happened)"); i < 0 || j < 0 || i > j {
+		t.Fatalf("upcast must run between decode and the variant assertion:\n%s", content)
+	}
+	assertAllImportsUsed(t, content)
+
+	// The reaction's deps share the same seam.
+	r := domainFile(true)
+	r.MessageType = append(r.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
+		Name: "t.react", Consumes: []string{"t.v1.Happened"}, Issues: []string{"t.v1.Do"},
+		Fetch: esv1.FetchMode_FETCH_MODE_STATE_AS_OF_EVENT_VERSION,
+	})})
+	if content, err = runWith(t, r); err != nil {
+		t.Fatalf("generate reaction: %v", err)
+	}
+	for _, want := range []string{
+		"StateUpcaster es.Upcaster[Event]",
+		"decoded, err = stateUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated reaction lacks %q:\n%s", want, content)
+		}
+	}
+
+	// Metadata-only specs decode nothing: no seam.
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_METADATA_ONLY
+	if content, err = runWith(t, readModel(spec), domainFile(true)); err != nil {
+		t.Fatalf("generate metadata-only: %v", err)
+	}
+	if strings.Contains(content, "Upcaster") {
+		t.Fatalf("metadata-only projection must not emit an upcaster seam:\n%s", content)
+	}
 }
 
 func TestProjectionErrors(t *testing.T) {
@@ -351,6 +416,87 @@ func TestProjectionMetadataOnlyHasNoUnusedImports(t *testing.T) {
 		t.Fatalf("metadata-only projection must not import fmt:\n%s", content)
 	}
 	assertAllImportsUsed(t, content)
+}
+
+// TestProjectionEventOnlyDecodesWithoutState (F38): a FETCH_MODE_EVENT_ONLY
+// spec validates like the other modes — rebuild is still required for a read
+// model — and its handlers receive the typed event, On<Event>(ctx, env,
+// ev *E), while the dispatch decodes and upcasts but never fetches state:
+// Deps carries the Codec and Upcaster seams and no loader, and the runner
+// has no required deps. Reactions share the same emit, with the issuer as
+// the trailing parameter.
+func TestProjectionEventOnlyDecodesWithoutState(t *testing.T) {
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_EVENT_ONLY
+	// Alone in its own file, the metadata-only shape of Task 17: the
+	// decode branch registers fmt, so nothing may be left unused either way.
+	content, err := runWith(t, readModel(spec), domainFile(true))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, want := range []string{
+		"OnHappened(ctx context.Context, env es.Envelope, ev *Happened) error",
+		"StateCodec es.Codec[Event]",
+		"StateUpcaster es.Upcaster[Event]",
+		"stateCodec := deps.StateCodec",
+		"if stateCodec == nil {",
+		"decoded, err = stateUpcaster.Upcast(env.TypeURL, env.SchemaVersion, decoded)",
+		`return fmt.Errorf("View: decode %s v%d: %w", env.StreamID, env.Version, err)`,
+		"return h.OnHappened(ctx, env, ev)",
+		"func NewViewRunner(h ViewHandler, deps ViewDeps) *projection.Runner",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated code lacks %q:\n%s", want, content)
+		}
+	}
+	// Decode-only: no loader seam, no loader field, no state fetch.
+	if strings.Contains(content, "Loader") {
+		t.Fatalf("event-only projection must not emit a state loader:\n%s", content)
+	}
+	if strings.Contains(content, "LoadAsOfVersion") {
+		t.Fatalf("event-only projection must not fetch state:\n%s", content)
+	}
+	// The handler is handed the upgraded event: upcast runs between decode
+	// and the variant assertion (Task 26's ordering, without the state load).
+	if i, j := strings.Index(content, "stateUpcaster.Upcast("), strings.Index(content, "decoded.(*Happened)"); i < 0 || j < 0 || i > j {
+		t.Fatalf("upcast must run between decode and the variant assertion:\n%s", content)
+	}
+	assertAllImportsUsed(t, content)
+
+	// Rebuild is required like the other modes: the kind rule is
+	// fetch-independent, so an EVENT_ONLY read model without FROM_LOG
+	// is rejected.
+	norebuild := goodSpec()
+	norebuild.Fetch = esv1.FetchMode_FETCH_MODE_EVENT_ONLY
+	norebuild.Rebuild = esv1.RebuildMode_REBUILD_MODE_UNSPECIFIED
+	f := domainFile(true)
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(norebuild)})
+	if _, err = runWith(t, f); err == nil || !strings.Contains(err.Error(), "requires rebuild = REBUILD_MODE_FROM_LOG") {
+		t.Fatalf("error = %v, want rebuild-required rejection", err)
+	}
+
+	// Reactions share the emit: the typed event precedes the issuer and
+	// no state fetch is emitted there either.
+	r := domainFile(true)
+	r.MessageType = append(r.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("React"), Options: reactionOpts(&esv1.ReactionSpec{
+		Name: "t.react", Consumes: []string{"t.v1.Happened"}, Issues: []string{"t.v1.Do"},
+		Fetch: esv1.FetchMode_FETCH_MODE_EVENT_ONLY,
+	})})
+	if content, err = runWith(t, r); err != nil {
+		t.Fatalf("generate reaction: %v", err)
+	}
+	for _, want := range []string{
+		"OnHappened(ctx context.Context, env es.Envelope, ev *Happened, issue *ReactIssuer) error",
+		"StateCodec es.Codec[Event]",
+		"StateUpcaster es.Upcaster[Event]",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("generated reaction lacks %q:\n%s", want, content)
+		}
+	}
+	if strings.Contains(content, "LoadAsOfVersion") {
+		t.Fatalf("event-only reaction must not fetch state:\n%s", content)
+	}
 }
 
 // The exported Consumes list preserves the proto option's order, not any
@@ -452,7 +598,6 @@ func TestReactionGeneratesIssuerAndRejectsNonCommand(t *testing.T) {
 func TestDocsCatalogue(t *testing.T) {
 	f := domainFile(true)
 	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(goodSpec())})
-	specNames = map[string]string{}
 	gen := fixture(t, f)
 	if err := run(gen, "PROJECTIONS.md"); err != nil {
 		t.Fatalf("generate: %v", err)
@@ -484,6 +629,32 @@ func TestDocsCatalogue(t *testing.T) {
 		}
 		if strings.Contains(content, "FETCH_MODE_") || strings.Contains(content, "| Owner |") {
 			t.Fatalf("catalogue still carries raw enum names or the wide table:\n%s", content)
+		}
+	}
+	if !found {
+		t.Fatal("catalogue file not generated")
+	}
+}
+
+// The catalogue renders the third fetch mode in words, like the other
+// two — never the raw enum (F38).
+func TestDocsCatalogueHumanisesEventOnly(t *testing.T) {
+	f := domainFile(true)
+	spec := goodSpec()
+	spec.Fetch = esv1.FetchMode_FETCH_MODE_EVENT_ONLY
+	f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{Name: proto.String("View"), Options: projectionOpts(spec)})
+	gen := fixture(t, f)
+	if err := run(gen, "PROJECTIONS.md"); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var found bool
+	for _, out := range gen.Response().File {
+		if out.GetName() != "PROJECTIONS.md" {
+			continue
+		}
+		found = true
+		if !strings.Contains(out.GetContent(), "- fetch: typed event only (no state)") {
+			t.Fatalf("catalogue lacks the humanised event-only fetch:\n%s", out.GetContent())
 		}
 	}
 	if !found {
@@ -548,7 +719,6 @@ func serviceFile(mutate func(req, resp *descriptorpb.DescriptorProto, svc *descr
 
 func TestServiceGeneratesHandlerInSiblingPackage(t *testing.T) {
 	f := serviceFile(nil)
-	specNames = map[string]string{}
 	gen := fixture(t, f)
 	if err := run(gen, ""); err != nil {
 		t.Fatalf("generate: %v", err)
@@ -576,6 +746,41 @@ func TestServiceGeneratesHandlerInSiblingPackage(t *testing.T) {
 			t.Fatalf("generated service lacks %q:\n%s", want, svcFile)
 		}
 	}
+}
+
+// The emitted handler carries the draft-compliant Idempotency-Key flow
+// (design D6, finding F6; draft-ietf-httpapi-idempotency-key-header-07):
+// Deps gains an optional Dedup, and a wired Dedup makes every RPC look the
+// command up after Authorize — replay the stored response, reject key
+// reuse, save fresh responses — inside one guarded block, so a nil Dedup
+// (or a request without the header) runs today's plain path unchanged.
+func TestServiceEmitsDedupFlow(t *testing.T) {
+	gen := fixture(t, serviceFile(nil))
+	if err := run(gen, ""); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	var svc string
+	for _, out := range gen.Response().File {
+		if strings.HasSuffix(out.GetName(), "tv1es/t_es.pb.go") {
+			svc = out.GetContent()
+		}
+	}
+	if svc == "" {
+		t.Fatalf("service handler not generated; files: %v", names(gen))
+	}
+	for _, want := range []string{
+		"Dedup es.Deduplicator",
+		`if h.d.Dedup != nil && req.Header().Get(cmdsvc.HdrIdempotencyKey) != "" {`,
+		"fp := cmdsvc.Fingerprint(req.Msg)",
+		"rec, found, err := h.d.Dedup.Lookup(ctx, key)",
+		"return nil, cmdsvc.IdempotencyKeyReused()",
+		"if err := h.d.Dedup.Save(ctx, key, es.DedupRecord{Fingerprint: fp, Response: stored}); err != nil {",
+	} {
+		if !strings.Contains(svc, want) {
+			t.Errorf("generated handler lacks %q:\n%s", want, svc)
+		}
+	}
+	assertAllImportsUsed(t, svc)
 }
 
 func names(gen *protogen.Plugin) []string {
@@ -615,7 +820,6 @@ func TestServiceErrors(t *testing.T) {
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
-			specNames = map[string]string{}
 			err := run(fixture(t, serviceFile(c.mutate)), "")
 			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("error = %v, want %q", err, c.want)
@@ -689,5 +893,161 @@ func TestHandlerNamesQualifiedAcrossAggregates(t *testing.T) {
 	}
 	if !strings.Contains(content, "OnHappened(ctx") || !strings.Contains(content, "func (i *ReactIssuer) Do(sid") {
 		t.Fatalf("single-aggregate spec must keep short names:\n%s", content)
+	}
+}
+
+// ---- F32: construction-time dep validation, result shape, run state -----
+
+// panicLoader satisfies the generated state-loader seam without touching a
+// store: constructing a runner must not call it.
+type panicLoader struct{}
+
+func (panicLoader) LoadAsOfVersion(context.Context, es.StreamID, uint64) (*counterv1.Counter, error) {
+	return nil, nil
+}
+
+// panicRouter satisfies the generated reaction.Dispatcher seam.
+type panicRouter struct{}
+
+func (panicRouter) Dispatch(context.Context, es.StreamID, counterv1.Command, es.Meta) error {
+	return nil
+}
+
+// assertPanicsNaming runs construct and requires a panic whose message
+// contains want — a missing-dep panic names the dep it wants.
+func assertPanicsNaming(t *testing.T, want string, construct func()) {
+	t.Helper()
+	defer func() {
+		t.Helper()
+		r := recover()
+		if r == nil {
+			t.Errorf("no panic, want one naming %q", want)
+			return
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, want) {
+			t.Errorf("panic = %q, want it to name %q", msg, want)
+		}
+	}()
+	construct()
+}
+
+// The generated constructors must reject a nil required dep at
+// construction, naming it, instead of accepting it and misbehaving on
+// first use (F32). The optional seams — Validate, Filter, Errors, Marker,
+// Codec, Upcaster — keep their nil defaults. The runner guards are proven
+// by constructing the checked-in counterview output (this generator's own
+// product, kept fresh by `task generate:check`); the service handler is
+// generated into the cmdsvc nested module, which this package cannot
+// import (ADR 0031 §4), so its guards are asserted on the emitted source.
+func TestHandlerPanicNamesMissingDeps(t *testing.T) {
+	// Runners: each required dep nil in turn.
+	assertPanicsNaming(t, "CounterViewDeps.Counter is required", func() {
+		counterviewv1.NewCounterViewRunner(nil, counterviewv1.CounterViewDeps{})
+	})
+	assertPanicsNaming(t, "ResetOnClosedDeps.Counter is required", func() {
+		counterviewv1.NewResetOnClosedRunner(nil, counterviewv1.ResetOnClosedDeps{CounterRouter: panicRouter{}})
+	})
+	assertPanicsNaming(t, "ResetOnClosedDeps.CounterRouter is required", func() {
+		counterviewv1.NewResetOnClosedRunner(nil, counterviewv1.ResetOnClosedDeps{Counter: panicLoader{}})
+	})
+	// Fully wired: no panic — Codec, Upcaster, Actor and Marker stay nil.
+	counterviewv1.NewCounterViewRunner(nil, counterviewv1.CounterViewDeps{Counter: panicLoader{}})
+	counterviewv1.NewResetOnClosedRunner(nil, counterviewv1.ResetOnClosedDeps{Counter: panicLoader{}, CounterRouter: panicRouter{}})
+	// A metadata-only runner has no required deps: empty Deps construct.
+	counterviewv1.NewCounterActivityRunner(nil, counterviewv1.CounterActivityDeps{})
+
+	// Service handler: Runtime, Authorize and Identity are required.
+	content, err := runWith(t, serviceFile(nil))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	for _, dep := range []string{"Runtime", "Authorize", "Identity"} {
+		want := fmt.Sprintf("panic(%q)", "ThingCommandServiceDeps."+dep+" is required")
+		if !strings.Contains(content, want) {
+			t.Errorf("generated handler lacks %s:\n%s", want, content)
+		}
+	}
+	for _, dep := range []string{"Validate", "Filter", "Errors"} {
+		if strings.Contains(content, dep+" is required") {
+			t.Errorf("generated handler must keep %s's nil default:\n%s", dep, content)
+		}
+	}
+}
+
+// resolveMethod must reject a `result` message (or response shape) that
+// cannot carry what cmdsvc.SetWriteResult writes, naming the offending
+// field (F32).
+func TestResultShapeValidatedAtGeneration(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(wr, resp *descriptorpb.DescriptorProto)
+		want   string
+	}{
+		"no version": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field = append(wr.Field[:1], wr.Field[2:]...)
+		}, `field named "version"`},
+		"no stream_id": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field = wr.Field[1:]
+		}, `field named "stream_id"`},
+		"stream_id not a string": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field[0] = uint64Field("stream_id", 1)
+		}, "stream_id must be a string field"},
+		"version not uint64": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field[1] = stringField("version", 2, nil)
+		}, "version must be a uint64 field"},
+		"global_position repeated": {func(wr, _ *descriptorpb.DescriptorProto) {
+			wr.Field[2].Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+		}, "global_position must be singular"},
+		"result repeated": {func(_, resp *descriptorpb.DescriptorProto) {
+			resp.Field[0].Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+		}, "`result` must be a singular"},
+		"state repeated": {func(_, resp *descriptorpb.DescriptorProto) {
+			resp.Field[1].Label = descriptorpb.FieldDescriptorProto_LABEL_REPEATED.Enum()
+		}, `"state" must be a singular`},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := serviceFile(nil)
+			var wr, resp *descriptorpb.DescriptorProto
+			for _, m := range f.MessageType {
+				switch m.GetName() {
+				case "WriteResult":
+					wr = m
+				case "DoResponse":
+					resp = m
+				}
+			}
+			if wr == nil || resp == nil {
+				t.Fatal("fixture lacks WriteResult or DoResponse")
+			}
+			c.mutate(wr, resp)
+			err := runPlugin(t, f)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %v, want a generation error naming %s", err, c.want)
+			}
+		})
+	}
+}
+
+// The spec-name uniqueness registry belongs to one generation run, not to
+// the process: the plugin runs once per protoc invocation, but the test
+// suite drives `run` many times in one process, so a fresh run must not
+// see names a previous run declared (F32).
+func TestSpecNamesNotGlobal(t *testing.T) {
+	runOnce := func(msgName string) error {
+		f := domainFile(true)
+		f.MessageType = append(f.MessageType, &descriptorpb.DescriptorProto{
+			Name:    proto.String(msgName),
+			Options: projectionOpts(goodSpec()),
+		})
+		return runPlugin(t, f)
+	}
+	// Two runs, one process, the same spec name declared by different
+	// messages: a per-run registry accepts both; a process-global one
+	// rejects the second as a duplicate.
+	if err := runOnce("View"); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if err := runOnce("View2"); err != nil {
+		t.Fatalf("second run declaring the same spec name: %v", err)
 	}
 }

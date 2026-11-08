@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/migrate"
 )
@@ -15,7 +16,8 @@ import (
 // rows under schema 0001, applies 0002, appends, and checks the ADR 0029 §5
 // behaviour: old rows stay unhashed, the first new row chains to
 // UnchainedHeadHash(sid, head), VerifyStream reports ChainedFrom, and the
-// migration version is 4 (0002 through 0004 applied together). It is an
+// migration version is 8 (0002 through 0008 applied together; sqlite has
+// no 0005 — Postgres's is RLS-role-specific). It is an
 // internal test so it can apply one migration at a time.
 func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 	ctx := context.Background()
@@ -42,27 +44,31 @@ func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 	}
 
 	// Two pre-chain rows, as the old Append wrote them (no hash columns).
+	// The audit UUIDs are the canonical nil-UUID strings Append writes for
+	// zero metadata — the scan rejects anything that does not parse (F34),
+	// and the old Append never wrote empty strings there.
 	sid, _ := es.NewStreamID("thing", "old")
 	old := es.TruncateMicros(time.Now().Add(-time.Hour))
+	nilUUID := uuid.Nil.String()
 	for v := 1; v <= 2; v++ {
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO events (event_id, stream_type, stream_id, version, type_url, schema_version, occurred_at, recorded_at,
 			   correlation_id, causation_id, command_id, actor_type, actor_id, actor_principal, payload)
 			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			newV7().String(), sid.Type, sid.Canonical(), v, "thing.v1.Happened", 1, formatTS(old), formatTS(old),
-			"", "", "", "", "", "", []byte{byte(v)}); err != nil {
+			nilUUID, nilUUID, nilUUID, "", "", "", []byte{byte(v)}); err != nil {
 			t.Fatalf("seed v%d: %v", v, err)
 		}
 	}
 
-	// Now the upgrade: Migrate applies every embedded migration through 0004.
+	// Now the upgrade: Migrate applies every embedded migration through 0008.
 	s, err := NewWithDB(ctx, db)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	var version int
-	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 4 {
-		t.Fatalf("schema version = %d err=%v, want 4", version, err)
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 8 {
+		t.Fatalf("schema version = %d err=%v, want 8", version, err)
 	}
 	since, err := s.ChainedSince(ctx)
 	if err != nil || since.IsZero() {

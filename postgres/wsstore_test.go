@@ -1,379 +1,262 @@
-package postgres_test
+package postgres
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/laenenai/es-lite/es"
-	"github.com/laenenai/es-lite/postgres"
 )
 
-// TestWorkspaceHead covers Workspace.Head: an empty workspace is at head 0,
-// and after three events the head is the third event's global_position. Head
-// is deliberately not on es.Store — it is the live-feed resume point, not a
-// general store read.
-func TestWorkspaceHead(t *testing.T) {
+// The fence-round tests in this file are internal (package postgres) on
+// purpose: they assert the unexported draws counter (F9) — the
+// instrumentation that proves idle polls burn no fence xid — and the
+// typed errSequenceCache (F27) by its exported alias, neither of which
+// an external postgres_test file can reach. The rest of the suite stays
+// external; only what must see inside lives here.
+
+// openStore is the internal-suite counterpart of the external
+// postgres_test.openStore: same PG_DSN gate, same per-test isolation (a
+// truncate of the shared tables — tests run sequentially), and the same
+// idempotent es_relay ensure, because TestSequenceCacheAsserted's
+// Anchor half reaches the role-gated bypass path and the suite must be
+// green against a bare container whatever the run order.
+func openStore(t testing.TB) *Store {
+	t.Helper()
+	dsn := os.Getenv("PG_DSN")
+	if dsn == "" {
+		t.Skip("set PG_DSN to run the Postgres integration tests")
+	}
 	ctx := context.Background()
-	s := openStore(t)
-	ws := s.WorkspaceStore("ws_head")
-	sid := streamID(t)
-
-	if head, err := ws.Head(ctx); err != nil || head != 0 {
-		t.Fatalf("empty workspace Head = (%d, %v), want (0, nil)", head, err)
-	}
-
-	res, err := ws.Append(ctx, es.AppendParams{
-		StreamID: sid,
-		Events: []es.EventData{
-			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("a")},
-			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("b")},
-			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("c")},
-		},
-	})
+	s, err := Open(ctx, dsn)
 	if err != nil {
-		t.Fatalf("append: %v", err)
+		t.Fatalf("open: %v", err)
 	}
-	want := res.Envelopes[len(res.Envelopes)-1].GlobalPosition
-
-	head, err := ws.Head(ctx)
-	if err != nil {
-		t.Fatalf("Head: %v", err)
+	if _, err := s.Pool().Exec(ctx, `DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'es_relay') THEN
+				CREATE ROLE es_relay NOLOGIN NOSUPERUSER NOBYPASSRLS;
+			END IF;
+		END $$`); err != nil {
+		t.Fatalf("ensure es_relay: %v", err)
 	}
-	if head != want {
-		t.Fatalf("Head = %d, want %d (the third event's global_position)", head, want)
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+		t.Fatalf("truncate: %v", err)
 	}
+	t.Cleanup(s.Close)
+	return s
 }
 
-// TestHeadIsSettledWhileAppendInFlight pins Head's settle guarantee (spec
-// §5.1): while an append is still in flight, Head never reports a position
-// at or above it — a checkpoint or resume at the raw max would ack the
-// cursor past the in-flight event and lose it when it commits. The shape is
-// the out-of-order commit: tx1 draws the lower position and stays open while
-// tx2 commits the higher one, so the raw max is above an in-flight position.
-// RawHead sees the committed event immediately (the stall-detection view,
-// §5.8); the settled Head stays at or below the in-flight position until the
-// fence clears, then converges to the full settled max.
-func TestHeadIsSettledWhileAppendInFlight(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	ws := s.WorkspaceStore("ws_head_settled")
-	const (
-		typeA = "feedtest.v1.E1" // tx1, lower position, held in flight
-		typeB = "feedtest.v1.E2" // tx2, higher position, committed
-	)
-
-	// tx1 draws the lower position and stays open: an append in flight.
-	tx1, err := s.Pool().Begin(ctx)
+// wsStream returns a stream id for the internal fence tests.
+func wsStream(t *testing.T, name string) es.StreamID {
+	t.Helper()
+	sid, err := es.NewStreamID("fence", name)
 	if err != nil {
-		t.Fatalf("begin tx1: %v", err)
+		t.Fatal(err)
 	}
-	defer tx1.Rollback(ctx)
-	gpA := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "head-settled-a"), 0, typeA)
+	return sid
+}
 
-	// tx2 draws the higher position and commits: gpB is committed and
-	// visible while the lower gpA is still in flight.
-	tx2, err := s.Pool().Begin(ctx)
+// drawsOf reads w.draws under the fence mutex: the counter is guarded
+// by it (drawFence's single caller, fenceBound, holds it), so the test
+// reads must agree — a peek without the lock could observe a torn value
+// and would be exactly the access pattern the race detector rejects.
+func drawsOf(w *Workspace) uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.draws
+}
+
+// appendOne appends a single event to ws and returns its
+// global_position.
+func appendOne(ctx context.Context, t *testing.T, ws *Workspace, sid es.StreamID, expected uint64, typeURL string) uint64 {
+	t.Helper()
+	res, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: expected,
+		Events: []es.EventData{{
+			TypeURL:       typeURL,
+			SchemaVersion: 1,
+			Payload:       []byte(typeURL),
+		}},
+	})
 	if err != nil {
-		t.Fatalf("begin tx2: %v", err)
+		t.Fatalf("append %s: %v", typeURL, err)
 	}
-	defer tx2.Rollback(ctx)
-	gpB := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "head-settled-b"), 0, typeB)
-	if gpA >= gpB {
-		t.Fatalf("insert order: tx1 gp=%d, tx2 gp=%d, want tx1 lower", gpA, gpB)
-	}
-	if err := tx2.Commit(ctx); err != nil {
-		t.Fatalf("commit tx2: %v", err)
-	}
+	return res.Envelopes[0].GlobalPosition
+}
 
-	// The raw head sees the committed gpB immediately — no fence, no
-	// wait: committed backlog above an in-flight predecessor, exactly
-	// what stall detection probes for.
-	raw, err := ws.RawHead(ctx)
-	if err != nil {
-		t.Fatalf("RawHead: %v", err)
-	}
-	if raw != gpB {
-		t.Fatalf("RawHead = %d, want %d (the committed event, immediately visible)", raw, gpB)
-	}
-
-	// The settled Head must not ack past the in-flight gpA: while tx1 is
-	// open it reports at most gpA — never the raw max. Two polls cover
-	// both round shapes: the fence-establishing poll and the stored-fence
-	// poll.
-	for i := 0; i < 2; i++ {
-		head, err := ws.Head(ctx)
-		if err != nil {
-			t.Fatalf("Head poll %d: %v", i, err)
-		}
-		if head > gpA {
-			t.Fatalf("Head poll %d = %d while gp=%d is in flight, want <= %d: a checkpoint at the raw max would ack past it",
-				i, head, gpA, gpA)
-		}
-	}
-
-	// Once tx1 settles, the fence clears and Head converges to the full
-	// settled max.
-	if err := tx1.Commit(ctx); err != nil {
-		t.Fatalf("commit tx1: %v", err)
-	}
+// pollPage polls the bounded read until it delivers a non-empty page and
+// returns it.
+func pollPage(ctx context.Context, t *testing.T, ws *Workspace, from uint64, types []string) []es.Envelope {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		head, err := ws.Head(ctx)
+		page, _, err := ws.ReadAllBounded(ctx, from, 100, 0, types)
 		if err != nil {
-			t.Fatalf("Head after commit: %v", err)
+			t.Fatalf("read page from %d: %v", from, err)
 		}
-		if head == gpB {
-			return
+		if len(page) > 0 {
+			return page
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("Head = %d past the deadline, want %d (the settled max once the fence clears)", head, gpB)
+			t.Fatalf("feed page from %d stayed empty past the deadline", from)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 }
 
-// TestWorkspaceMatchingHeadIsFenceBoundedAndFiltered pins MatchingHead's
-// two semantics (spec §5.8): the filtered maximum — only the requested
-// types' positions count — and the fence bound — while a transaction
-// blocks the fence, MatchingHead reports 0 exactly like Head, reusing the
-// stored fence round instead of drawing a fresh one per probe. RawHead
-// sees the committed maximum immediately, the contrast that makes stall
-// detection meaningful.
-func TestWorkspaceMatchingHeadIsFenceBoundedAndFiltered(t *testing.T) {
+// TestIdleWorkspaceBurnsNoFence pins the F9 idle short-circuit: a
+// workspace whose committed max sits at the caller's cursor is idle, and
+// polling it must not draw a fence xid. Another workspace appending does
+// not make THIS workspace non-idle — the global sequence moves, but no
+// event visible to this workspace's caller does — so without the
+// short-circuit every poll of every idle workspace burns a fence
+// transaction per poll cycle. The fresh append at the end is the
+// positive control: once something new is visible, the next poll must
+// draw again.
+func TestIdleWorkspaceBurnsNoFence(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
-	ws := s.WorkspaceStore("ws_matching_head")
-	const (
-		typeA = "feedtest.v1.E1" // tx1, lower position, held in flight
-		typeB = "feedtest.v1.E2" // tx2, higher position, committed
-	)
+	const typeURL = "fencetest.v1.E"
+	types := []string{typeURL}
+	wsA := s.WorkspaceStore("ws_fence_idle_a")
+	wsB := s.WorkspaceStore("ws_fence_idle_b")
+	sidA := wsStream(t, "idle-a")
+	sidB := wsStream(t, "idle-b")
 
-	// tx1 draws the lower position and stays open.
-	tx1, err := s.Pool().Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx1: %v", err)
+	n := appendOne(ctx, t, wsA, sidA, 0, typeURL)
+	if n == 0 {
+		t.Fatal("workspace A's event drew position 0")
 	}
-	defer tx1.Rollback(ctx)
-	gpA := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "matching-head-a"), 0, typeA)
+	// B appends after A is idle: the global sequence last_value moves
+	// above n, but A's committed max stays at n.
+	appendOne(ctx, t, wsB, sidB, 0, typeURL)
 
-	// tx2 draws the higher position and commits.
-	tx2, err := s.Pool().Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin tx2: %v", err)
-	}
-	defer tx2.Rollback(ctx)
-	gpB := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "matching-head-b"), 0, typeB)
-	if gpA >= gpB {
-		t.Fatalf("insert order: tx1 gp=%d, tx2 gp=%d, want tx1 lower", gpA, gpB)
-	}
-	if err := tx2.Commit(ctx); err != nil {
-		t.Fatalf("commit tx2: %v", err)
-	}
-
-	// The raw maximum is committed and visible; the matching heads are
-	// not: the fence is blocked by tx1, so both filter shapes report 0.
-	// The second call reuses the stored fence round — still 0, still no
-	// error — instead of drawing a fresh fence per probe.
-	if raw, err := ws.RawHead(ctx); err != nil {
-		t.Fatalf("RawHead: %v", err)
-	} else if raw != gpB {
-		t.Fatalf("RawHead = %d, want %d (the committed maximum, unfenced)", raw, gpB)
-	}
-	for i := 0; i < 2; i++ {
-		for _, types := range [][]string{{typeA}, {typeA, typeB}, nil} {
-			head, err := ws.MatchingHead(ctx, types)
-			if err != nil {
-				t.Fatalf("MatchingHead poll %d (%v): %v", i, types, err)
-			}
-			if head != 0 {
-				t.Fatalf("MatchingHead poll %d (%v) = %d while gp=%d is in flight, want 0 (the fence is blocked, like Head)",
-					i, types, head, gpA)
-			}
-		}
-	}
-
-	// tx1 settles: the fence clears and MatchingHead reports each type
-	// set's own maximum. An empty type set matches nothing.
-	if err := tx1.Commit(ctx); err != nil {
-		t.Fatalf("commit tx1: %v", err)
-	}
-	cases := []struct {
-		types []string
-		want  uint64
-	}{
-		{[]string{typeA}, gpA},
-		{[]string{typeB}, gpB},
-		{[]string{typeA, typeB}, gpB},
-		{[]string{"feedtest.v1.Absent"}, 0},
-		{nil, 0},
-	}
-	for _, c := range cases {
-		head, err := ws.MatchingHead(ctx, c.types)
+	before := drawsOf(wsA)
+	for i := 0; i < 5; i++ {
+		envs, truncated, err := wsA.ReadAllBounded(ctx, n, 10, 0, types)
 		if err != nil {
-			t.Fatalf("MatchingHead (%v): %v", c.types, err)
+			t.Fatalf("idle poll %d: %v", i, err)
 		}
-		if head != c.want {
-			t.Fatalf("MatchingHead (%v) = %d, want %d", c.types, head, c.want)
+		if len(envs) != 0 || truncated {
+			t.Fatalf("idle poll %d: %d events, truncated=%t, want an empty page", i, len(envs), truncated)
 		}
-	}
-}
-
-// appendEvents is the ReadAllBounded fixture: it appends one event per
-// (typeURL, payload) pair to ws and fails the test on the first error.
-func appendEvents(ctx context.Context, t *testing.T, ws *postgres.Workspace, sid es.StreamID, events []es.EventData) []es.Envelope {
-	t.Helper()
-	res, err := ws.Append(ctx, es.AppendParams{StreamID: sid, Events: events})
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	return res.Envelopes
-}
-
-// tenBytes is a 10-byte payload: a round unit for byte-budget arithmetic.
-func tenBytes() []byte { return []byte("0123456789") }
-
-// TestWorkspaceReadAllBoundedFiltersByType: only rows whose type_url is in
-// types come back, in global order, from a position; a page cut short by
-// limit is not truncation (only the byte budget reports truncated); another
-// workspace's rows are invisible (the query runs under the workspace RLS).
-func TestWorkspaceReadAllBoundedFiltersByType(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	ws := s.WorkspaceStore("ws_rab")
-	sid := streamID(t)
-
-	appendEvents(ctx, t, ws, sid, []es.EventData{
-		{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: []byte("a")},
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: []byte("b")},
-		{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("cc")},
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: []byte("d")},
-	})
-	// Another workspace's matching event must be invisible.
-	other := s.WorkspaceStore("ws_rab_other")
-	otherSid := streamID(t)
-	appendEvents(ctx, t, other, otherSid, []es.EventData{
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: []byte("x")},
-	})
-
-	events, truncated, err := ws.ReadAllBounded(ctx, 0, 10, 0, []string{"counter.v1.Closed"})
-	if err != nil {
-		t.Fatalf("ReadAllBounded: %v", err)
-	}
-	if truncated {
-		t.Fatalf("truncated = true with no byte budget in the way")
-	}
-	if len(events) != 2 || events[0].Payload[0] != 'b' || events[1].Payload[0] != 'd' {
-		t.Fatalf("events = %v, want the two Closed events in global order", summarize(events))
-	}
-
-	// A position resumes strictly after it.
-	afterFirst := events[0].GlobalPosition
-	events, truncated, err = ws.ReadAllBounded(ctx, afterFirst, 10, 0, []string{"counter.v1.Closed"})
-	if err != nil || truncated {
-		t.Fatalf("resume: events=%v truncated=%t err=%v", summarize(events), truncated, err)
-	}
-	if len(events) != 1 || events[0].Payload[0] != 'd' {
-		t.Fatalf("from %d: events = %v, want only the later Closed event", afterFirst, summarize(events))
-	}
-
-	// A page cut short by limit is not truncation.
-	events, truncated, err = ws.ReadAllBounded(ctx, 0, 1, 0, []string{"counter.v1.Closed"})
-	if err != nil || truncated {
-		t.Fatalf("limit cut: events=%v truncated=%t err=%v", summarize(events), truncated, err)
-	}
-	if len(events) != 1 {
-		t.Fatalf("events = %v, want the limit of 1", summarize(events))
-	}
-}
-
-// TestWorkspaceReadAllBoundedEmptyTypesReturnsNoEvents: an empty type set
-// matches nothing — no events, no error, no truncation.
-func TestWorkspaceReadAllBoundedEmptyTypesReturnsNoEvents(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	ws := s.WorkspaceStore("ws_rab_empty")
-	appendEvents(ctx, t, ws, streamID(t), []es.EventData{
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: []byte("b")},
-	})
-
-	for _, types := range [][]string{nil, {}} {
-		events, truncated, err := ws.ReadAllBounded(ctx, 0, 10, 1000, types)
-		if err != nil || truncated || len(events) != 0 {
-			t.Fatalf("types=%v: events=%v truncated=%t err=%v, want none", types, summarize(events), truncated, err)
+		if d := drawsOf(wsA); d != before {
+			t.Fatalf("idle poll %d advanced draws %d → %d: an idle workspace must not burn a fence xid per poll (F9)", i, before, d)
 		}
 	}
+
+	// The positive control: a fresh append to A makes it non-idle, so
+	// the next poll must draw again — the short-circuit may only skip
+	// when nothing new is visible.
+	fresh := appendOne(ctx, t, wsA, sidA, 1, typeURL)
+	if fresh <= n {
+		t.Fatalf("fresh append drew position %d, want > %d", fresh, n)
+	}
+	grew := drawsOf(wsA)
+	page := pollPage(ctx, t, wsA, n, types)
+	if len(page) != 1 || page[0].GlobalPosition != fresh {
+		t.Fatalf("page after the fresh append = %d events (first at %d), want the one event at %d", len(page), page[0].GlobalPosition, fresh)
+	}
+	if d := drawsOf(wsA); d <= grew {
+		t.Fatalf("the poll after a fresh append drew nothing (draws %d → %d): the short-circuit must not skip visible work", grew, d)
+	}
 }
 
-// TestWorkspaceReadAllBoundedStopsAtTheByteBudget: the page stops before an
-// event whose payload would push the running total past maxBytes and reports
-// truncated=true; an exact fit is not "past" and does not truncate. A
-// non-matching oversized event in between eats no budget: filtering happens
-// in SQL, before the walk.
-func TestWorkspaceReadAllBoundedStopsAtTheByteBudget(t *testing.T) {
+// TestHeadEmptyWorkspaceBurnsNoFence pins the other F9 half: Head on a
+// workspace with zero events reports 0 without drawing a fence — the
+// committed-max short-circuit fires from 0 — while a workspace with a
+// committed event still draws for its settled head, so the
+// short-circuit cannot degenerate into never fencing at all.
+func TestHeadEmptyWorkspaceBurnsNoFence(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
-	ws := s.WorkspaceStore("ws_rab_budget")
-	sid := streamID(t)
+	const typeURL = "fencetest.v1.Head"
+	ws := s.WorkspaceStore("ws_fence_head_empty")
+	sid := wsStream(t, "head-empty")
 
-	appendEvents(ctx, t, ws, sid, []es.EventData{
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: tenBytes()},
-		{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: tenBytes()}, // not requested
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: tenBytes()},
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: tenBytes()},
-	})
-
-	// 10+10 fit in 25; the third would make 30 > 25.
-	events, truncated, err := ws.ReadAllBounded(ctx, 0, 10, 25, []string{"counter.v1.Closed"})
+	before := drawsOf(ws)
+	head, err := ws.Head(ctx)
 	if err != nil {
-		t.Fatalf("ReadAllBounded: %v", err)
+		t.Fatalf("Head on an empty workspace: %v", err)
 	}
-	if len(events) != 2 || !truncated {
-		t.Fatalf("maxBytes=25: %d events, truncated=%t, want 2 and true", len(events), truncated)
+	if head != 0 {
+		t.Fatalf("Head on an empty workspace = %d, want 0", head)
+	}
+	if d := drawsOf(ws); d != before {
+		t.Fatalf("Head on an empty workspace advanced draws %d → %d: zero events settle without a fence round (F9)", before, d)
 	}
 
-	// 10+10+10 = 30 is not past 30: the whole page fits, nothing was stopped.
-	events, truncated, err = ws.ReadAllBounded(ctx, 0, 10, 30, []string{"counter.v1.Closed"})
-	if err != nil {
-		t.Fatalf("ReadAllBounded: %v", err)
+	// The positive control: once the workspace has an event, Head's
+	// fence round draws again and reports the event's position.
+	gp := appendOne(ctx, t, ws, sid, 0, typeURL)
+	if gp == 0 {
+		t.Fatal("the appended event drew position 0")
 	}
-	if len(events) != 3 || truncated {
-		t.Fatalf("maxBytes=30: %d events, truncated=%t, want 3 and false", len(events), truncated)
+	grew := drawsOf(ws)
+	head, err = ws.Head(ctx)
+	if err != nil {
+		t.Fatalf("Head after an append: %v", err)
+	}
+	if head != gp {
+		t.Fatalf("Head after an append = %d, want %d (the settled head)", head, gp)
+	}
+	if d := drawsOf(ws); d == grew {
+		t.Fatal("Head after an append drew no fence: the workspace is no longer idle")
 	}
 }
 
-// TestWorkspaceReadAllBoundedReturnsTheFirstOversizedEvent: the first event
-// of a page is always included, even alone over budget — an oversized event
-// must be visible, not forever skipped.
-func TestWorkspaceReadAllBoundedReturnsTheFirstOversizedEvent(t *testing.T) {
+// TestSequenceCacheAsserted pins the F27 assertion: with the position
+// sequence's cache_size above 1, every fence round refuses to certify a
+// bound — a batched nextval could hand a position at or below the
+// just-read bound to a LATER transaction, voiding the settledness the
+// fence exists to guarantee — so the feed page (ReadAllBounded) and the
+// anchor path (Anchor via settledBound) both fail with
+// ErrSequenceCacheMisconfigured, whose message names the fix. The
+// shared sequence is restored to CACHE 1 on every path (t.Cleanup runs
+// after failures too), so the suite stays re-runnable against the
+// shared database.
+func TestSequenceCacheAsserted(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
-	ws := s.WorkspaceStore("ws_rab_oversize")
-	sid := streamID(t)
 
-	appendEvents(ctx, t, ws, sid, []es.EventData{
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: tenBytes()},
-		{TypeURL: "counter.v1.Closed", SchemaVersion: 1, Payload: []byte("e")},
+	if _, err := s.Pool().Exec(ctx, `ALTER SEQUENCE events_global_position_seq CACHE 2`); err != nil {
+		t.Fatalf("alter sequence to CACHE 2: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.Pool().Exec(context.Background(), `ALTER SEQUENCE events_global_position_seq CACHE 1`); err != nil {
+			t.Errorf("restore CACHE 1: %v", err)
+		}
 	})
 
-	events, truncated, err := ws.ReadAllBounded(ctx, 0, 10, 3, []string{"counter.v1.Closed"})
-	if err != nil {
-		t.Fatalf("ReadAllBounded: %v", err)
+	const typeURL = "fencetest.v1.Cache"
+	ws := s.WorkspaceStore("ws_fence_cache")
+	sid := wsStream(t, "cache")
+	// The workspace must not be idle at 0, or the feed round would
+	// short-circuit before it ever reads the sequence state.
+	gp := appendOne(ctx, t, ws, sid, 0, typeURL)
+	if gp == 0 {
+		t.Fatal("the appended event drew position 0")
 	}
-	if len(events) != 1 || !truncated {
-		t.Fatalf("maxBytes=3: %d events, truncated=%t, want the oversized first event and true", len(events), truncated)
-	}
-	if len(events[0].Payload) != 10 {
-		t.Fatalf("first event payload = %d bytes, want the 10-byte oversized event", len(events[0].Payload))
-	}
-}
 
-// summarize renders an envelope slice for failure messages.
-func summarize(events []es.Envelope) []string {
-	out := make([]string, len(events))
-	for i, e := range events {
-		out[i] = fmt.Sprintf("%s@%d:%q", e.TypeURL, e.GlobalPosition, e.Payload)
+	// The feed path: the round reads the sequence state and must refuse
+	// to fence over a batched cache.
+	_, _, err := ws.ReadAllBounded(ctx, 0, 10, 0, []string{typeURL})
+	if !errors.Is(err, ErrSequenceCacheMisconfigured) {
+		t.Fatalf("ReadAllBounded under CACHE 2: %v, want ErrSequenceCacheMisconfigured", err)
 	}
-	return out
+	if !strings.Contains(err.Error(), "ALTER SEQUENCE events_global_position_seq CACHE 1") {
+		t.Fatalf("error %q does not name the fix", err)
+	}
+
+	// The anchor path fails with the same typed error, never silently:
+	// an anchor recorded over a batched cache could be disputed by its
+	// own CheckAnchor once a cached position commits inside its bound.
+	if _, err := s.Anchor(ctx, 0); !errors.Is(err, ErrSequenceCacheMisconfigured) {
+		t.Fatalf("Anchor under CACHE 2: %v, want ErrSequenceCacheMisconfigured", err)
+	}
 }

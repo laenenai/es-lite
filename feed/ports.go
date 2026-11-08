@@ -92,10 +92,11 @@ type LeaseStore interface {
 // instead of polling. The first event of a page is included even when it alone
 // exceeds maxBytes, so an oversized event is visible to the caller.
 //
-// Head, RawHead and MatchingHead are the three head views the feed's
-// resume, stall detection and lag reporting need. On a fence-bounded Log
-// (Postgres, spec §5.1) they disagree while a transaction is in flight:
-// Head and MatchingHead settle only past the fence; RawHead never waits.
+// Head, RawHead, MatchingHead and MatchingRawHead are the four head
+// views the feed's resume, stall detection and lag reporting need. On a
+// fence-bounded Log (Postgres, spec §5.1) they disagree while a
+// transaction is in flight: Head and MatchingHead settle only past the
+// fence; RawHead and MatchingRawHead never wait.
 //
 // limit <= 0 and maxBytes <= 0 are adapter-defined defaults; the feed always
 // passes positive values from its Config.
@@ -112,14 +113,25 @@ type Log interface {
 	// flight, so it is never a resume position. It exists for the
 	// fence-aware resume clamp — raw >= checkpoint proves the
 	// checkpoint's events are still in the log, so a low Head is a
-	// blocked fence, not a restored log — and for stall detection
-	// (Observer.OnStall).
+	// blocked fence, not a restored log.
 	RawHead(ctx context.Context) (uint64, error)
 	// MatchingHead returns the highest settled position among events of
 	// types — the subscription's own head, what Status reports and
 	// measures lag against. It is fence-bounded exactly like Head on
 	// backends that fence. An empty types set matches nothing: 0.
 	MatchingHead(ctx context.Context, types []string) (uint64, error)
+	// MatchingRawHead returns the highest raw committed position among
+	// events of types: the subscription's own backlog, with no settle
+	// bound. It is the view stall detection compares against
+	// (Observer.OnStall), measured over the subscription's consumed
+	// types so a filtered stream that is caught up never reports a
+	// stall while unrelated event types keep landing. Like RawHead it
+	// never waits for the fence: it can jump past positions whose
+	// appends are still in flight. Stall detection is a liveness
+	// signal, not a correctness boundary — a torn read can only
+	// mis-time a stall report, never corrupt data. An empty types set
+	// matches nothing: 0.
+	MatchingRawHead(ctx context.Context, types []string) (uint64, error)
 }
 
 // Logs opens the Log for one scope (the platform's tenant/workspace).
@@ -169,10 +181,16 @@ type DeadLetterStore interface {
 
 // Waiter is an optional wakeup source. Subscribe calls Wait after a short page
 // instead of sleeping; Wait returns when new events may exist, after timeout,
-// or when ctx ends. A normal timeout is a nil return: only ctx ending or a real
-// failure returns an error, which stops the stream. A nil Waiter means polling.
+// or when ctx ends. woke reports whether the waiter observed a genuine
+// wakeup — an append notification or another wake source firing — and is
+// false on a timeout: a normal timeout is a (false, nil) return, and only ctx
+// ending or a real failure returns an error, which stops the stream. The
+// server floors the idle wait only when woke is false, so a genuine wake
+// reaches the next page read without waiting out the poll; an implementation
+// that cannot distinguish a wake from a timeout must always return false. A
+// nil Waiter means polling.
 type Waiter interface {
-	Wait(ctx context.Context, timeout time.Duration) error
+	Wait(ctx context.Context, timeout time.Duration) (woke bool, err error)
 }
 
 // Clock supplies wall time where the server needs it (lease owner
@@ -188,6 +206,9 @@ type Clock interface {
 // calls it from its own goroutines (the stream and its renewer) and from
 // Checkpoint's caller, so implementations must be safe for concurrent use
 // and must not block: the stream never waits for an observer.
+// OnSubscribeError is the one exception to the caller: the consumer
+// adapter's reconnect loop — not the server — reports it (see the
+// method).
 type Observer interface {
 	// OnPage reports one page read from the Log, empty pages included:
 	// events is the page's row count and bytes the sum of its payload
@@ -205,23 +226,37 @@ type Observer interface {
 	// leaves the log, and Skip past the position is the recovery.
 	OnPoison(err *EventTooLargeError)
 	// OnStall reports a stalled stream: the page came back empty while
-	// RawHead is above the stream's settled position — committed backlog
-	// the settled reads cannot deliver yet, typically because an
-	// in-flight transaction holds the fence. Exactly one OnStall per
-	// stall episode; the probes behind it are rate-limited, so a fleet
-	// of idle streams cannot stampede the log.
-	OnStall(settledHead, rawHead uint64)
+	// the matching raw head — MatchingRawHead over the subscription's
+	// consumed types — is above the stream's settled position: committed
+	// backlog of the subscription's own events the settled reads cannot
+	// deliver yet, typically because an in-flight transaction holds the
+	// fence. Exactly one OnStall per stall episode; the probes behind it
+	// are rate-limited, so a fleet of idle streams cannot stampede the
+	// log.
+	OnStall(settledHead, matchingRawHead uint64)
+	// OnSubscribeError reports one subscription attempt that ended in an
+	// error rather than a drop: the consumer adapter's reconnect loop
+	// (eventfeed) calls it — from the feed's own goroutine, while its
+	// caller context is still live — with the Subscribe error for the
+	// named key, before it backs off and retries or, for the terminal
+	// ones, returns the error to its caller. Fatal or not, poison
+	// included: a wedged subscription that never delivers a page is
+	// otherwise invisible, because the loop's own verdict stays silent.
+	// An attempt ended by the caller's own cancellation is a shutdown,
+	// not a fault, and reports nothing.
+	OnSubscribeError(scope, projection, instance string, err error)
 }
 
 // NoopObserver is the default Observer: it discards every signal. A nil
 // Config.Observer behaves exactly like NoopObserver.
 type NoopObserver struct{}
 
-func (NoopObserver) OnPage(int, int)                            {}
-func (NoopObserver) OnCheckpoint(uint64)                        {}
-func (NoopObserver) OnLeaseLost(string, string, string, string) {}
-func (NoopObserver) OnPoison(*EventTooLargeError)               {}
-func (NoopObserver) OnStall(uint64, uint64)                     {}
+func (NoopObserver) OnPage(int, int)                                {}
+func (NoopObserver) OnCheckpoint(uint64)                            {}
+func (NoopObserver) OnLeaseLost(string, string, string, string)     {}
+func (NoopObserver) OnPoison(*EventTooLargeError)                   {}
+func (NoopObserver) OnStall(uint64, uint64)                         {}
+func (NoopObserver) OnSubscribeError(string, string, string, error) {}
 
 // Request is one subscription. Scope, Projection and Instance identify the
 // checkpoint/lease key. Definition is the projection's generated metadata
@@ -278,7 +313,8 @@ type Ack struct {
 // the checkpoint to advance; Position is the event being skipped (resume
 // reads strictly after it); Actor and Reason carry the audit trail that
 // lands in the dead letter; Force authorizes the skip over a live lease,
-// exactly like ResetCheckpoint's force.
+// exactly like ResetCheckpoint's force — and it alone authorizes a rewind,
+// since a Position behind the stored checkpoint is otherwise refused.
 type SkipRequest struct {
 	// Scope, Projection and Instance name the checkpoint to advance.
 	Scope, Projection, Instance string
@@ -289,7 +325,9 @@ type SkipRequest struct {
 	// Reason records why the event is being skipped; it lands in the
 	// dead letter.
 	Reason string
-	// Force allows the skip while a live lease holds the key.
+	// Force allows the skip while a live lease holds the key, and is the
+	// only way to rewind: a Position behind the stored checkpoint fails
+	// with ErrInvalidRequest unless it is set.
 	Force bool
 }
 

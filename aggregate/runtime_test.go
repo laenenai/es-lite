@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/laenenai/es-lite/aggregate"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
@@ -152,5 +154,136 @@ func TestWithChainVerificationPassesOnIntactStream(t *testing.T) {
 	}
 	if st, v, err := rt.Load(ctx, sid); err != nil || v != 2 || st.GetCount() != 15 {
 		t.Fatalf("verified load: count=%d v=%d err=%v", st.GetCount(), v, err)
+	}
+}
+
+// Pinned command ids for the deterministic-event-id tests: fixed literals
+// so every comparison below is reproducible run to run.
+var (
+	retryCmdID  = uuid.MustParse("11111111-1111-4111-8111-111111111111")
+	controlInit = uuid.MustParse("22222222-2222-4222-8222-222222222222")
+	detInitID   = uuid.MustParse("33333333-3333-4333-8333-333333333333")
+)
+
+func TestDeterministicEventIDsCollideOnRetry(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	meta := es.Meta{CommandID: retryCmdID}
+
+	// Control — without the option, the same command handled twice appends
+	// twice: the adapter mints a fresh UUIDv7 per event, so nothing collides.
+	// Today's behavior, pinned.
+	control, _ := es.NewStreamID("counter", "det-control")
+	ctl := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
+	if _, err := ctl.Handle(ctx, control, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 0}), es.Meta{CommandID: controlInit}); err != nil {
+		t.Fatalf("control init: %v", err)
+	}
+	if _, err := ctl.Handle(ctx, control, counterv1.Command(&counterv1.Increment{By: 1}), meta); err != nil {
+		t.Fatalf("control first handle: %v", err)
+	}
+	if _, err := ctl.Handle(ctx, control, counterv1.Command(&counterv1.Increment{By: 1}), meta); err != nil {
+		t.Fatalf("control: retried command without the option must append as today, got %v", err)
+	}
+
+	// With WithDeterministicEventIDs, the retry derives the same event id
+	// from the command id and collides with the first run's row on the
+	// events.event_id unique constraint → es.ErrDuplicateEventID.
+	det, _ := es.NewStreamID("counter", "det-main")
+	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{}).WithDeterministicEventIDs()
+	if _, err := rt.Handle(ctx, det, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 0}), es.Meta{CommandID: detInitID}); err != nil {
+		t.Fatalf("det init: %v", err)
+	}
+	if _, err := rt.Handle(ctx, det, counterv1.Command(&counterv1.Increment{By: 1}), meta); err != nil {
+		t.Fatalf("det first handle: %v", err)
+	}
+	if _, err := rt.Handle(ctx, det, counterv1.Command(&counterv1.Increment{By: 1}), meta); !errors.Is(err, es.ErrDuplicateEventID) {
+		t.Fatalf("retried command error = %v, want ErrDuplicateEventID", err)
+	}
+}
+
+// TestDeterministicEventIDsStableForSameCommandAndIndex pins that the
+// derivation is a pure function of (namespace, command id, index): the same
+// command id handled in two fresh stores yields the same event id for index
+// 0. (Within one store that equality is what makes the retry collide — the
+// test above — so stability needs a second store to observe directly.)
+func TestDeterministicEventIDsStableForSameCommandAndIndex(t *testing.T) {
+	ctx := context.Background()
+	meta := es.Meta{CommandID: retryCmdID}
+
+	incrementEventID := func(t *testing.T, dsn string) uuid.UUID {
+		t.Helper()
+		s, err := sqlite.Open(ctx, "file:"+dsn+"?mode=memory&cache=shared")
+		if err != nil {
+			t.Fatalf("open sqlite: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		sid, _ := es.NewStreamID("counter", "det-stable")
+		rt := aggregate.NewRuntime(s, counter.Decider, counterv1.EventCodec{}).WithDeterministicEventIDs()
+		if _, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 0}), es.Meta{CommandID: detInitID}); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		res, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Increment{By: 1}), meta)
+		if err != nil {
+			t.Fatalf("increment: %v", err)
+		}
+		return res.Envelopes[0].EventID
+	}
+
+	first := incrementEventID(t, t.Name())
+	second := incrementEventID(t, t.Name()+"-again")
+	if first == uuid.Nil || second == uuid.Nil {
+		t.Fatalf("event ids not filled: %s / %s", first, second)
+	}
+	if first != second {
+		t.Fatalf("same command id derived %s then %s, want stable", first, second)
+	}
+}
+
+// TestDeterministicEventIDsDifferAcrossCommands pins that two different
+// command ids never derive the same event id.
+func TestDeterministicEventIDsDifferAcrossCommands(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	sid, _ := es.NewStreamID("counter", "det-distinct")
+	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{}).WithDeterministicEventIDs()
+
+	resA, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 0}), es.Meta{CommandID: controlInit})
+	if err != nil {
+		t.Fatalf("first command: %v", err)
+	}
+	resB, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Increment{By: 1}), es.Meta{CommandID: retryCmdID})
+	if err != nil {
+		t.Fatalf("second command: %v", err)
+	}
+	idA, idB := resA.Envelopes[0].EventID, resB.Envelopes[0].EventID
+	if idA == uuid.Nil || idB == uuid.Nil {
+		t.Fatalf("event ids not filled: %s / %s", idA, idB)
+	}
+	if idA == idB {
+		t.Fatalf("different command ids derived the same event id %s", idA)
+	}
+}
+
+// TestDeterministicEventIDsWithoutCommandIDNeverCollide pins the nil
+// command id edge: with the option on, a caller that passes no CommandID
+// keeps today's behavior — the runtime mints one per Handle and the events
+// append without colliding, because a nil command id can't derive a fixed
+// event id.
+func TestDeterministicEventIDsWithoutCommandIDNeverCollide(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	sid, _ := es.NewStreamID("counter", "det-nil-cmd")
+	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{}).WithDeterministicEventIDs()
+
+	res1, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 0}), es.Meta{})
+	if err != nil {
+		t.Fatalf("first nil-command handle: %v", err)
+	}
+	res2, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Increment{By: 1}), es.Meta{})
+	if err != nil {
+		t.Fatalf("second nil-command handle: %v", err)
+	}
+	if res1.Envelopes[0].EventID == res2.Envelopes[0].EventID {
+		t.Fatalf("nil command ids shared one event id %s", res1.Envelopes[0].EventID)
 	}
 }

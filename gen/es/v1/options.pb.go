@@ -24,8 +24,9 @@ const (
 )
 
 // FetchMode says how a projector gets content. Payloads on the bus may be
-// sealed, so a projector either works from envelope metadata alone or
-// fetches aggregate state through a loader. Closed.
+// sealed, so a projector either works from envelope metadata alone,
+// decodes the typed event, or additionally fetches aggregate state
+// through a loader. Closed.
 type FetchMode int32
 
 const (
@@ -38,6 +39,11 @@ const (
 	// latest, so a rebuild from the log equals the live run. Handlers
 	// receive the decoded event and that state.
 	FetchMode_FETCH_MODE_STATE_AS_OF_EVENT_VERSION FetchMode = 2
+	// Receives the decoded event alone: the dispatch decodes (and upcasts
+	// when the deps carry an Upcaster) and the handler is handed the typed
+	// event, but no state is ever fetched — a projection or reaction that
+	// needs only the event pays no state load per event.
+	FetchMode_FETCH_MODE_EVENT_ONLY FetchMode = 3
 )
 
 // Enum value maps for FetchMode.
@@ -46,11 +52,13 @@ var (
 		0: "FETCH_MODE_UNSPECIFIED",
 		1: "FETCH_MODE_METADATA_ONLY",
 		2: "FETCH_MODE_STATE_AS_OF_EVENT_VERSION",
+		3: "FETCH_MODE_EVENT_ONLY",
 	}
 	FetchMode_value = map[string]int32{
 		"FETCH_MODE_UNSPECIFIED":               0,
 		"FETCH_MODE_METADATA_ONLY":             1,
 		"FETCH_MODE_STATE_AS_OF_EVENT_VERSION": 2,
+		"FETCH_MODE_EVENT_ONLY":                3,
 	}
 )
 
@@ -642,12 +650,18 @@ var (
 	// struct field of that name for a field called decided_at).
 	//
 	// The client value is intent, not authority. aggregate.Runtime always
-	// stamps Envelope.OccurredAt from the server clock (Meta.OccurredAt is
-	// ignored), rejects a tagged-but-unset field with es.ErrDecidedAtMissing,
+	// stamps Envelope.OccurredAt from the server clock, rejects a
+	// tagged-but-unset field with es.ErrDecidedAtMissing,
 	// rejects a value further than es.MaxDecisionSkew (five minutes) from
 	// server time with *es.DecidedAtSkewError, and replaces the command's
 	// decided_at with server time before Decide runs so a decider checking an
-	// expiry window validates against the server clock. Generation fails when
+	// expiry window validates against the server clock. A command whose
+	// decision time cannot be replaced — es.StampDecisionTime reports
+	// false: the command is neither an es.DecisionTimeSetter nor a proto
+	// message with a tagged Timestamp field — is rejected with
+	// es.ErrDecidedAtUnstampable, naming the command type, before anything
+	// is loaded or appended; generated variants are always settable, so
+	// only hand-written command types can reach it. Generation fails when
 	// the field is not a Timestamp or its message is not a variant of a
 	// "Command" sum type.
 	//
@@ -689,11 +703,12 @@ const file_es_v1_options_proto_rawDesc = "" +
 	"\x05fetch\x18\x04 \x01(\x0e2\x10.es.v1.FetchModeR\x05fetch\x12#\n" +
 	"\rowner_context\x18\x05 \x01(\tR\fownerContext\".\n" +
 	"\x0eCommandService\x12\x1c\n" +
-	"\taggregate\x18\x01 \x01(\tR\taggregate*o\n" +
+	"\taggregate\x18\x01 \x01(\tR\taggregate*\x8a\x01\n" +
 	"\tFetchMode\x12\x1a\n" +
 	"\x16FETCH_MODE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18FETCH_MODE_METADATA_ONLY\x10\x01\x12(\n" +
-	"$FETCH_MODE_STATE_AS_OF_EVENT_VERSION\x10\x02*F\n" +
+	"$FETCH_MODE_STATE_AS_OF_EVENT_VERSION\x10\x02\x12\x19\n" +
+	"\x15FETCH_MODE_EVENT_ONLY\x10\x03*F\n" +
 	"\vRebuildMode\x12\x1c\n" +
 	"\x18REBUILD_MODE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15REBUILD_MODE_FROM_LOG\x10\x01*\x8a\x01\n" +

@@ -97,21 +97,24 @@ type Store struct {
 	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
 	maxPayloadBytes int
 
-	// relayRoleOnce runs the es_relay startup check that every RLS-bypass
-	// path shares — Drain and the anchor path's bypassTx
-	// (checkRelayRole) — at most once per Store. Migration 0005 gates the
-	// RLS bypass on that membership. The verdict is cached on the Store
+	// relayRoleMu guards the es_relay membership verdict below — the
+	// startup check every RLS-bypass path shares — Drain and the anchor
+	// path's bypassTx (checkRelayRole). Migration 0005 gates the RLS
+	// bypass on that membership. The verdict is cached on the Store
 	// rather than the package: a process is expected to hold one Store
 	// (see Store's doc), so this is once per process, and a Store opened
 	// later — a different principal, or after the runbook's GRANT —
 	// re-verifies instead of inheriting another pool's verdict.
-	relayRoleOnce sync.Once
+	relayRoleMu sync.Mutex
 
-	// relayRoleErr is the cached verdict of checkRelayRole:
-	// ErrRelayRoleMissing (wrapped, runbook in the message) when the
-	// session user is not an es_relay member, or the probe's own error.
-	// Nil means the check passed.
-	relayRoleErr error
+	// relayRoleChecked records that the probe reached a definitive
+	// verdict, held in relayRoleMember. Until it does — including after
+	// a transient probe failure such as a cancelled context or a flaky
+	// connection — every bypass call re-probes, so one blip cannot
+	// poison the Store's lifetime (F4). Both fields are read and
+	// written only under relayRoleMu.
+	relayRoleChecked bool
+	relayRoleMember  bool
 }
 
 // Open connects to Postgres and applies migrations (unless WithoutAutoMigrate).
@@ -125,6 +128,10 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
+	}
+	if err := probePostgresFloor(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
 	}
 	cfg := newOpenConfig(opts)
 	s := &Store{pool: pool, ownsPool: true, maxPayloadBytes: cfg.maxPayloadBytes}
@@ -154,12 +161,41 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 	if pool == nil {
 		return nil, fmt.Errorf("postgres: open with pool: pool is nil")
 	}
+	if err := probePostgresFloor(ctx, pool); err != nil {
+		return nil, err
+	}
 	cfg := newOpenConfig(opts)
 	s := &Store{pool: pool, ownsPool: false, maxPayloadBytes: cfg.maxPayloadBytes}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// probePostgresFloor is the PostgreSQL 14 floor check both constructors run
+// once, before any migration (F33): the append path's P1 xid draw and the
+// horizon fence both call pg_current_xact_id(), so a server without it
+// would otherwise fail every append and every fence round deep inside with
+// a confusing "function pg_current_xact_id() does not exist". The 14+
+// floor is the support policy, not a single feature gate:
+// pg_current_xact_id() — and the pg_current_snapshot/pg_snapshot_xmin pair
+// the fence reads — exist from PostgreSQL 13, so the probe mechanically
+// rejects only servers older than 13 and a 13 server passes it; the
+// docs state the floor as policy with the probe as the tripwire. The
+// undefined-function error becomes a clear message naming the minimum;
+// any other failure (a dead DSN, a cancelled context) is a probe failure,
+// not a version verdict, and is wrapped as such.
+func probePostgresFloor(ctx context.Context, pool *pgxpool.Pool) error {
+	var xid uint64
+	err := pool.QueryRow(ctx, `SELECT pg_current_xact_id()`).Scan(&xid)
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42883" { // undefined_function
+		return fmt.Errorf("postgres: this server is older than PostgreSQL 14, the minimum es-lite supports (pg_current_xact_id is unavailable: %w)", err)
+	}
+	return fmt.Errorf("postgres: version probe: %w", err)
 }
 
 // migrateIfConfigured applies migrations unless the options disable them. It
@@ -171,56 +207,129 @@ func (s *Store) migrateIfConfigured(ctx context.Context, cfg openConfig) error {
 	return s.Migrate(ctx)
 }
 
-// Migrate applies pending versioned migrations under a session advisory lock,
-// so concurrent migrators are safe (ADR 0010). Each migration runs in its own
-// transaction and is recorded in schema_migrations. Idempotent.
+// Migrate applies pending versioned migrations (ADR 0010). Each pending
+// migration runs in exactly one transaction — BEGIN; SELECT
+// pg_advisory_xact_lock($1); re-check the recorded version; apply;
+// record; COMMIT — and the schema_migrations bootstrap runs inside a
+// transaction of the same shape.
+//
+// The lock is transaction-scoped on purpose (F10): the session-scoped
+// pg_advisory_lock this path used to take stayed latched on a pooled
+// connection whenever the run was cancelled or failed (the deferred
+// unlock never ran on a dead context), blocking every later migration
+// that landed on another connection. A transaction-level advisory lock
+// works "the same as pg_advisory_lock, except that the lock is
+// automatically released at the end of the current transaction and
+// cannot be released explicitly" (PostgreSQL docs, System Administration
+// Functions: Advisory Lock Functions), so commit, rollback, cancellation
+// and connection loss all release it — there is no unlock statement to
+// skip.
+//
+// Concurrency: two migrators may both see a version pending, but the
+// second to acquire the lock re-checks the recorded version inside the
+// transaction and skips what the first applied, so every migrator
+// observes a consistent, monotone history. Idempotent.
 func (s *Store) Migrate(ctx context.Context) error {
 	migs, err := migrate.Load(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("postgres: acquire: %w", err)
-	}
-	defer conn.Release()
-
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrateLockKey); err != nil {
-		return fmt.Errorf("postgres: advisory lock: %w", err)
-	}
-	defer conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrateLockKey)
-
-	if _, err := conn.Exec(ctx,
-		`CREATE TABLE IF NOT EXISTS schema_migrations (
-			version    int         PRIMARY KEY,
-			applied_at timestamptz NOT NULL DEFAULT now()
-		)`); err != nil {
+	// Bootstrap the history table in its own xact-locked transaction,
+	// shaped exactly like a migration's: concurrent migrators may all
+	// reach this on a fresh database, and CREATE TABLE IF NOT EXISTS is
+	// idempotent under the lock.
+	if err := s.migrateInLock(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`CREATE TABLE IF NOT EXISTS schema_migrations (
+				version    int         PRIMARY KEY,
+				applied_at timestamptz NOT NULL DEFAULT now()
+			)`)
+		return err
+	}); err != nil {
 		return fmt.Errorf("postgres: schema_migrations: %w", err)
 	}
-	for _, m := range migs {
-		var exists bool
-		if err := conn.QueryRow(ctx,
-			`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&exists); err != nil {
-			return fmt.Errorf("postgres: check migration %d: %w", m.Version, err)
+	// The recorded versions, read once as a fast path: a version listed
+	// here is applied, and a version missing here may since have been
+	// applied by a concurrent migrator — which is why every version the
+	// read marks pending is re-checked under the lock below. The read
+	// can be stale only towards "pending", and a stale miss costs an
+	// empty locked skip, never a double apply.
+	rows, err := s.pool.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("postgres: read schema_migrations: %w", err)
+	}
+	defer rows.Close()
+	applied := map[int]bool{}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			return fmt.Errorf("postgres: read schema_migrations: %w", err)
 		}
-		if exists {
+		applied[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("postgres: read schema_migrations: %w", err)
+	}
+
+	for _, m := range migs {
+		if applied[m.Version] {
 			continue
 		}
-		tx, err := conn.Begin(ctx)
-		if err != nil {
+		if err := s.migrateInLock(ctx, func(tx pgx.Tx) error {
+			// The re-check under the lock: a concurrent migrator may
+			// have applied and recorded this version since the read
+			// above; the lock serializes the two, so this verdict is
+			// authoritative.
+			var exists bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&exists); err != nil {
+				return fmt.Errorf("postgres: check migration %d: %w", m.Version, err)
+			}
+			if exists {
+				return nil
+			}
+			if _, err := tx.Exec(ctx, m.SQL); err != nil {
+				return fmt.Errorf("postgres: migration %04d_%s: %w", m.Version, m.Name, err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
+				return fmt.Errorf("postgres: record migration %d: %w", m.Version, err)
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, m.SQL); err != nil {
-			tx.Rollback(ctx)
-			return fmt.Errorf("postgres: migration %04d_%s: %w", m.Version, m.Name, err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
-			tx.Rollback(ctx)
-			return fmt.Errorf("postgres: record migration %d: %w", m.Version, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("postgres: commit migration %d: %w", m.Version, err)
-		}
+	}
+	return nil
+}
+
+// migrateInLock runs fn inside one transaction that holds the migration
+// advisory lock for its whole duration: BEGIN; SELECT
+// pg_advisory_xact_lock($1); fn; COMMIT. The lock is transaction-level,
+// so it is "automatically released at the end of the current
+// transaction" (PostgreSQL docs, System Administration Functions:
+// Advisory Lock Functions) — commit and rollback both end it, and a
+// cancelled run cannot leave it latched on a pooled connection (F10).
+//
+// The rollback runs on a context detached from the caller's on purpose:
+// a ctx cancelled mid-migration must still send its ROLLBACK, so the
+// transaction — and with it the lock — ends at a definite point instead
+// of whenever the server notices a dying connection, and the pooled
+// connection survives the cancellation.
+func (s *Store) migrateInLock(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: begin: %w", err)
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockKey); err != nil {
+		return fmt.Errorf("postgres: advisory lock: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit: %w", err)
 	}
 	return nil
 }
@@ -278,6 +387,21 @@ const envelopeCols = `
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, workspace_id, prev_hash, hash`
 
+// parseStoredUUID parses one stored audit-UUID column (event_id,
+// correlation_id, causation_id, command_id). A value that does not parse
+// fails the whole read (F34): the old code zeroed it and handed back an
+// envelope whose audit trail pointed at nothing. The error names the column
+// and the value's LENGTH only — never the value's bytes, which must not
+// leak into logs, and never uuid.Parse's own error, whose message quotes
+// the offending string.
+func parseStoredUUID(column, value string) (uuid.UUID, error) {
+	id, err := uuid.Parse(value)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("stored %s is not a valid uuid: length %d", column, len(value))
+	}
+	return id, nil
+}
+
 // scanEnvelope reads one row (in envelopeCols order). The payload is opaque —
 // stored and returned as-is (ADR 0025); es-lite performs no decryption.
 func scanEnvelope(row pgx.Row) (es.Envelope, error) {
@@ -306,10 +430,21 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	}
 	e.StreamID = sid
 	e.Workspace = workspaceID
-	e.EventID, _ = uuid.Parse(eventID)
-	e.CorrelationID, _ = uuid.Parse(correlationID)
-	e.CausationID, _ = uuid.Parse(causationID)
-	e.CommandID, _ = uuid.Parse(commandID)
+	// The audit UUIDs are load-bearing (F34): a value that does not parse
+	// fails the read rather than being silently zeroed into a forged
+	// envelope.
+	if e.EventID, err = parseStoredUUID("event_id", eventID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CorrelationID, err = parseStoredUUID("correlation_id", correlationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CausationID, err = parseStoredUUID("causation_id", causationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CommandID, err = parseStoredUUID("command_id", commandID); err != nil {
+		return es.Envelope{}, err
+	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	e.Payload = payload
 	return e, nil

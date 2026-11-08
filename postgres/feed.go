@@ -59,7 +59,9 @@ func (s *Store) runWorkspace(ctx context.Context, ws string, fn func(tx DBTX) er
 // 1:1 to a workspace id — the platform's transport authorizes the scope
 // upstream — and Open hands back the workspace-pinned *Workspace, which
 // implements feed.Log: fenced ReadAllBounded pages (spec §5.1), the
-// settled Head and MatchingHead, and the unbounded RawHead.
+// settled Head and MatchingHead, and the unbounded raw heads — RawHead
+// (all types, the resume clamp's view) and MatchingRawHead (the
+// subscription's own backlog, the stall probe's view).
 type Logs struct {
 	store *Store
 }

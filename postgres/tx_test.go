@@ -110,12 +110,11 @@ func TestAppendTxRollbackDiscardsEventsAndClaims(t *testing.T) {
 		t.Fatalf("rollback: %v", err)
 	}
 
-	rows, err := s.Workspace("ws_tx_rollback").ReadStream(ctx, sid, 0, 0)
-	if err != nil {
-		t.Fatalf("read after rollback: %v", err)
-	}
-	if len(rows) != 0 {
-		t.Fatalf("rows after rollback = %d, want 0", len(rows))
+	// The rolled-back append left the stream never-written, so the read
+	// reports ErrStreamNotFound rather than a silent empty slice.
+	_, err = s.Workspace("ws_tx_rollback").ReadStream(ctx, sid, 0, 0)
+	if !errors.Is(err, es.ErrStreamNotFound) {
+		t.Fatalf("read after rollback: got %v, want ErrStreamNotFound — the events were discarded", err)
 	}
 	if v, err := s.Workspace("ws_tx_rollback").CurrentStreamVersion(ctx, sid); err != nil || v != 0 {
 		t.Fatalf("version after rollback = %d (err %v), want 0", v, err)

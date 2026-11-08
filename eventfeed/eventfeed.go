@@ -73,7 +73,9 @@ type Config struct {
 	// Observer is the optional observability sink. Poison — the oversized
 	// event the log can never deliver — surfaces through OnPoison on
 	// every reconnect attempt until an operator skips past the position;
-	// nil behaves exactly like feed.NoopObserver.
+	// every attempt-ending Subscribe error — poison included — surfaces
+	// through OnSubscribeError while the caller's ctx is live. nil
+	// behaves exactly like feed.NoopObserver.
 	Observer feed.Observer
 }
 
@@ -143,34 +145,39 @@ func New(cfg Config) *Feed {
 		// Min and Max stay zero: ReconnectingFeed's own defaults are the
 		// 250ms initial backoff and 30s ceiling this adapter is specified
 		// with.
+		//
+		// Definition drift is terminal (spec §5.5): the checkpoint names
+		// the definition its position was acknowledged under, every
+		// reconnect re-fails the subscription identically, and the
+		// recovery is an operator's ResetCheckpoint — never a retry — so
+		// the error is classified fatal. Feed returns it to the caller
+		// (the runner exits loudly) instead of spinning behind the
+		// backoff forever, invisible.
+		IsFatal: func(err error) bool {
+			var dce *feed.DefinitionChangedError
+			return errors.As(err, &dce)
+		},
 	}
 	return f
 }
 
 // Feed implements projection.Feed. It blocks until ctx ends —
 // reconnecting through the server whenever the stream drops — and
-// returns ctx.Err() then. A Feed is one subscription, so call Feed once
-// at a time; concurrent calls would race for one lease.
+// returns ctx.Err() then, or the terminal Subscribe error early:
+// definition drift (ErrDefinitionChanged) is returned to the caller as
+// soon as the attempt that hit it ends, because no reconnect can clear
+// it — the recovery is an operator's ResetCheckpoint. A Feed is one
+// subscription, so call Feed once at a time; concurrent calls would
+// race for one lease.
 func (f *Feed) Feed(ctx context.Context, handle func(ctx context.Context, e es.Envelope) error) error {
 	return f.inner.Feed(ctx, handle)
 }
 
 // newToken mints the stable lease-owner token: 8 random bytes, the same
 // shape as the server's per-process owner prefix, unique across processes
-// so two feed processes can never pass each other's fence.
-//
-// The token is stable for the Feed's whole life (the spec leaves the
-// reconnect token policy to the builder; this is the stable-token
-// choice): a reconnect re-acquires under the same owner, so the adapter
-// self-steals its own lingering lease instead of waiting out the TTL —
-// a same-owner acquire succeeds where a fresh token would loop on
-// LeaseHeld. The trade-off (spec §5.4): because Renew carries no epoch,
-// a zombie stream of this same Feed can keep renewing for a bounded
-// overlap window after a self-steal, so both the old and the new stream
-// deliver — duplicates, never loss: the marker dedups, and the
-// monotonic cursor never advances past a position a holder actually
-// delivered. A foreign owner still fails closed: cross-owner takeover
-// is rejected at acquire, and the loser's next renewal fails.
+// so two feed processes can never pass each other's fence. Why the token
+// is stable for the Feed's whole life — the reconnect token policy and
+// its self-steal/zombie-overlap trade-off — is documented once, on New.
 func newToken() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -252,6 +259,17 @@ func (a *attempt) Feed(ctx context.Context, handle func(ctx context.Context, e e
 	var poison *feed.EventTooLargeError
 	if errors.As(err, &poison) {
 		a.feed.cfg.Observer.OnPoison(poison)
+	}
+	// Every attempt-ending Subscribe error — poison included, fatal or
+	// not — is reported to the observer while the caller's ctx is still
+	// live, before the reconnect loop backs off (or, for the terminal
+	// ones, returns the error to the caller). The loop's own verdict is
+	// silent, so this report is the only way a wedged subscription — one
+	// that never delivers a page — becomes visible to an operator. A
+	// shutdown is not a fault: an attempt ended by the caller's own
+	// cancellation reports nothing.
+	if err != nil && ctx.Err() == nil {
+		a.feed.cfg.Observer.OnSubscribeError(a.feed.cfg.Scope, a.feed.cfg.Definition.Name, a.feed.cfg.Instance, err)
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		return cerr

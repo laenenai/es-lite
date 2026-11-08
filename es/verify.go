@@ -14,9 +14,10 @@ import (
 type ChainReport struct {
 	StreamID StreamID
 
-	// ChainedFrom is the first version carrying a hash; 0 when no row in the
-	// stream is hashed (the whole stream predates migration 0002). Rows
-	// before it are unattested — the store can vouch for nothing about them.
+	// ChainedFrom is the first version carrying a hash among those fed to
+	// the checker; 0 when no row in the stream is hashed (the whole stream
+	// predates migration 0002). Rows before it are unattested — the store
+	// can vouch for nothing about them.
 	ChainedFrom uint64
 
 	// Head is the highest version read and HeadHash its stored hash (nil
@@ -77,12 +78,16 @@ func VerifyStreamWith(ctx context.Context, store Store, sid StreamID, opts Verif
 	c := NewChainChecker(sid)
 	c.ChainedSince = opts.ChainedSince
 	var from uint64
+	var firstVersion uint64
 	for {
 		envs, err := store.ReadStream(ctx, sid, from, from+uint64(page))
 		if err != nil && !errors.Is(err, ErrStreamNotFound) {
 			return c.Report(), err
 		}
 		for _, e := range envs {
+			if firstVersion == 0 {
+				firstVersion = e.Version
+			}
 			if err := c.Next(e); err != nil {
 				return c.Report(), err
 			}
@@ -93,6 +98,15 @@ func VerifyStreamWith(ctx context.Context, store Store, sid StreamID, opts Verif
 		from = envs[len(envs)-1].Version
 	}
 	rep := c.Report()
+	// Head truncation: versions are 1-based and contiguous, so a first
+	// surviving version above 1 means the rows before it were deleted. The
+	// checker saw a chain that links and reports it intact — only the first
+	// version fed gives the deletion away.
+	if rep.Head > 0 && firstVersion > 1 && rep.Intact() {
+		rep.BrokenAt = firstVersion
+		rep.Err = fmt.Errorf("%w: stream %s head truncated: first version is %d", ErrChainBroken, sid, firstVersion)
+		return rep, rep.Err
+	}
 	if opts.Strict && rep.Head > 0 && rep.ChainedFrom != 1 {
 		rep.BrokenAt = 1
 		rep.Err = fmt.Errorf("%w: stream %s chained from version %d, strict mode requires 1", ErrChainBroken, sid, rep.ChainedFrom)

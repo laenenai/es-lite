@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/feed"
@@ -19,11 +21,30 @@ import (
 // statement execution only, with no Commit, Rollback, Begin or pool. It is
 // the shape sqlc uses for pgx/v5 and the shape tenancy.TenantTx exposes, so a
 // tenant-scoped transaction satisfies it without es-lite importing tenancy.
-// *pgxpool.Pool and pgx.Tx also satisfy it.
+// *pgx.Tx also satisfies it. *pgxpool.Pool satisfies it too as a type, but
+// the *Tx methods refuse it at entry (requireTx): a pool runs every
+// statement in its own autocommit transaction, which would silently break
+// the append's one-transaction guarantees (the xid draw and the is_local
+// workspace setting) instead of joining the caller's transaction.
 type DBTX interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// requireTx guards the transaction-aware methods: db must be an active
+// transaction, and a *pgxpool.Pool is the one shape that satisfies DBTX
+// while silently running every statement in its own autocommit
+// transaction (F33). On a pool the append's P1 xid draw and the insert
+// would land in different transactions and the is_local workspace setting
+// would die with its own statement — no error, all guarantees gone (a
+// non-superuser session fails later with a confusing RLS violation
+// instead). The check is a type assertion before any statement runs.
+func requireTx(db DBTX, method string) error {
+	if _, ok := db.(*pgxpool.Pool); ok {
+		return fmt.Errorf("postgres: %s requires an active transaction, not a pool", method)
+	}
+	return nil
 }
 
 // Workspace is an es.Store scoped to one workspace. Every operation sets
@@ -78,6 +99,14 @@ type Workspace struct {
 	mu     sync.Mutex
 	boundL uint64
 	fenceR uint64
+
+	// draws counts the fence xids this Workspace's round has drawn — the
+	// F9 instrumentation the internal tests assert: an idle workspace's
+	// polls must not advance it, because every draw spends a transaction
+	// id (and burns a slot of the sequence the fence aborts into).
+	// Guarded by mu; incremented only in the drawFence delegation below,
+	// whose single caller (fenceBound) holds mu.
+	draws uint64
 }
 
 var _ es.Store = (*Workspace)(nil)
@@ -120,11 +149,16 @@ func (w *Workspace) Append(ctx context.Context, p es.AppendParams) (es.AppendRes
 // (is_local=true) so the workspace RLS policy applies for the rest of the
 // transaction; the caller's tenant context is left untouched.
 //
-// db must be an active transaction, not a pool: the local setting lasts only
-// until the transaction ends, and every statement in one append must share
-// it. tenancy.TenantTx satisfies db directly, without a pool or Commit.
+// db must be an active transaction, not a pool — enforced at entry, before
+// any statement runs: a *pgxpool.Pool is rejected with the requireTx error.
+// The local setting lasts only until the transaction ends, and every
+// statement in one append must share it. tenancy.TenantTx satisfies db
+// directly, without a pool or Commit.
 func (w *Workspace) AppendTx(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
 	var zero es.AppendResult
+	if err := requireTx(db, "AppendTx"); err != nil {
+		return zero, err
+	}
 	if err := validateAppend(p); err != nil {
 		return zero, err
 	}
@@ -253,13 +287,59 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			env.PrevHash, env.Hash,
 		).Scan(&gp)
 		if err != nil {
-			if isUniqueViolation(err) {
-				return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+				// Classify by constraint (F25). Postgres reports the
+				// constraint partition-scoped on the HASH-partitioned
+				// events table: the migration's
+				// events_workspace_id_event_id_key fires as
+				// events_p3_workspace_id_event_id_key on whichever
+				// partition the workspace hashed to (verified against
+				// the running server; likewise events_pkey as
+				// events_p3_pkey), so the names match on what they ARE,
+				// not on the full prefix. The (workspace, event_id)
+				// unique key is the duplicate-EventID case — the event
+				// itself is a rerun; the primary key is the version-race
+				// backstop and keeps today's ErrConflict. Any other
+				// violation takes the original wrap below.
+				switch {
+				case strings.HasSuffix(pgErr.ConstraintName, "event_id_key"):
+					return zero, fmt.Errorf("%w: %s at v%d: %v", es.ErrDuplicateEventID, p.StreamID, version, err)
+				case strings.HasSuffix(pgErr.ConstraintName, "_pkey"):
+					return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
+				}
 			}
 			return zero, fmt.Errorf("insert v%d: %w", version, err)
 		}
 		env.GlobalPosition = gp
 		envs[i] = env
+	}
+
+	// Log-order attestation (design D1, F11): one log_order row per
+	// non-empty batch, hashed and inserted in THIS transaction from
+	// exactly the (position, hash) pairs the loop above already
+	// collected — no new reads, no new locks, no cross-transaction
+	// dependency, so the append path gains no serialization (ADR 0029's
+	// global-chain rejection stands; the single INSERT is the accepted
+	// D1 cost). The entries go in loop order, which is position order:
+	// one transaction draws its positions in event order. Anchors
+	// aggregate these rows into the order root that attests the global
+	// append order, and `es-verify order` recomputes each row's hash
+	// from the events in its range.
+	if len(p.Events) > 0 {
+		entries := make([]es.OrderEntry, len(envs))
+		for i := range envs {
+			entries[i] = es.OrderEntry{Position: envs[i].GlobalPosition, Hash: envs[i].Hash}
+		}
+		batchHash := es.BatchOrderHash(entries)
+		if _, err := db.Exec(ctx,
+			`INSERT INTO log_order (from_position, to_position, workspace_id, stream_id, event_count, batch_hash)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			int64(envs[0].GlobalPosition), int64(envs[len(envs)-1].GlobalPosition),
+			w.ws, canonical, len(envs), batchHash[:],
+		); err != nil {
+			return zero, fmt.Errorf("insert log_order: %w", err)
+		}
 	}
 
 	if err := w.applyClaims(ctx, db, canonical, p.Constraints); err != nil {
@@ -335,6 +415,13 @@ func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, o
 }
 
 // ReadStream implements es.Store. It opens and owns a transaction.
+//
+// A read from the beginning of a stream that was never written —
+// fromVersion 0 and no rows for the stream at all, whatever toVersion is —
+// returns an error wrapping es.ErrStreamNotFound (with the canonical
+// stream id in the message) instead of a silent empty slice. An empty
+// range is not "not found": reads with fromVersion > 0, and reads from 0
+// of a stream that exists, return (nil, nil).
 func (w *Workspace) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err
@@ -347,14 +434,65 @@ func (w *Workspace) ReadStream(ctx context.Context, sid es.StreamID, fromVersion
 	if err := setWorkspace(ctx, tx, w.ws); err != nil {
 		return nil, err
 	}
-	return w.readStream(ctx, tx, sid, fromVersion, toVersion)
+	envs, err := w.readStream(ctx, tx, sid, fromVersion, toVersion)
+	if err != nil {
+		return nil, err
+	}
+	if fromVersion == 0 && len(envs) == 0 {
+		// A read from the beginning of the stream matched nothing. With no
+		// upper bound that already proves no row exists — the stream was
+		// never written. A bound makes the empty range ambiguous (rows
+		// deleted out-of-band can survive only above it), so only an
+		// existence probe can tell "never written" from "empty range on
+		// an existing stream" — and only the first is ErrStreamNotFound.
+		if toVersion > 0 {
+			exists, err := w.streamExists(ctx, tx, sid)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				return envs, nil
+			}
+		}
+		return nil, fmt.Errorf("%w: %s", es.ErrStreamNotFound, sid.Canonical())
+	}
+	return envs, nil
+}
+
+// streamExists reports whether the stream has any event row at all — the
+// existence probe behind ReadStream's ErrStreamNotFound: a read from the
+// start that matched nothing is "not found" only when nothing was ever
+// written to the stream. Runs with the workspace RLS variable set, on the
+// same transaction as the read it decides for.
+func (w *Workspace) streamExists(ctx context.Context, db DBTX, sid es.StreamID) (bool, error) {
+	var one int
+	err := db.QueryRow(ctx,
+		`SELECT 1 FROM events WHERE workspace_id = $1 AND stream_id = $2 LIMIT 1`,
+		w.ws, sid.Canonical(),
+	).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReadStreamTx reads inside a transaction the caller already owns. It never
 // commits or rolls back that transaction, and it sets app.workspace_id on db
-// (is_local=true) exactly as AppendTx does. db must be an active transaction;
-// tenancy.TenantTx satisfies it directly.
+// (is_local=true) exactly as AppendTx does. db must be an active
+// transaction — a *pgxpool.Pool is rejected at entry by requireTx, before
+// any statement runs; tenancy.TenantTx satisfies it directly.
+//
+// Unlike ReadStream it does not report ErrStreamNotFound: a read of a
+// stream with no events returns (nil, nil), so logic inside a
+// caller-owned transaction always deals in plain ranges, never the
+// not-found sentinel.
 func (w *Workspace) ReadStreamTx(ctx context.Context, db DBTX, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
+	if err := requireTx(db, "ReadStreamTx"); err != nil {
+		return nil, err
+	}
 	if err := sid.Validate(); err != nil {
 		return nil, err
 	}
@@ -399,20 +537,53 @@ func (w *Workspace) ReadAll(ctx context.Context, fromPosition uint64, limit int)
 	return w.query(ctx, q, w.ws, fromPosition, limit)
 }
 
-// readLastPosition is fence statement 1 (spec §5.1.1): the position
-// sequence's last_value, read outside any transaction. It reflects every
-// position drawn so far, committed or not — conservative and safe, because
-// delivery waits on the fence, not on L. A fresh sequence reports
-// last_value=1 before any draw; L can exceed the highest drawn position.
-func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
-	var last uint64
-	err := w.store.pool.QueryRow(ctx,
-		`SELECT last_value FROM events_global_position_seq`,
-	).Scan(&last)
+// The fence statements (spec §5.1.1) live at Store level: the fence is
+// transaction-global — it waits out every transaction that existed when R
+// was drawn, whatever workspace appended — so the anchor path
+// (settledBound, anchor.go), which spans workspaces by construction,
+// shares them with the feed through the Workspace delegations below.
+
+// errSequenceCache is the typed error every fence round — the feed's
+// fenceBound and the anchor path's settledBound alike — returns when the
+// position sequence's cache_size is not 1. The CACHE 1 assertion is
+// load-bearing (F27): with cache_size > 1, a session's nextval()
+// batch-fetches values that a LATER transaction can insert — a position
+// ≤ the bound you read can commit after your fence draw R clears,
+// breaking the fence's settledness guarantee and producing false
+// ErrAnchorMismatch. CACHE 1 guarantees draw-time = the only assignment
+// path in the current transaction. The message names the fix.
+var errSequenceCache = errors.New("position sequence events_global_position_seq must use CACHE 1; run ALTER SEQUENCE events_global_position_seq CACHE 1")
+
+// ErrSequenceCacheMisconfigured reports that the position sequence's
+// cache_size is not 1, so no fence round can certify a settled bound —
+// see errSequenceCache for why the fence requires CACHE 1, and the
+// message for the fix.
+var ErrSequenceCacheMisconfigured = errSequenceCache
+
+// readSequenceState is fence statement 1 (spec §5.1.1): the position
+// sequence's last_value and cache_size, read outside any transaction.
+// It reflects every position drawn so far, committed or not —
+// conservative and safe, because delivery waits on the fence, not on
+// L; L can exceed the highest drawn position (uncommitted and aborted
+// draws both count).
+//
+// The read goes through the pg_sequences view rather than the direct
+// sequence read it replaces (F5/F38): the view exposes last_value AND
+// cache_size in one statement, and masks last_value to NULL for roles
+// without USAGE on the sequence — so the fence needs only USAGE, not
+// the SELECT the direct read demanded (the privilege the anchor gate
+// test had to grant). COALESCE folds the two NULL shapes to 0: a
+// sequence never called yet (where the direct read reported the START
+// value; the view's pg_sequence_last_value reports NULL), and a role
+// without privileges, whose fence then simply sees an idle log.
+func (s *Store) readSequenceState(ctx context.Context) (last uint64, cache int, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT COALESCE(last_value, 0), cache_size FROM pg_sequences WHERE sequencename = 'events_global_position_seq'`,
+	).Scan(&last, &cache)
 	if err != nil {
-		return 0, fmt.Errorf("read last position: %w", err)
+		return 0, 0, fmt.Errorf("read sequence state: %w", err)
 	}
-	return last, nil
+	return last, cache, nil
 }
 
 // drawFence is fence statement 2 (spec §5.1.1): draw the reader's own
@@ -421,8 +592,8 @@ func (w *Workspace) readLastPosition(ctx context.Context) (uint64, error) {
 // makes in-flight appenders snapshot-visible to the next statement (Task 1b
 // verified; without it a lone in-flight append looks idle to every
 // snapshot).
-func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
-	tx, err := w.store.pool.Begin(ctx)
+func (s *Store) drawFence(ctx context.Context) (uint64, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin fence: %w", err)
 	}
@@ -437,9 +608,9 @@ func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
 // fenceCleared is fence statement 3 (spec §5.1.1): true once no transaction
 // that already existed when R was drawn is still in flight, observed as
 // the snapshot horizon having reached R.
-func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
+func (s *Store) fenceCleared(ctx context.Context, r uint64) (bool, error) {
 	var cleared bool
-	err := w.store.pool.QueryRow(ctx,
+	err := s.pool.QueryRow(ctx,
 		`SELECT pg_snapshot_xmin(pg_current_snapshot()) >= $1`, r,
 	).Scan(&cleared)
 	if err != nil {
@@ -448,12 +619,39 @@ func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
 	return cleared, nil
 }
 
+// The Workspace fence round delegates to the Store-level statements above:
+// the workspace scope adds only the (boundL, fenceR) state below.
+
+func (w *Workspace) readSequenceState(ctx context.Context) (uint64, int, error) {
+	return w.store.readSequenceState(ctx)
+}
+
+// drawFence on the Workspace delegates to the Store statement and
+// counts the draw (F9): fenceBound, its only caller, holds w.mu, so the
+// counter increments under it without a second lock.
+func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
+	r, err := w.store.drawFence(ctx)
+	if err == nil {
+		w.draws++
+	}
+	return r, err
+}
+
+func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
+	return w.store.fenceCleared(ctx, r)
+}
+
 // fenceBound runs one horizon-fence round (spec §5.1.1) and returns the
 // position bound a page may deliver up to. Zero means deliver nothing now:
 // either an established fence is still blocked (the state stays stored and
-// the caller's wait cycle retries), or the log is idle at from (no fence
-// drawn — idle streams burn no transaction ids). A cleared fence drops the
-// state; the next delivered page re-establishes a fresh fence.
+// the caller's wait cycle retries), or the workspace is idle at from — its
+// committed max is at or below from, so nothing new is visible and no
+// fence is drawn (F9): an idle workspace must not burn a fence xid on
+// every poll. The short-circuit only skips when nothing new is VISIBLE:
+// an append still in flight is invisible to the caller anyway, and the
+// next poll re-checks the committed max, so the round starts the moment
+// new work becomes visible. A cleared fence drops the state; the next
+// delivered page re-establishes a fresh fence.
 func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -471,10 +669,42 @@ func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error)
 		return bound, nil
 	}
 
-	last, err := w.readLastPosition(ctx)
+	// Idle short-circuit (F9): with no fence stored, the workspace's
+	// committed max — a RawHead-shaped read, no xid drawn — decides
+	// whether a round is worth a fence at all. Another workspace
+	// appending moves the global sequence but not this max, so a poll
+	// of an idle workspace costs one cheap read instead of a fence
+	// transaction per poll cycle.
+	max, err := w.RawHead(ctx)
 	if err != nil {
 		return 0, err
 	}
+	if max <= from {
+		return 0, nil
+	}
+
+	last, cache, err := w.readSequenceState(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// Every round certifies a settled bound, so every round asserts the
+	// sequence's CACHE 1 (F27, errSequenceCache): a batched cache could
+	// hand a position at or below this bound to a later transaction,
+	// and the fence would be certifying nothing.
+	if cache != 1 {
+		return 0, errSequenceCache
+	}
+	// This guard is reachable only in the masked-NULL case (M5): a
+	// healthy read cannot get here, because every committed position was
+	// drawn, so last >= the committed max RawHead just reported above
+	// from. A role without USAGE on the sequence reads last as NULL —
+	// COALESCE folds it to 0 — and the guard keeps that masked 0 from
+	// being fenced and delivered as a real bound: a fence at last=0
+	// would burn a fence xid every poll and certify a section that
+	// delivers nothing, stalling the feed silently behind the missing
+	// grant (the same masked-NULL shape the anchor path's
+	// ErrAnchorSequenceMasked tripwire refuses outright). Idle is the
+	// honest verdict a masked round can return.
 	if last <= from {
 		return 0, nil
 	}
@@ -611,10 +841,15 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	if len(positions) == 0 {
 		return nil, false, nil
 	}
-	// Step 2: fetch full rows for the chosen positions only, in the same
-	// transaction and therefore the same snapshot — the page cannot change
-	// under the fetch, and no payload the selection did not clear is ever
-	// selected. global_position is bigint, so positions always fit int64
+	// Step 2: fetch full rows for the chosen positions only. The safety
+	// here is position immutability, not snapshot identity: under READ
+	// COMMITTED each statement takes its own snapshot (sharing a
+	// transaction does not make the two reads share one), but a row's
+	// global_position never changes, and inside the fence-settled bound
+	// nothing at or below it can appear later — so fetching by exactly
+	// the positions step 1 cleared returns exactly those rows, and no
+	// payload the selection did not clear is ever selected.
+	// global_position is bigint, so positions always fit int64
 	// (pgx sends []uint64 as numeric[], which would force a cast).
 	positions64 := make([]int64, len(positions))
 	for i, p := range positions {
@@ -664,14 +899,16 @@ func (w *Workspace) CurrentStreamVersion(ctx context.Context, sid es.StreamID) (
 // value below the raw max: 0 until a fence clears, then whatever has
 // settled up to the clearing round's L. It converges to the full settled
 // max once the blocking transaction commits or aborts. Callers that need
-// the immediate committed maximum — for stall detection — use RawHead.
+// the immediate committed maximum for stall detection — over the
+// subscription's own consumed types — use MatchingRawHead.
 func (w *Workspace) Head(ctx context.Context) (uint64, error) {
-	// One fence round (spec §5.1.1), from 0: Head reads the whole log, so
-	// any drawn position is new and the idle shortcut never fires — every
-	// call either checks the stored fence or draws a fresh one. A zero
-	// bound means no settled range yet — a transaction is in flight that
-	// blocks the fence — and Head reports 0 rather than a position it
-	// would have to take back.
+	// One fence round (spec §5.1.1), from 0: a workspace with zero
+	// committed events short-circuits before the fence — its committed
+	// max is 0, nothing new is visible, and no xid is burned (F9); a
+	// workspace with any committed event draws, since a whole-log read
+	// is new at any drawn position. A zero bound means no settled range
+	// yet — a transaction is in flight that blocks the fence — and Head
+	// reports 0 rather than a position it would have to take back.
 	bound, err := w.fenceBound(ctx, 0)
 	if err != nil {
 		return 0, err
@@ -708,10 +945,12 @@ func (w *Workspace) MatchingHead(ctx context.Context, types []string) (uint64, e
 	if len(types) == 0 {
 		return 0, nil
 	}
-	// One fence round from 0, like Head: MatchingHead reads the whole
-	// log's matching maximum, so any drawn position is new and the idle
-	// shortcut never fires. A zero bound means the fence is blocked —
-	// report 0 rather than a position above the unsettled horizon.
+	// One fence round from 0, like Head: an empty workspace
+	// short-circuits before the fence (F9); any committed event —
+	// matching or not — makes the round draw, since a whole-log read is
+	// new at any drawn position whatever the filter matches. A zero
+	// bound means the fence is blocked — report 0 rather than a
+	// position above the unsettled horizon.
 	bound, err := w.fenceBound(ctx, 0)
 	if err != nil {
 		return 0, err
@@ -741,10 +980,11 @@ func (w *Workspace) MatchingHead(ctx context.Context, types []string) (uint64, e
 // with no fence and no bounding. It can jump past positions whose appends
 // are still in flight — the raw max is not a settle point — so it is not a
 // resume position: a feed that acked to RawHead would skip an in-flight
-// event when it commits. It exists for stall detection only (spec §5.8):
-// RawHead above the feed's position is committed backlog the settled reads
-// have not delivered, the signal to report OnStall; probe it rate-limited.
-// Deliberately not on es.Store.
+// event when it commits. It exists for the feed's fence-aware resume
+// clamp (spec §5.1): raw >= checkpoint proves the checkpoint's events
+// are still in the committed log, so a low Head is a blocked fence, not
+// a restored log. Stall detection reads its filtered counterpart,
+// MatchingRawHead. Deliberately not on es.Store.
 func (w *Workspace) RawHead(ctx context.Context) (uint64, error) {
 	tx, err := w.store.pool.Begin(ctx)
 	if err != nil {
@@ -758,6 +998,39 @@ func (w *Workspace) RawHead(ctx context.Context) (uint64, error) {
 	err = tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(global_position), 0) FROM events WHERE workspace_id = $1`,
 		w.ws,
+	).Scan(&head)
+	return head, err
+}
+
+// MatchingRawHead returns the highest raw committed position among
+// events of the given types — the subscription's own backlog, the view
+// stall detection compares against (spec §5.8), so a filtered stream
+// that is caught up on its consumed types never reports a stall while
+// unrelated event types keep landing. It is the MatchingHead query
+// without the fence round, read immediately like RawHead in its own
+// RLS-pinned transaction. Skipping the fence is sound because stall
+// detection is a liveness signal, not a correctness boundary — a torn
+// read can only mis-time a stall report, never corrupt data — so the
+// probe pays no fence round and never waits for in-flight appends to
+// settle. An empty types set matches nothing: 0. Deliberately not on
+// es.Store.
+func (w *Workspace) MatchingRawHead(ctx context.Context, types []string) (uint64, error) {
+	if len(types) == 0 {
+		return 0, nil
+	}
+	tx, err := w.store.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setWorkspace(ctx, tx, w.ws); err != nil {
+		return 0, err
+	}
+	var head uint64
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(global_position), 0) FROM events
+		  WHERE workspace_id = $1 AND type_url = ANY($2)`,
+		w.ws, types,
 	).Scan(&head)
 	return head, err
 }

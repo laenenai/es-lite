@@ -183,3 +183,31 @@ func TestReconnectingFeedReconnectsAfterNilReturnOnLiveContext(t *testing.T) {
 		t.Fatalf("opens = %d, want 3 (nil-returning attempts reconnected)", opens)
 	}
 }
+
+// TestReconnectingFeedFatalEscape pins the terminal-error contract: an
+// attempt error IsFatal classifies as terminal — one no retry can
+// clear, like a checkpoint whose definition hash drifted — is returned
+// to the caller, not swallowed into the backoff loop. IsFatal nil
+// keeps the documented behavior: nothing is fatal, the loop retries
+// until ctx ends.
+func TestReconnectingFeedFatalEscape(t *testing.T) {
+	errTerminal := errors.New("terminal: no retry can clear it")
+	opens := 0
+	f := &ReconnectingFeed{
+		Min: time.Millisecond, Max: time.Millisecond,
+		IsFatal: func(err error) bool { return err == errTerminal },
+		Open: func(context.Context) (Feed, error) {
+			opens++
+			return FeedFunc(func(context.Context, func(context.Context, es.Envelope) error) error {
+				return errTerminal
+			}), nil
+		},
+	}
+	err := f.Feed(context.Background(), func(context.Context, es.Envelope) error { return nil })
+	if !errors.Is(err, errTerminal) {
+		t.Fatalf("Feed = %v, want the fatal attempt error returned to the caller", err)
+	}
+	if opens != 1 {
+		t.Fatalf("opens = %d, want 1 (a fatal error is not retried)", opens)
+	}
+}

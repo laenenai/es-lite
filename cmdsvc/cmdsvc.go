@@ -7,6 +7,8 @@ package cmdsvc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -44,7 +46,15 @@ func (f ValidatorFunc) Validate(msg proto.Message) error { return f(msg) }
 // Validator that rejects every request with that error rather than one that
 // silently allows.
 func DefaultValidator() Validator {
-	v, err := protovalidate.New()
+	return newValidator(func() (protovalidate.Validator, error) { return protovalidate.New() })
+}
+
+// newValidator is DefaultValidator's body with the constructor behind a
+// function, so the fail-closed branch is testable: when construction fails,
+// the returned Validator rejects every message with that error — never
+// allows one through.
+func newValidator(construct func() (protovalidate.Validator, error)) Validator {
+	v, err := construct()
 	if err != nil {
 		return ValidatorFunc(func(proto.Message) error { return fmt.Errorf("cmdsvc: protovalidate: %w", err) })
 	}
@@ -61,15 +71,21 @@ type ErrorMapper func(err error) *connect.Error
 type Reload func(ctx context.Context) (version uint64, state proto.Message, err error)
 
 // MetaFrom builds the command's audit metadata from the request headers and
-// the authenticated actor: Correlation-Id (a UUID) and Idempotency-Key (a
-// UUID, or any string hashed to a UUIDv5 so retries share a CommandID).
-// OccurredAt is left zero because the runtime always stamps it from the
-// server clock (ADR 0034).
+// the authenticated actor. Correlation-Id passes through when it is a UUID;
+// any other value is hashed to a stable UUIDv5 in idempotencyNamespace — the
+// same treatment non-UUID Idempotency-Keys get — so a client's free-text
+// correlation id still reaches the audit trail and stays stable across
+// retries instead of being dropped. Idempotency-Key is a UUID, or any string
+// hashed to a UUIDv5 so retries share a CommandID. es.Meta carries no event
+// time: the runtime stamps every event's OccurredAt from the server clock
+// (ADR 0034).
 func MetaFrom(h http.Header, actor es.Actor) es.Meta {
 	m := es.Meta{Actor: actor}
 	if v := h.Get(HdrCorrelationID); v != "" {
 		if id, err := uuid.Parse(v); err == nil {
 			m.CorrelationID = id
+		} else {
+			m.CorrelationID = uuid.NewSHA1(idempotencyNamespace, []byte(v))
 		}
 	}
 	if v := h.Get(HdrIdempotencyKey); v != "" {
@@ -84,6 +100,44 @@ func MetaFrom(h http.Header, actor es.Actor) es.Meta {
 
 // idempotencyNamespace is the fixed UUIDv5 namespace for non-UUID keys.
 var idempotencyNamespace = uuid.MustParse("3b5a0c2e-7f5d-4b1a-9c3e-2d6f8a1b4c7e")
+
+// Fingerprint returns the SHA-256 hex digest of msg's wire form — the
+// checksum-of-payload option of draft-ietf-httpapi-idempotency-key-header-07
+// §2.4, which the handler flow matches a stored dedup record against: the
+// same request fingerprints identically across retries, a different
+// payload under the same key fingerprints differently. Marshaling uses
+// the deterministic option so a map field's entry order cannot turn a
+// retry into a false mismatch. A message proto.Marshal rejects (invalid
+// UTF-8 in a proto3 string field, for instance) has no fingerprint: the
+// empty string, which never matches the digest of a marshalable
+// request, so the flow fails closed as key reuse rather than replaying
+// an unrelated response.
+func Fingerprint(msg proto.Message) string {
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(msg)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// IdempotencyConcurrent maps es.ErrDuplicateEventID: the Idempotency-Key
+// names a command whose events are already in the log — the concurrent
+// duplicate that lost the insert race, or a retry of a command that
+// committed without its response being stored. Connect code aborted, the
+// message naming HTTP 409 semantics (draft §2.6): the client must not
+// retry with the same key.
+func IdempotencyConcurrent() *connect.Error {
+	return connect.NewError(connect.CodeAborted, errors.New("cmdsvc: idempotency-key conflict: a command with this key already committed (HTTP 409); use a fresh key"))
+}
+
+// IdempotencyKeyReused reports a request whose Idempotency-Key names a
+// completed command but whose payload differs — key reuse. Connect code
+// aborted, the message naming HTTP 422 semantics (draft §2.7): the key
+// is spent on a different request; the client must pick a fresh one.
+func IdempotencyKeyReused() *connect.Error {
+	return connect.NewError(connect.CodeAborted, errors.New("cmdsvc: idempotency-key reuse: this key already names a different request payload (HTTP 422); use a fresh key"))
+}
 
 // InvalidArgument maps a validation or parse failure. A protovalidate
 // ValidationError attaches its violations as an error detail.
@@ -125,10 +179,12 @@ func passOr(code connect.Code, err error) *connect.Error {
 //	es.ErrConflict            failed_precondition + VersionConflict detail (via reload)
 //	es.ErrTerminal            failed_precondition
 //	es.ErrConstraintViolated  already_exists
+//	es.ErrDuplicateEventID    aborted (IdempotencyConcurrent, HTTP 409 semantics)
 //	es.ErrInvalidStreamID,
 //	es.ErrDecidedAtMissing,
-//	es.ErrDecidedAtSkew,
-//	es.ErrDecidedAtMismatch   invalid_argument
+//	es.ErrDecidedAtSkew       invalid_argument
+//	context.Canceled          canceled
+//	context.DeadlineExceeded  deadline_exceeded
 //	anything else             mapper(err) if it returns non-nil, else failed_precondition
 //
 // expected is the version the command asserted (0 if none); a
@@ -164,8 +220,13 @@ func MapError(ctx context.Context, err error, mapper ErrorMapper, reload Reload,
 		return connect.NewError(connect.CodeFailedPrecondition, err)
 	case errors.Is(err, es.ErrConstraintViolated):
 		return connect.NewError(connect.CodeAlreadyExists, err)
+	case errors.Is(err, es.ErrDuplicateEventID):
+		// The event-id collision of a command re-run under the same key
+		// (deterministic event ids): an idempotency signal, never a retry
+		// cue — the concurrent duplicate of draft §2.6.
+		return IdempotencyConcurrent()
 	case errors.Is(err, es.ErrInvalidStreamID), errors.Is(err, es.ErrDecidedAtMissing),
-		errors.Is(err, es.ErrDecidedAtSkew), errors.Is(err, es.ErrDecidedAtMismatch):
+		errors.Is(err, es.ErrDecidedAtSkew):
 		return connect.NewError(connect.CodeInvalidArgument, err)
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, err)

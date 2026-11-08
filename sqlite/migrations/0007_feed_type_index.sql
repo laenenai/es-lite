@@ -1,0 +1,31 @@
+-- The feed's type index (review finding F18) — the SQLite mirror of
+-- Postgres's events_ws_type_pos_idx. Every type-filtered feed read
+-- filters on type_url: MatchingHead and MatchingRawHead's
+-- `MAX(global_position) ... WHERE type_url IN (...)`, and the page
+-- query's `global_position > ? AND type_url IN (...)`. Until now no
+-- index served that column, so each filtered head read and each poll's
+-- page scanned the whole events table. On SQLite that scan runs on the
+-- store's single shared connection (spec §5.10.1.4), so a rare-type
+-- subscription's ~250ms poll walked the entire log tail and blocked
+-- appends behind it — a walk that grows as the log grows, forever.
+--
+-- (type_url, global_position) is the shape: the leading column takes
+-- the equality/IN filter, and global_position — the events table's
+-- rowid, which Append assigns in commit order — bounds each type's run
+-- by position. That answers the head reads' filtered MAX from the index
+-- alone (the index covers the query) and lets the page query touch only
+-- rows of the requested types instead of scanning the whole log. SQLite
+-- is single-workspace (0001's rule), so unlike the Postgres index this
+-- mirrors, no workspace_id leads the key.
+--
+-- The index is pure metadata over the append-only events table: no row
+-- is read or rewritten, and Migrate applies each migration file inside
+-- one transaction (store.go), so the index either fully exists or not
+-- at all. IF NOT EXISTS keeps re-application a no-op, like 0001's
+-- indexes. This migration is append-only DDL: it adds the index and
+-- nothing else.
+--
+-- Numbered 0007, after 0006, for cross-backend version parity (SQLite
+-- has no 0005 — Postgres's is RLS-role-specific).
+
+CREATE INDEX IF NOT EXISTS events_type_pos_idx ON events (type_url, global_position);

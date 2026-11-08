@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -163,13 +164,23 @@ func TestDrainFailsFastWithoutRelayRole(t *testing.T) {
 
 	ensureRelayRole(t, ctx, s)
 	ensureDrainRole(t, ctx, s)
+	// The member half below grants es_relay to the probe and leaves it,
+	// as a production deployment would. On a long-lived shared test
+	// database that leftover grant must not leak into the next run's
+	// outsider half (CI's throwaway containers never see it), so reset it
+	// here: the outsider half always starts as a non-member.
+	if _, err := s.Pool().Exec(ctx, `REVOKE `+relayRole+` FROM `+drainProbe); err != nil {
+		t.Fatalf("revoke %s from %s: %v", relayRole, drainProbe, err)
+	}
 	// Drain's privileges as the probe: the FOR UPDATE SKIP LOCKED claim
-	// and the published_at flip need UPDATE, the claim needs SELECT, and
-	// naming any of them needs schema USAGE. Nothing more — the bypass
-	// must be a policy matter, not a privilege one.
+	// and the published_at flip need UPDATE on that column alone
+	// (column-level UPDATE also satisfies SELECT ... FOR UPDATE), the
+	// claim needs SELECT, and naming any of them needs schema USAGE — the
+	// runbook's relay line (docs/deploy/README.md, "Grants"). Nothing
+	// more — the bypass must be a policy matter, not a privilege one.
 	if _, err := s.Pool().Exec(ctx,
 		`GRANT USAGE ON SCHEMA public TO `+drainProbe+`;
-		 GRANT SELECT, UPDATE ON events TO `+drainProbe); err != nil {
+		 GRANT SELECT, UPDATE (published_at) ON events TO `+drainProbe); err != nil {
 		t.Fatalf("grant drain privileges: %v", err)
 	}
 
@@ -238,6 +249,43 @@ func TestDrainFailsFastWithoutRelayRole(t *testing.T) {
 	}
 }
 
+// TestRelayRoleTransientErrorIsNotLatched is F4's regression test: a
+// transient probe failure must not poison the Store. The verdict cache
+// used to latch whatever the first probe returned — including the
+// context.Canceled of a caller's dead ctx — for the Store's lifetime, so
+// one blip failed every later Drain and anchor call even though the role
+// existed. A cancelled first Drain must fail (its ctx is dead), but as a
+// transient: the next Drain re-probes, decoupled from that dead ctx, and
+// succeeds.
+func TestRelayRoleTransientErrorIsNotLatched(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	// The login user is a superuser, hence a trivially es_relay member:
+	// on a live context the probe can only conclude member=true, so the
+	// cancelled ctx stages the transient itself — never a definitive
+	// non-membership.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	n, err := s.Drain(cancelled, 10, func(context.Context, []es.Envelope) error { return nil })
+	if err == nil {
+		t.Fatalf("drain with a cancelled context: n=%d err=nil, want an error", n)
+	}
+	if errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("drain with a cancelled context: err=%v, want a transient failure — the superuser is a member, so this must not be a definitive non-membership", err)
+	}
+
+	// The transient must not be latched: a live-context Drain succeeds,
+	// claiming the 0 unpublished rows the freshly truncated store holds.
+	n, err = s.Drain(ctx, 10, func(context.Context, []es.Envelope) error { return nil })
+	if err != nil {
+		t.Fatalf("drain after a transient probe failure: err=%v, want nil — one transient failure must not poison the Store", err)
+	}
+	if n != 0 {
+		t.Fatalf("drain after a transient probe failure claimed %d rows, want 0", n)
+	}
+}
+
 // TestAnchorPathFailsFastWithoutRelayRole pins the fix round's other half
 // of Review Focus 6: the anchor path reads events under the same bypass
 // Drain uses (bypassTx), so post-0005 a non-member session would not
@@ -253,14 +301,29 @@ func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
 
 	ensureRelayRole(t, ctx, s)
 	ensureAnchorProbe(t, ctx, s)
+	// Reset the probe's membership: the member half below grants es_relay
+	// and leaves it in place, and on a long-lived shared test database
+	// (unlike CI's throwaway containers) that leftover must not leak into
+	// the next run's outsider half — it must always start as a non-member.
+	if _, err := s.Pool().Exec(ctx, `REVOKE `+relayRole+` FROM `+anchorProbe); err != nil {
+		t.Fatalf("revoke %s from %s: %v", relayRole, anchorProbe, err)
+	}
 	// The anchor path's privileges as the probe: reading events (the log
-	// head, stream heads, the stream list) and reading/writing anchors.
+	// head, stream heads, the stream list), reading/writing anchors
+	// (writing through the RETURNING needs SELECT on the column), reading
+	// log_order (the order root over the per-batch rows, Task 7) and —
+	// since the anchor path fences on the horizon (Task 4) — reading the
+	// position sequence the fence's first statement reads through
+	// pg_sequences, which needs USAGE only (Task 16 relaxed the direct
+	// read's SELECT; USAGE is what reveals last_value in the view).
 	// Nothing more — the bypass must stay a policy matter, not a
 	// privilege one.
 	if _, err := s.Pool().Exec(ctx,
 		`GRANT USAGE ON SCHEMA public TO `+anchorProbe+`;
 		 GRANT SELECT ON events TO `+anchorProbe+`;
-		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe); err != nil {
+		 GRANT SELECT ON log_order TO `+anchorProbe+`;
+		 GRANT SELECT, INSERT ON anchors TO `+anchorProbe+`;
+		 GRANT USAGE ON SEQUENCE events_global_position_seq TO `+anchorProbe); err != nil {
 		t.Fatalf("grant anchor-path privileges: %v", err)
 	}
 
@@ -294,6 +357,15 @@ func TestAnchorPathFailsFastWithoutRelayRole(t *testing.T) {
 	}
 	if _, err := outsider.ListAnchors(ctx); !errors.Is(err, postgres.ErrRelayRoleMissing) {
 		t.Fatalf("list anchors as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+	// The log-order reads the anchor path grew in Task 7 are gated the
+	// same way: raw order rows and the deep verify both refuse, never a
+	// vacuous root over invisible rows or a verdict over them.
+	if _, err := outsider.OrderRows(ctx, 0); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("order rows as a non-member: err=%v, want ErrRelayRoleMissing", err)
+	}
+	if _, err := outsider.VerifyOrder(ctx, 0); !errors.Is(err, postgres.ErrRelayRoleMissing) {
+		t.Fatalf("verify order as a non-member: err=%v, want ErrRelayRoleMissing", err)
 	}
 	// Mutates nothing: only the superuser's anchor exists — a non-member
 	// session must not have recorded a root over zero heads behind the
@@ -395,5 +467,71 @@ func TestRelayRoleGatesTheBypassArm(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestDrainPublishedAtIsDBClock pins the delivery relay's clock contract
+// (F33): Drain stamps published_at with the database's own clock
+// (clock_timestamp() in SQL), never the relay process's — a relay whose
+// clock skews against the database can never place the stamp outside the
+// DB-clock window. The window is taken from feedDBClock around the
+// drain, so the assertion holds whatever skew exists between the test
+// process and the database.
+func TestDrainPublishedAtIsDBClock(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	appendUnpublishedEvent(t, ctx, s, "ws_drain_clock")
+
+	dbBefore := feedDBClock(t, ctx, s)
+	n, err := s.Drain(ctx, 10, func(context.Context, []es.Envelope) error { return nil })
+	if err != nil || n != 1 {
+		t.Fatalf("drain: n=%d err=%v, want 1/nil", n, err)
+	}
+	dbAfter := feedDBClock(t, ctx, s)
+
+	var publishedAt time.Time
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT published_at FROM events WHERE workspace_id = $1`, "ws_drain_clock",
+	).Scan(&publishedAt); err != nil {
+		t.Fatalf("read published_at: %v", err)
+	}
+	if publishedAt.Before(dbBefore) || publishedAt.After(dbAfter) {
+		t.Fatalf("published_at = %v, want the DB clock between %v and %v (not the relay process's clock)",
+			publishedAt, dbBefore, dbAfter)
+	}
+}
+
+// TestAnchorCreatedAtIsDBClock pins the anchor path's clock contract
+// (F33): Anchor records created_at from the database's own clock
+// (clock_timestamp() in SQL), never the anchoring process's, and the
+// anchor it returns carries exactly the stamp the database wrote.
+func TestAnchorCreatedAtIsDBClock(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	for _, ws := range []string{"ws_anchor_clock_a", "ws_anchor_clock_b"} {
+		appendUnpublishedEvent(t, ctx, s, ws)
+	}
+
+	dbBefore := feedDBClock(t, ctx, s)
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("anchor: %v", err)
+	}
+	dbAfter := feedDBClock(t, ctx, s)
+
+	if a.CreatedAt.Before(dbBefore) || a.CreatedAt.After(dbAfter) {
+		t.Fatalf("anchor created_at = %v, want the DB clock between %v and %v (not the anchoring process's clock)",
+			a.CreatedAt, dbBefore, dbAfter)
+	}
+	// The returned anchor and the recorded row are the same stamp.
+	var stored time.Time
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT created_at FROM anchors WHERE anchor_id = $1`, a.ID,
+	).Scan(&stored); err != nil {
+		t.Fatalf("read anchor row: %v", err)
+	}
+	if !stored.Equal(a.CreatedAt) {
+		t.Fatalf("stored created_at %v != returned %v — the anchor must carry the stamp the database wrote",
+			stored, a.CreatedAt)
 	}
 }

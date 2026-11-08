@@ -172,8 +172,14 @@ func resolveMethod(where string, m *protogen.Method, agg *aggregateInfo, cmds *s
 			if fld.Message == nil {
 				return sm, fmt.Errorf("%s: response field `result` must be a message", where)
 			}
+			if fld.Desc.IsList() || fld.Desc.IsMap() {
+				return sm, fmt.Errorf("%s: response field `result` must be a singular message, not a list", where)
+			}
 			sm.result = fld
 		case fld.Message != nil && fld.Message == agg.state:
+			if fld.Desc.IsList() || fld.Desc.IsMap() {
+				return sm, fmt.Errorf("%s: response field %q must be a singular %s, not a list", where, fld.Desc.Name(), agg.state.Desc.FullName())
+			}
 			if sm.state != nil {
 				return sm, fmt.Errorf("%s: response carries two %s fields", where, agg.state.Desc.FullName())
 			}
@@ -183,10 +189,50 @@ func resolveMethod(where string, m *protogen.Method, agg *aggregateInfo, cmds *s
 	if sm.result == nil {
 		return sm, fmt.Errorf("%s: response needs a message field named `result` (with stream_id, version, global_position)", where)
 	}
+	if err := checkWriteResult(where, sm.result.Message); err != nil {
+		return sm, err
+	}
 	if sm.state == nil {
 		return sm, fmt.Errorf("%s: response needs exactly one field of type %s", where, agg.state.Desc.FullName())
 	}
 	return sm, nil
+}
+
+// writeResultShape is what cmdsvc.SetWriteResult writes into the `result`
+// message, so the generated handler can only compile against a response
+// that carries all three — a proto missing or mistyping one of them
+// generates code that cannot report a successful write.
+var writeResultShape = []struct {
+	name string
+	kind protoreflect.Kind
+}{
+	{"stream_id", protoreflect.StringKind},
+	{"version", protoreflect.Uint64Kind},
+	{"global_position", protoreflect.Uint64Kind},
+}
+
+// checkWriteResult rejects a `result` message whose shape cannot carry a
+// write result, naming the offending field.
+func checkWriteResult(where string, m *protogen.Message) error {
+	for _, want := range writeResultShape {
+		var field *protogen.Field
+		for _, fld := range m.Fields {
+			if fld.Desc.Name() == protoreflect.Name(want.name) {
+				field = fld
+				break
+			}
+		}
+		if field == nil {
+			return fmt.Errorf("%s: result message %s lacks a singular %s field named %q", where, m.Desc.FullName(), want.kind, want.name)
+		}
+		if field.Desc.Kind() != want.kind {
+			return fmt.Errorf("%s: result field %s.%s must be a %s field, is a %s", where, m.Desc.FullName(), want.name, want.kind, field.Desc.Kind())
+		}
+		if field.Desc.IsList() || field.Desc.IsMap() {
+			return fmt.Errorf("%s: result field %s.%s must be singular, not a list or map", where, m.Desc.FullName(), want.name)
+		}
+	}
+	return nil
 }
 
 // connectIdent returns an identifier in the protoc-gen-connect-go package
@@ -235,7 +281,6 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 	ctx := g.QualifiedGoIdent(contextPkgPath.Ident("Context"))
 	streamID := g.QualifiedGoIdent(esPkgPath.Ident("StreamID"))
 	actor := g.QualifiedGoIdent(esPkgPath.Ident("Actor"))
-	meta := g.QualifiedGoIdent(esPkgPath.Ident("Meta"))
 	newStreamID := g.QualifiedGoIdent(esPkgPath.Ident("NewStreamID"))
 	runtime := g.QualifiedGoIdent(aggregatePkgPath.Ident("Runtime"))
 	validator := g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Validator"))
@@ -282,6 +327,20 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 	g.P("	// Errors maps domain errors (decider rejections) to Connect errors; nil")
 	g.P("	// maps them to failed_precondition.")
 	g.P("	Errors ", errorMapper)
+	g.P("	// Dedup stores and replays the responses of completed commands for")
+	g.P("	// requests carrying an Idempotency-Key")
+	g.P("	// (draft-ietf-httpapi-idempotency-key-header-07 §2.6, design D6).")
+	g.P("	// nil (the default) is no dedup — today's behavior; a request without")
+	g.P("	// the header never enters the flow either. Wired, the flow runs after")
+	g.P("	// Authorize: a replay with the same payload gets the stored response")
+	g.P("	// back; the same key with a different payload is rejected as key reuse")
+	g.P("	// (aborted, HTTP 422 semantics); a concurrent duplicate loses on the")
+	g.P("	// event-id constraint — wire Runtime.WithDeterministicEventIDs for")
+	g.P("	// that arm — and is reported aborted (HTTP 409 semantics). The")
+	g.P("	// adapter's workspace scoping is the draft §5 composite key's")
+	g.P("	// client-attribute component; the fingerprint covers the request as")
+	g.P("	// the handler sees it, after principal injection.")
+	g.P("	Dedup ", g.QualifiedGoIdent(esPkgPath.Ident("Deduplicator")))
 	g.P("}")
 	g.P()
 
@@ -291,7 +350,14 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 	g.P()
 	g.P("// New", name, "Handler returns the Connect handler for ", name, ". Mount it with")
 	g.P("// ", string(f.GoPackageName)+"connect", ".New", name, "Handler.")
+	g.P("// A nil required dep (Runtime, Authorize, Identity) panics at construction;")
+	g.P("// Validate, Filter and Errors keep their nil defaults.")
 	g.P("func New", name, "Handler(d ", name, "Deps) ", handlerIface, " {")
+	for _, dep := range []string{"Runtime", "Authorize", "Identity"} {
+		g.P("	if d.", dep, " == nil {")
+		g.P("		panic(", fmt.Sprintf("%q", name+"Deps."+dep+" is required"), ")")
+		g.P("	}")
+	}
 	g.P("	if d.Validate == nil {")
 	g.P("		d.Validate = ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("DefaultValidator")), "()")
 	g.P("	}")
@@ -356,18 +422,73 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 		g.P("	if err := h.d.Authorize.Authorize", m.m.GoName, "(ctx, sid, cmd); err != nil {")
 		g.P("		return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("PermissionDenied")), "(err)")
 		g.P("	}")
-		// 5. meta; 6. handle
+		// 5. meta; 6. dedup; 7. handle
 		g.P("	meta := ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("MetaFrom")), "(req.Header(), actor)")
 		expected := "uint64(0)"
 		if m.expected != nil {
 			expected = "cmd.Get" + m.expected.GoName + "()"
 		}
 		g.P("	expected := ", expected)
+		// The Idempotency-Key dedup flow (draft-ietf-httpapi-idempotency-key-header-07,
+		// design D6): one guarded block AFTER Authorize — an unauthorized replay
+		// must leak nothing: no stored response, no fingerprint oracle. A nil
+		// Dedup, or a request carrying no Idempotency-Key, falls straight through
+		// to the plain path below: today's behavior, byte for byte.
+		g.P("	// Idempotency-Key dedup (draft-ietf-httpapi-idempotency-key-header-07):")
+		g.P("	// one guarded block after Authorize, so an unauthorized replay leaks")
+		g.P("	// nothing — no stored response, no fingerprint oracle. A nil Dedup, or")
+		g.P("	// a request carrying no Idempotency-Key, falls through to the plain")
+		g.P("	// path below, unchanged.")
+		g.P("	if h.d.Dedup != nil && req.Header().Get(", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("HdrIdempotencyKey")), `) != "" {`)
+		g.P("		key := ", g.QualifiedGoIdent(esPkgPath.Ident("DedupKey")), "{StreamID: sid.Canonical(), CommandID: meta.CommandID.String()}")
+		g.P("		fp := ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Fingerprint")), "(req.Msg)")
+		g.P("		rec, found, err := h.d.Dedup.Lookup(ctx, key)")
+		g.P("		if err != nil {")
+		g.P("			return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Internal")), "(err)")
+		g.P("		}")
+		g.P("		if found {")
+		g.P("			if rec.Fingerprint != fp {")
+		g.P("				// Draft §2.7: the key already names a different payload.")
+		g.P("				return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("IdempotencyKeyReused")), "()")
+		g.P("			}")
+		g.P("			// Draft §2.6: replay the stored response — no Handle, no append.")
+		g.P("			replay := &", out, "{}")
+		g.P("			if err := ", g.QualifiedGoIdent(protoMsgPkgPath.Ident("Unmarshal")), "(rec.Response, replay); err != nil {")
+		g.P("				return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Internal")), "(err)")
+		g.P("			}")
+		g.P("			return ", newResponse, "(replay), nil")
+		g.P("		}")
+		g.P("		res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)")
+		g.P("		if err != nil {")
+		g.P("			// es.ErrDuplicateEventID (deterministic event ids) is the")
+		g.P("			// concurrent duplicate: MapError reports it aborted, HTTP 409.")
+		g.P("			return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("MapError")), "(ctx, err, h.d.Errors, h.reload(sid), expected)")
+		g.P("		}")
+		g.P("		resp := &", out, "{}")
+		g.P("		resp.", m.result.GoName, " = &", g.QualifiedGoIdent(m.result.Message.GoIdent), "{}")
+		g.P("		if err := ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("SetWriteResult")), "(resp.", m.result.GoName, ", sid, res.ToVersion, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("LastGlobalPosition")), "(res.Envelopes)); err != nil {")
+		g.P("			return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Internal")), "(err)")
+		g.P("		}")
+		g.P("		resp.", m.state.GoName, " = h.filter(ctx, res.State)")
+		g.P("		stored, err := ", g.QualifiedGoIdent(protoMsgPkgPath.Ident("Marshal")), "(resp)")
+		g.P("		if err != nil {")
+		g.P("			return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Internal")), "(err)")
+		g.P("		}")
+		g.P("		if err := h.d.Dedup.Save(ctx, key, ", g.QualifiedGoIdent(esPkgPath.Ident("DedupRecord")), "{Fingerprint: fp, Response: stored}); err != nil {")
+		g.P("			// The command committed but its response was not stored. The")
+		g.P("			// client's retry with this key re-handles, collides on the")
+		g.P("			// event ids and is aborted until it uses a fresh key. Internal,")
+		g.P("			// never a silent success.")
+		g.P("			return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("Internal")), "(err)")
+		g.P("		}")
+		g.P("		return ", newResponse, "(resp), nil")
+		g.P("	}")
+		// 7. plain path (Dedup nil, or no Idempotency-Key): handle
 		g.P("	res, err := h.d.Runtime.HandleAt(ctx, sid, cmd, meta, expected)")
 		g.P("	if err != nil {")
 		g.P("		return nil, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("MapError")), "(ctx, err, h.d.Errors, h.reload(sid), expected)")
 		g.P("	}")
-		// 7. response
+		// 8. response
 		g.P("	resp := &", out, "{}")
 		g.P("	resp.", m.result.GoName, " = &", g.QualifiedGoIdent(m.result.Message.GoIdent), "{}")
 		g.P("	if err := ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("SetWriteResult")), "(resp.", m.result.GoName, ", sid, res.ToVersion, ", g.QualifiedGoIdent(cmdsvcPkgPath.Ident("LastGlobalPosition")), "(res.Envelopes)); err != nil {")
@@ -378,5 +499,4 @@ func writeService(g *protogen.GeneratedFile, f *protogen.File, s svcSpec) {
 		g.P("}")
 		g.P()
 	}
-	_ = meta
 }

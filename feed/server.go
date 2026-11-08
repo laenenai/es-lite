@@ -247,7 +247,10 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 	// Release ordering: stop the stream, wait for the renewer to exit, then
 	// release. A Renew can therefore never race the Release and resurrect the
 	// lease. The release uses a context detached from the caller's, because
-	// cancellation must not leak the lease.
+	// cancellation must not leak the lease. The tail below already ran the
+	// same cancel-and-join once the stream ended; both are idempotent, so
+	// this defer reads as a no-op on that path and stays self-contained on
+	// every other one.
 	defer func() {
 		cancel()
 		renewals.Wait()
@@ -258,18 +261,35 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 
 	streamErr := s.stream(runCtx, req, sink, s.batchSize(req.BatchSize))
 
+	// Stop the renewer and wait for it to exit before assembling the causes
+	// (review F35): a renewal failure observed just before the stream ended
+	// may still be on its way to lost — the renewer can be anywhere between
+	// the store's failed Renew and the channel send — and a drain that runs
+	// before the renewer exits drops that diagnosis from the returned error.
+	// cancel() unblocks a renewer parked on its ticker or inside a Renew
+	// call; renewals.Wait() then guarantees every loss it recorded is in
+	// lost before the drain below. Both are idempotent, so the deferred
+	// cancel-and-join below still reads; and neither can wait on anything
+	// un-cancelable — the renewer's own waits are on ctx (already cancelled)
+	// or its ticker, the same waits the deferred join always made.
+	cancel()
+	renewals.Wait()
+
 	// Collect the independent causes instead of letting one silently replace
 	// another. A stream error caused by our own cancellation, or by the
 	// caller's own deadline arriving, is derived, not a diagnosis, and is
 	// dropped; a real send/read error that races a lease loss is joined so
 	// both remain visible.
-	var leaseErr error
-	select {
-	case leaseErr = <-lost:
-	default:
+	drainLost := func() error {
+		select {
+		case err := <-lost:
+			return err
+		default:
+			return nil
+		}
 	}
 	var causes []error
-	if leaseErr != nil {
+	if leaseErr := drainLost(); leaseErr != nil {
 		causes = append(causes, leaseErr)
 	}
 	callerExpired := false
@@ -277,6 +297,7 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 		callerExpired = true
 		causes = append(causes, callerErr)
 	}
+	joined := streamErr
 	if len(causes) > 0 {
 		// The stream runs under a child of ctx, so a caller deadline reaches
 		// it too: the stream's own deadline error is the caller's error echoed
@@ -287,11 +308,19 @@ func (s *Server) Subscribe(ctx context.Context, req Request, sink Sink) (err err
 			causes = append(causes, streamErr)
 		}
 		if len(causes) == 1 {
-			return causes[0]
+			joined = causes[0]
+		} else {
+			joined = errors.Join(causes...)
 		}
-		return errors.Join(causes...)
 	}
-	return streamErr
+	// A second receive after the join: nothing can deliver to lost once the
+	// renewer has exited — it is the only writer — but the invariant "every
+	// observed loss is in the returned error" must not depend on that. Any
+	// error that did appear joins instead of vanishing.
+	if leaseErr := drainLost(); leaseErr != nil {
+		joined = errors.Join(joined, leaseErr)
+	}
+	return joined
 }
 
 // releaseLease releases the subscription key for owner on a context detached
@@ -337,9 +366,22 @@ func (s *Server) renew(ctx context.Context, scope, projection, instance, owner s
 }
 
 // stallProbeEvery bounds the OnStall probe cadence: a stream idling on
-// empty pages consults Log.RawHead at most once per window, so a fleet of
-// idle subscribers cannot stampede the log with probes (spec §5.12).
+// empty pages or waiting out a blocked clamp consults
+// Log.MatchingRawHead at most once per window, so a fleet of idle or
+// clamped subscribers cannot stampede the log with probes (spec
+// §5.12). Both probes — the read loop's and the clamp loop's — share
+// one window per stream.
 const stallProbeEvery = 3 * time.Second
+
+// clampProbeThreshold is N, the consecutive-observation count the clamp
+// loop's probe requires before reporting: OnStall fires after N=2
+// consecutive rate-limited probes — spaced by stallProbeEvery — each
+// observed head < pos with matchingRaw >= pos. The cadence starts
+// unarmed, so the first probe runs on the clamp's first re-head and the
+// second after one full window: a block persistent for about one probe
+// window signals, while an ordinary in-flight transaction that settles
+// inside the window stays silent.
+const clampProbeThreshold = 2
 
 // stream is the read/send loop. It runs under runCtx, which the renewer may
 // cancel; Subscribe translates the result. The event type set is the
@@ -377,6 +419,67 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 	if err != nil {
 		return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
 	}
+	// Stall detection state (spec §5.8): the probe is rate-limited and
+	// one OnStall fires per stall episode, re-armed by the next page
+	// that delivers. Both probes share this state: the read loop's
+	// empty-page probe and the clamp loop's blocked-clamp probe space
+	// their MatchingRawHead consultations on one cadence, and an
+	// episode — from the first report to the next delivered page —
+	// reports exactly once, whichever loop observed it.
+	var (
+		lastProbe     time.Time
+		stallReported bool
+	)
+	probeStall := func() {
+		if stallReported || time.Since(lastProbe) < stallProbeEvery {
+			return
+		}
+		lastProbe = time.Now()
+		// The probe compares against the subscription's own backlog —
+		// the raw head over its consumed types — never the all-type
+		// raw head: a filtered stream caught up on its types is not
+		// stalled, however many unrelated events land above it.
+		matchingRaw, rerr := log.MatchingRawHead(ctx, req.Definition.Consumes)
+		if rerr != nil {
+			return // observability must never kill the stream
+		}
+		if matchingRaw > pos {
+			stallReported = true
+			s.cfg.Observer.OnStall(pos, matchingRaw)
+		}
+	}
+
+	// probeClamp observes the clamp loop's blocked wait (review F15):
+	// the resume checkpoint sits above the settled head while the
+	// committed matching backlog still covers it — the position is
+	// alive, only the fence is wedged. Rate-limited on the shared
+	// cadence, it counts consecutive observations of that regime and
+	// reports OnStall(pos, matchingRaw) after clampProbeThreshold of
+	// them, latching the same stallReported the read loop's probe
+	// re-arms on delivery — one report per episode, not one per re-head.
+	// An observation of anything else — the fence cleared, or the
+	// matching backlog no longer covers the position — breaks the streak.
+	clampStreak := 0
+	probeClamp := func() {
+		if stallReported || time.Since(lastProbe) < stallProbeEvery {
+			return
+		}
+		lastProbe = time.Now()
+		matchingRaw, rerr := log.MatchingRawHead(ctx, req.Definition.Consumes)
+		if rerr != nil {
+			return // observability must never kill the stream
+		}
+		if head >= pos || matchingRaw < pos {
+			clampStreak = 0
+			return
+		}
+		clampStreak++
+		if clampStreak >= clampProbeThreshold {
+			stallReported = true
+			s.cfg.Observer.OnStall(pos, matchingRaw)
+		}
+	}
+
 	// A checkpoint ahead of the settled head is ambiguous (spec §5.1):
 	// either the log was restored to an earlier point or is empty —
 	// clamp locally, never rewriting the consumer's checkpoint — or the
@@ -386,6 +489,8 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 	// regimes: raw >= pos proves the checkpoint's position is still in
 	// the committed log, so the fence is merely blocked and the stream
 	// waits and re-heads; only raw < pos (the position is gone) clamps.
+	// The wait is not silent: a block that persists across re-heads is
+	// reported through the shared stall signal.
 	for pos > head {
 		raw, rerr := log.RawHead(ctx)
 		if rerr != nil {
@@ -401,28 +506,9 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 		if head, err = log.Head(ctx); err != nil {
 			return fmt.Errorf("feed: head for scope %q: %w", req.Scope, err)
 		}
-	}
-
-	// Stall detection state (spec §5.8): the probe is rate-limited and
-	// one OnStall fires per stall episode, re-armed by the next page that
-	// delivers.
-	var (
-		lastProbe     time.Time
-		stallReported bool
-	)
-	probeStall := func() {
-		if stallReported || time.Since(lastProbe) < stallProbeEvery {
-			return
-		}
-		lastProbe = time.Now()
-		raw, rerr := log.RawHead(ctx)
-		if rerr != nil {
-			return // observability must never kill the stream
-		}
-		if raw > pos {
-			stallReported = true
-			s.cfg.Observer.OnStall(pos, raw)
-		}
+		// The re-head is the probe point: a clamp that persists here is
+		// a wedged fence, and the wait is observable.
+		probeClamp()
 	}
 
 	for {
@@ -493,10 +579,12 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 // wait idles until the next poll, or until the Waiter reports new events.
 // The fence-clamp loop's re-head retry uses it: an unjittered, unfloored
 // pause is the right shape there — a bounded retry cadence, not the idle
-// poll. The read loop's idle branch uses idleWait instead.
+// poll. The read loop's idle branch uses idleWait instead. There is no
+// floor to bypass here, so whether the Waiter genuinely woke is discarded.
 func (s *Server) wait(ctx context.Context) error {
 	if s.cfg.Waiter != nil {
-		return s.cfg.Waiter.Wait(ctx, s.cfg.Poll)
+		_, err := s.cfg.Waiter.Wait(ctx, s.cfg.Poll)
+		return err
 	}
 	t := time.NewTimer(s.cfg.Poll)
 	defer t.Stop()
@@ -515,14 +603,16 @@ func (s *Server) wait(ctx context.Context) error {
 // connection pool. The factor is drawn per idle wait, so each stream's phase
 // random-walks away from the fleet's.
 //
-// The Waiter path is floored: Wait returning nil means "timeout" by the
-// Waiter contract, so a Waiter whose implementation returns nil immediately
-// must not turn the loop into a spin against the log. Whatever the Waiter
-// did, the loop iteration that began at iterStart has spent at least Poll by
-// the time idleWait returns — the server sleeps the remainder. The timer
-// path needs no floor: the timer itself waits the jittered poll out, and
-// sleeping a remainder on top would both double-sleep and cancel the
-// sub-Poll half of the jitter.
+// The Waiter path is floored only when the Waiter did not genuinely wake:
+// (false, nil) means "timeout" by the Waiter contract, so a Waiter whose
+// implementation returns immediately must not turn the loop into a spin
+// against the log — a non-wake spends at least Poll from iterStart before
+// idleWait returns. A genuine wake (woke true) bypasses the floor: the wake
+// source already proved new events may exist, so the next page read happens
+// immediately instead of paying the poll on top of the wait (review F35).
+// The timer path needs no floor: the timer itself waits the jittered poll
+// out, and sleeping a remainder on top would both double-sleep and cancel
+// the sub-Poll half of the jitter.
 func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
 	d := s.cfg.Poll
 	if s.jitter != nil {
@@ -538,18 +628,21 @@ func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
 			return nil
 		}
 	}
-	if err := s.cfg.Waiter.Wait(ctx, d); err != nil {
+	woke, err := s.cfg.Waiter.Wait(ctx, d)
+	if err != nil {
 		return err
 	}
-	// The floor: at least Poll since the iteration began. Cancellation
-	// still ends the stream promptly — the floor never blocks shutdown.
-	if rem := s.cfg.Poll - time.Since(iterStart); rem > 0 {
-		t := time.NewTimer(rem)
-		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-t.C:
+	if !woke {
+		// The floor: at least Poll since the iteration began. Cancellation
+		// still ends the stream promptly — the floor never blocks shutdown.
+		if rem := s.cfg.Poll - time.Since(iterStart); rem > 0 {
+			t := time.NewTimer(rem)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+			}
 		}
 	}
 	return nil
@@ -663,6 +756,15 @@ func (s *Server) ResetCheckpoint(ctx context.Context, req Request, position uint
 // never moved underneath it. The normal flow needs no force: the poison
 // error already killed the stream and released its lease.
 //
+// Skip is also forward-only: a Position behind the stored checkpoint fails
+// with ErrInvalidRequest — accepting it would silently rewind the
+// subscription and re-deliver history the consumer already acknowledged —
+// and the refusal lands before the dead letter, so a refused skip moves no
+// cursor and records no audit row. An equal position is not behind
+// (re-skipping the event at the cursor is idempotent) and a first skip with
+// no stored checkpoint has nothing to be behind; Force is the deliberate
+// rewind, the same escape hatch ResetCheckpoint's force provides.
+//
 // Skip does not require the position to exist or the event to be over-cap;
 // it is a deliberate admin cursor-advance, and validateKey gates the
 // subscription identity.
@@ -688,6 +790,18 @@ func (s *Server) Skip(ctx context.Context, sr SkipRequest) error {
 	cp, _, err := s.cfg.Checkpoints.Checkpoint(ctx, sr.Scope, sr.Projection, sr.Instance)
 	if err != nil {
 		return fmt.Errorf("feed: load checkpoint %s/%s/%s: %w", sr.Scope, sr.Projection, sr.Instance, err)
+	}
+	// Skip is forward-only: a position behind the stored checkpoint would
+	// silently rewind the subscription and re-deliver history the consumer
+	// already acknowledged. Refuse it before recording anything — a refused
+	// skip leaves both the cursor and the audit trail untouched — unless
+	// Force authorizes the deliberate rewind. An equal position is not
+	// behind (re-skipping the event at the cursor is idempotent), and with
+	// no stored checkpoint there is nothing to be behind: the first skip
+	// moves freely.
+	if sr.Position < cp.Position && !sr.Force {
+		return fmt.Errorf("%w: skip position %d is behind the checkpoint %d; pass Force to rewind",
+			ErrInvalidRequest, sr.Position, cp.Position)
 	}
 	// Record the audit row before advancing: a crash between the two
 	// leaves a dead letter and an unadvanced cursor — safe, the skip is
@@ -809,10 +923,15 @@ func validateRequest(req Request, sink Sink) error {
 }
 
 // validateDefinition checks the definition every definition-carrying call
-// must pass: a name that matches the projection and at least one consumed
-// type. Subscribe resolves and authorizes the type set before calling the
-// core; an empty definition would seal the stream silently, and a
-// mismatched name would file one projection's checkpoints under another's.
+// must pass: a name that matches the projection, at least one consumed
+// type, and no control byte in any consumed type URL. Subscribe resolves
+// and authorizes the type set before calling the core; an empty definition
+// would seal the stream silently, and a mismatched name would file one
+// projection's checkpoints under another's. The control-byte refusal is
+// the same byte-level hygiene as the subscription key (containsControl):
+// a control byte is never legitimate in a type URL, and one accepted here
+// reaches every adapter's type filter and every matching-head probe the
+// core runs over the type set.
 func validateDefinition(req Request) error {
 	if req.Definition.Name == "" {
 		return fmt.Errorf("%w: definition name is required", ErrInvalidRequest)
@@ -823,6 +942,11 @@ func validateDefinition(req Request) error {
 	}
 	if len(req.Definition.Consumes) == 0 {
 		return fmt.Errorf("%w: definition consumes is required", ErrInvalidRequest)
+	}
+	for _, typ := range req.Definition.Consumes {
+		if containsControl(typ) {
+			return fmt.Errorf("%w: consumed type %q contains a control byte", ErrInvalidRequest, typ)
+		}
 	}
 	return nil
 }

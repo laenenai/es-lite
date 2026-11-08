@@ -28,6 +28,13 @@ type Store interface {
 	// starts at the beginning; toVersion=0 means "no upper bound". So
 	// ReadStream(sid, 0, 0) is the whole stream, and ReadStream(sid, 0, N)
 	// is the prefix used for time-travel-by-version.
+	//
+	// A read from the beginning of a stream that was never written —
+	// fromVersion=0 and no rows for the stream at all, whatever toVersion
+	// is — returns an error wrapping ErrStreamNotFound (match it with
+	// errors.Is) instead of a silent empty slice. An empty range is not
+	// "not found": reads with fromVersion > 0, and reads from 0 of a
+	// stream that exists, return (nil, nil).
 	ReadStream(ctx context.Context, sid StreamID, fromVersion, toVersion uint64) ([]Envelope, error)
 
 	// ReadStreamAsOf returns a stream's events with RecordedAt <= asOf,

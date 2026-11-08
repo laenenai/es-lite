@@ -220,3 +220,31 @@ ordered durable record a relay tails. Adding an outbox table would
 reintroduce the dual-write it was invented to avoid, plus a cleanup job.
 The only reason to add a claim column is the Postgres visibility gap
 (§5) — and there it lives *on the events table*, not as a second table.
+
+## Errata (2026-11-07)
+
+The cut table above is the record of the 2026-08-01 decision; two of its
+rows have since been reversed, and the reversal is part of the history
+rather than an edit to it:
+
+1. **"Mandatory multi-tenancy + RLS | ✂" — reversed in spirit.** What was
+   cut is the parent's *mandatory* multi-tenancy. Optional per-workspace
+   isolation over RLS and hash partitioning landed as the Postgres
+   backend's core feature (ADR 0004): `Store.Workspace(id)` pins a
+   workspace, every table carries a workspace arm, and the feed tables
+   admit no bypass at all. A single-tenant deployment still opts out by
+   simply not partitioning its users — the lite property the cut was
+   protecting.
+2. **"Tamper-evident hash chain | ✂" — reversed by ADR 0029** (keyless,
+   per-stream, sealed-payload chains with exported anchors — see its own
+   errata for what the anchors did and did not attest when it landed), and
+   extended by ADR 0038 (per-batch `log_order` attestation of global
+   append order). The cut's rationale — immutability + backups covering
+   audit "for non-adversarial threat models" — is exactly the threat
+   boundary the first production consumer rejected, which is why the
+   feature came back.
+3. **§5's Postgres delivery gap is closed** (ADR 0037's horizon fence
+   bounds every feed-facing read; the raw `ReadAll` cursor it leaves
+   unfenced is documented there). This paragraph was updated in place when
+   the fence landed; it is noted here so the cut table and §5 read
+   consistently.

@@ -278,3 +278,47 @@ verifier must be in Go anyway. One encoding, one implementation.
   redelivery (`version <= last`) is accepted, not flagged.
 - **`es-verify`** is its own command (`cmd/es-verify`), the image's fourth
   entrypoint; exit 0 intact, 1 broken/mismatch, 2 usage or connection error.
+
+## Errata (2026-11-07)
+
+A documentation truth pass (review F37) walked this ADR against the landed
+code. The decision stands; these claims needed correction or completion, and
+the history above is left as written:
+
+1. **§2's "cross-stream ordering is attested by anchors (§4) instead" was
+   false as implemented until 2026-11-07.** The §4 root hashed
+   `(workspace_id, stream_id, head_version, head_hash)` — `global_position`
+   appears nowhere in it, so an anchor attested nothing about order, and
+   cross-stream repositioning was undetectable (review F11, confirmed by two
+   reviewers). The claim is now true: every append transaction writes a
+   `log_order` row hashing its own events' positions and chain hashes
+   (`es.BatchOrderHash`), and every anchor carries an `order_root_hash` over
+   those rows (`es.OrderRoot`) — see ADR 0038, which records the design.
+   `es/hash.go`'s comment on the `GlobalPosition` exclusion now points there.
+2. **Head truncation.** §3's verification described the chain starting at the
+   first surviving row, which is exactly why deleting a stream's *earliest*
+   rows was invisible to it (§4's anchors catch tail deletion; the chain
+   cannot see its own head being cut). Since 2026-11-07 `es.VerifyStream`
+   reports it directly: a stream whose first surviving version is greater
+   than 1 breaks the report at that version
+   (`es/verify.go`: `head truncated: first version is %d`), so the default
+   `es-verify stream|all` audit detects head truncation without an anchor.
+   Mid-stream starts remain legitimate for `ChainChecker` (snapshot-seeded
+   loads); only `VerifyStreamWith`, which always pages from 0, reports it.
+3. **§4's role gate covered fewer policies than the prose implied.** This
+   ADR says the anchor path runs under the role-gated bypass "migration 0005
+   requires `es_relay` membership" — but migration 0005 role-gated only the
+   two policies it enumerated (`events`, `unique_claims`); the `anchors`
+   table's own bypass policy carried the ungated arm until migration 0007
+   (2026-11-07) recreated all three bypass-carrying policies with the gate
+   and the `EXISTS` guard. Migration 0007's header carries the errata for
+   0005's "Both policies" comment; the migration-level test
+   `TestAllBypassPoliciesRoleGated` pins all three.
+4. **"Verified once per `Store` at startup" (§4 and Implementation notes) is
+   no longer the mechanism.** The membership check runs lazily, on the first
+   bypassed call, and only a *definitive* verdict is cached for the Store's
+   lifetime: a transient probe failure (cancelled context, connection blip)
+   is returned but not cached and re-probes on the next call, so one blip can
+   no longer refuse a process forever (review F4,
+   `postgres/drain.go` `checkRelayRole`). A definitive refusal still stands
+   until restart — the runbook's grant-then-restart guidance is unchanged.

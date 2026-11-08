@@ -136,6 +136,8 @@ func humanise(v string) string {
 		return "state as of the event's version"
 	case "FETCH_MODE_METADATA_ONLY":
 		return "metadata and payload only (no state)"
+	case "FETCH_MODE_EVENT_ONLY":
+		return "typed event only (no state)"
 	case "REBUILD_MODE_FROM_LOG":
 		return "from the log"
 	case "", "FETCH_MODE_UNSPECIFIED", "REBUILD_MODE_UNSPECIFIED":

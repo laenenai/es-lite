@@ -3,9 +3,18 @@
 // ports (feed.Log/Logs, feed.CheckpointStore, feed.LeaseStore).
 //
 // SQLite is the first backend precisely because its single-writer model
-// makes the delivery cursor gap-free for free (docs/adr/0001 §5). The
-// store keeps a single database connection so writes are serialized and
-// global_position is assigned in commit order.
+// makes the delivery cursor gap-free for free (docs/adr/0001 §5). It is
+// the file-level single-writer lock that keeps global_position gap-free
+// and commit-ordered.
+//
+// The store also holds a single Go database connection —
+// db.SetMaxOpenConns(1), enforced by Open and re-enforced by NewWithDB on
+// borrowed handles. That one connection is what buys
+// busy_timeout/BUSY_SNAPSHOT immunity (a read-then-write transaction
+// cannot straddle two connections) and keeps a mode=memory database alive
+// for the Store's lifetime. The driver must be modernc.org/sqlite:
+// isConstraintViolation classifies constraint failures by matching that
+// driver's error type only, so no other driver is supported.
 //
 // One database is one workspace. The feed ports accept a scope for parity
 // with multi-tenant backends, but SQLite has no row-level security and no
@@ -84,8 +93,17 @@ func formatTS(t time.Time) string         { return t.UTC().Format(tsLayout) }
 func parseTS(s string) (time.Time, error) { return time.Parse(tsLayout, s) }
 
 // Store is the SQLite-backed es.Store.
+//
+// Handle ownership depends on which constructor was used: Open creates the
+// handle and Close closes it, whereas NewWithDB borrows a caller-provided
+// handle and Close leaves it alone.
 type Store struct {
 	db *sql.DB
+
+	// ownsDB records whether this Store created the *sql.DB and may
+	// therefore close it. False for a handle handed in by NewWithDB,
+	// where the caller may still be using it for other work.
+	ownsDB bool
 
 	// maxPayloadBytes is the effective append-time payload cap
 	// (WithMaxPayloadBytes): appends holding a larger payload are rejected
@@ -99,6 +117,9 @@ var _ es.Store = (*Store)(nil)
 // the schema. dsn is a modernc.org/sqlite DSN, e.g.
 // "file:events.db" or "file:mem?mode=memory&cache=shared". Pragmas for
 // WAL, busy-timeout, and foreign keys are set automatically.
+//
+// The Store owns the handle it creates, so Close closes it. A caller that
+// needs to manage the handle itself should use NewWithDB.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	dsn = withPragmas(dsn)
 	db, err := sql.Open("sqlite", dsn)
@@ -110,7 +131,7 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	db.SetMaxOpenConns(1)
 
 	cfg := newOpenConfig(opts)
-	s := &Store{db: db, maxPayloadBytes: cfg.maxPayloadBytes}
+	s := &Store{db: db, ownsDB: true, maxPayloadBytes: cfg.maxPayloadBytes}
 	if cfg.autoMigrate {
 		if err := s.Migrate(ctx); err != nil {
 			db.Close()
@@ -120,9 +141,20 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 	return s, nil
 }
 
-// NewWithDB wraps an already-open *sql.DB. Useful for tests that manage the
-// handle themselves. Applies migrations unless WithoutAutoMigrate is passed.
+// NewWithDB wraps an already-open *sql.DB. The handle is borrowed, not
+// owned: Close leaves it open and the caller closes it (mirroring
+// postgres.OpenWithPool). NewWithDB does enforce the package's
+// single-connection contract — it calls db.SetMaxOpenConns(1) whatever
+// limit the handle carried — but the DSN's pragmas (WAL, busy_timeout,
+// foreign_keys) remain the caller's, and the driver must be
+// modernc.org/sqlite (see the package doc). Useful for tests that manage
+// the handle themselves. Applies migrations unless WithoutAutoMigrate is
+// passed.
 func NewWithDB(ctx context.Context, db *sql.DB, opts ...Option) (*Store, error) {
+	// Hold borrowed handles to the same contract as Open's (F19): more
+	// than one connection forfeits the busy_timeout/BUSY_SNAPSHOT
+	// immunity and memory-DB lifetime the package guarantees.
+	db.SetMaxOpenConns(1)
 	cfg := newOpenConfig(opts)
 	s := &Store{db: db, maxPayloadBytes: cfg.maxPayloadBytes}
 	if cfg.autoMigrate {
@@ -133,14 +165,28 @@ func NewWithDB(ctx context.Context, db *sql.DB, opts ...Option) (*Store, error) 
 	return s, nil
 }
 
-// Migrate applies pending versioned migrations (ADR 0010). SQLite is
-// single-writer, so no lock is needed; each migration runs in its own
-// transaction and is recorded in schema_migrations. Idempotent.
+// Migrate applies pending versioned migrations (ADR 0010). Each
+// migration is ONE write transaction that INSERTs its schema_migrations
+// row FIRST and applies the DDL second — there is no pre-check SELECT
+// to race on (F34: with check-then-apply, two processes migrating one
+// file DSN can both pass the check and both apply, the loser failing on
+// a duplicate column or a lost version-row insert). The INSERT itself
+// is the lock: SQLite allows one writer per database file, so rival
+// migrators serialize on the write lock the INSERT takes, and a
+// primary-key violation means the winner's row is committed — roll back
+// and skip. SQLite DDL is transactional, so the version row and the
+// schema change commit atomically: a recorded version always has its
+// schema, and a skipped version was fully applied by the rival.
+// Idempotent.
 func (s *Store) Migrate(ctx context.Context) error {
 	migs, err := migrate.Load(migrationsFS, "migrations")
 	if err != nil {
 		return err
 	}
+	// Bootstrap: schema_migrations must exist before the first
+	// INSERT-first transaction can record anything. CREATE TABLE IF NOT
+	// EXISTS is idempotent — racing bootstraps serialize on the same
+	// write lock and the second is a no-op.
 	if _, err := s.db.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    INTEGER PRIMARY KEY,
@@ -149,24 +195,25 @@ func (s *Store) Migrate(ctx context.Context) error {
 		return fmt.Errorf("sqlite: schema_migrations: %w", err)
 	}
 	for _, m := range migs {
-		var exists int
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT 1 FROM schema_migrations WHERE version = ?`, m.Version).Scan(&exists); err == nil {
-			continue // already applied
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("sqlite: check migration %d: %w", m.Version, err)
-		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
+		// Insert first. This statement takes the file's single write
+		// lock, which serializes rival migrators; a primary-key
+		// violation against a rival's committed row means this
+		// migration is already applied — roll back (releasing the one
+		// connection) and skip.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (?)`, m.Version); err != nil {
+			tx.Rollback()
+			if isConstraintViolation(err) {
+				continue
+			}
+			return fmt.Errorf("sqlite: record migration %d: %w", m.Version, err)
+		}
 		if _, err := tx.ExecContext(ctx, m.SQL); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("sqlite: migration %04d_%s: %w", m.Version, m.Name, err)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version) VALUES (?)`, m.Version); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("sqlite: record migration %d: %w", m.Version, err)
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("sqlite: commit migration %d: %w", m.Version, err)
@@ -175,8 +222,15 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the underlying database.
-func (s *Store) Close() error { return s.db.Close() }
+// Close closes the underlying database when the Store owns it — when it
+// came from Open. A Store built with NewWithDB borrowed the caller's
+// handle and leaves it open; the caller closes it.
+func (s *Store) Close() error {
+	if !s.ownsDB {
+		return nil
+	}
+	return s.db.Close()
+}
 
 // DB exposes the underlying handle (for read-model projections that live
 // in the same database as the log).
@@ -291,7 +345,15 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		)
 		if err != nil {
 			if isConstraintViolation(err) {
-				// A concurrent writer claimed this version first.
+				// The modernc message names the violated index definition
+				// (F25): events.event_id is the duplicate-EventID case —
+				// the event itself is a rerun, and retrying can never win —
+				// while events.stream_id, events.version is the
+				// version-race backstop and keeps today's ErrConflict. An
+				// unrecognized violation falls back to the conflict arm.
+				if isDuplicateEventIDViolation(err) {
+					return zero, fmt.Errorf("%w: %s at v%d: %v", es.ErrDuplicateEventID, p.StreamID, version, err)
+				}
 				return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
 			}
 			return zero, fmt.Errorf("insert event v%d: %w", version, err)
@@ -302,6 +364,32 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		}
 		env.GlobalPosition = uint64(gp)
 		envs[i] = env
+	}
+
+	// Log-order attestation (design D1, F11): one log_order row per
+	// non-empty batch, hashed and inserted in THIS transaction from
+	// exactly the (position, hash) pairs the loop above already
+	// collected — no new reads, no new locks, no cross-transaction
+	// dependency, so the append path gains no serialization. The
+	// entries go in loop order, which is position order: the single
+	// writer assigns rowids in insert order. Anchors aggregate these
+	// rows into the order root that attests the global append order,
+	// and `es-verify order` recomputes each row's hash from the events
+	// in its range.
+	if len(p.Events) > 0 {
+		entries := make([]es.OrderEntry, len(envs))
+		for i := range envs {
+			entries[i] = es.OrderEntry{Position: envs[i].GlobalPosition, Hash: envs[i].Hash}
+		}
+		batchHash := es.BatchOrderHash(entries)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO log_order (from_position, to_position, stream_id, event_count, batch_hash)
+			 VALUES (?,?,?,?,?)`,
+			envs[0].GlobalPosition, envs[len(envs)-1].GlobalPosition,
+			canonical, len(envs), batchHash[:],
+		); err != nil {
+			return zero, fmt.Errorf("insert log_order: %w", err)
+		}
 	}
 
 	if err := applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
@@ -380,6 +468,13 @@ func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.Cons
 }
 
 // ReadStream implements es.Store.
+//
+// A read from the beginning of a stream that was never written —
+// fromVersion 0 and no rows for the stream at all, whatever toVersion is —
+// returns an error wrapping es.ErrStreamNotFound (with the canonical
+// stream id in the message) instead of a silent empty slice. An empty
+// range is not "not found": reads with fromVersion > 0, and reads from 0
+// of a stream that exists, return (nil, nil).
 func (s *Store) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, toVersion uint64) ([]es.Envelope, error) {
 	if err := sid.Validate(); err != nil {
 		return nil, err
@@ -391,7 +486,47 @@ func (s *Store) ReadStream(ctx context.Context, sid es.StreamID, fromVersion, to
 		args = append(args, toVersion)
 	}
 	q += ` ORDER BY version ASC`
-	return s.queryEnvelopes(ctx, q, args...)
+	envs, err := s.queryEnvelopes(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	if fromVersion == 0 && len(envs) == 0 {
+		// A read from the beginning of the stream matched nothing. With no
+		// upper bound that already proves no row exists — the stream was
+		// never written. A bound makes the empty range ambiguous (rows
+		// deleted out-of-band can survive only above it), so only an
+		// existence probe can tell "never written" from "empty range on
+		// an existing stream" — and only the first is ErrStreamNotFound.
+		if toVersion > 0 {
+			exists, err := s.streamExists(ctx, sid)
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				return envs, nil
+			}
+		}
+		return nil, fmt.Errorf("%w: %s", es.ErrStreamNotFound, sid.Canonical())
+	}
+	return envs, nil
+}
+
+// streamExists reports whether the stream has any event row at all — the
+// existence probe behind ReadStream's ErrStreamNotFound: a read from the
+// start that matched nothing is "not found" only when nothing was ever
+// written to the stream.
+func (s *Store) streamExists(ctx context.Context, sid es.StreamID) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM events WHERE stream_id = ? LIMIT 1`, sid.Canonical(),
+	).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReadStreamAsOf implements es.Store.
@@ -480,6 +615,9 @@ func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es
 
 // scanEnvelope scans one row selected with envelopeCols. It is the single
 // column list/scan pairing shared by every read, including the feed page.
+// The audit UUIDs are load-bearing (F34): a stored event_id,
+// correlation_id, causation_id or command_id that does not parse fails the
+// read rather than being silently zeroed into a forged envelope.
 func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	var (
 		e                                     es.Envelope
@@ -497,8 +635,8 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		return es.Envelope{}, err
 	}
 	var err error
-	if e.EventID, err = uuid.Parse(eventID); err != nil {
-		return es.Envelope{}, fmt.Errorf("parse event_id %q: %w", eventID, err)
+	if e.EventID, err = parseStoredUUID("event_id", eventID); err != nil {
+		return es.Envelope{}, err
 	}
 	if e.StreamID, err = es.ParseCanonical(streamID); err != nil {
 		return es.Envelope{}, fmt.Errorf("parse stream_id %q: %w", streamID, err)
@@ -509,11 +647,32 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	if e.RecordedAt, err = parseTS(recordedAt); err != nil {
 		return es.Envelope{}, fmt.Errorf("parse recorded_at %q: %w", recordedAt, err)
 	}
-	e.CorrelationID, _ = uuid.Parse(correlationID)
-	e.CausationID, _ = uuid.Parse(causationID)
-	e.CommandID, _ = uuid.Parse(commandID)
+	if e.CorrelationID, err = parseStoredUUID("correlation_id", correlationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CausationID, err = parseStoredUUID("causation_id", causationID); err != nil {
+		return es.Envelope{}, err
+	}
+	if e.CommandID, err = parseStoredUUID("command_id", commandID); err != nil {
+		return es.Envelope{}, err
+	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	return e, nil
+}
+
+// parseStoredUUID parses one stored audit-UUID column (event_id,
+// correlation_id, causation_id, command_id). A value that does not parse
+// fails the whole read (F34): the old code zeroed it and handed back an
+// envelope whose audit trail pointed at nothing. The error names the
+// column and the value's LENGTH only — never the value's bytes, which
+// must not leak into logs, and never uuid.Parse's own error, whose
+// message quotes the offending string.
+func parseStoredUUID(column, value string) (uuid.UUID, error) {
+	id, err := uuid.Parse(value)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("stored %s is not a valid uuid: length %d", column, len(value))
+	}
+	return id, nil
 }
 
 // LoadCheckpoint returns the last processed global_position for a
@@ -552,6 +711,20 @@ func isConstraintViolation(err error) bool {
 			code == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
 	}
 	return false
+}
+
+// isDuplicateEventIDViolation reports whether a failed events INSERT hit
+// the event_id UNIQUE constraint (F25). modernc.org/sqlite names the
+// violated index definition in its message — "UNIQUE constraint failed:
+// events.event_id" for this one, "UNIQUE constraint failed:
+// events.stream_id, events.version" for the version backstop — so the
+// column list in the message is the only discriminator.
+func isDuplicateEventIDViolation(err error) bool {
+	se, ok := errors.AsType[*msqlite.Error](err)
+	if !ok {
+		return false
+	}
+	return strings.Contains(se.Error(), "events.event_id")
 }
 
 func newV7() uuid.UUID {

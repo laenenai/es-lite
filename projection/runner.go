@@ -29,14 +29,25 @@ func (f FeedFunc) Feed(ctx context.Context, handle func(ctx context.Context, e e
 
 // LogFeed is a Feed over the event log itself: it pages Source.ReadAll from
 // From (exclusive) in global order and polls every Poll for more. A handler
-// error is retried on the same envelope after Poll, so delivery is
-// at-least-once in order. From is normally the runner's marker; LogFeed itself
-// keeps no checkpoint.
+// error is retried on the same envelope — at-least-once, in order — after a
+// backoff that starts at Poll and doubles per attempt, capped at MaxBackoff;
+// attempts are unbounded, so a poison event blocks the stream forever, but
+// each retry is reported through OnRetry when one is set. From is normally
+// the runner's marker; LogFeed itself keeps no checkpoint.
 type LogFeed struct {
 	Source Source
 	From   uint64
 	Batch  int           // default 500
 	Poll   time.Duration // default 50ms
+	// OnRetry is called before every retry backoff with the envelope that
+	// failed, the error the handler returned for it and the attempt number
+	// (1 = the first retry of the envelope). It is the retry loop's only
+	// signal: without it a poison event blocks the stream silently. Nil
+	// keeps the loop silent.
+	OnRetry func(ctx context.Context, e es.Envelope, err error, attempt int)
+	// MaxBackoff caps the retry backoff. Zero means 5s, so a bare LogFeed
+	// keeps the documented cadence with the doubling bounded.
+	MaxBackoff time.Duration
 }
 
 // Feed implements Feed. It returns ctx.Err() when ctx ends, and a Source
@@ -49,6 +60,10 @@ func (f *LogFeed) Feed(ctx context.Context, handle func(ctx context.Context, e e
 	if poll <= 0 {
 		poll = 50 * time.Millisecond
 	}
+	max := f.MaxBackoff
+	if max <= 0 {
+		max = 5 * time.Second
+	}
 	pos := f.From
 	for {
 		evs, err := f.Source.ReadAll(ctx, pos, batch)
@@ -56,12 +71,31 @@ func (f *LogFeed) Feed(ctx context.Context, handle func(ctx context.Context, e e
 			return err
 		}
 		for _, e := range evs {
+			attempt := 1
+			delay := poll
+			if delay > max {
+				delay = max
+			}
 			for {
-				if err := handle(ctx, e); err == nil {
+				herr := handle(ctx, e)
+				if herr == nil {
 					break
 				}
-				if err := sleep(ctx, poll); err != nil {
-					return err
+				if f.OnRetry != nil {
+					f.OnRetry(ctx, e, herr, attempt)
+				}
+				if serr := sleep(ctx, delay); serr != nil {
+					return serr
+				}
+				attempt++
+				if delay < max {
+					// Double toward the cap; a wrapped product (a
+					// MaxBackoff beyond int64's reach) pins at the cap
+					// instead of sleeping a negative duration.
+					delay *= 2
+					if delay > max || delay <= 0 {
+						delay = max
+					}
 				}
 			}
 			pos = e.GlobalPosition
@@ -179,15 +213,41 @@ func (r *Runner) Position(ctx context.Context) (uint64, error) {
 }
 
 // Run consumes feed until ctx ends. Returns ctx.Err() on cancellation.
+// On return it also flushes a marker that buffers saves — any Marker also
+// implementing interface{ Flush(context.Context) error }, e.g.
+// BufferedMarker — so the last window cannot sit pending with no further
+// Save to trigger it. The exit flush runs on context.WithoutCancel(ctx)
+// with a 5s timeout: a cancelled Run still flushes, and the flush cannot
+// hang Run beyond the timeout. A flush error is returned only when the
+// feed itself succeeded; otherwise the feed's error wins and the flush
+// error is dropped (a failed flush keeps its positions pending for the
+// next trigger).
 func (r *Runner) Run(ctx context.Context, feed Feed) error {
 	if err := r.loadMarker(ctx); err != nil {
 		return err
 	}
 	err := feed.Feed(ctx, r.apply)
+	flushErr := r.flushMarker(context.WithoutCancel(ctx))
 	if err != nil && errors.Is(err, context.Canceled) && ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if err == nil {
+		return flushErr
+	}
 	return err
+}
+
+// flushMarker flushes r.Marker when it buffers saves. Run calls it on
+// every return: the last window has no later Save to trigger it, so
+// without this flush it would sit pending until the process exits.
+func (r *Runner) flushMarker(ctx context.Context) error {
+	flusher, ok := r.Marker.(interface{ Flush(context.Context) error })
+	if !ok {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return flusher.Flush(ctx)
 }
 
 // Apply handles one ordered batch — the projection.Apply shape, so Replay
@@ -204,7 +264,11 @@ func (r *Runner) Apply(ctx context.Context, batch []es.Envelope) error {
 // Rebuild replays src from position 0 through Apply and returns the last
 // position applied (ADR 0005). Reset the marker and the read model first;
 // otherwise the marker makes every already-applied position a no-op, which
-// is the resume-after-crash behaviour, not a rebuild.
+// is the resume-after-crash behaviour, not a rebuild. With a
+// BufferedMarker, Discard the projection's pending position too (or Close
+// the marker) after resetting the inner marker — a pending pre-reset
+// position would otherwise be flushed after the reset and resurrect the
+// marker above the rebuilt state.
 func (r *Runner) Rebuild(ctx context.Context, src Source, batch int) (uint64, error) {
 	return Replay(ctx, src, 0, batch, r.Apply)
 }

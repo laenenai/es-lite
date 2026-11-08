@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/laenenai/es-lite/aggregate"
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/examples/counter"
@@ -47,8 +49,17 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// anchor tests run before drain_test's own ensure).
 	ensureRelayRole(t, ctx, s)
 	// Isolate each test: tests run sequentially, so a truncate is safe and
-	// keeps the shared partitioned tables clean.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+	// keeps the shared partitioned tables clean. log_order is truncated
+	// with events — its rows are written by the same appends, and a stale
+	// row would dispute the next test's order roots and deep verifies.
+	// command_dedup joins the list for the same reason: a dedup Save must
+	// be free to create its row, and the dedup tests' first-record-wins
+	// and per-workspace-count verdicts must not inherit a stale row from
+	// a previous run.
+	// The bare checkpoints table is gone (0008: dead on Postgres — only
+	// SQLite implements delivery.Checkpoints), so it is no longer
+	// truncated here.
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -104,18 +115,16 @@ func TestWorkspaceIsolationRLS(t *testing.T) {
 		t.Fatalf("init in ws_a: %v", err)
 	}
 
-	// A different workspace sees an empty stream for the same StreamID: RLS
-	// blocks cross-workspace reads even with the identical id.
-	evs, err := s.Workspace("ws_b").ReadStream(ctx, sid, 0, 0)
-	if err != nil {
-		t.Fatalf("read ws_b: %v", err)
-	}
-	if len(evs) != 0 {
-		t.Fatalf("ws_b saw %d events for ws_a's stream; RLS leak", len(evs))
+	// A different workspace sees the stream as never-written for the same
+	// StreamID: RLS blocks cross-workspace reads even with the identical
+	// id, so ws_b's read reports ErrStreamNotFound, not ws_a's events.
+	_, err := s.Workspace("ws_b").ReadStream(ctx, sid, 0, 0)
+	if !errors.Is(err, es.ErrStreamNotFound) {
+		t.Fatalf("read ws_b: got %v, want ErrStreamNotFound — RLS must hide ws_a's rows", err)
 	}
 
 	// ws_a still sees its own event.
-	evs, err = s.Workspace("ws_a").ReadStream(ctx, sid, 0, 0)
+	evs, err := s.Workspace("ws_a").ReadStream(ctx, sid, 0, 0)
 	if err != nil || len(evs) != 1 {
 		t.Fatalf("ws_a read: len=%d err=%v, want 1", len(evs), err)
 	}
@@ -140,6 +149,109 @@ func TestOptimisticConcurrency(t *testing.T) {
 	})
 	if !errors.Is(err, es.ErrConflict) {
 		t.Fatalf("stale append: got %v, want ErrConflict", err)
+	}
+}
+
+// TestDuplicateEventIDIsNotConflict pins the F25 classification: appending
+// an EventID the log already stores — on ANOTHER stream, so no version is
+// contested — fails with es.ErrDuplicateEventID, which is not
+// es.ErrConflict. A caller that retried on ErrConflict would loop forever:
+// the event is already in the log and the append can never win.
+func TestDuplicateEventIDIsNotConflict(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_dup")
+	sidA, _ := es.NewStreamID("thing", "a")
+	sidB, _ := es.NewStreamID("thing", "b")
+	id := uuid.MustParse("11111111-1111-7111-8111-111111111111")
+
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sidA,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{EventID: id, TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+
+	// The same EventID on a different stream: both appends expect v0 of a
+	// fresh stream, so no version is contested — this is the
+	// (workspace_id, event_id) unique constraint, not the pkey backstop.
+	_, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sidB,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{EventID: id, TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("y")}},
+	})
+	if !errors.Is(err, es.ErrDuplicateEventID) {
+		t.Fatalf("duplicate event id append: got %v, want ErrDuplicateEventID", err)
+	}
+	if errors.Is(err, es.ErrConflict) {
+		t.Fatalf("duplicate event id append misrouted to ErrConflict: %v", err)
+	}
+
+	// The rejected append wrote nothing: stream B is still unwritten.
+	if v, err := ws.CurrentStreamVersion(ctx, sidB); err != nil || v != 0 {
+		t.Fatalf("stream B version after rejected append = %d (err %v), want 0", v, err)
+	}
+}
+
+// TestScanRejectsCorruptEventID pins the F34 read-side contract: a stored
+// audit-UUID column (event_id, correlation_id, causation_id, command_id)
+// that is not a UUID fails the read instead of being silently zeroed into
+// a forged envelope, and the error names the offending column and the
+// value's LENGTH only — the corrupt bytes themselves must never leak into
+// logs.
+func TestScanRejectsCorruptEventID(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_scan")
+
+	for i, col := range []string{"event_id", "correlation_id", "causation_id", "command_id"} {
+		t.Run(col, func(t *testing.T) {
+			sid, err := es.NewStreamID("thing", "corrupt-"+col)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Each row gets a distinct valid EventID (the unique
+			// constraint would otherwise reject the seed itself) and a
+			// corrupt value in exactly one audit column.
+			good := fmt.Sprintf("11111111-1111-4111-8111-%012d", i)
+			bad := "corrupt-" + col
+			cols := map[string]string{
+				"event_id":       good,
+				"correlation_id": good,
+				"causation_id":   good,
+				"command_id":     good,
+			}
+			cols[col] = bad
+			if _, err := s.Pool().Exec(ctx,
+				`INSERT INTO events (workspace_id, event_id, stream_type, stream_id, version,
+				   type_url, schema_version, occurred_at, recorded_at,
+				   correlation_id, causation_id, command_id,
+				   actor_type, actor_id, actor_principal, payload, prev_hash, hash)
+				 VALUES ('ws_scan', $1, 'thing', $2, 1,
+				   'thing.v1.Corrupt', 1, now(), now(),
+				   $3, $4, $5,
+				   'thing', 'seed', 'thing:seed', 'x', '', '')`,
+				cols["event_id"], sid.Canonical(), cols["correlation_id"], cols["causation_id"], cols["command_id"],
+			); err != nil {
+				t.Fatalf("seed corrupt row: %v", err)
+			}
+
+			_, rerr := ws.ReadStream(ctx, sid, 0, 0)
+			if rerr == nil {
+				t.Fatalf("read of a corrupt %s succeeded: want the read to fail", col)
+			}
+			msg := rerr.Error()
+			if !strings.Contains(msg, col) {
+				t.Fatalf("error %q does not name the offending column %q", msg, col)
+			}
+			if !strings.Contains(msg, fmt.Sprintf("length %d", len(bad))) {
+				t.Fatalf("error %q does not report the corrupt value's length %d", msg, len(bad))
+			}
+			if strings.Contains(msg, bad) {
+				t.Fatalf("error %q leaks the corrupt value's bytes", msg)
+			}
+		})
 	}
 }
 
@@ -285,10 +397,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0005 (relay role
-	// policies) made it five.
-	if v != 5 {
-		t.Fatalf("applied version = %d, want 5", v)
+	// Every embedded migration is applied on Open; 0010 (command_dedup)
+	// made it ten.
+	if v != 10 {
+		t.Fatalf("applied version = %d, want 10", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.
@@ -488,4 +600,114 @@ func TestAppendRejectsOversizedPayload(t *testing.T) {
 			t.Fatalf("at-cap append: %v", err)
 		}
 	})
+}
+
+// TestReadStreamStreamNotFound pins the ReadStream not-found contract: a
+// read from the beginning of a stream that was never written reports
+// es.ErrStreamNotFound (naming the stream) instead of a silent empty
+// slice — whatever the upper bound, since from the start of the stream an
+// empty result means no rows exist at all.
+func TestReadStreamStreamNotFound(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.Workspace("ws_nf")
+	sid := streamID(t)
+
+	for _, tc := range []struct {
+		name string
+		to   uint64
+	}{
+		{"whole stream", 0},
+		{"bounded prefix", 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ws.ReadStream(ctx, sid, 0, tc.to)
+			if !errors.Is(err, es.ErrStreamNotFound) {
+				t.Fatalf("ReadStream(0, %d) on a never-written stream: got %v, want ErrStreamNotFound", tc.to, err)
+			}
+			if !strings.Contains(err.Error(), sid.Canonical()) {
+				t.Fatalf("error %q does not name the stream %s", err, sid.Canonical())
+			}
+		})
+	}
+
+	// The caller-owned-transaction read keeps the plain empty result: the
+	// not-found contract is ReadStream's, not the Tx join's.
+	t.Run("ReadStreamTx is unaffected", func(t *testing.T) {
+		tx, err := s.Pool().Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		envs, err := s.WorkspaceStore("ws_nf").ReadStreamTx(ctx, narrowTx{tx}, sid, 0, 0)
+		if err != nil || len(envs) != 0 {
+			t.Fatalf("ReadStreamTx on a never-written stream: envs=%d err=%v, want (nil, nil)", len(envs), err)
+		}
+	})
+}
+
+// TestReadStreamEmptyRangeStillNil pins the other half of the contract: an
+// empty range is not "stream not found". Reads with fromVersion > 0, and
+// reads from 0 of a stream that exists, return (nil, nil).
+func TestReadStreamEmptyRangeStillNil(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.Workspace("ws_range")
+	sid := streamID(t)
+
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{TypeURL: "counter.v1.Initialized", SchemaVersion: 1, Payload: []byte("x")}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// An existing stream read from its head: an empty range, not a
+	// missing stream.
+	current, err := ws.CurrentStreamVersion(ctx, sid)
+	if err != nil {
+		t.Fatalf("current version: %v", err)
+	}
+	envs, err := ws.ReadStream(ctx, sid, current, 0)
+	if err != nil || len(envs) != 0 {
+		t.Fatalf("read from head v%d: envs=%d err=%v, want (nil, nil)", current, len(envs), err)
+	}
+
+	// Head truncation staged out-of-band (the F2 threat model), bypassing
+	// RLS the way the raw-payload helpers do: the stream still has rows
+	// above the bound, so a bounded read from 0 that matches nothing is an
+	// empty range, not a missing stream.
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 1,
+		Events:          []es.EventData{{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("y")}},
+	}); err != nil {
+		t.Fatalf("append v2: %v", err)
+	}
+	tx, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.bypass_rls', 'on', true)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM events WHERE workspace_id=$1 AND stream_id=$2 AND version <= 1`, "ws_range", sid.Canonical(),
+	); err != nil {
+		t.Fatalf("stage truncation: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	envs, err = ws.ReadStream(ctx, sid, 0, 1)
+	if err != nil || len(envs) != 0 {
+		t.Fatalf("bounded read of a head-truncated stream: envs=%d err=%v, want (nil, nil)", len(envs), err)
+	}
+	// The whole-stream read still sees the survivor: the stream exists.
+	envs, err = ws.ReadStream(ctx, sid, 0, 0)
+	if err != nil || len(envs) != 1 || envs[0].Version != 2 {
+		t.Fatalf("whole read after truncation: envs=%d err=%v, want the v2 survivor alone", len(envs), err)
+	}
 }

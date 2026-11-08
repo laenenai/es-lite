@@ -58,7 +58,8 @@ func TestOpenWithPoolAppliesCallerPoolConfig(t *testing.T) {
 		t.Fatalf("open with pool: %v", err)
 	}
 	t.Cleanup(s.Close)
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, checkpoints, unique_claims`); err != nil {
+	// The bare checkpoints table is gone (0008: dead on Postgres).
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, unique_claims`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
