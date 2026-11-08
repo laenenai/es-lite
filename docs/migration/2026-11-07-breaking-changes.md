@@ -315,8 +315,15 @@ backend: scheduled anchor/audit jobs now block for as long as an append
 is in flight instead of returning immediately, and anchors recorded
 under live appends no longer fail `CheckAnchor` with a false
 `ErrAnchorMismatch` once those appends commit (the bug this fixes).
-Operators of the anchor job's role: without the sequence grant the path
-fails with a permission error where it used to work.
+Operators of the anchor job's role: without `USAGE` on the sequence the
+path still fails loudly — `postgres.ErrAnchorSequenceMasked`, naming
+the missing grant — but by a different mechanism than this entry first
+recorded. The `pg_sequences` read masks `last_value` to NULL for a role
+without `USAGE` instead of erroring, so the old permission error is
+gone; over a non-empty log the masked bound of 0 is a self-contradiction
+(attested rows above the bound) that the anchor path now refuses,
+where the silent failure it guards against is a root over zero heads
+recorded as a real anchor.
 
 **What to do.** Nothing in code for correctness — an anchor recorded now
 verifies forever after. Grant the anchor role `SELECT ON SEQUENCE

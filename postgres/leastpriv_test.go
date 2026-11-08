@@ -118,8 +118,9 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 		// (RETURNING created_at and the job's ListAnchors verify pass
 		// need SELECT too), schema_migrations for ChainedSince, the
 		// sequence USAGE the anchor fence's pg_sequences read needs
-		// (without it the bound folds to 0 and Anchor records a root
-		// over zero heads), es_relay for the bypass.
+		// (without it the bound folds to 0 over a non-empty log and
+		// the tripwire refuses the anchor with ErrAnchorSequenceMasked),
+		// es_relay for the bypass.
 		{lpAnchor, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAnchor + `;
 			GRANT SELECT ON events, log_order, schema_migrations TO ` + lpAnchor + `;
@@ -306,6 +307,100 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	list, err := anchorJob.ListAnchors(ctx)
 	if err != nil || len(list) != 1 {
 		t.Fatalf("list anchors under the anchor grants = %d rows (err %v), want the 1 recorded anchor", len(list), err)
+	}
+}
+
+// lpAnchorMasked is a fifth probe: the anchor job's runbook grants minus
+// the one under test — no USAGE on the position sequence, so the
+// pg_sequences view masks last_value to NULL for its sessions.
+const lpAnchorMasked = "es_lp_anchor_masked"
+
+// TestAnchorRefusesMaskedSequence pins the masked-sequence tripwire
+// (backlog 2026-11-07_anchor-masked-sequence-tripwire, final review
+// I2). Under a role without USAGE on the sequence, the fence's
+// pg_sequences read folds the whole-log bound to 0 — and over a
+// non-empty log that made Anchor silently record an internally
+// incoherent anchor: a root over zero heads (heads(0) is empty) with a
+// FULL order root (orderRows(0) reads the whole log). The tripwire is
+// the contradiction check — a covered row starting above the resolved
+// bound cannot exist — so Anchor must fail loudly with the typed error
+// naming the sequence grant, and record nothing. The genuine empty-log
+// shape must stay silent: a fresh database has no rows above any bound,
+// and its anchor is the true genesis anchor (verified forever by the
+// empty-bound rule).
+func TestAnchorRefusesMaskedSequence(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	if _, err := s.Pool().Exec(ctx, `DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+lpAnchorMasked+`') THEN
+				CREATE ROLE `+lpAnchorMasked+` NOLOGIN NOSUPERUSER NOBYPASSRLS;
+			END IF;
+		END $$`); err != nil {
+		t.Fatalf("create %s: %v", lpAnchorMasked, err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.Pool().Exec(ctx, `DROP OWNED BY `+lpAnchorMasked); err != nil {
+			t.Errorf("drop owned by %s: %v", lpAnchorMasked, err)
+			return
+		}
+		if _, err := s.Pool().Exec(ctx, `DROP ROLE `+lpAnchorMasked); err != nil {
+			t.Errorf("drop role %s: %v", lpAnchorMasked, err)
+		}
+	})
+	if _, err := s.Pool().Exec(ctx, `
+		GRANT USAGE ON SCHEMA public TO `+lpAnchorMasked+`;
+		GRANT SELECT ON events, log_order, schema_migrations TO `+lpAnchorMasked+`;
+		GRANT SELECT, INSERT ON anchors TO `+lpAnchorMasked+`;
+		GRANT es_relay TO `+lpAnchorMasked); err != nil {
+		t.Fatalf("grant the anchor job's runbook grants minus the sequence USAGE: %v", err)
+	}
+
+	maskedJob := drainStoreAs(t, lpAnchorMasked)
+
+	// No false positive on a genuinely empty log: the probe's bound
+	// resolves to 0 there because the log IS empty (no events, no
+	// attested rows above any bound), and the anchor it records is the
+	// true genesis anchor — bound 0, the empty contract.
+	genesis, err := maskedJob.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("anchor over a genuinely empty log under the masked grant: %v — the tripwire must not fire on a true empty bound", err)
+	}
+	if genesis.UptoGlobalPosition != 0 || genesis.StreamCount != 0 || genesis.OrderCount != 0 {
+		t.Fatalf("genesis anchor under the masked grant = %+v, want the empty contract at bound 0", genesis)
+	}
+
+	// The log grows — appended by the superuser, so the masking is the
+	// probe's alone.
+	sid, err := es.NewStreamID("leastpriv", "masked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WorkspaceStore(lpWS).Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events:          []es.EventData{{TypeURL: lpType, SchemaVersion: 1, Payload: []byte("masked")}},
+	}); err != nil {
+		t.Fatalf("append behind the masked probe's back: %v", err)
+	}
+
+	// The masked shape: the probe's next Anchor resolves the bound to 0
+	// over the now-non-empty log. The tripwire must refuse it with the
+	// typed error — never record the incoherent root over zero heads.
+	_, err = maskedJob.Anchor(ctx, 0)
+	if !errors.Is(err, postgres.ErrAnchorSequenceMasked) {
+		t.Fatalf("anchor under the masked sequence grant: err=%v, want ErrAnchorSequenceMasked — never a silently incoherent anchor", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "events_global_position_seq") {
+		t.Fatalf("the tripwire error must name the sequence: %q", msg)
+	}
+
+	// Nothing was recorded behind the error's back: the anchors table
+	// still holds exactly the genesis anchor.
+	list, err := s.ListAnchors(ctx)
+	if err != nil || len(list) != 1 || list[0].ID != genesis.ID {
+		t.Fatalf("anchors after the refused call = %+v err=%v, want only the genesis anchor %s", list, err, genesis.ID)
 	}
 }
 

@@ -57,6 +57,18 @@ func (s *Store) bypassTx(ctx context.Context) (pgx.Tx, error) {
 // an in-flight transaction blocks it.
 const anchorFencePoll = 100 * time.Millisecond
 
+// ErrAnchorSequenceMasked reports the anchor path's masked-sequence
+// tripwire: the resolved bound was 0 while attested log_order rows exist
+// above it — a self-contradiction, since a covered row's from_position
+// is at most the bound it was selected by. The pg_sequences view masks
+// last_value to NULL for a role without USAGE on the position sequence,
+// which folds the whole-log bound to 0 over a non-empty log — and
+// heads(0) being empty, the path would otherwise silently record a root
+// over zero heads with a full order root (backlog
+// 2026-11-07_anchor-masked-sequence-tripwire). The message names the
+// grant the runbook carries (docs/deploy/README.md, "Anchor job").
+var ErrAnchorSequenceMasked = errors.New("anchor bound resolved to 0 over a non-empty log: this role cannot read events_global_position_seq (pg_sequences masks last_value without USAGE on the sequence) — grant it per docs/deploy/README.md")
+
 // settledBound returns a global_position bound that is permanently
 // settled: every event row at or below it that will ever exist has
 // committed (or its append aborted, leaving a permanent hole), so heads
@@ -140,6 +152,12 @@ func (s *Store) settledBound(ctx context.Context, upto uint64) (uint64, error) {
 // that append settled (its row included) or below it (its position
 // excluded), and CheckAnchor agrees forever after. The order rows join
 // the same settled section, so the order root is exactly as permanent.
+//
+// A resolved bound of 0 with attested rows above it is refused with
+// ErrAnchorSequenceMasked: that shape is the masked-sequence read (a
+// role without USAGE on the position sequence), never a real log — and
+// the only alternative to refusing it would be recording an anchor over
+// zero heads as a real anchor.
 func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 	// The role gate precedes the fence (bypassTx re-verifies for free,
 	// once per Store): a non-member session must fail fast with the typed
@@ -169,6 +187,19 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 	rows, err := orderRows(ctx, tx, upto)
 	if err != nil {
 		return es.Anchor{}, err
+	}
+	// The masked-sequence tripwire (backlog
+	// 2026-11-07_anchor-masked-sequence-tripwire): a covered row
+	// starting above the resolved bound is a self-contradiction — the
+	// read selected these rows as sitting at or below upto — and the
+	// only way one exists is the masked-NULL read: a role without USAGE
+	// on the sequence resolves the whole-log bound to 0 over a
+	// non-empty log, and heads(0) being empty, the path would silently
+	// record a root over zero heads with a full order root. Refuse that
+	// shape loudly, with the typed error naming the grant; a genuinely
+	// fresh log has no rows, so the check cannot false-positive on one.
+	if len(rows) > 0 && rows[0].From > upto {
+		return es.Anchor{}, fmt.Errorf("postgres: anchor: %w", ErrAnchorSequenceMasked)
 	}
 	orderRoot := es.OrderRoot(rows)
 	a := es.Anchor{

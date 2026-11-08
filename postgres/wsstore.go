@@ -694,6 +694,17 @@ func (w *Workspace) fenceBound(ctx context.Context, from uint64) (uint64, error)
 	if cache != 1 {
 		return 0, errSequenceCache
 	}
+	// This guard is reachable only in the masked-NULL case (M5): a
+	// healthy read cannot get here, because every committed position was
+	// drawn, so last >= the committed max RawHead just reported above
+	// from. A role without USAGE on the sequence reads last as NULL —
+	// COALESCE folds it to 0 — and the guard keeps that masked 0 from
+	// being fenced and delivered as a real bound: a fence at last=0
+	// would burn a fence xid every poll and certify a section that
+	// delivers nothing, stalling the feed silently behind the missing
+	// grant (the same masked-NULL shape the anchor path's
+	// ErrAnchorSequenceMasked tripwire refuses outright). Idle is the
+	// honest verdict a masked round can return.
 	if last <= from {
 		return 0, nil
 	}

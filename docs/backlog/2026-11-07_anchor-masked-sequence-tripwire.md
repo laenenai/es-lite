@@ -2,7 +2,7 @@
 
 - **Filed:** 2026-11-07 (recorded during Task 36; found by the Task 19 review)
 - **Area:** postgres storage / anchors
-- **Status:** Open (parked for the final whole-branch review by the controller)
+- **Status:** Closed — implemented by the final review fix wave (2026-11-08)
 
 ## Problem
 
@@ -35,3 +35,18 @@ bound of 0 differently.
   end.
 - The runbook's anchor-job grant note explains the failure the tripwire
   turns on.
+
+## Resolution
+
+Implemented as the contradiction check the review proposed: after the
+order rows are read, `len(rows) > 0 && rows[0].From > upto` is a
+self-contradiction (a covered row cannot start above the bound that
+selected it) and fails `Anchor` with `postgres.ErrAnchorSequenceMasked`,
+whose message names the missing `USAGE` grant — no false positive on a
+genuinely fresh log, which has no rows above any bound. The masked shape
+is pinned end to end by `TestAnchorRefusesMaskedSequence`
+(postgres/leastpriv_test.go): a probe role holding the anchor job's
+runbook grants minus the sequence `USAGE` records the true genesis
+anchor over an empty log, then is refused once the log grows, with
+nothing recorded behind the error's back. The runbook's anchor-job note
+(docs/deploy/README.md) names the error the tripwire turns on.

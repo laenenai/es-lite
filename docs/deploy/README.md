@@ -214,14 +214,17 @@ GRANT SELECT ON unique_claims, log_order TO <relay>;
 `CheckAnchor`, `ListAnchors`): it reads heads and the per-batch `log_order`
 rows across workspaces under the role-gated bypass, records anchors, and
 reads `schema_migrations` for the chain's `ChainedSince`. The `SELECT` on
-`anchors` is the job's own read path — `es-verify anchor` re-checks every
-stored anchor — and `Anchor`'s `RETURNING created_at` (the database-clock
-stamp it reports) needs it too. The `USAGE` on the sequence is not
-optional: the anchor path fences on the same horizon the feed does
-(`settledBound`), whose first statement reads the position sequence
-through `pg_sequences` — and the view masks `last_value` for roles
-without `USAGE`, which would fold the bound to 0 and make `Anchor`
-silently record a root over zero heads as a real anchor:
+`anchors` serves the job's read-back of recorded rows — `es-verify
+anchor list` (`ListAnchors`) — and `Anchor`'s `RETURNING created_at`
+(the database-clock stamp it reports); `es-verify anchor --check`
+verifies one exported anchor JSON, never a stored row. The `USAGE` on
+the sequence is not optional: the anchor path
+fences on the same horizon the feed does (`settledBound`), whose first
+statement reads the position sequence through `pg_sequences` — and the
+view masks `last_value` for roles without `USAGE`, which would fold the
+bound to 0 over a non-empty log. `Anchor` refuses that shape loudly with
+`postgres.ErrAnchorSequenceMasked` (the message names this grant)
+instead of recording a root over zero heads as a real anchor:
 
 ```sql
 GRANT SELECT ON events, log_order, schema_migrations TO <anchor job>;
