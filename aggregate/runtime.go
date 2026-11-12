@@ -251,9 +251,14 @@ func (r *Runtime[S, C, E]) Handle(ctx context.Context, sid es.StreamID, cmd C, m
 // HandleAt is Handle with a caller-asserted stream version (ADR 0031): when
 // expected is non-zero and the stream's current version differs, it returns
 // an *es.ConflictError carrying both versions without deciding or
-// appending. Unlike a write race, that conflict is never retried by
-// WithConflictRetry — the caller's assertion is stale, and only the caller
-// can refresh it. expected == 0 means "no assertion" (plain Handle).
+// appending. expected == 0 means "no assertion" (plain Handle).
+//
+// A stale assertion is never retried by WithConflictRetry — only the
+// caller can refresh it, so another attempt would re-assert the same stale
+// version and lose again. A write race is retried. The two are told apart
+// by expected, not by the error: the store backends return
+// *es.ConflictError for their own append-time conflicts too, so every
+// conflict now carries its versions whether or not it is retryable.
 func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, opts ...HandleOption) (Result[S, E], error) {
 	var zero Result[S, E]
 
@@ -300,8 +305,20 @@ func (r *Runtime[S, C, E]) HandleAt(ctx context.Context, sid es.StreamID, cmd C,
 
 	for attempt := 0; ; attempt++ {
 		res, err := r.handleOnce(ctx, sid, cmd, meta, expected, now, ho)
-		var stale *es.ConflictError
-		if err == nil || !errors.Is(err, es.ErrConflict) || errors.As(err, &stale) || attempt >= r.retries {
+		// A caller-asserted version is never retried: another attempt
+		// would re-assert the SAME stale expected version against a
+		// stream that has already moved, so it could only lose again —
+		// only the caller can refresh the assertion. expected != 0 tests
+		// that condition directly.
+		//
+		// It used to be tested as errors.As(err, **es.ConflictError),
+		// which held only while HandleAt was the single producer of that
+		// type. The store backends now return it for the append-time
+		// write race as well — and that race is precisely the conflict
+		// retrying exists for, since handleOnce reloads the stream and
+		// re-decides on each attempt. Discriminating by type would have
+		// silently turned WithConflictRetry into a no-op.
+		if err == nil || !errors.Is(err, es.ErrConflict) || expected != 0 || attempt >= r.retries {
 			if err != nil && attempt > 0 {
 				return zero, fmt.Errorf("aggregate: conflict retry exhausted after %d attempts: %w", attempt+1, err)
 			}

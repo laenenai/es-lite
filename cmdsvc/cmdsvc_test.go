@@ -124,6 +124,62 @@ func TestMapErrorTable(t *testing.T) {
 		}
 	})
 
+	// The precedence rule: the conflict's own current version is a floor
+	// reload may advance but never retract. Reload is exported, so an
+	// application can wire it to a replica or any other lagging read.
+	t.Run("a reload behind the conflict's version is discarded whole", func(t *testing.T) {
+		// A replica 5 versions behind. Answering "the stream is at v4" to a
+		// client whose v3 assertion just lost at v9 is not an instruction
+		// it can act on, and its state is as stale as its version.
+		reload := func(context.Context) (uint64, proto.Message, error) {
+			return 4, &counterv1.Counter{Count: 4}, nil
+		}
+		sid, _ := es.NewStreamID("counter", "main")
+		ce := MapError(ctx, &es.ConflictError{StreamID: sid, Expected: 3, Current: 9}, nil, reload, 0)
+		vc, ok := VersionConflictDetail(ce)
+		if !ok || vc.GetExpectedVersion() != 3 || vc.GetCurrentVersion() != 9 {
+			t.Fatalf("detail = %+v, want expected 3 current 9 — the exact version the append proved", vc)
+		}
+		if vc.GetCurrentState() != nil {
+			t.Fatal("stale state attached as current_state; a lagging reload must be discarded whole, not split")
+		}
+	})
+
+	t.Run("a reload level with the conflict's version wins and brings state", func(t *testing.T) {
+		reload := func(context.Context) (uint64, proto.Message, error) {
+			return 9, &counterv1.Counter{Count: 9}, nil
+		}
+		sid, _ := es.NewStreamID("counter", "main")
+		ce := MapError(ctx, &es.ConflictError{StreamID: sid, Expected: 3, Current: 9}, nil, reload, 0)
+		vc, ok := VersionConflictDetail(ce)
+		if !ok || vc.GetCurrentVersion() != 9 {
+			t.Fatalf("detail = %+v, want current 9", vc)
+		}
+		var state counterv1.Counter
+		if err := vc.GetCurrentState().UnmarshalTo(&state); err != nil || state.GetCount() != 9 {
+			t.Fatalf("current_state = %+v err = %v, want count 9 — a reload at the floor is coherent and must be kept",
+				vc.GetCurrentState(), err)
+		}
+	})
+
+	t.Run("a reload ahead of the conflict's version wins both fields", func(t *testing.T) {
+		// The stream moved on between the rejected append and the reload.
+		// That pair is fresher AND coherent, so it is the better answer.
+		reload := func(context.Context) (uint64, proto.Message, error) {
+			return 12, &counterv1.Counter{Count: 12}, nil
+		}
+		sid, _ := es.NewStreamID("counter", "main")
+		ce := MapError(ctx, &es.ConflictError{StreamID: sid, Expected: 3, Current: 9}, nil, reload, 0)
+		vc, ok := VersionConflictDetail(ce)
+		if !ok || vc.GetCurrentVersion() != 12 {
+			t.Fatalf("detail = %+v, want current 12", vc)
+		}
+		var state counterv1.Counter
+		if err := vc.GetCurrentState().UnmarshalTo(&state); err != nil || state.GetCount() != 12 {
+			t.Fatalf("current_state = %+v err = %v, want count 12", vc.GetCurrentState(), err)
+		}
+	})
+
 	t.Run("the app's mapper maps what it claims", func(t *testing.T) {
 		mapper := func(error) *connect.Error {
 			return connect.NewError(connect.CodeOutOfRange, errors.New("out of range"))

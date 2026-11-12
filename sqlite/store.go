@@ -292,8 +292,11 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		return zero, err
 	}
 	if current != p.ExpectedVersion {
-		return zero, fmt.Errorf("%w: stream %s at v%d, expected v%d",
-			es.ErrConflict, p.StreamID, current, p.ExpectedVersion)
+		// Structured, not formatted — same contract as the Postgres
+		// backend: both versions reach the caller as fields, Error()
+		// renders the text this path used to format, and errors.Is(err,
+		// es.ErrConflict) still matches through ConflictError.Unwrap.
+		return zero, &es.ConflictError{StreamID: p.StreamID, Expected: p.ExpectedVersion, Current: current}
 	}
 
 	// Commit clock, sampled AFTER the version check inside the transaction:
@@ -354,7 +357,14 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 				if isDuplicateEventIDViolation(err) {
 					return zero, fmt.Errorf("%w: %s at v%d: %v", es.ErrDuplicateEventID, p.StreamID, version, err)
 				}
-				return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
+				// UNIQUE(stream_id, version) names the version already
+				// taken, so Current is the version that cost us the race
+				// and a lower bound on the head — the Postgres backstop's
+				// contract, held to for parity. An unrecognized violation
+				// reaches here too (the arm is the fallback), and for it
+				// Current is only the version this insert attempted; that
+				// was already true of the message this replaces.
+				return zero, &es.ConflictError{StreamID: p.StreamID, Expected: p.ExpectedVersion, Current: version}
 			}
 			return zero, fmt.Errorf("insert event v%d: %w", version, err)
 		}

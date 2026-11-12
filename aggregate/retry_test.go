@@ -92,6 +92,27 @@ func TestConflictRetryExhausted(t *testing.T) {
 	if got := rs.attempts.Load(); got != 3 {
 		t.Fatalf("append attempts = %d, want 3 (1 + 2 retries)", got)
 	}
+	// Two halves of one contract, pinned together on purpose.
+	//
+	// The store's write-race conflict is structured — it survives the
+	// retry wrapper, so cmdsvc.MapError can still build a VersionConflict
+	// detail from the exhausted error without re-reading the head.
+	//
+	// And it was RETRIED all the same, which is why the retry loop must
+	// not discriminate on this type: every attempt here loses a real
+	// version race and returns an *es.ConflictError, so a loop that
+	// stopped at the type would report 1 attempt, not 3, and
+	// WithConflictRetry would be a no-op. The attempt count above is that
+	// guard.
+	var ce *es.ConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("exhausted retry error = %v, want it to carry an *es.ConflictError", err)
+	}
+	// The rival increments once before each of the 3 attempts, from v1:
+	// the last attempt loaded v3 and asserted it, the rival had moved to v4.
+	if ce.Expected != 3 || ce.Current != 4 {
+		t.Fatalf("exhausted conflict = {expected %d, current %d}, want {3, 4}", ce.Expected, ce.Current)
+	}
 }
 
 func TestConflictRetryDefaultOff(t *testing.T) {

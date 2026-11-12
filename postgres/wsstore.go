@@ -229,8 +229,15 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		return zero, err
 	}
 	if current != p.ExpectedVersion {
-		return zero, fmt.Errorf("%w: stream %s at v%d, expected v%d",
-			es.ErrConflict, p.StreamID, current, p.ExpectedVersion)
+		// Structured, not formatted: the versions this check already holds
+		// reach the caller as fields instead of only as message text. A
+		// consumer that has to tell a client "the stream moved to v7,
+		// rebase" would otherwise parse the string or re-read the head —
+		// an extra round trip that can also observe a version LATER than
+		// the one that actually cost this append. Error() renders exactly
+		// the text this path used to format, and errors.Is(err,
+		// es.ErrConflict) still matches through ConflictError.Unwrap.
+		return zero, &es.ConflictError{StreamID: p.StreamID, Expected: p.ExpectedVersion, Current: current}
 	}
 
 	// Commit clock, sampled AFTER the version check inside the transaction
@@ -306,7 +313,17 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 				case strings.HasSuffix(pgErr.ConstraintName, "event_id_key"):
 					return zero, fmt.Errorf("%w: %s at v%d: %v", es.ErrDuplicateEventID, p.StreamID, version, err)
 				case strings.HasSuffix(pgErr.ConstraintName, "_pkey"):
-					return zero, fmt.Errorf("%w: stream %s v%d", es.ErrConflict, p.StreamID, version)
+					// The pkey is (workspace_id, stream_id, version), so
+					// the collision says exactly which version is already
+					// taken: Current is the version that cost us the race
+					// — and a LOWER BOUND on the head, since the winner
+					// may have committed a longer batch. The exact head is
+					// deliberately not fetched: this INSERT has already
+					// aborted the transaction, so every further statement
+					// on it fails, and reading the head would mean a
+					// second connection — the extra round trip the
+					// structured error exists to spare the caller.
+					return zero, &es.ConflictError{StreamID: p.StreamID, Expected: p.ExpectedVersion, Current: version}
 				}
 			}
 			return zero, fmt.Errorf("insert v%d: %w", version, err)

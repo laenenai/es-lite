@@ -176,7 +176,7 @@ func passOr(code connect.Code, err error) *connect.Error {
 
 // MapError maps a Runtime.Handle error to a Connect error (ADR 0031 §2):
 //
-//	es.ErrConflict            failed_precondition + VersionConflict detail (via reload)
+//	es.ErrConflict            failed_precondition + VersionConflict detail
 //	es.ErrTerminal            failed_precondition
 //	es.ErrConstraintViolated  already_exists
 //	es.ErrDuplicateEventID    aborted (IdempotencyConcurrent, HTTP 409 semantics)
@@ -189,6 +189,13 @@ func passOr(code connect.Code, err error) *connect.Error {
 //
 // expected is the version the command asserted (0 if none); a
 // *es.ConflictError in err overrides it.
+//
+// The VersionConflict detail is assembled from two sources, in this
+// precedence. An *es.ConflictError in err supplies both versions, read in
+// the very transaction that rejected the append: current_version from it
+// is exact, and the stream is PROVABLY at or past it. reload then refines
+// the detail — it is the only source of current_state — but it may not
+// contradict that floor. See the conflict arm below for why.
 func MapError(ctx context.Context, err error, mapper ErrorMapper, reload Reload, expected uint64) *connect.Error {
 	var ce *connect.Error
 	if errors.As(err, &ce) {
@@ -202,8 +209,26 @@ func MapError(ctx context.Context, err error, mapper ErrorMapper, reload Reload,
 		if errors.As(err, &conflict) {
 			detail.ExpectedVersion, detail.CurrentVersion = conflict.Expected, conflict.Current
 		}
+		// reload refines the detail; it does not get to contradict it.
+		//
+		// It is a separate, later, non-transactional read, and Reload is
+		// exported — an application may wire it to a read replica or any
+		// other lagging source. So it can come back BEHIND the version the
+		// append's own transaction proved was already taken. Letting it win
+		// there would answer a client that just lost at v9 with "the stream
+		// is at v4": not a usable instruction, and a retry that can only
+		// lose again.
+		//
+		// At or past the floor it wins both fields, because version and
+		// state are then one reading and stay the coherent pair
+		// current_state promises. Behind the floor it is discarded whole:
+		// its state is as stale as its version, and labelling stale state
+		// "now" is worse than sending no state at all.
+		//
+		// Without a structured error the floor is 0 and reload wins
+		// outright, as it always has.
 		if reload != nil {
-			if version, state, rerr := reload(ctx); rerr == nil {
+			if version, state, rerr := reload(ctx); rerr == nil && version >= detail.CurrentVersion {
 				detail.CurrentVersion = version
 				if state != nil {
 					if a, aerr := anypb.New(state); aerr == nil {

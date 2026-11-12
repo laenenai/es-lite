@@ -133,7 +133,18 @@ For the conflict detail the generated code reloads via `d.Runtime.Load`
 (current version and state) after `ErrConflict`, filters the state, and
 attaches the detail with `connect.NewErrorDetail`. `expected_version` is the
 version the command carried when the request message has a field tagged
-`(es.v1.expected_version)`, otherwise the version `Handle` loaded. The
+`(es.v1.expected_version)`, otherwise the version `Handle` loaded.
+
+The detail has two sources and `MapError` resolves them by precedence. An
+`*es.ConflictError` supplies both versions, read in the transaction that
+rejected the append, so its `current_version` is exact and the stream is
+provably at or past it. The reload then refines the detail — it is the only
+source of `current_state` — but may not contradict that floor: a reload at
+or past it wins both fields, because version and state are then one
+coherent reading, while a reload behind it is discarded whole rather than
+split into a fresh-looking version and stale state. `Reload` is exported,
+so an application may wire it to a replica or another lagging read; without
+a structured error the floor is 0 and the reload wins outright. The
 `VersionConflict` message type itself is es-lite's (`es/v1/cmdsvc.proto`,
 `es.v1.VersionConflict{uint64 expected_version; uint64 current_version;
 google.protobuf.Any current_state}`) so the mapper is generic; `contracts`'
@@ -213,8 +224,15 @@ clobbered under a naming rule.
   `(es.v1.expected_version)` field (or 0), so the client's optimistic
   concurrency is actually enforced — §2 step 6 alone (`Handle`) would have
   silently used the loaded version. `VersionConflict.expected_version` is
-  the command's value, or `ConflictError.Expected`, else 0: the runtime does
-  not expose "the version Handle loaded" on a write-race conflict.
+  the command's value, or `ConflictError.Expected`, else 0.
+
+  Amended: the store backends now return `*es.ConflictError` from their own
+  append-time conflicts too — the pre-insert version check and the
+  unique-violation backstop — so a write-race conflict does expose both
+  versions, and `MapError` fills `current_version` from it without a
+  reload. The retry rule is unchanged but no longer keyed on the error
+  type, which would have made `WithConflictRetry` a no-op once the stores
+  shared it: `HandleAt` keys on `expected != 0`, the condition it means.
 - **Identity.** The generated `<Svc>Identity` interface is
   `Principal(ctx) (*P, es.Actor, error)` when any RPC command carries
   `(es.v1.acting_principal)` (one principal type per service, enforced), else
