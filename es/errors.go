@@ -116,14 +116,27 @@ func (e *DecidedAtSkewError) Error() string {
 // Unwrap makes errors.Is(err, ErrDecidedAtSkew) true.
 func (e *DecidedAtSkewError) Unwrap() error { return ErrDecidedAtSkew }
 
-// ConflictError is the structured form of ErrConflict a caller-supplied
-// expected version produces (aggregate.Runtime.HandleAt, ADR 0031): it
-// carries the versions a VersionConflict detail reports. errors.Is(err,
-// ErrConflict) still matches.
+// ConflictError is the structured form of ErrConflict: it carries the
+// versions a VersionConflict detail reports, so a caller can tell a client
+// which version to rebase onto without parsing the message or re-reading
+// the head. errors.Is(err, ErrConflict) still matches, via Unwrap.
+//
+// Every optimistic-concurrency failure returns it — a caller-supplied
+// expected version that is already stale (aggregate.Runtime.HandleAt, ADR
+// 0031) and both append-time paths of each store backend: the pre-insert
+// version check and the unique-violation backstop that catches a writer
+// who committed between that check and the insert.
+//
+// Current is exact wherever the store read the head to find it. On a
+// backstop it is instead the version the unique violation reports as
+// already taken: the version that cost the append its race, and a lower
+// bound on the head — the winner may have committed a longer batch. A
+// caller that needs the exact head there must read it, which is the round
+// trip this type otherwise spares; retrying the command re-reads it anyway.
 type ConflictError struct {
 	StreamID StreamID
 	Expected uint64 // what the caller asserted
-	Current  uint64 // what the stream was at when checked
+	Current  uint64 // what the stream was at when checked (see above)
 }
 
 func (e *ConflictError) Error() string {

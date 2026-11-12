@@ -223,3 +223,55 @@ func TestScanRejectsCorruptEventID(t *testing.T) {
 		})
 	}
 }
+
+// TestAppendConflictCarriesVersions pins the SQLite backend to the same
+// structured-conflict contract as Postgres: the pre-insert version check
+// returns *es.ConflictError, so a caller reads both versions as fields,
+// while errors.Is(err, es.ErrConflict) — what every existing consumer
+// matches on — still holds.
+//
+// Only the pre-insert path is exercised here. The UNIQUE(stream_id,
+// version) backstop is the same structured error (see sqlite/store.go), but
+// SQLite serializes writers on the single connection, so there is no
+// interleave a test can force between the head read and the insert; the
+// Postgres suite covers that path against a backend that can race.
+func TestAppendConflictCarriesVersions(t *testing.T) {
+	ctx := context.Background()
+	s := openAppendStore(t)
+	sid, err := es.NewStreamID("thing", "conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Three events, so the head is at v3 and Current can only have come
+	// from the head read.
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID: sid, ExpectedVersion: 0,
+		Events: []es.EventData{
+			{TypeURL: "thing.v1.A", SchemaVersion: 1, Payload: []byte("a")},
+			{TypeURL: "thing.v1.B", SchemaVersion: 1, Payload: []byte("b")},
+			{TypeURL: "thing.v1.C", SchemaVersion: 1, Payload: []byte("c")},
+		},
+	}); err != nil {
+		t.Fatalf("seed append: %v", err)
+	}
+
+	_, err = s.Append(ctx, es.AppendParams{
+		StreamID: sid, ExpectedVersion: 1,
+		Events: []es.EventData{{TypeURL: "thing.v1.D", SchemaVersion: 1, Payload: []byte("d")}},
+	})
+	if err == nil {
+		t.Fatal("stale append succeeded, want a conflict")
+	}
+	if !errors.Is(err, es.ErrConflict) {
+		t.Fatalf("errors.Is(err, ErrConflict) = false for %v — this is the compatibility contract", err)
+	}
+	var conflict *es.ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("errors.As(err, **es.ConflictError) = false for %v — the versions are still only in the message", err)
+	}
+	if conflict.StreamID != sid || conflict.Expected != 1 || conflict.Current != 3 {
+		t.Fatalf("conflict = {%s expected %d, current %d}, want {%s 1 3}",
+			conflict.StreamID, conflict.Expected, conflict.Current, sid)
+	}
+}
