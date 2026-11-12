@@ -2,7 +2,7 @@
 # Run `mise install` (or `mise i`) on a fresh checkout to install everything.
 
 [tools]
-go      = "1.27.3"
+go      = "1.27.4"
 buf     = "1.65.0"
 task    = "3.48.0"
 golangci-lint = "2.15.0"

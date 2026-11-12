@@ -456,7 +456,7 @@ and reaction on SQLite), `upcast` — and [`cmdsvc/example`](./cmdsvc/example)
 
 ## Development
 
-Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.27.3, buf, task,
+Toolchain pinned in [`.mise.toml`](./.mise.toml) (Go 1.27.4, buf, task,
 golangci-lint, govulncheck); run `mise install`. The module has no private
 dependencies. `cmdsvc/` is a nested Go module (connect-go + protovalidate
 stay out of the core graph); every `task` target covers both.
