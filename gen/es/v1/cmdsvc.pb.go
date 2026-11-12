@@ -31,9 +31,13 @@ type VersionConflict struct {
 	// The version the command carried ((es.v1.expected_version)), or the
 	// version the handler had loaded when the append failed; 0 if unknown.
 	ExpectedVersion uint64 `protobuf:"varint,1,opt,name=expected_version,json=expectedVersion,proto3" json:"expected_version,omitempty"`
-	// The stream's version now.
+	// The stream's version now: at least the version the rejected append
+	// found already taken, and never behind it. 0 only when the server could
+	// establish no version at all.
 	CurrentVersion uint64 `protobuf:"varint,2,opt,name=current_version,json=currentVersion,proto3" json:"current_version,omitempty"`
 	// The stream's state now, filtered as the service's Filter dictates.
+	// When set it is one reading together with current_version, never a mix
+	// of two: a server that cannot pair them coherently sends no state.
 	CurrentState  *anypb.Any `protobuf:"bytes,3,opt,name=current_state,json=currentState,proto3" json:"current_state,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
