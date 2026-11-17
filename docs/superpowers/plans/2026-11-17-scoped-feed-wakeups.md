@@ -54,7 +54,7 @@ The failure modes the ADR implies but no existing test exercises, most likely fi
   - `TestUnscopedDecoratorDoesNotForwardScope` (Review Focus 1): `type waitOnlyWaiter struct{ inner *scopedWakingWaiter }` implements only `Wait`, delegating to `inner.Wait`. Pass it as `Config.Waiter`. Assert `len(inner.scopesSnapshot()) == 0` and `inner.waitCalls() > 0` after the first idle wait.
   - `TestScopedWaiterErrorStopsStream`: a `WaitScope` returning `errors.New("wake source failed")` makes `Subscribe` return an error matching that cause.
 - [ ] **Step 2: Write the failing internal test** in `feed/server_internal_test.go`:
-  - `scopedInstantWaiter` returns `(false, nil)` immediately and records the scope.
+  - `scopedInstantWaiter` implements both `Wait` and `WaitScope`; it returns `(false, nil)` immediately and records the scope.
   - `TestScopedWaiterTimeoutKeepsFloor`: pin jitter to identity (`srv.jitter = func(d time.Duration) time.Duration { return d }`), `Poll: 100ms`, empty `idlePageLog`; assert consecutive page reads span at least `Poll` and the waiter saw scope `"tenant"`.
 - [ ] **Step 3: Run** `GOWORK=off go test ./feed/...` — expected: FAIL (`ScopedWaiter` undefined; `waitFor` missing; signature mismatch).
 - [ ] **Step 4: Implement.**
@@ -99,7 +99,7 @@ The failure modes the ADR implies but no existing test exercises, most likely fi
   - `TestHubWakeDuringParkLeavesNoEntry` (Review Focus 2): start a waiter on `"a"`; poll until `h.scopes["a"] != nil`; call `Wake("a")`; wait for the waiter to return; assert `len(h.scopes) == 0`. This is the interleaving the "replace and leave" lifecycle leaks.
   - `TestHubTenThousandScopesLeaveNoEntries`: for 10 000 distinct scopes, call `WaitScope` with an already-cancelled context, and every tenth scope with `Wake` racing it; assert `len(h.scopes) == 0` at the end and `runtime.NumGoroutine()` has not grown by more than 2 over a baseline.
   - `TestHubZeroValuePanics`: `assertPanics` for `(*Hub)(nil).Wake("a")`, `(*Hub)(nil).Wait`, and `var h Hub; h.WakeAll()`.
-  - `TestHubStats`: `Wake` twice and `WakeAll` once; `Stats()` returns `Wakes: 3, WakeAlls: 1` (Wake counts calls, not scopes).
+  - `TestHubStats`: `Wake` three times and `WakeAll` once; `Stats()` returns `Wakes: 3, WakeAlls: 1` (Wake counts calls, not scopes).
   - `TestHubConcurrentWakeAndWait`: 32 goroutines × 200 iterations of `WaitScope` with a 1 ms timeout and a concurrent `Wake`/`WakeAll`; run under `-race`.
 - [ ] **Step 2: Run** `GOWORK=off go test ./feed/ -run TestHub -count=1` — expected: FAIL (`Hub` undefined).
 - [ ] **Step 3: Implement** `feed/hub.go` with exactly these invariants:
@@ -220,7 +220,7 @@ The failure modes the ADR implies but no existing test exercises, most likely fi
   - Open one store per subtest with `postgres.Open(ctx, dsn)`; `wsID := "lat-" + subtest`; `ws := store.WorkspaceStore(wsID)`; `hub := feed.NewHub()`.
   - `countingLogs{inner: postgres.NewLogs(store)}` wraps the logs: `Open` records every `feed.Log` it returns; `fenceDraws()` sums `FenceDraws()` across the recorded logs via `interface{ FenceDraws() uint64 }`. Use it as `feed.Config.Logs`, plus `postgres.NewCheckpointStore(store)`, `postgres.NewLeaseStore(store)`, `Waiter` per subtest, `Poll: 250ms`.
   - Matching request: `Scope: wsID`, `Projection: "latency.view"`, `Instance: "i"`, `Owner: "latency-owner"`, `Definition: projection.Definition{Name: "latency.view", Consumes: []string{"latency.v1.Event"}}`.
-  - Second, non-matching subscription: `Projection: "latency.other"`, `Instance: "i"`, `Consumes: []string{"latency.v1.Other"}`, a `nullSink`; it never delivers. It exists so the wake's read amplification is measurable: every append wakes it too, and it draws a fence for an empty page.
+  - Second, non-matching subscription: `Projection: "latency.other"`, `Instance: "i"`, `Consumes: []string{"latency.v1.Other"}`, a test-local null sink; it never delivers. It exists so the wake's read amplification is measurable: every append wakes it too, and it draws a fence for an empty page.
   - `envelopeSink{ch chan delivered}` where `delivered{at time.Time; position uint64}`; `Send` records `time.Now()` and the position, then sends.
   - Subscribe both in goroutines; a test loop receives from the matching sink, acks via `srv.Checkpoint(ctx, feed.Ack{Scope: wsID, Projection: "latency.view", Instance: "i", Owner: "latency-owner", Position: d.position, Definition: def.Hash()})`, and records `d.at.Sub(appendAt)`.
   - Warm up with one append/delivery before measuring.
@@ -287,7 +287,7 @@ The failure modes the ADR implies but no existing test exercises, most likely fi
   - `openConfig` gains `notifyChannel string`; `WithAppendNotify(channel string) Option` sets it. Add `func (c openConfig) validate() error` returning the `validNotifyChannel` error.
   - Fail fast: in `Open`, move `cfg := newOpenConfig(opts)` above `pgxpool.New` and call `cfg.validate()` before opening the pool. In `OpenWithPool`, call it after the nil-pool check and before `probePostgresFloor`. Both constructors set `Store.notifyChannel = cfg.notifyChannel`.
   - `Store` gains `notifyChannel string`.
-  - `validNotifyChannel`: non-empty; `len(s) <= 63` (NAMEDATALEN−1); first byte a letter or `_`; remaining bytes letters, digits or `_`. Error text names the channel but never logs it elsewhere.
+  - `validNotifyChannel`: non-empty; `len(s) <= 63` (NAMEDATALEN−1); first byte a letter or `_`; remaining bytes letters, digits or `_`. Error text names the channel but never logs it elsewhere. Define it in `postgres/store.go` next to the option, so both constructors and `NotifyListener` (Task 7) use one validator.
   - `notifyAppend`:
     ```go
     func (w *Workspace) notifyAppend(ctx context.Context, db DBTX, p es.AppendParams) error {
