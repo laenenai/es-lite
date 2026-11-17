@@ -42,6 +42,7 @@ func Replay(ctx context.Context, src Source, from uint64, batch int, apply Apply
 	if batch <= 0 {
 		batch = 500
 	}
+	ctx = withReplay(ctx)
 	pos := from
 	for {
 		evs, err := src.ReadAll(ctx, pos, batch)
@@ -69,4 +70,25 @@ func Replay(ctx context.Context, src Source, from uint64, batch int, apply Apply
 type Marker interface {
 	Load(ctx context.Context, projection string) (uint64, error)
 	Save(ctx context.Context, projection string, position uint64) error
+}
+
+// replayKey is the context key Replay marks its ctx with. A struct type, so
+// no other package can collide with it or set the value itself.
+type replayKey struct{}
+
+// withReplay marks ctx as replay-driven. Replay applies it once, before the
+// loop, so every batch — and every downstream Dispatch — sees the same mark.
+func withReplay(ctx context.Context) context.Context {
+	return context.WithValue(ctx, replayKey{}, true)
+}
+
+// IsReplaying reports whether ctx belongs to a Replay-driven rebuild (ADR
+// 0040 §3.6): true inside Replay's apply callback — and inside
+// Runner.Rebuild, which calls Replay — false everywhere else, including a
+// direct Runner.Apply, which is live delivery. A consumer's dispatch wrapper
+// reads it to suppress span links while rebuilding: a rebuild is not a live
+// business signal, so its spans must not be linked to a producer's.
+func IsReplaying(ctx context.Context) bool {
+	replaying, _ := ctx.Value(replayKey{}).(bool)
+	return replaying
 }
