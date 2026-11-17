@@ -670,7 +670,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		correlationID, causationID, commandID string
 		actorType, actorID                    string
 		traceID, spanID                       []byte
-		flags                                 *int16
+		flags                                 *int64
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -707,10 +707,14 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	var f uint8
 	if flags != nil {
 		// The CHECK pins flags to 0..255, but a restored dump can land
-		// a row that bypassed it. Narrowing such a value to uint8 would
-		// fabricate a valid context (300 would parse as 44), so an
-		// out-of-range flags reads as absent: keep the zero SpanContext
-		// and skip the parse entirely (ADR 0040 §4).
+		// a row that bypassed it. flags scans as int64 — SQLite's
+		// INTEGER is 64-bit, so a narrower *int16 target (the size
+		// Postgres's smallint column makes right) would fail the whole
+		// read on a stored 40000; telemetry must never fail a read
+		// (ADR 0040 §4). Narrowing an out-of-range value to uint8
+		// would fabricate a valid context (300 would parse as 44), so
+		// it reads as absent: keep the zero SpanContext and skip the
+		// parse entirely.
 		if *flags < 0 || *flags > 255 {
 			return e, nil
 		}
