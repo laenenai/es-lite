@@ -329,7 +329,7 @@ without reopening the spin hole a misbehaving `Waiter` could create.
 > paragraph's claim that the `Waiter` contract "cannot distinguish 'woken
 > because new events exist' from 'timed out' — both return nil" is stale:
 > the landed port returns `(woke bool, err error)`
-> (`feed/ports.go:192-194`), a genuine wake reports `woke == true` and
+> (`feed/ports.go:196-198`), a genuine wake reports `woke == true` and
 > bypasses the idle floor, and a timeout keeps it — so the page-confirmed
 > floor described here is not needed; the wake-confirmed floor in
 > `Server.idleWait` already provides it.

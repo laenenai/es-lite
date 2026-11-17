@@ -105,7 +105,9 @@ wait) — see ADR 0037 for the deferred LISTEN/NOTIFY question there.
 - **Latency is tunable independently of correctness.** Wire a LISTEN/NOTIFY
   listener into the `Signal`/`Waiter` seam for near-instant delivery
   (es-lite ships no push source — no append-time `NOTIFY`, by ADR 0037's
-  write-path rule); rely on the poll interval alone for simplicity. Either
+  write-path rule; amended in part by ADR 0039 (2026-11-17), which adds an
+  opt-in append-time `NOTIFY` source and leaves the default path
+  unchanged); rely on the poll interval alone for simplicity. Either
   way, the checkpoint is the source of truth for progress.
 - **SQLite and Postgres are genuinely different deployment shapes**, not
   just different drivers — single-writer-local vs. shared-multi-writer.

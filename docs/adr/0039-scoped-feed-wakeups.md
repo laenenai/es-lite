@@ -606,7 +606,9 @@ failure model is in the runbook.
 
 ## Measurements (2026-11-17)
 
-Recorded from the implementation branch. Environment: local Docker
+Recorded from the implementation branch — the controller's confirmation
+run; earlier per-run numbers live in the task reports. Environment: local
+Docker
 `postgres:17` (the `task test:pg` shape, localhost), macOS host, `-race`
 builds for the latency runs. Latency shapes are 50 iterations each
 (30 ms parks between appends, a matching and a non-matching subscription
