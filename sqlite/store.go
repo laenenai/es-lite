@@ -706,6 +706,14 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	var f uint8
 	if flags != nil {
+		// The CHECK pins flags to 0..255, but a restored dump can land
+		// a row that bypassed it. Narrowing such a value to uint8 would
+		// fabricate a valid context (300 would parse as 44), so an
+		// out-of-range flags reads as absent: keep the zero SpanContext
+		// and skip the parse entirely (ADR 0040 §4).
+		if *flags < 0 || *flags > 255 {
+			return e, nil
+		}
 		f = uint8(*flags)
 	}
 	// A stored context that does not parse is treated as absent

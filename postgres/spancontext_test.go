@@ -167,7 +167,7 @@ func TestSpanContextPartialRejected(t *testing.T) {
 // even a raw INSERT that bypasses the store cannot store a half context.
 // The column list mirrors insertPoisonRow (feed_test.go) plus trace_id;
 // trace_id set with span_id NULL trips the migration's all-or-nothing
-// CHECK as SQLSTATE 23514.
+// CHECK — the events_span_context_complete constraint — as SQLSTATE 23514.
 func TestSpanContextCheckRejectsRawPartial(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -189,7 +189,8 @@ func TestSpanContextCheckRejectsRawPartial(t *testing.T) {
 		traceID[:],
 	)
 	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "23514" { // check_violation
-		t.Fatalf("raw partial insert: error = %v, want SQLSTATE 23514 (check_violation)", err)
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" || // check_violation
+		pgErr.ConstraintName != "events_span_context_complete" {
+		t.Fatalf("raw partial insert: error = %v, want SQLSTATE 23514 (check_violation) on constraint events_span_context_complete", err)
 	}
 }
