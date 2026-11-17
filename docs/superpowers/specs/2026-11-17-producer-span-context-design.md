@@ -96,9 +96,9 @@ type SpanContext struct {
 // IsValid reports whether the context is complete: both ids non-zero.
 func (s SpanContext) IsValid() bool
 
-// ParseSpanContext is the one validation rule: both ids empty means absent
-// (the zero value); otherwise both ids must be exactly 16 and 8 bytes and
-// non-zero. Anything else is ErrMalformedSpanContext.
+// ParseSpanContext is the one validation rule: both ids empty and flags zero
+// means absent (the zero value); otherwise both ids must be exactly 16 and 8
+// bytes and non-zero. Anything else is ErrMalformedSpanContext.
 func ParseSpanContext(traceID, spanID []byte, flags uint8) (SpanContext, error)
 ```
 

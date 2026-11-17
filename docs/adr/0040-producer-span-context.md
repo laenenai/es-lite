@@ -75,10 +75,10 @@ func ParseSpanContext(traceID, spanID []byte, flags uint8) (SpanContext, error)
 ```
 
 `IsValid` is the absence test and never panics. `ParseSpanContext` is the one
-validation rule: both ids empty means absent (the zero value); otherwise both
-must be exactly 16 and 8 bytes and non-zero; anything else is
-`ErrMalformedSpanContext`. It exists so the stores and the platform's feed
-client share one rule instead of three.
+validation rule: both ids empty **and** flags zero means absent (the zero
+value); otherwise both must be exactly 16 and 8 bytes and non-zero; anything
+else is `ErrMalformedSpanContext`. It exists so the stores and the platform's
+feed client share one rule instead of three.
 
 `Envelope` gains `SpanContext`; **`AppendParams` gains the same field**.
 `AppendParams` is the input to both append entry points — `Store.Append` and
