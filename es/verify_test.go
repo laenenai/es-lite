@@ -188,6 +188,18 @@ func TestVerifyStreamPopulatedStore(t *testing.T) {
 	}
 }
 
+// Telemetry is not an attested fact (ADR 0040): tampering with the span
+// context must not change the hash a verifier recomputes.
+func TestEnvelopeHashIgnoresSpanContextTampering(t *testing.T) {
+	e := chain(1, 0)[0]
+	e.SpanContext = es.SpanContext{TraceID: [16]byte{1, 2, 3}, SpanID: [8]byte{4, 5}, Flags: 1}
+	first := es.EnvelopeHash(e)
+	e.SpanContext.TraceID[0] = 0xff
+	if es.EnvelopeHash(e) != first {
+		t.Fatal("span context tampering changed the envelope hash")
+	}
+}
+
 func TestChainCheckerMidStreamStart(t *testing.T) {
 	rows := chain(5, 0)
 	c := es.NewChainChecker(sidMain)

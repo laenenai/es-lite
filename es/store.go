@@ -91,6 +91,12 @@ type AppendParams struct {
 	CausationID   uuid.UUID
 	Actor         Actor
 	OccurredAt    time.Time // domain time; adapter uses now if zero (Runtime always sets it, ADR 0034)
+
+	// SpanContext is the producer's trace context (ADR 0040), copied onto
+	// every produced Envelope. Command/batch-scoped like CorrelationID:
+	// it applies to every event in the batch. Producer telemetry only —
+	// excluded from the hash chain — and may be absent (the zero value).
+	SpanContext SpanContext
 }
 
 // EventData is one event to append: its encoded form plus an optional

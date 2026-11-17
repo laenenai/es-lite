@@ -43,6 +43,13 @@ type Envelope struct {
 	CommandID     uuid.UUID // the command that produced this event
 	Actor         Actor     // who caused it
 
+	// SpanContext is the producer's trace context (ADR 0040), carried so
+	// consumers can join these events back to the producing trace. It is
+	// producer telemetry only: excluded from CanonicalEnvelope, so it
+	// never enters the hash chain. It may be absent — the zero value —
+	// when the caller has no trace context.
+	SpanContext SpanContext
+
 	// Payload — canonical serialized event bytes (proto by convention).
 	Payload []byte
 
