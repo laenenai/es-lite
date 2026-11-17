@@ -24,6 +24,14 @@
 -- maximum, which DROP/RENAME carries over, so the next append draws
 -- max+1 and the cursor keeps its meaning.
 --
+-- Do NOT re-run this script against a database already migrated to
+-- 0009: the copy selects only the 18 base columns (the 0008 source
+-- table it was written for has no others), so a re-run would NULL any
+-- stored span contexts. Migrate's exactly-once schema_migrations
+-- protocol makes that unreachable in production; only a hand re-run
+-- can hit it (the rebuild test does, deliberately, on rows whose
+-- contexts are all absent).
+--
 -- Telemetry, not attestation: the columns are excluded from the
 -- envelope hash (es.EnvelopeHash), so a context is never part of the
 -- chain and a legacy reader ignores them safely.

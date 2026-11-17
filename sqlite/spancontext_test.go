@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -49,22 +50,25 @@ func appendSpanEvent(t testing.TB, ctx context.Context, s *sqlite.Store, sid es.
 
 // insertRawEvent inserts one events row with raw SQL, bypassing the
 // store — the poison-row pattern from insertFeedRowDirect (feed_test.go).
-// traceID is the only span column it sets: nil writes all three NULL,
-// which satisfies the migration's CHECK, and a non-nil trace id with
+// position is written explicitly into global_position (the rowid): the
+// rebuild test needs a gap to prove the migration's copy preserves
+// positions, and every other caller simply passes a free one. traceID is
+// the only span column it sets: nil writes all three NULL, which
+// satisfies the migration's CHECK, and a non-nil trace id with
 // span_id/trace_flags NULL trips it. The timestamp literal matches the
 // fixed-width layout the store writes (tsLayout) so a materialized row
 // still parses.
-func insertRawEvent(t testing.TB, ctx context.Context, s *sqlite.Store, eventID string, sid es.StreamID, version uint64, traceID []byte) error {
+func insertRawEvent(t testing.TB, ctx context.Context, s *sqlite.Store, eventID string, sid es.StreamID, version, position uint64, traceID []byte) error {
 	t.Helper()
 	_, err := s.DB().ExecContext(ctx,
 		`INSERT INTO events (
-			event_id, stream_type, stream_id, version,
+			global_position, event_id, stream_type, stream_id, version,
 			type_url, schema_version, occurred_at, recorded_at,
 			correlation_id, causation_id, command_id,
 			actor_type, actor_id, actor_principal, payload,
 			trace_id
-		) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?)`,
-		eventID, sid.Type, sid.Canonical(), version,
+		) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?)`,
+		position, eventID, sid.Type, sid.Canonical(), version,
 		spanTypeURL, 1, "2026-01-01T00:00:00.000000000Z", "2026-01-01T00:00:00.000000000Z",
 		"", "", "",
 		sid.Type, "raw", "conformance:raw", []byte("p"),
@@ -210,7 +214,7 @@ func TestSpanContextCheckRejectsRawPartial(t *testing.T) {
 	sid := mustStreamID(t, "counter", "main")
 	traceID := spanContextPopulated().TraceID
 
-	err := insertRawEvent(t, ctx, s, "11111111-1111-7111-8111-111111111111", sid, 1, traceID[:])
+	err := insertRawEvent(t, ctx, s, "11111111-1111-7111-8111-111111111111", sid, 1, 1, traceID[:])
 	if err == nil {
 		t.Fatal("raw partial insert succeeded, want the CHECK to reject it")
 	}
@@ -236,13 +240,21 @@ func TestSpanContextRebuild(t *testing.T) {
 
 	// Three committed events — global_position 1, 2, 3 — written through
 	// the store so the rebuild copies rows exactly as production finds
-	// them. Their contexts are absent, like every pre-0009 row.
+	// them, plus one raw row planted at position 9: a gap. Gap-free rows
+	// renumber to themselves, so on [1 2 3] alone a copy that dropped the
+	// explicit positions would be undetectable — with the gap, the same
+	// copy surfaces as [1 2 3 4]. The gap row lives on its own stream (at
+	// v1, context absent, like every pre-0009 row) so the sid append
+	// below still expects v3.
 	var firstEventID string
 	for i := range 3 {
 		env := appendSpanEvent(t, ctx, s, sid, uint64(i), es.SpanContext{})
 		if i == 0 {
 			firstEventID = env.EventID.String()
 		}
+	}
+	if err := insertRawEvent(t, ctx, s, "33333333-3333-4333-8333-333333333333", mustStreamID(t, "counter", "gap"), 1, 9, nil); err != nil {
+		t.Fatalf("plant the position-9 gap row: %v", err)
 	}
 
 	sqlText, err := os.ReadFile("migrations/0009_producer_span_context.sql")
@@ -261,15 +273,15 @@ func TestSpanContextRebuild(t *testing.T) {
 		t.Fatalf("commit rebuild: %v", err)
 	}
 
-	// All three rows survive the rebuild, with their exact positions:
+	// All four rows survive the rebuild, at their exact positions:
 	// global_position is the log cursor and log_order's basis, and
 	// renumbering it would rewrite history.
 	var count int
 	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&count); err != nil {
 		t.Fatalf("count events: %v", err)
 	}
-	if count != 3 {
-		t.Fatalf("row count after the rebuild = %d, want 3", count)
+	if count != 4 {
+		t.Fatalf("row count after the rebuild = %d, want 4", count)
 	}
 	var positions []uint64
 	rows, err := s.DB().QueryContext(ctx, `SELECT global_position FROM events ORDER BY global_position`)
@@ -289,16 +301,17 @@ func TestSpanContextRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("iterate positions: %v", err)
 	}
-	if !slices.Equal(positions, []uint64{1, 2, 3}) {
-		t.Fatalf("global_position set after the rebuild = %v, want [1 2 3]", positions)
+	if !slices.Equal(positions, []uint64{1, 2, 3, 9}) {
+		t.Fatalf("global_position set after the rebuild = %v, want [1 2 3 9]", positions)
 	}
 
-	// sqlite_sequence carried over: the next append draws max+1 = 4, not
-	// 1. It carries a populated context, proving the rebuilt table also
-	// accepts (and reads back) the three new columns.
+	// sqlite_sequence carried over: the next append draws max+1 = 10 —
+	// not 1 (a fresh sequence) and not 5 (a renumbered copy, whose max
+	// would be 4). It carries a populated context, proving the rebuilt
+	// table also accepts (and reads back) the three new columns.
 	env := appendSpanEvent(t, ctx, s, sid, 3, spanContextPopulated())
-	if env.GlobalPosition != 4 {
-		t.Fatalf("global_position after the rebuild = %d, want max+1 = 4", env.GlobalPosition)
+	if env.GlobalPosition != 10 {
+		t.Fatalf("global_position after the rebuild = %d, want max+1 = 10", env.GlobalPosition)
 	}
 	stream, err := s.ReadStream(ctx, sid, 0, 0)
 	if err != nil {
@@ -343,19 +356,62 @@ func TestSpanContextRebuild(t *testing.T) {
 		}
 	}
 
+	// Each index is also on the right columns, in order: a rebuild that
+	// recreated the names from a wrong or older definition must fail
+	// here, not at query time.
+	for _, idx := range []struct {
+		name string
+		cols []string
+	}{
+		{"events_correlation_idx", []string{"correlation_id"}},
+		{"events_command_idx", []string{"command_id"}},
+		{"events_actor_idx", []string{"actor_principal"}},
+		{"events_stream_time_idx", []string{"stream_id", "recorded_at"}},
+		{"events_type_pos_idx", []string{"type_url", "global_position"}},
+	} {
+		infoRows, err := s.DB().QueryContext(ctx, fmt.Sprintf(`PRAGMA index_info(%s)`, idx.name))
+		if err != nil {
+			t.Fatalf("index_info(%s): %v", idx.name, err)
+		}
+		var cols []string
+		for infoRows.Next() {
+			var seqno, cid int
+			var col string
+			if err := infoRows.Scan(&seqno, &cid, &col); err != nil {
+				infoRows.Close()
+				t.Fatalf("scan index_info(%s): %v", idx.name, err)
+			}
+			// Rows come in seqno order; enforce it rather than trust it,
+			// the comparison below is order-sensitive.
+			if seqno != len(cols) {
+				infoRows.Close()
+				t.Fatalf("index_info(%s): seqno %d out of order", idx.name, seqno)
+			}
+			cols = append(cols, col)
+		}
+		err = infoRows.Err()
+		infoRows.Close()
+		if err != nil {
+			t.Fatalf("iterate index_info(%s): %v", idx.name, err)
+		}
+		if !slices.Equal(cols, idx.cols) {
+			t.Fatalf("index %s is on %v, want %v", idx.name, cols, idx.cols)
+		}
+	}
+
 	// Both UNIQUE constraints survived: reusing v1's event_id on a fresh
 	// stream, and a fresh event_id on v1's (stream, version), must each
 	// fail — naming the constraint they hit, so a missing UNIQUE (the
 	// silent loss of the optimistic-concurrency backstop) cannot pass as
 	// something else.
-	err = insertRawEvent(t, ctx, s, firstEventID, mustStreamID(t, "counter", "fresh-stream"), 1, nil)
+	err = insertRawEvent(t, ctx, s, firstEventID, mustStreamID(t, "counter", "fresh-stream"), 1, 20, nil)
 	if err == nil {
 		t.Fatal("duplicate event_id insert succeeded; UNIQUE (event_id) did not survive the rebuild")
 	}
 	if !strings.Contains(err.Error(), "events.event_id") {
 		t.Fatalf("duplicate event_id insert: error = %v, want the events.event_id UNIQUE", err)
 	}
-	err = insertRawEvent(t, ctx, s, "22222222-2222-4222-8222-222222222222", sid, 1, nil)
+	err = insertRawEvent(t, ctx, s, "22222222-2222-4222-8222-222222222222", sid, 1, 21, nil)
 	if err == nil {
 		t.Fatal("duplicate (stream_id, version) insert succeeded; the version backstop did not survive the rebuild")
 	}
@@ -363,16 +419,38 @@ func TestSpanContextRebuild(t *testing.T) {
 		t.Fatalf("duplicate (stream_id, version) insert: error = %v, want the events.stream_id, events.version UNIQUE", err)
 	}
 
-	// Exactly the 21 expected columns: 0001's sixteen, 0002's
-	// prev_hash/hash, the three new ones — no more, no fewer.
-	wantCols := []string{
-		"actor_id", "actor_principal", "actor_type", "causation_id",
-		"command_id", "correlation_id", "event_id", "global_position",
-		"hash", "occurred_at", "payload", "prev_hash", "recorded_at",
-		"schema_version", "span_id", "stream_id", "stream_type",
-		"trace_flags", "trace_id", "type_url", "version",
+	// Exactly the 21 expected columns, each with its declared type and
+	// nullability: 0001's sixteen, 0002's prev_hash/hash, the three new
+	// ones — no more, no fewer. global_position is the rowid alias,
+	// which table_info reports as notnull=0, pk=1.
+	type colSpec struct {
+		typ         string
+		notnull, pk int
 	}
-	var gotCols []string
+	wantCols := map[string]colSpec{
+		"global_position": {"INTEGER", 0, 1},
+		"event_id":        {"TEXT", 1, 0},
+		"stream_type":     {"TEXT", 1, 0},
+		"stream_id":       {"TEXT", 1, 0},
+		"version":         {"INTEGER", 1, 0},
+		"type_url":        {"TEXT", 1, 0},
+		"schema_version":  {"INTEGER", 1, 0},
+		"occurred_at":     {"TEXT", 1, 0},
+		"recorded_at":     {"TEXT", 1, 0},
+		"correlation_id":  {"TEXT", 1, 0},
+		"causation_id":    {"TEXT", 1, 0},
+		"command_id":      {"TEXT", 1, 0},
+		"actor_type":      {"TEXT", 1, 0},
+		"actor_id":        {"TEXT", 1, 0},
+		"actor_principal": {"TEXT", 1, 0},
+		"payload":         {"BLOB", 1, 0},
+		"prev_hash":       {"BLOB", 0, 0},
+		"hash":            {"BLOB", 0, 0},
+		"trace_id":        {"BLOB", 0, 0},
+		"span_id":         {"BLOB", 0, 0},
+		"trace_flags":     {"INTEGER", 0, 0},
+	}
+	seen := make(map[string]bool, len(wantCols))
 	colRows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(events)`)
 	if err != nil {
 		t.Fatalf("table_info: %v", err)
@@ -385,15 +463,31 @@ func TestSpanContextRebuild(t *testing.T) {
 			colRows.Close()
 			t.Fatalf("scan table_info: %v", err)
 		}
-		gotCols = append(gotCols, name)
+		want, ok := wantCols[name]
+		if !ok {
+			colRows.Close()
+			t.Fatalf("unexpected column %s (%s) after the rebuild", name, typ)
+		}
+		if typ != want.typ || notnull != want.notnull || pk != want.pk {
+			colRows.Close()
+			t.Fatalf("column %s = (%s, notnull %d, pk %d), want (%s, notnull %d, pk %d)",
+				name, typ, notnull, pk, want.typ, want.notnull, want.pk)
+		}
+		seen[name] = true
 	}
 	err = colRows.Err()
 	colRows.Close()
 	if err != nil {
 		t.Fatalf("iterate table_info: %v", err)
 	}
-	slices.Sort(gotCols)
-	if !slices.Equal(gotCols, wantCols) {
-		t.Fatalf("columns after the rebuild = %v (len %d), want the 21 %v", gotCols, len(gotCols), wantCols)
+	var missing []string
+	for name := range wantCols {
+		if !seen[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		t.Fatalf("columns missing after the rebuild: %v", missing)
 	}
 }
