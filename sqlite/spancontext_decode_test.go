@@ -56,6 +56,7 @@ func TestDecodeSpanContext(t *testing.T) {
 		{"REAL flags", decodeTraceID[:], decodeSpanID[:], float64(1), es.SpanContext{}},
 		{"TEXT flags", decodeTraceID[:], decodeSpanID[:], "abc", es.SpanContext{}},
 		{"BLOB flags", decodeTraceID[:], decodeSpanID[:], []byte{1}, es.SpanContext{}},
+		{"bool flags", decodeTraceID[:], decodeSpanID[:], true, es.SpanContext{}},
 		// In-range int64 flags with valid ids are the only populated
 		// shapes — sampled (1, 255) and unsampled (0, a valid W3C
 		// link target the store itself can write).

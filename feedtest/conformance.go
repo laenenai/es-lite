@@ -810,6 +810,9 @@ func RunLog(t *testing.T, newLog NewStore) {
 			if got[1].SpanContext.IsValid() {
 				t.Fatalf("feedtest: the absent-context event arrived with %+v, want the zero SpanContext", got[1].SpanContext)
 			}
+			if got[1].SpanContext != (es.SpanContext{}) {
+				t.Fatalf("feedtest: the absent-context event arrived with %+v, want the exact zero SpanContext, never a fabricated one", got[1].SpanContext)
+			}
 		})
 	})
 }

@@ -144,7 +144,7 @@ func TestSpanContextExcludedFromCanonicalAndHash(t *testing.T) {
 	withContext := goldenV1
 	withContext.SpanContext = es.SpanContext{TraceID: [16]byte{1}, SpanID: [8]byte{2}, Flags: 1}
 	if got, want := es.CanonicalEnvelope(withContext), es.CanonicalEnvelope(goldenV1); !bytes.Equal(got, want) {
-		t.Fatalf("span context leaked into the canonical encoding")
+		t.Fatal("span context leaked into the canonical encoding")
 	}
 	if es.EnvelopeHash(withContext) != es.EnvelopeHash(goldenV1) {
 		t.Fatal("span context changed the envelope hash")

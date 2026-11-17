@@ -47,9 +47,11 @@ func appendOne(t testing.TB, ctx context.Context, ws es.Store, sid es.StreamID, 
 	return res.Envelopes[0]
 }
 
-// TestSpanContextRoundTrip pins the write and read mapping: a batch
-// appended with a populated context comes back with the same valid
-// context on both the stream read and the global-order read.
+// TestSpanContextRoundTrip pins the write and read mapping: one
+// two-event batch appended with a populated context comes back with the
+// same valid context on both envelopes — the mapping is per row, not
+// just the batch's first event — on both the stream read and the
+// global-order read.
 func TestSpanContextRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -57,8 +59,21 @@ func TestSpanContextRoundTrip(t *testing.T) {
 	sid := streamID(t)
 	sc := spanContextPopulated()
 
-	appendOne(t, ctx, ws, sid, 0, sc)
-	appendOne(t, ctx, ws, sid, 1, sc)
+	res, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		SpanContext:     sc,
+		Events: []es.EventData{
+			{TypeURL: spanTypeURL, SchemaVersion: 1, Payload: []byte("p")},
+			{TypeURL: spanTypeURL, SchemaVersion: 1, Payload: []byte("p")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(res.Envelopes) != 2 {
+		t.Fatalf("append returned %d envelopes, want 2", len(res.Envelopes))
+	}
 
 	stream, err := ws.ReadStream(ctx, sid, 0, 0)
 	if err != nil {
