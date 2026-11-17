@@ -37,6 +37,7 @@ than editing history.
 | 0037 | [Commit-Safe Feed Reads on Postgres](./0037-commit-safe-feed-reads.md) | Accepted (implemented); closes ADR 0001 §5's deferred Postgres gap |
 | 0038 | [Log-Order Attestation (Per-Batch `log_order` Rows)](./0038-log-order-attestation.md) | Accepted (implemented); makes ADR 0029 §2's ordering claim true |
 | 0039 | [Scoped Feed Wake-Ups](./0039-scoped-feed-wakeups.md) | Accepted (implemented) |
+| 0040 | [Producer Span Context in the Event Envelope](./0040-producer-span-context.md) | Proposed; plan for v0.15.0 only |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in
