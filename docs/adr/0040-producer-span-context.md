@@ -1,6 +1,6 @@
 # ADR 0040: Producer Span Context in the Event Envelope
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-17
 - **Related:** ADR 0001 (storage neutrality), ADR 0029 (tamper-evident hash
   chain), ADR 0035 (caller-owned transactions), ADR 0025 (payload
