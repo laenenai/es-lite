@@ -5,7 +5,7 @@
 //
 //	task test:pg
 //
-// One test drives three shapes over the REAL feed adapters, 50 iterations
+// One test drives four shapes over the REAL feed adapters, 50 iterations
 // each, one store per subtest:
 //
 //   - poll: Waiter nil. The baseline: an idle append waits out the 250ms
@@ -16,6 +16,15 @@
 //     after the append transaction commits. A clean-fence append must
 //     deliver in single-digit milliseconds — the gate number: Phase C does
 //     not start unless this p50 < 10ms.
+//   - notify: like hub, but the wake hint travels through Postgres
+//     NOTIFY: the store is opened WithAppendNotify(channel) and a
+//     postgres.NotifyListener LISTENs on it, its OnNotify calling
+//     hub.Wake and its OnReconnected calling hub.WakeAll — the gateway
+//     wiring ADR 0039 names. The hint now crosses the append
+//     transaction's pg_notify plus the listener's delivery instead of
+//     the in-process hook, and must still deliver in single-digit
+//     milliseconds: the same p50 < 10ms gate, now for the opt-in C2
+//     path.
 //   - contended: like hub, but each measured append is preceded by an open
 //     transaction that has drawn an xid — a pinned fence — committed 50ms
 //     after the append. The wake fires, but the fence holds the page empty
@@ -67,6 +76,9 @@ const (
 	// consumes a type nothing ever appends.
 	latType  = "latency.v1.Event"
 	latOther = "latency.v1.Other"
+	// The notify shape's channel: a fixed test fixture (never logged),
+	// LISTENed by the shape's own NotifyListener.
+	latNotifyChannel = "es_lite_latency_notify"
 	// waitDelivery's bound: generous over the poll-shaped subtests
 	// (~350ms worst case) and over the hub's single-digit delivery.
 	latDeliveryTimeout = 10 * time.Second
@@ -237,6 +249,63 @@ func (p *fencePin) commitError() error {
 	return p.commitErr
 }
 
+// wakeMode selects which wake path a subtest measures.
+type wakeMode uint8
+
+const (
+	// modePoll: the Waiter is nil — the poll-only baseline.
+	modePoll wakeMode = iota
+	// modeHub: the Waiter is the hub; the append wakes it through the
+	// in-process es.WithAfterAppend hook.
+	modeHub
+	// modeNotify: the Waiter is the hub; the append hints through the
+	// store's opt-in pg_notify (WithAppendNotify) and a
+	// postgres.NotifyListener turns the notification into a wake.
+	modeNotify
+)
+
+// notifyHubWaker is the notify shape's gateway wiring (ADR 0039 C2):
+// OnNotify wakes the delivered scope — the appended workspace's ID, the
+// notification payload, used verbatim — and OnReconnected wakes every
+// scope, because hints emitted while the listener was down were missed.
+// Both run on the listener's goroutine and must not block; hub.Wake and
+// hub.WakeAll are non-blocking.
+type notifyHubWaker struct {
+	hub *feed.Hub
+}
+
+func (w notifyHubWaker) OnNotify(scope string) { w.hub.Wake(scope) }
+func (w notifyHubWaker) OnReconnected()        { w.hub.WakeAll() }
+
+// startNotifyWake starts the notify shape's listener and joins it in
+// cleanup (after the subscriptions have ended, before the store closes:
+// cleanups run last-registered-first). It fails the test if the listener
+// does not connect and LISTEN within 10s — PID() is nonzero only after
+// LISTEN succeeded — because a deaf listener would leave the poll to
+// deliver and the subtest would forge poll-shaped numbers as notify ones.
+func startNotifyWake(t *testing.T, ctx context.Context, hub *feed.Hub) {
+	t.Helper()
+	l := postgres.NewNotifyListener(os.Getenv("PG_DSN"), latNotifyChannel, notifyHubWaker{hub: hub})
+	lctx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- l.Run(lctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("notify listener Run did not return within 10s of cancellation")
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for l.PID() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("notify listener did not connect and LISTEN within 10s (PID still 0)")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // runWakeLatency runs one shape: a fresh store, workspace, hub and server;
 // the two subscriptions; one warm-up append; then latIterations measured
 // append→delivery latencies, acking each delivery under the matching
@@ -244,16 +313,22 @@ func (p *fencePin) commitError() error {
 // per append — countingLogs's total across both subscriptions divided by
 // the iteration count — and logs the same numbers the ADR records.
 //
-// wake wires the ADR 0039 shape: the hub is the Waiter and the append
-// goes through es.WithAfterAppend, so hub.Wake fires with the workspace
-// scope after the append transaction commits. pinFence adds the contended
-// shape's pinner: one open xact drawn before each append, committed 50ms
-// after it.
-func runWakeLatency(t *testing.T, name string, wake, pinFence bool) (p50, p99 time.Duration, drawsPerAppend float64) {
+// mode wires the ADR 0039 shape: modeHub is the hub as the Waiter with the
+// append going through es.WithAfterAppend, so hub.Wake fires with the
+// workspace scope after the append transaction commits; modeNotify opens
+// the store WithAppendNotify and starts a postgres.NotifyListener whose
+// handler wakes the hub; modePoll leaves the Waiter nil. pinFence adds the
+// contended shape's pinner: one open xact drawn before each append,
+// committed 50ms after it.
+func runWakeLatency(t *testing.T, name string, mode wakeMode, pinFence bool) (p50, p99 time.Duration, drawsPerAppend float64) {
 	t.Helper()
 	ctx := context.Background()
 
-	store := openStore(t)
+	var opts []postgres.Option
+	if mode == modeNotify {
+		opts = append(opts, postgres.WithAppendNotify(latNotifyChannel))
+	}
+	store := openStoreWithOptions(t, opts...)
 	wsID := "lat-" + name
 	ws := store.WorkspaceStore(wsID)
 	hub := feed.NewHub()
@@ -261,9 +336,13 @@ func runWakeLatency(t *testing.T, name string, wake, pinFence bool) (p50, p99 ti
 	logs := &countingLogs{inner: postgres.NewLogs(store)}
 	var waiter feed.Waiter
 	appendStore := es.Store(ws)
-	if wake {
+	switch mode {
+	case modeHub:
 		waiter = hub
 		appendStore = es.WithAfterAppend(ws, func(context.Context, es.AppendResult) { hub.Wake(wsID) })
+	case modeNotify:
+		waiter = hub
+		startNotifyWake(t, ctx, hub)
 	}
 	srv, err := feed.NewServer(feed.Config{
 		Checkpoints: postgres.NewCheckpointStore(store),
@@ -419,30 +498,38 @@ func runWakeLatency(t *testing.T, name string, wake, pinFence bool) (p50, p99 ti
 
 // TestFeedWakeLatency is ADR 0039's gate evidence: the poll baseline is
 // real, a scoped wake delivers an idle append in single-digit
-// milliseconds on a clean fence, a pinned fence pushes delivery back to
-// the poll without stalling past it, and the wake's read amplification is
-// measured as draws per append.
+// milliseconds on a clean fence — through the in-process hook and
+// through the opt-in Postgres NOTIFY path alike — a pinned fence pushes
+// delivery back to the poll without stalling past it, and the wake's
+// read amplification is measured as draws per append.
 func TestFeedWakeLatency(t *testing.T) {
 	if os.Getenv("PG_DSN") == "" {
 		t.Skip("set PG_DSN to run the Postgres integration tests (task test:pg starts a throwaway Postgres)")
 	}
 
 	t.Run("poll", func(t *testing.T) {
-		p50, _, _ := runWakeLatency(t, "poll", false, false)
+		p50, _, _ := runWakeLatency(t, "poll", modePoll, false)
 		if p50 < 100*time.Millisecond {
 			t.Fatalf("poll: p50=%v, want >= 100ms — the poll baseline must be real", p50)
 		}
 	})
 
 	t.Run("hub", func(t *testing.T) {
-		p50, _, _ := runWakeLatency(t, "hub", true, false)
+		p50, _, _ := runWakeLatency(t, "hub", modeHub, false)
 		if p50 >= 10*time.Millisecond {
 			t.Fatalf("hub: p50=%v, want < 10ms — the ADR 0039 gate: a scoped wake must deliver an idle append in single-digit milliseconds on a clean fence", p50)
 		}
 	})
 
+	t.Run("notify", func(t *testing.T) {
+		p50, _, _ := runWakeLatency(t, "notify", modeNotify, false)
+		if p50 >= 10*time.Millisecond {
+			t.Fatalf("notify: p50=%v, want < 10ms — the C2 gate: the opt-in Postgres NOTIFY wake must deliver an idle append in single-digit milliseconds, like the in-process hook", p50)
+		}
+	})
+
 	t.Run("contended", func(t *testing.T) {
-		p50, p99, _ := runWakeLatency(t, "contended", true, true)
+		p50, p99, _ := runWakeLatency(t, "contended", modeHub, true)
 		if p50 < latPinSettle {
 			t.Fatalf("contended: p50=%v, want >= %v — the pinned fence must engage (delivery only after the pinner settles)", p50, latPinSettle)
 		}
