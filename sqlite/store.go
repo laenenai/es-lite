@@ -255,6 +255,14 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 			return zero, err
 		}
 	}
+	// A partial span context (ADR 0040) is refused before anything runs:
+	// the zero value means "absent" and is fine, but a caller that sets
+	// one id and not the other has produced a malformed context, and the
+	// events table's CHECK would abort the whole insert anyway. The
+	// error names the stream.
+	if p.SpanContext != (es.SpanContext{}) && !p.SpanContext.IsValid() {
+		return zero, fmt.Errorf("%w: %s", es.ErrMalformedSpanContext, p.StreamID)
+	}
 
 	// Payload cap (production review): reject the whole batch before the
 	// transaction is even opened — nothing is inserted, no position drawn.
@@ -306,6 +314,9 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	recorded := es.TruncateMicros(time.Now())
 
 	canonical := p.StreamID.Canonical()
+	// The span context is a property of the append (the producing trace),
+	// not of an individual event, so one mapping covers the whole batch.
+	traceID, spanID, flags := spanContextArgs(p.SpanContext)
 	envs := make([]es.Envelope, len(p.Events))
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
@@ -325,6 +336,7 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 			CausationID:   p.CausationID,
 			CommandID:     p.CommandID,
 			Actor:         p.Actor,
+			SpanContext:   p.SpanContext,
 			Payload:       ev.Payload,
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
@@ -338,13 +350,15 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 				type_url, schema_version, occurred_at, recorded_at,
 				correlation_id, causation_id, command_id,
 				actor_type, actor_id, actor_principal, payload,
-				prev_hash, hash
-			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?)`,
+				prev_hash, hash,
+				trace_id, span_id, trace_flags
+			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?)`,
 			eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, formatTS(occurred), formatTS(recorded),
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
 			env.PrevHash, env.Hash,
+			traceID, spanID, flags,
 		)
 		if err != nil {
 			if isConstraintViolation(err) {
@@ -414,6 +428,23 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// spanContextArgs maps a SpanContext onto the events table's three
+// nullable columns (trace_id, span_id, trace_flags): the zero value —
+// "absent" (ADR 0040) — writes NULL, NULL, NULL, and a populated one
+// writes both ids as BLOBs and the flags byte as an integer. Append has
+// already rejected non-zero invalid values, so the populated arm only
+// ever sees a complete context. Deliberately duplicated from the
+// Postgres adapter rather than shared through es (plan ruling R1): a
+// six-line helper twice beats putting SQL NULL semantics in the domain
+// package.
+func spanContextArgs(sc es.SpanContext) (traceID, spanID []byte, flags *int16) {
+	if sc == (es.SpanContext{}) {
+		return nil, nil, nil
+	}
+	f := int16(sc.Flags)
+	return sc.TraceID[:], sc.SpanID[:], &f
 }
 
 // readHead returns the stream's current version and the prev_hash the next
@@ -600,7 +631,8 @@ const envelopeCols = `
 	global_position, event_id, stream_type, stream_id, version,
 	type_url, schema_version, occurred_at, recorded_at,
 	correlation_id, causation_id, command_id,
-	actor_type, actor_id, payload, prev_hash, hash`
+	actor_type, actor_id, payload, prev_hash, hash,
+	trace_id, span_id, trace_flags`
 
 func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -627,7 +659,9 @@ func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es
 // column list/scan pairing shared by every read, including the feed page.
 // The audit UUIDs are load-bearing (F34): a stored event_id,
 // correlation_id, causation_id or command_id that does not parse fails the
-// read rather than being silently zeroed into a forged envelope.
+// read rather than being silently zeroed into a forged envelope. The span
+// context is the one deliberate exception: a value that does not parse
+// reads as absent, never a read error (ADR 0040 §4).
 func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	var (
 		e                                     es.Envelope
@@ -635,12 +669,15 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		occurredAt, recordedAt                string
 		correlationID, causationID, commandID string
 		actorType, actorID                    string
+		traceID, spanID                       []byte
+		flags                                 *int16
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
 		&e.TypeURL, &e.SchemaVersion, &occurredAt, &recordedAt,
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
+		&traceID, &spanID, &flags,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -667,6 +704,17 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		return es.Envelope{}, err
 	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
+	var f uint8
+	if flags != nil {
+		f = uint8(*flags)
+	}
+	// A stored context that does not parse is treated as absent
+	// (ADR 0040 §4): telemetry must never fail a read. The table's CHECK
+	// makes the state unreachable from the store; this tolerance is the
+	// second line of defence, for a restored dump or a bypassed check.
+	if sc, err := es.ParseSpanContext(traceID, spanID, f); err == nil {
+		e.SpanContext = sc
+	}
 	return e, nil
 }
 
