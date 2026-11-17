@@ -562,22 +562,40 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	e.Payload = payload
-	var f uint8
-	if flags != nil {
-		// The CHECK pins flags to 0..255, but a restored dump can land
-		// a row that bypassed it. Narrowing such a value to uint8 would
-		// fabricate a valid context (300 would parse as 44), so an
-		// out-of-range flags reads as absent: keep the zero SpanContext
-		// and skip the parse entirely (ADR 0040 §4).
-		if *flags < 0 || *flags > 255 {
-			return e, nil
-		}
-		f = uint8(*flags)
-	}
-	if sc, err := es.ParseSpanContext(traceID, spanID, f); err == nil {
-		e.SpanContext = sc
-	}
-	// A non-NULL value that does not parse is treated as absent (ADR 0040 §4):
-	// telemetry must never fail a read. The CHECK makes the state unreachable.
+	// The span context is the one deliberate exception to the
+	// load-bearing-UUID rule above: a stored value that does not parse
+	// reads as absent, never a read error (ADR 0040 §4). The decode is
+	// total and unit-tested against shapes the CHECK keeps out of the
+	// store.
+	e.SpanContext = decodeSpanContext(traceID, spanID, flags)
 	return e, nil
+}
+
+// decodeSpanContext decodes the three stored span-context columns — the
+// raw trace_id and span_id bytes and the smallint trace_flags — into an
+// es.SpanContext, never an error: telemetry must never fail a read
+// (ADR 0040 §4). The events_span_context_complete CHECK makes every
+// malformed shape below unreachable from the store; this tolerance is
+// the second line of defence, for a restored dump or a constraint
+// bypassed during a migration.
+//
+// NULL trace_flags reads as absent: the CHECK ties NULL flags to NULL
+// ids, so ids alongside a NULL flags column are dump corruption, and
+// the row recorded no context to trust them against. An out-of-range
+// flags reads as absent too — narrowing it would fabricate a context
+// (300 would parse as 44). Otherwise ParseSpanContext decides, and
+// whatever it rejects (wrong-length or all-zero ids, a half context)
+// reads as absent as well.
+func decodeSpanContext(traceID, spanID []byte, flags *int16) es.SpanContext {
+	if flags == nil {
+		return es.SpanContext{}
+	}
+	if *flags < 0 || *flags > 255 {
+		return es.SpanContext{}
+	}
+	sc, err := es.ParseSpanContext(traceID, spanID, uint8(*flags))
+	if err != nil {
+		return es.SpanContext{}
+	}
+	return sc
 }

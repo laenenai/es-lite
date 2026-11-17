@@ -47,9 +47,11 @@ func appendOne(t testing.TB, ctx context.Context, ws es.Store, sid es.StreamID, 
 	return res.Envelopes[0]
 }
 
-// TestSpanContextRoundTrip pins the write and read mapping: a batch
-// appended with a populated context comes back with the same valid
-// context on both the stream read and the global-order read.
+// TestSpanContextRoundTrip pins the write and read mapping: one
+// two-event batch appended with a populated context comes back with the
+// same valid context on both envelopes — the mapping is per row, not
+// just the batch's first event — on both the stream read and the
+// global-order read.
 func TestSpanContextRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -57,8 +59,21 @@ func TestSpanContextRoundTrip(t *testing.T) {
 	sid := streamID(t)
 	sc := spanContextPopulated()
 
-	appendOne(t, ctx, ws, sid, 0, sc)
-	appendOne(t, ctx, ws, sid, 1, sc)
+	res, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		SpanContext:     sc,
+		Events: []es.EventData{
+			{TypeURL: spanTypeURL, SchemaVersion: 1, Payload: []byte("p")},
+			{TypeURL: spanTypeURL, SchemaVersion: 1, Payload: []byte("p")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(res.Envelopes) != 2 {
+		t.Fatalf("append returned %d envelopes, want 2", len(res.Envelopes))
+	}
 
 	stream, err := ws.ReadStream(ctx, sid, 0, 0)
 	if err != nil {
@@ -192,5 +207,57 @@ func TestSpanContextCheckRejectsRawPartial(t *testing.T) {
 	if !errors.As(err, &pgErr) || pgErr.Code != "23514" || // check_violation
 		pgErr.ConstraintName != "events_span_context_complete" {
 		t.Fatalf("raw partial insert: error = %v, want SQLSTATE 23514 (check_violation) on constraint events_span_context_complete", err)
+	}
+}
+
+// TestSpanContextAppendTxRoundTrip proves the caller-owned-transaction
+// append path persists a supplied context. AppendTx sits outside every
+// store decorator (ADR 0040 §3.1, §10.2) — the platform fills
+// AppendParams.SpanContext at its own call sites — so it is the path
+// most likely to silently carry nothing. A populated context appended
+// inside a caller's transaction must survive the commit and read back
+// through the ordinary store.
+func TestSpanContextAppendTxRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_span_ctx_tx")
+	sid := streamID(t)
+	sc := spanContextPopulated()
+
+	tx, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	res, err := ws.AppendTx(ctx, narrowTx{tx}, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		SpanContext:     sc,
+		Events:          []es.EventData{{TypeURL: spanTypeURL, SchemaVersion: 1, Payload: []byte("p")}},
+	})
+	if err != nil {
+		t.Fatalf("append tx: %v", err)
+	}
+	if len(res.Envelopes) != 1 || res.Envelopes[0].SpanContext != sc {
+		t.Fatalf("AppendTx result = %+v, want one envelope carrying %+v", res.Envelopes, sc)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	rows, err := ws.ReadStream(ctx, sid, 0, 0)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("stream has %d events, want 1", len(rows))
+	}
+	if rows[0].SpanContext != sc {
+		t.Fatalf("ReadStream carries %+v, want the appended %+v", rows[0].SpanContext, sc)
+	}
+	if !rows[0].SpanContext.IsValid() {
+		t.Fatal("the round-tripped context is not valid")
 	}
 }

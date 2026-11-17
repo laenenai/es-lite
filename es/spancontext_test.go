@@ -24,6 +24,7 @@ func TestParseSpanContext(t *testing.T) {
 		{"valid", trace, span, 1, false, true},
 		{"valid all flags", trace, span, 0xff, false, true},
 		{"absent", nil, nil, 0, false, false},
+		{"empty non-nil", []byte{}, []byte{}, 0, false, false},
 		{"partial span", trace, nil, 0, true, false},
 		{"partial trace", nil, span, 0, true, false},
 		{"trace too short", trace[:15], span, 0, true, false},
@@ -41,6 +42,9 @@ func TestParseSpanContext(t *testing.T) {
 				if !errors.Is(err, es.ErrMalformedSpanContext) {
 					t.Fatalf("ParseSpanContext() error = %v, want ErrMalformedSpanContext", err)
 				}
+				if err != es.ErrMalformedSpanContext {
+					t.Fatalf("ParseSpanContext() error = %v, want the sentinel itself, not a wrapped error", err)
+				}
 				if sc != (es.SpanContext{}) {
 					t.Fatalf("ParseSpanContext() on error = %+v, want zero SpanContext", sc)
 				}
@@ -53,10 +57,10 @@ func TestParseSpanContext(t *testing.T) {
 				t.Fatalf("ParseSpanContext().IsValid() = %v, want %v", got, tt.wantValid)
 			}
 			if tt.wantValid {
-				if sc.TraceID != ([16]byte(bytes.Repeat([]byte{0xab}, 16))) {
+				if sc.TraceID != [16]byte(trace) {
 					t.Errorf("TraceID = %x, want %x", sc.TraceID, trace)
 				}
-				if sc.SpanID != ([8]byte(bytes.Repeat([]byte{0xcd}, 8))) {
+				if sc.SpanID != [8]byte(span) {
 					t.Errorf("SpanID = %x, want %x", sc.SpanID, span)
 				}
 				if sc.Flags != tt.flags {

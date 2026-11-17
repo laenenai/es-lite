@@ -203,9 +203,10 @@ What it does **not** guarantee:
   chain pins it).
 - **Tamper-evident trace context.** The producer's W3C span context (trace id,
   span id, flags) travels with the envelope and survives the store round trip
-  and the remote feed, but it is telemetry: it is excluded from
-  `CanonicalEnvelope` and `EnvelopeHash`, it may be absent on any event, and a
-  rewritten value still verifies. Delivery never depends on it.
+  and, once the feed contract carries it (ADR 0040 §3.5), the remote feed; but
+  it is telemetry: it is excluded from `CanonicalEnvelope` and `EnvelopeHash`,
+  it may be absent on any event, and a rewritten value still verifies. Delivery
+  never depends on it.
 - **Push wake-ups, not push delivery.** Wake-ups (ADR 0039) are *hints*
   that only cut latency; delivery remains fenced, and the poll
   (~250 ms by default, jittered ±20%) stays the safety net. With a wake

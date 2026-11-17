@@ -670,7 +670,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		correlationID, causationID, commandID string
 		actorType, actorID                    string
 		traceID, spanID                       []byte
-		flags                                 *int64
+		flags                                 any
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -704,30 +704,45 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		return es.Envelope{}, err
 	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
-	var f uint8
-	if flags != nil {
-		// The CHECK pins flags to 0..255, but a restored dump can land
-		// a row that bypassed it. flags scans as int64 — SQLite's
-		// INTEGER is 64-bit, so a narrower *int16 target (the size
-		// Postgres's smallint column makes right) would fail the whole
-		// read on a stored 40000; telemetry must never fail a read
-		// (ADR 0040 §4). Narrowing an out-of-range value to uint8
-		// would fabricate a valid context (300 would parse as 44), so
-		// it reads as absent: keep the zero SpanContext and skip the
-		// parse entirely.
-		if *flags < 0 || *flags > 255 {
-			return e, nil
-		}
-		f = uint8(*flags)
-	}
-	// A stored context that does not parse is treated as absent
-	// (ADR 0040 §4): telemetry must never fail a read. The table's CHECK
-	// makes the state unreachable from the store; this tolerance is the
-	// second line of defence, for a restored dump or a bypassed check.
-	if sc, err := es.ParseSpanContext(traceID, spanID, f); err == nil {
-		e.SpanContext = sc
-	}
+	e.SpanContext = decodeSpanContext(traceID, spanID, flags)
 	return e, nil
+}
+
+// decodeSpanContext decodes the three stored span-context columns — the
+// raw trace_id and span_id bytes and trace_flags — into an
+// es.SpanContext, never an error: telemetry must never fail a read
+// (ADR 0040 §4). The rebuild migration's CHECK makes every malformed
+// shape below unreachable from the store; this tolerance is the second
+// line of defence, for a restored dump or a constraint bypassed during a
+// migration.
+//
+// trace_flags is declared INTEGER, but SQLite's typing is dynamic and a
+// restored dump can land any value in the column — the reason flags
+// scans as any, which accepts every driver value, instead of a *int64,
+// which fails the whole read on a TEXT value. Only an int64 in 0..255
+// proceeds; NULL, every other type and every out-of-range integer read
+// as absent (narrowing an out-of-range value would fabricate a context
+// — 300 would parse as 44). Otherwise ParseSpanContext decides, and
+// whatever it rejects (wrong-length or all-zero ids, a half context)
+// reads as absent as well.
+func decodeSpanContext(traceID, spanID []byte, flags any) es.SpanContext {
+	var f uint8
+	switch v := flags.(type) {
+	case nil:
+		return es.SpanContext{}
+	case int64:
+		if v < 0 || v > 255 {
+			return es.SpanContext{}
+		}
+		f = uint8(v)
+	default:
+		return es.SpanContext{}
+	}
+	sc, err := es.ParseSpanContext(traceID, spanID, f)
+	if err != nil {
+		return es.SpanContext{}
+	}
+	return sc
 }
 
 // parseStoredUUID parses one stored audit-UUID column (event_id,
