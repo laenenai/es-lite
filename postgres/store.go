@@ -496,7 +496,8 @@ const envelopeCols = `
 	global_position, event_id, stream_type, stream_id, version,
 	type_url, schema_version, occurred_at, recorded_at,
 	correlation_id, causation_id, command_id,
-	actor_type, actor_id, payload, workspace_id, prev_hash, hash`
+	actor_type, actor_id, payload, workspace_id, prev_hash, hash,
+	trace_id, span_id, trace_flags`
 
 // parseStoredUUID parses one stored audit-UUID column (event_id,
 // correlation_id, causation_id, command_id). A value that does not parse
@@ -523,12 +524,15 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		actorType, actorID                    string
 		payload                               []byte
 		workspaceID                           string
+		traceID, spanID                       []byte
+		flags                                 *int16
 	)
 	if err := row.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
 		&e.TypeURL, &e.SchemaVersion, &e.OccurredAt, &e.RecordedAt,
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &payload, &workspaceID, &e.PrevHash, &e.Hash,
+		&traceID, &spanID, &flags,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -558,5 +562,14 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
 	e.Payload = payload
+	var f uint8
+	if flags != nil {
+		f = uint8(*flags)
+	}
+	if sc, err := es.ParseSpanContext(traceID, spanID, f); err == nil {
+		e.SpanContext = sc
+	}
+	// A non-NULL value that does not parse is treated as absent (ADR 0040 §4):
+	// telemetry must never fail a read. The CHECK makes the state unreachable.
 	return e, nil
 }
