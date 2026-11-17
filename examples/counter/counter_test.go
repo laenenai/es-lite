@@ -286,12 +286,34 @@ func TestDeliveryPoller(t *testing.T) {
 		}
 	}
 
-	// The checkpoint should now sit at the last event's position.
-	pos, err := store.LoadCheckpoint(ctx, "test-sub")
-	if err != nil {
-		t.Fatalf("load checkpoint: %v", err)
-	}
-	if pos != lastPos {
-		t.Fatalf("checkpoint=%d, want %d", pos, lastPos)
+	// The checkpoint should eventually sit at the last event's position.
+	// It cannot be asserted immediately: drain hands the batch to the
+	// handler first and saves the checkpoint after it returns
+	// (delivery/poller.go), so a handler that has already delivered the
+	// last envelope does not yet imply the save happened. A crash in
+	// that window redelivers the batch — at-least-once, by design.
+	waitForCheckpoint(t, store, "test-sub", lastPos)
+}
+
+// waitForCheckpoint polls until subscriber's checkpoint reaches want, or
+// fails with the last observed value. Polling is the correct wait here:
+// the save is an asynchronous consequence of the handler returning, not
+// something the handler can observe.
+func waitForCheckpoint(t *testing.T, store *sqlite.Store, subscriber string, want uint64) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pos, err := store.LoadCheckpoint(ctx, subscriber)
+		if err != nil {
+			t.Fatalf("load checkpoint: %v", err)
+		}
+		if pos == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("checkpoint=%d, want %d (handler returned before the save)", pos, want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
