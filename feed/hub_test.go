@@ -282,12 +282,14 @@ func TestHubZeroValuePanics(t *testing.T) {
 	assertPanics(t, want, func() { nilHub.WakeAll() })
 	assertPanics(t, want, func() { nilHub.Wait(ctx, time.Second) })
 	assertPanics(t, want, func() { nilHub.WaitScope(ctx, "a", time.Second) })
+	assertPanics(t, want, func() { nilHub.Stats() })
 
 	var zero Hub
 	assertPanics(t, want, func() { zero.Wake("a") })
 	assertPanics(t, want, func() { zero.WakeAll() })
 	assertPanics(t, want, func() { zero.Wait(ctx, time.Second) })
 	assertPanics(t, want, func() { zero.WaitScope(ctx, "a", time.Second) })
+	assertPanics(t, want, func() { zero.Stats() })
 }
 
 // TestHubStats pins the wake diagnostic: Wake counts calls, not scopes, and
