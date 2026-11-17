@@ -201,9 +201,13 @@ What it does **not** guarantee:
   infer "A happened before B" from delivery order across two streams.
   Within one stream, version order is the append contract (ADR 0029's
   chain pins it).
-- **Push.** No LISTEN/NOTIFY ships — the feed polls (~250 ms by default,
-  jittered ±20%). The `Waiter` port is the future hook; ADR 0037 records
-  the deferred design question.
+- **Push wake-ups, not push delivery.** Wake-ups (ADR 0039) are *hints*
+  that only cut latency; delivery remains fenced, and the poll
+  (~250 ms by default, jittered ±20%) stays the safety net. With a wake
+  source wired, a clean fence delivers at single-digit-ms p50 and a
+  blocked fence costs ~`Poll` p99; a lost wake costs at most one poll.
+  C1 (the application hint) is recommended; C2 (Postgres
+  LISTEN/NOTIFY) is opt-in.
 - **That every read API is fenced.** On Postgres, commit safety lives on
   the feed-facing reads. The raw `Store.ReadAll` cursor — the in-process
   `projection.LogFeed`/`Replay` tail and the legacy `delivery.Poller` — is

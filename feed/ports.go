@@ -188,9 +188,21 @@ type DeadLetterStore interface {
 // server floors the idle wait only when woke is false, so a genuine wake
 // reaches the next page read without waiting out the poll; an implementation
 // that cannot distinguish a wake from a timeout must always return false. A
-// nil Waiter means polling.
+// nil Waiter means polling. A decorator that wraps a Waiter must forward
+// WaitScope (see ScopedWaiter) when the wrapped value implements it —
+// embedding the wrapped waiter is the safe pattern — because a Wait-only
+// decorator silently downgrades the deployment to global wakes, and there
+// is no runtime signal for that.
 type Waiter interface {
 	Wait(ctx context.Context, timeout time.Duration) (woke bool, err error)
+}
+
+// ScopedWaiter is an optional extension of Waiter. When the configured
+// Waiter also implements it, the server waits through WaitScope with the
+// stream's Request.Scope, so a wake source can wake only the streams of the
+// scope that received events. Same contract as Waiter.Wait.
+type ScopedWaiter interface {
+	WaitScope(ctx context.Context, scope string, timeout time.Duration) (woke bool, err error)
 }
 
 // Clock supplies wall time where the server needs it (lease owner

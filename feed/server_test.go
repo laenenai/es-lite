@@ -568,6 +568,73 @@ func (w *wakingWaiter) Wait(ctx context.Context, _ time.Duration) (bool, error) 
 	}
 }
 
+// scopedWakingWaiter is the scoped counterpart of wakingWaiter: it
+// implements both Wait and WaitScope. WaitScope records the scope it was
+// called with and reports (true, nil) once its delay passes — a genuine
+// scoped wake; Wait only records its call and reports (false, nil), the
+// timeout shape, so only the scoped path ever claims a wake. err, when set,
+// makes WaitScope fail with it: the scoped error path.
+type scopedWakingWaiter struct {
+	delay time.Duration
+	err   error
+
+	mu     sync.Mutex
+	waits  int
+	scopes []string
+}
+
+var (
+	_ feed.Waiter       = (*scopedWakingWaiter)(nil)
+	_ feed.ScopedWaiter = (*scopedWakingWaiter)(nil)
+)
+
+func (w *scopedWakingWaiter) Wait(_ context.Context, _ time.Duration) (bool, error) {
+	w.mu.Lock()
+	w.waits++
+	w.mu.Unlock()
+	return false, nil
+}
+
+func (w *scopedWakingWaiter) WaitScope(ctx context.Context, scope string, _ time.Duration) (bool, error) {
+	w.mu.Lock()
+	w.scopes = append(w.scopes, scope)
+	err := w.err
+	w.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	t := time.NewTimer(w.delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-t.C:
+		return true, nil
+	}
+}
+
+func (w *scopedWakingWaiter) scopesSnapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.scopes...)
+}
+
+func (w *scopedWakingWaiter) waitCalls() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.waits
+}
+
+// waitOnlyWaiter wraps a scopedWakingWaiter but implements only Wait,
+// delegating to the wrapped waiter: the Wait-only decorator the Waiter doc
+// warns about. The wrapped value's scoped path is unreachable through it —
+// a silent downgrade to global wakes the server must keep working with.
+type waitOnlyWaiter struct{ inner *scopedWakingWaiter }
+
+func (w waitOnlyWaiter) Wait(ctx context.Context, timeout time.Duration) (bool, error) {
+	return w.inner.Wait(ctx, timeout)
+}
+
 // recordingObserver captures every Observer signal so tests can pin what
 // the server reported. Its accessors copy under the mutex: the renewer
 // goroutine (OnLeaseLost) and the stream goroutine call in concurrently.
@@ -904,6 +971,23 @@ func waitWaits(t *testing.T, w *blockingWaiter, n int) {
 	for w.count() < n {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %d waits, got %d", n, w.count())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitScopedWaits blocks until the waiter has recorded at least n WaitScope
+// calls and returns the recorded scopes.
+func waitScopedWaits(t *testing.T, w *scopedWakingWaiter, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		scopes := w.scopesSnapshot()
+		if len(scopes) >= n {
+			return scopes
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d WaitScope calls, got %d", n, len(scopes))
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1535,6 +1619,84 @@ func TestWaiterWakeBypassesFloor(t *testing.T) {
 	if elapsed > 100*time.Millisecond {
 		t.Fatalf("second page read after %v, want within 100ms: a genuine wake must bypass the 250ms poll floor", elapsed)
 	}
+}
+
+// A ScopedWaiter is waited on through WaitScope with the stream's
+// Request.Scope, and a genuine scoped wake still bypasses the poll floor:
+// scoping changes who is woken, not when the next page read happens.
+func TestScopedWaiterReceivesStreamScope(t *testing.T) {
+	logs := newMemLogs() // empty log: every page is an idle wait
+	waiter := &scopedWakingWaiter{delay: 10 * time.Millisecond}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: logs,
+		Waiter: waiter,
+		Poll:   250 * time.Millisecond,
+	})
+	cancel, done := start(t, srv, testRequest("live"), newMemSink())
+
+	started := time.Now()
+	scopes := waitScopedWaits(t, waiter, 1)
+	if scopes[0] != "tenant" {
+		t.Fatalf("WaitScope scope = %q, want exactly %q", scopes[0], "tenant")
+	}
+	waitCalls(t, logs, 2)
+	elapsed := time.Since(started)
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("second page read after %v, want within 100ms: a genuine scoped wake must bypass the 250ms poll floor", elapsed)
+	}
+}
+
+// A decorator that implements only Wait must not be treated as scoped: the
+// server falls back to Wait, the wrapped ScopedWaiter never sees a scope,
+// and the stream still waits — the silent global-wake downgrade the Waiter
+// doc warns about, which must keep the deployment running unchanged.
+func TestUnscopedDecoratorDoesNotForwardScope(t *testing.T) {
+	inner := &scopedWakingWaiter{delay: 10 * time.Millisecond}
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: newMemLeases(), Logs: newMemLogs(),
+		Waiter: &waitOnlyWaiter{inner: inner},
+	})
+	cancel, done := start(t, srv, testRequest("live"), newMemSink())
+
+	deadline := time.Now().Add(3 * time.Second)
+	for inner.waitCalls() == 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the stream never reached its first idle wait: the server stopped waiting")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := await(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Subscribe error = %v, want context.Canceled", err)
+	}
+	if n := len(inner.scopesSnapshot()); n != 0 {
+		t.Fatalf("WaitScope recorded %d scopes, want 0: a Wait-only decorator must not forward a scope", n)
+	}
+	if inner.waitCalls() == 0 {
+		t.Fatal("the wrapped waiter never saw a Wait call: the server stopped waiting")
+	}
+}
+
+// A ScopedWaiter's WaitScope error stops the stream with that cause, like a
+// Wait error does: the wakeup source is part of the stream's health.
+func TestScopedWaiterErrorStopsStream(t *testing.T) {
+	leases := newMemLeases()
+	waitErr := errors.New("wake source failed")
+	srv := newServer(t, feed.Config{
+		Checkpoints: newMemCheckpoints(time.Now()), Leases: leases, Logs: newMemLogs(),
+		Waiter: &scopedWakingWaiter{delay: 10 * time.Millisecond, err: waitErr},
+	})
+	req := testRequest("live")
+	_, done := start(t, srv, req, newMemSink())
+	if err := await(t, done); !errors.Is(err, waitErr) {
+		t.Fatalf("error = %v, want the WaitScope error", err)
+	}
+	waitHeld(t, leases, req.Scope, req.Projection, req.Instance, false)
 }
 
 func TestStatusReportsPositionHeadLagAndHolder(t *testing.T) {

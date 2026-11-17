@@ -430,3 +430,77 @@ func TestWaiterFloorPreventsSpin(t *testing.T) {
 		t.Fatalf("Waiter was called %d times, want at least 5 (it returns instantly, so the loop keeps reaching it)", n)
 	}
 }
+
+// scopedInstantWaiter is the scoped degenerate Waiter: it implements both
+// Wait and WaitScope, records the scope each WaitScope carries, and returns
+// (false, nil) immediately — the timeout shape by the Waiter contract.
+type scopedInstantWaiter struct {
+	mu     sync.Mutex
+	scopes []string
+}
+
+var (
+	_ Waiter       = (*scopedInstantWaiter)(nil)
+	_ ScopedWaiter = (*scopedInstantWaiter)(nil)
+)
+
+func (w *scopedInstantWaiter) Wait(context.Context, time.Duration) (bool, error) { return false, nil }
+
+func (w *scopedInstantWaiter) WaitScope(_ context.Context, scope string, _ time.Duration) (bool, error) {
+	w.mu.Lock()
+	w.scopes = append(w.scopes, scope)
+	w.mu.Unlock()
+	return false, nil
+}
+
+func (w *scopedInstantWaiter) snapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.scopes...)
+}
+
+// TestScopedWaiterTimeoutKeepsFloor pins that scoping the wait changes who
+// is woken, not the idle pacing: a scoped waiter that returns (false, nil)
+// immediately — a timeout by the contract — still spends at least Poll per
+// iteration (the floor survives the scoped route), and every WaitScope
+// carries the stream's Request.Scope.
+func TestScopedWaiterTimeoutKeepsFloor(t *testing.T) {
+	const poll = 100 * time.Millisecond
+	log := newIdlePageLog(64)
+	waiter := &scopedInstantWaiter{}
+	srv, err := NewServer(Config{
+		Checkpoints: stubCheckpoints{}, Leases: stubLeases{},
+		Logs: stubLogs{log}, Waiter: waiter, Poll: poll,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The floor is the subject: keep the jitter at the identity so the
+	// bound asserts the floor, not the default random source.
+	srv.jitter = func(d time.Duration) time.Duration { return d }
+
+	stop := startIdleStream(t, srv)
+	if !waitForReads(t, log, 6, 5*time.Second) {
+		stop()
+		t.Fatalf("only %d page reads in 5s, want at least 6 (the floor paces the scoped idle loop at one read per poll)", len(log.snapshot()))
+	}
+	stop()
+
+	const lowerSlack = 25 * time.Millisecond
+	reads := log.snapshot()
+	for i := 0; i+1 < len(reads); i++ {
+		if gap := reads[i+1].Sub(reads[i]); gap < poll-lowerSlack {
+			t.Fatalf("idle iteration #%d spanned %v, want at least Poll %v (−%v slack): the scoped timeout path spins the loop",
+				i, gap, poll, lowerSlack)
+		}
+	}
+	scopes := waiter.snapshot()
+	if len(scopes) == 0 {
+		t.Fatal("WaitScope was never called: the scoped waiter never saw the stream's scope")
+	}
+	for i, scope := range scopes {
+		if scope != "tenant" {
+			t.Fatalf("WaitScope scope #%d = %q, want %q", i, scope, "tenant")
+		}
+	}
+}

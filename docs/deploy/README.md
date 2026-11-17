@@ -407,3 +407,97 @@ subscription state; the feed never reads across tenants. Connect feed
 processes as ordinary non-superuser, non-`BYPASSRLS` roles and grant them
 exactly the schema access they need — the `es_relay` grant above exists
 for `Drain` and the anchor/verify path, not for the feed.
+
+## Feed wake-ups (ADR 0039)
+
+The feed's idle path is a poll — a committed append reaches an idle
+subscriber on average one half-poll after commit. ADR 0039 adds an optional
+wake seam on top of it: a *hint* that new events may exist, which lets a
+subscriber read sooner. The horizon fence, checkpoints, leases and delivery
+semantics are unchanged — a missed, late or duplicated wake costs at most one
+poll, never an event. Two sources exist; both are optional, and with neither
+configured behaviour is exactly the polling described above.
+
+- **C1 — application hint (default, recommended).** The process that appends
+  calls `hub.Wake(scope)` after a successful append — in-process, or relayed
+  over the application's own bus cross-process. es-lite ships no broker: the
+  bus, its subjects and its authorization are the application's concern, on
+  both backends (SQLite has no C2).
+- **C2 — Postgres `LISTEN/NOTIFY` (opt-in, off by default).** The Postgres
+  adapter's `WithAppendNotify(channel)` option makes each non-empty append
+  transaction run `pg_notify` with the workspace ID as payload; a
+  `NotifyListener` in the feed process receives it and wakes the hub. NOTIFY
+  is transactional, so the hint commits with the append — including
+  caller-owned transactions, which C1 cannot cover without touching every
+  call site.
+
+### C2's trust precondition
+
+**C2 is enabled only when every role that can `CONNECT` to the database is
+trusted, or the database is dedicated to the append/feed path.** `LISTEN` and
+`pg_notify` are not RLS-filtered — notifications are visible to all users —
+and any role that can `CONNECT` can both `LISTEN` on a nameable channel and
+spoof a notification on it. The precondition is therefore about *all*
+connect-capable roles, not just the role the listener runs under: this is
+stricter than "run the listener under a trusted role". Before enabling,
+enumerate who can connect and confirm every role is trusted — the login
+roles, plus the database-level `CONNECT` grants shown by `\l` in `psql`
+(`PUBLIC` holds `CONNECT` unless it has been revoked):
+
+```sql
+SELECT rolname FROM pg_roles WHERE rolcanconnect;
+```
+
+A co-tenant database with untrusted roles uses C1 instead. The listener
+itself needs only `CONNECT` — no new grants, no schema change, no rows — but
+that is not what makes C2 safe; the precondition above is.
+
+### Operating a C2 listener
+
+- **The channel name is a capability.** Generate it high-entropy and
+  unguessable; the adapter validates it as a strict PostgreSQL identifier at
+  `Open` (length ≤ `NAMEDATALEN`−1) and quotes it for `LISTEN`. **Never log
+  it**: roles holding `pg_read_all_stats` can read other sessions' query text
+  and thereby learn the name. An unguessable name mitigates eavesdropping and
+  injection, but it is not a substitute for the trust precondition.
+- **One listener connection per process, dedicated.** The listener owns one
+  connection that is never returned to a pool — a direct or session-pooled
+  connection only, because **PgBouncer transaction pooling breaks `LISTEN`**
+  (the session must outlive the `LISTEN`). Every gateway replica runs its own
+  listener: the connection count scales with processes, not workspaces. The
+  listener sets an `application_name`, so it is identifiable in
+  `pg_stat_activity`.
+- **Reconnect backoff starts at `Poll`.** On connection loss the listener
+  reconnects with jittered backoff — the schedule starts at the feed's
+  default `Poll` (250 ms) with ±20% jitter, doubling to 30 s. The floor is
+  the schedule's, not each draw's: a draw may fall below `Poll`, and
+  clamping every draw at `Poll` would re-herd a fleet of listeners that
+  lost their connections together. The listener then re-issues `LISTEN`
+  and fires `OnReconnected`, wired to `hub.WakeAll()` to repair hints
+  missed while it was down. A missed wake is indistinguishable from a
+  slow poll: delivery falls back to the fence-bounded poll, so the failure
+  mode is delay, never loss.
+- **Alert on `pg_notification_queue_usage()`.** Postgres's async notification
+  queue is bounded, and when it is exhausted, NOTIFY-ing transactions **fail
+  at commit** — the hint can fail a durable-looking append. A listener that
+  is alive but not draining pins queue cleanup, so sustained appends can
+  begin failing while the listener itself looks healthy. Alert on the
+  queue-usage fraction (0–1) and treat sustained growth as a listener-health
+  alarm before it becomes an append outage.
+- **No two-phase commit.** A transaction that executed NOTIFY cannot be
+  prepared for two-phase commit: `PREPARE TRANSACTION` fails for it. Do not
+  enable C2 on an append path that flows through a 2PC preparer.
+
+The cost when enabled: one extra statement per non-empty append plus the
+commit-time notify-queue lock, which briefly serialises committing notifiers
+— the price of the hint riding the append's own commit.
+
+### When to prefer C1
+
+Prefer C1 for **any shared database, any deployment without a trusted
+listener role, and any append rate where the extra commit-time lock is
+unwelcome.** C1's hint is best-effort and outside the transaction: a failed
+hint never fails the append, and delivery falls back to the poll. C2's one
+advantage — zero per-call-site wiring, including caller-owned-transaction
+commits — is why it exists as an opt-in behind the preconditions above, not
+why it should be the default.

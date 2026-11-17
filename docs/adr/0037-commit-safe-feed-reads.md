@@ -322,6 +322,18 @@ the page; skip the remainder of the poll interval only if the page is
 non-empty. That keeps wakeup latency single-digit for a real push source
 without reopening the spin hole a misbehaving `Waiter` could create.
 
+> **Update (ADR 0039, 2026-11-17):** the deferral is lifted in part. An
+> opt-in `postgres.WithAppendNotify`/`NotifyListener` source and the
+> application-hint seam (`feed.Hub`/`ScopedWaiter`, `es.WithAfterAppend`)
+> ship; the fence and this ADR's delivery semantics are unchanged. The
+> paragraph's claim that the `Waiter` contract "cannot distinguish 'woken
+> because new events exist' from 'timed out' — both return nil" is stale:
+> the landed port returns `(woke bool, err error)`
+> (`feed/ports.go:196-198`), a genuine wake reports `woke == true` and
+> bypasses the idle floor, and a timeout keeps it — so the page-confirmed
+> floor described here is not needed; the wake-confirmed floor in
+> `Server.idleWait` already provides it.
+
 ## Consequences
 
 ### Positive

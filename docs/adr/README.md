@@ -36,6 +36,7 @@ than editing history.
 | 0036 | [No Broker in es-lite; Postgres and SQLite Only](./0036-postgres-only-no-broker.md) | Accepted (implemented); supersedes 0003/0009/0028 |
 | 0037 | [Commit-Safe Feed Reads on Postgres](./0037-commit-safe-feed-reads.md) | Accepted (implemented); closes ADR 0001 §5's deferred Postgres gap |
 | 0038 | [Log-Order Attestation (Per-Batch `log_order` Rows)](./0038-log-order-attestation.md) | Accepted (implemented); makes ADR 0029 §2's ordering claim true |
+| 0039 | [Scoped Feed Wake-Ups](./0039-scoped-feed-wakeups.md) | Accepted (implemented) |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in

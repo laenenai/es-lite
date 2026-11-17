@@ -86,6 +86,15 @@ never load-bearing for completeness. The `feed` package exposes the same
 seam one level up (`feed.Waiter`, consumed by the subscribe loop's idle
 wait) — see ADR 0037 for the deferred LISTEN/NOTIFY question there.
 
+> **Erratum (ADR 0039, 2026-11-17):** this section's "no push source
+> ships" statement is amended in part. The core still ships no broker and
+> no default push source, but ADR 0039 adds the scoped `Waiter`/`Hub`
+> wake-up seam, an opt-in Postgres LISTEN/NOTIFY source
+> (`postgres.WithAppendNotify` + `NotifyListener`), and the
+> application-hint decorator (`es.WithAfterAppend`). Delivery semantics
+> are unchanged: a wake remains a best-effort hint, and the poll stays
+> the safety net that guarantees no event is ever skipped.
+
 ## Consequences
 
 - **Writes scale by adding replicas.** No leader election on the hot
@@ -96,7 +105,9 @@ wait) — see ADR 0037 for the deferred LISTEN/NOTIFY question there.
 - **Latency is tunable independently of correctness.** Wire a LISTEN/NOTIFY
   listener into the `Signal`/`Waiter` seam for near-instant delivery
   (es-lite ships no push source — no append-time `NOTIFY`, by ADR 0037's
-  write-path rule); rely on the poll interval alone for simplicity. Either
+  write-path rule; amended in part by ADR 0039 (2026-11-17), which adds an
+  opt-in append-time `NOTIFY` source and leaves the default path
+  unchanged); rely on the poll interval alone for simplicity. Either
   way, the checkpoint is the source of truth for progress.
 - **SQLite and Postgres are genuinely different deployment shapes**, not
   just different drivers — single-writer-local vs. shared-multi-writer.
