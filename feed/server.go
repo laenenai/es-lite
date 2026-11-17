@@ -500,7 +500,7 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 			pos = head
 			break
 		}
-		if werr := s.wait(ctx); werr != nil {
+		if werr := s.wait(ctx, req.Scope); werr != nil {
 			return werr
 		}
 		if head, err = log.Head(ctx); err != nil {
@@ -570,7 +570,7 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 		// committed backlog the settled reads cannot deliver — then wait
 		// out the poll.
 		probeStall()
-		if err := s.idleWait(ctx, iterStart); err != nil {
+		if err := s.idleWait(ctx, iterStart, req.Scope); err != nil {
 			return err
 		}
 	}
@@ -581,9 +581,10 @@ func (s *Server) stream(ctx context.Context, req Request, sink Sink, batch int) 
 // pause is the right shape there — a bounded retry cadence, not the idle
 // poll. The read loop's idle branch uses idleWait instead. There is no
 // floor to bypass here, so whether the Waiter genuinely woke is discarded.
-func (s *Server) wait(ctx context.Context) error {
+// The wait is routed by scope through waitFor.
+func (s *Server) wait(ctx context.Context, scope string) error {
 	if s.cfg.Waiter != nil {
-		_, err := s.cfg.Waiter.Wait(ctx, s.cfg.Poll)
+		_, err := s.waitFor(ctx, scope, s.cfg.Poll)
 		return err
 	}
 	t := time.NewTimer(s.cfg.Poll)
@@ -612,8 +613,9 @@ func (s *Server) wait(ctx context.Context) error {
 // immediately instead of paying the poll on top of the wait (review F35).
 // The timer path needs no floor: the timer itself waits the jittered poll
 // out, and sleeping a remainder on top would both double-sleep and cancel
-// the sub-Poll half of the jitter.
-func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
+// the sub-Poll half of the jitter. The wait is routed by scope through
+// waitFor, so scoping changes who is woken, never the pacing.
+func (s *Server) idleWait(ctx context.Context, iterStart time.Time, scope string) error {
 	d := s.cfg.Poll
 	if s.jitter != nil {
 		d = s.jitter(d)
@@ -628,7 +630,7 @@ func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
 			return nil
 		}
 	}
-	woke, err := s.cfg.Waiter.Wait(ctx, d)
+	woke, err := s.waitFor(ctx, scope, d)
 	if err != nil {
 		return err
 	}
@@ -646,6 +648,20 @@ func (s *Server) idleWait(ctx context.Context, iterStart time.Time) error {
 		}
 	}
 	return nil
+}
+
+// waitFor routes one wait through the configured Waiter by the stream's
+// subscription scope (ADR 0039): a Waiter that also implements ScopedWaiter
+// is waited on through WaitScope with that scope, so a wake source can wake
+// only the streams of the scope that received events; a Wait-only Waiter
+// keeps the unscoped Wait — the silent global-wake downgrade the Waiter doc
+// warns about. The woke/err contract is the same on both paths, so callers
+// treat them identically. The Waiter must be non-nil.
+func (s *Server) waitFor(ctx context.Context, scope string, timeout time.Duration) (bool, error) {
+	if sw, ok := s.cfg.Waiter.(ScopedWaiter); ok {
+		return sw.WaitScope(ctx, scope, timeout)
+	}
+	return s.cfg.Waiter.Wait(ctx, timeout)
 }
 
 // batchSize resolves Request.BatchSize against Config.Batch and MaxBatch.
