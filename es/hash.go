@@ -44,7 +44,9 @@ var ZeroHash [HashSize]byte
 //
 // GlobalPosition is excluded (assigned during the INSERT; attested instead by
 // the per-batch log_order rows and the anchor's order root over them —
-// ADR 0038) and so is the relay's mutable published_at marker. Timestamps are
+// ADR 0038), and so are the relay's mutable published_at marker and the
+// producer's SpanContext telemetry (ADR 0040): telemetry is not an attested
+// fact, so including it would change every new event's hash. Timestamps are
 // truncated to microseconds — the precision every backend returns — so a
 // verifier recomputes from what the database hands back.
 func CanonicalEnvelope(e Envelope) []byte {

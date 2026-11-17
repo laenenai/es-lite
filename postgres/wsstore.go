@@ -172,12 +172,35 @@ func validateAppend(p es.AppendParams) error {
 	if err := p.StreamID.Validate(); err != nil {
 		return err
 	}
+	// A partial span context (ADR 0040) is refused before anything runs —
+	// this check sits here so both Append and AppendTx inherit it: the
+	// zero value means "absent" and is fine, but a caller that sets one
+	// id and not the other has produced a malformed context, and the
+	// events table's CHECK would abort the whole insert anyway. The
+	// error names the stream.
+	if p.SpanContext != (es.SpanContext{}) && !p.SpanContext.IsValid() {
+		return fmt.Errorf("%w: %s", es.ErrMalformedSpanContext, p.StreamID)
+	}
 	for _, op := range p.Constraints {
 		if err := op.Validate(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// spanContextArgs maps a SpanContext onto the events table's three
+// nullable columns (trace_id, span_id, trace_flags): the zero value —
+// "absent" (ADR 0040) — writes NULL, NULL, NULL, and a populated one
+// writes both ids as bytea and the flags byte as a smallint.
+// validateAppend has already rejected non-zero invalid values, so the
+// populated arm only ever sees a complete context.
+func spanContextArgs(sc es.SpanContext) (traceID, spanID []byte, flags *int16) {
+	if sc == (es.SpanContext{}) {
+		return nil, nil, nil
+	}
+	f := int16(sc.Flags)
+	return sc.TraceID[:], sc.SpanID[:], &f
 }
 
 // append is the shared append body. The caller has validated p, set the
@@ -251,6 +274,9 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 	recorded = es.TruncateMicros(recorded)
 
 	envs := make([]es.Envelope, len(p.Events))
+	// The span context is a property of the append (the producing trace),
+	// not of an individual event, so one mapping covers the whole batch.
+	traceID, spanID, flags := spanContextArgs(p.SpanContext)
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
 		eventID := ev.EventID
@@ -270,6 +296,7 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			CausationID:   p.CausationID,
 			CommandID:     p.CommandID,
 			Actor:         p.Actor,
+			SpanContext:   p.SpanContext,
 			Payload:       ev.Payload,                      // opaque bytes, echoed back unchanged
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
@@ -284,14 +311,16 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 				type_url, schema_version, occurred_at, recorded_at,
 				correlation_id, causation_id, command_id,
 				actor_type, actor_id, actor_principal, payload,
-				prev_hash, hash
-			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15,$16, $17,$18)
+				prev_hash, hash,
+				trace_id, span_id, trace_flags
+			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15,$16, $17,$18, $19,$20,$21)
 			RETURNING global_position`,
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, occurred, recorded,
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
 			env.PrevHash, env.Hash,
+			traceID, spanID, flags,
 		).Scan(&gp)
 		if err != nil {
 			var pgErr *pgconn.PgError

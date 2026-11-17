@@ -62,12 +62,15 @@ func expireFeedLease(t *testing.T, ctx context.Context, s *postgres.Store, scope
 }
 
 // feedAppendEvent appends one event to sid in workspace scope at the
-// given expected version and returns the committed envelope.
-func feedAppendEvent(t testing.TB, ctx context.Context, s *postgres.Store, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
+// given expected version and returns the committed envelope. sc is the
+// producer's span context (ADR 0040) persisted with the event; the zero
+// value means absent.
+func feedAppendEvent(t testing.TB, ctx context.Context, s *postgres.Store, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext) es.Envelope {
 	t.Helper()
 	res, err := s.WorkspaceStore(scope).Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: version,
+		SpanContext:     sc,
 		Events:          []es.EventData{{TypeURL: typeURL, SchemaVersion: 1, Payload: payload}},
 	})
 	if err != nil {
@@ -94,8 +97,8 @@ func newPostgresFeedStore(ctx context.Context, t testing.TB) (feedtest.Store, fu
 		Leases:          postgres.NewLeaseStore(s),
 		DeadLetters:     postgres.NewDeadLetterStore(s),
 		MaxPayloadBytes: 64,
-		Append: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope {
-			return feedAppendEvent(t, ctx, s, scope, sid, version, typeURL, payload)
+		Append: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext) es.Envelope {
+			return feedAppendEvent(t, ctx, s, scope, sid, version, typeURL, payload, sc)
 		},
 		PlantOverCap: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
 			return insertPoisonRow(t, ctx, s, scope, sid, version, typeURL, payload)
@@ -168,8 +171,8 @@ func TestLogsOpenReturnsTheWorkspaceLog(t *testing.T) {
 		t.Fatal("Open returned a nil workspace")
 	}
 
-	own := feedAppendEvent(t, ctx, s, scopeA, feedStream(t, "logs-a"), 0, "feedtest.v1.E", []byte("own"))
-	foreign := feedAppendEvent(t, ctx, s, scopeB, feedStream(t, "logs-b"), 0, "feedtest.v1.E", []byte("foreign"))
+	own := feedAppendEvent(t, ctx, s, scopeA, feedStream(t, "logs-a"), 0, "feedtest.v1.E", []byte("own"), es.SpanContext{})
+	foreign := feedAppendEvent(t, ctx, s, scopeB, feedStream(t, "logs-b"), 0, "feedtest.v1.E", []byte("foreign"), es.SpanContext{})
 
 	head, err := lg.Head(ctx)
 	if err != nil {
@@ -536,8 +539,8 @@ func TestFeedStoresRefuseCrossWorkspaceAccess(t *testing.T) {
 	// an events row that exists (in B) is invisible under A's GUC when
 	// the query carries no explicit workspace filter — the policy alone
 	// must hide it. A row in A's own events (appended now) is visible.
-	ownEvent := feedAppendEvent(t, ctx, s, wsA, feedStream(t, "rls-own"), 0, "feedtest.v1.E", []byte("x"))
-	foreignEvent := feedAppendEvent(t, ctx, s, wsB, feedStream(t, "rls-foreign"), 0, "feedtest.v1.E", []byte("x"))
+	ownEvent := feedAppendEvent(t, ctx, s, wsA, feedStream(t, "rls-own"), 0, "feedtest.v1.E", []byte("x"), es.SpanContext{})
+	foreignEvent := feedAppendEvent(t, ctx, s, wsB, feedStream(t, "rls-foreign"), 0, "feedtest.v1.E", []byte("x"), es.SpanContext{})
 	for _, probe := range []struct {
 		ws   string
 		pos  int64
