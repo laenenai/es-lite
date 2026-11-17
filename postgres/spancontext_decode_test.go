@@ -63,6 +63,9 @@ func TestDecodeSpanContext(t *testing.T) {
 		// Wrong-length ids do not parse — the CHECK pins 16 and 8.
 		{"15-byte trace id", decodeTraceID[:15], decodeSpanID[:], flagsPtr(1), es.SpanContext{}},
 		{"7-byte span id", decodeTraceID[:], decodeSpanID[:7], flagsPtr(1), es.SpanContext{}},
+		// A NULL id scans as a nil slice, not a zero-length one: pgx
+		// returns nil for the bytea, and the parse must reject it.
+		{"nil span id with trace id", decodeTraceID[:], nil, flagsPtr(1), es.SpanContext{}},
 		// Right lengths but all-zero ids do not parse either: an
 		// all-zero id is not a usable trace partner.
 		{"all-zero trace id", make([]byte, 16), decodeSpanID[:], flagsPtr(1), es.SpanContext{}},

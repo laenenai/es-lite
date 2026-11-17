@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"testing"
+	"time"
 
 	"github.com/laenenai/es-lite/es"
 )
@@ -57,6 +58,7 @@ func TestDecodeSpanContext(t *testing.T) {
 		{"TEXT flags", decodeTraceID[:], decodeSpanID[:], "abc", es.SpanContext{}},
 		{"BLOB flags", decodeTraceID[:], decodeSpanID[:], []byte{1}, es.SpanContext{}},
 		{"bool flags", decodeTraceID[:], decodeSpanID[:], true, es.SpanContext{}},
+		{"TIME flags", decodeTraceID[:], decodeSpanID[:], time.Unix(0, 0), es.SpanContext{}},
 		// In-range int64 flags with valid ids are the only populated
 		// shapes — sampled (1, 255) and unsampled (0, a valid W3C
 		// link target the store itself can write).
