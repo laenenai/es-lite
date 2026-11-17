@@ -108,10 +108,14 @@ type Store struct {
 
 	// Append seeds one event to sid under scope at the given expected
 	// stream version, through the backend's own append path, and returns
-	// the committed envelope. Multi-workspace backends put the event in
-	// scope's workspace; single-workspace backends ignore the scope (one
-	// database is one workspace).
-	Append func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) es.Envelope
+	// the committed envelope. The span context (ADR 0040) is the
+	// producer's trace context the backend must persist: the suite
+	// appends a populated one and the zero value and asserts each
+	// subscriber later reads back exactly what was appended.
+	// Multi-workspace backends put the event in scope's workspace;
+	// single-workspace backends ignore the scope (one database is one
+	// workspace).
+	Append func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext) es.Envelope
 
 	// PlantOverCap inserts one events row whose payload exceeds the
 	// store's cap, bypassing the append-time cap — once the cap exists,
@@ -394,9 +398,9 @@ func RunLog(t *testing.T, newLog NewStore) {
 			// of the third insert's global position.
 			a := testStream(t, "head-a")
 			b := testStream(t, "head-b")
-			st.Append(ctx, t, logScope, a, 0, typHappened, []byte("one"))
-			st.Append(ctx, t, logScope, b, 0, typHappened, []byte("two"))
-			res := st.Append(ctx, t, logScope, a, 1, typHappened, []byte("three"))
+			st.Append(ctx, t, logScope, a, 0, typHappened, []byte("one"), es.SpanContext{})
+			st.Append(ctx, t, logScope, b, 0, typHappened, []byte("two"), es.SpanContext{})
+			res := st.Append(ctx, t, logScope, a, 1, typHappened, []byte("three"), es.SpanContext{})
 
 			head, err = lg.Head(ctx)
 			if err != nil {
@@ -423,9 +427,9 @@ func RunLog(t *testing.T, newLog NewStore) {
 			// like the Head test above.
 			a := testStream(t, "heads-raw-a")
 			b := testStream(t, "heads-raw-b")
-			st.Append(ctx, t, logScope, a, 0, typHappened, []byte("one"))
-			st.Append(ctx, t, logScope, b, 0, typHappened, []byte("two"))
-			last := st.Append(ctx, t, logScope, a, 1, typHappened, []byte("three"))
+			st.Append(ctx, t, logScope, a, 0, typHappened, []byte("one"), es.SpanContext{})
+			st.Append(ctx, t, logScope, b, 0, typHappened, []byte("two"), es.SpanContext{})
+			last := st.Append(ctx, t, logScope, a, 1, typHappened, []byte("three"), es.SpanContext{})
 
 			head, err := lg.Head(ctx)
 			if err != nil {
@@ -457,7 +461,7 @@ func RunLog(t *testing.T, newLog NewStore) {
 
 			var appended []es.Envelope
 			for i, typ := range []string{typConsumed, typIgnored, typConsumed, typIgnored, typHappened} {
-				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typ, []byte("x")))
+				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typ, []byte("x"), es.SpanContext{}))
 			}
 			lastConsumed := appended[2].GlobalPosition // the last typConsumed event
 			lastIgnored := appended[3].GlobalPosition  // the last typIgnored event
@@ -540,7 +544,7 @@ func RunLog(t *testing.T, newLog NewStore) {
 
 			var appended []es.Envelope
 			for i, typ := range []string{typConsumed, typIgnored, typConsumed, typIgnored, typConsumed} {
-				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typ, []byte("x")))
+				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typ, []byte("x"), es.SpanContext{}))
 			}
 
 			got, truncated, err := lg.ReadAllBounded(ctx, 0, 10, 0, []string{typConsumed})
@@ -578,7 +582,7 @@ func RunLog(t *testing.T, newLog NewStore) {
 
 		t.Run("an empty type set returns no events", func(t *testing.T) {
 			lg, st := open(t)
-			st.Append(ctx, t, logScope, testStream(t, "empty-types"), 0, typHappened, []byte("x"))
+			st.Append(ctx, t, logScope, testStream(t, "empty-types"), 0, typHappened, []byte("x"), es.SpanContext{})
 
 			got, truncated, err := lg.ReadAllBounded(ctx, 0, 10, 0, nil)
 			if err != nil {
@@ -595,7 +599,7 @@ func RunLog(t *testing.T, newLog NewStore) {
 
 			var appended []es.Envelope
 			for i := 0; i < 4; i++ {
-				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typHappened, []byte("abcd"))) // 4 bytes each
+				appended = append(appended, st.Append(ctx, t, logScope, sid, uint64(i), typHappened, []byte("abcd"), es.SpanContext{})) // 4 bytes each
 			}
 
 			// Budget 10: 4 + 4 fit; the third row (12) stops the page.
@@ -634,8 +638,8 @@ func RunLog(t *testing.T, newLog NewStore) {
 			lg, st := open(t)
 			sid := testStream(t, "exact-budget")
 
-			st.Append(ctx, t, logScope, sid, 0, typHappened, []byte("abcd")) // 4 bytes
-			st.Append(ctx, t, logScope, sid, 1, typHappened, []byte("efgh")) // 4 bytes
+			st.Append(ctx, t, logScope, sid, 0, typHappened, []byte("abcd"), es.SpanContext{}) // 4 bytes
+			st.Append(ctx, t, logScope, sid, 1, typHappened, []byte("efgh"), es.SpanContext{}) // 4 bytes
 
 			// The page totals exactly the budget and no rows remain: it
 			// must not be reported truncated. A >= comparison would stop
@@ -654,7 +658,7 @@ func RunLog(t *testing.T, newLog NewStore) {
 			sid := testStream(t, "default-limit")
 
 			for i := 0; i < 101; i++ {
-				st.Append(ctx, t, logScope, sid, uint64(i), typHappened, []byte("x"))
+				st.Append(ctx, t, logScope, sid, uint64(i), typHappened, []byte("x"), es.SpanContext{})
 			}
 
 			got, _, err := lg.ReadAllBounded(ctx, 0, 0, 0, []string{typHappened})
@@ -670,8 +674,8 @@ func RunLog(t *testing.T, newLog NewStore) {
 			lg, st := open(t)
 			sid := testStream(t, "oversized")
 
-			st.Append(ctx, t, logScope, sid, 0, typHappened, []byte("12345")) // 5 bytes
-			st.Append(ctx, t, logScope, sid, 1, typHappened, []byte("67890"))
+			st.Append(ctx, t, logScope, sid, 0, typHappened, []byte("12345"), es.SpanContext{}) // 5 bytes
+			st.Append(ctx, t, logScope, sid, 1, typHappened, []byte("67890"), es.SpanContext{})
 
 			got, truncated, err := lg.ReadAllBounded(ctx, 0, 10, 3, []string{typHappened})
 			if err != nil {
@@ -691,7 +695,7 @@ func RunLog(t *testing.T, newLog NewStore) {
 
 			gp := st.PlantOverCap(ctx, t, logScope, testStream(t, "poison-first"), 1, typHappened, oversized)
 			// A normal row follows the poison row.
-			st.Append(ctx, t, logScope, testStream(t, "poison-first-ok"), 0, typHappened, []byte("ok"))
+			st.Append(ctx, t, logScope, testStream(t, "poison-first-ok"), 0, typHappened, []byte("ok"), es.SpanContext{})
 
 			got, _, err := lg.ReadAllBounded(ctx, 0, 10, 0, []string{typHappened})
 			var tooLarge *feed.EventTooLargeError
@@ -712,9 +716,9 @@ func RunLog(t *testing.T, newLog NewStore) {
 			lg, st := open(t)
 			oversized := bytes.Repeat([]byte("p"), st.MaxPayloadBytes*64)
 
-			first := st.Append(ctx, t, logScope, testStream(t, "poison-later"), 0, typHappened, []byte("ok"))
+			first := st.Append(ctx, t, logScope, testStream(t, "poison-later"), 0, typHappened, []byte("ok"), es.SpanContext{})
 			gp := st.PlantOverCap(ctx, t, logScope, testStream(t, "poison-later-b"), 1, typHappened, oversized)
-			after := st.Append(ctx, t, logScope, testStream(t, "poison-later-after"), 0, typHappened, []byte("after"))
+			after := st.Append(ctx, t, logScope, testStream(t, "poison-later-after"), 0, typHappened, []byte("after"), es.SpanContext{})
 			if !(first.GlobalPosition < gp && gp < after.GlobalPosition) {
 				t.Fatalf("feedtest: insert order: first=%d poison=%d after=%d, want the poison row between the normal rows",
 					first.GlobalPosition, gp, after.GlobalPosition)
@@ -749,6 +753,58 @@ func RunLog(t *testing.T, newLog NewStore) {
 			}
 			if len(got) != 0 {
 				t.Fatalf("feedtest: the over-cap first row was materialized: %d envelopes, want none", len(got))
+			}
+		})
+
+		// The span-context round trip (ADR 0040): what a producer
+		// appends through the backend's own append path is what a
+		// subscriber later reads. An event appended with a populated
+		// context arrives with an equal, valid context; an event
+		// appended with the zero value — the "absent" context — arrives
+		// absent too, never fabricated.
+		t.Run("the span context round trips through the log", func(t *testing.T) {
+			_, st := open(t)
+
+			traced := es.SpanContext{
+				TraceID: [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+				SpanID:  [8]byte{21, 22, 23, 24, 25, 26, 27, 28},
+				Flags:   1,
+			}
+			withSC := st.Append(ctx, t, logScope, testStream(t, "span-traced"), 0, typHappened, []byte("traced"), traced)
+			withoutSC := st.Append(ctx, t, logScope, testStream(t, "span-plain"), 0, typHappened, []byte("plain"), es.SpanContext{})
+
+			srv := newServer(t, st)
+			req := feed.Request{
+				Scope:      logScope,
+				Projection: "p",
+				Instance:   "live",
+				Consumer:   "feedtest",
+				Definition: projection.Definition{Name: "p", Consumes: []string{typHappened}},
+			}
+			ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel1()
+			sink := &ackingSink{}
+			if err := srv.Subscribe(ctx1, req, sink); err != nil &&
+				!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("feedtest: subscribe: %v", err)
+			}
+
+			got := sink.got()
+			if len(got) != 2 {
+				t.Fatalf("feedtest: delivered %d events, want 2: %+v", len(got), got)
+			}
+			if got[0].GlobalPosition != withSC.GlobalPosition || got[1].GlobalPosition != withoutSC.GlobalPosition {
+				t.Fatalf("feedtest: delivered positions = %v, want %d,%d (the traced event first, in global order)",
+					positions(got), withSC.GlobalPosition, withoutSC.GlobalPosition)
+			}
+			if got[0].SpanContext != traced {
+				t.Fatalf("feedtest: delivered span context = %+v, want the appended %+v round-tripped", got[0].SpanContext, traced)
+			}
+			if !got[0].SpanContext.IsValid() {
+				t.Fatal("feedtest: the traced event's delivered span context is invalid, want valid")
+			}
+			if got[1].SpanContext.IsValid() {
+				t.Fatalf("feedtest: the absent-context event arrived with %+v, want the zero SpanContext", got[1].SpanContext)
 			}
 		})
 	})
@@ -1304,9 +1360,9 @@ func runEndToEnd(t *testing.T, newStore NewStore) {
 		t.Cleanup(cleanup)
 
 		sid := testStream(t, "e2e-resume")
-		first := st.Append(ctx, t, e2eScope, sid, 0, typConsumed, []byte("a1"))
-		st.Append(ctx, t, e2eScope, sid, 1, typIgnored, []byte("b1"))
-		third := st.Append(ctx, t, e2eScope, sid, 2, typConsumed, []byte("a2"))
+		first := st.Append(ctx, t, e2eScope, sid, 0, typConsumed, []byte("a1"), es.SpanContext{})
+		st.Append(ctx, t, e2eScope, sid, 1, typIgnored, []byte("b1"), es.SpanContext{})
+		third := st.Append(ctx, t, e2eScope, sid, 2, typConsumed, []byte("a2"), es.SpanContext{})
 
 		srv := newServer(t, st)
 		req := feed.Request{
@@ -1361,7 +1417,7 @@ func runEndToEnd(t *testing.T, newStore NewStore) {
 
 		// One more event: the resumed subscription delivers exactly it
 		// — never anything before the checkpoint.
-		next := st.Append(ctx, t, e2eScope, sid, 3, typConsumed, []byte("a3"))
+		next := st.Append(ctx, t, e2eScope, sid, 3, typConsumed, []byte("a3"), es.SpanContext{})
 		ctx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel2()
 		sink2 := &cancelSink{want: 1, cancel: cancel2}
@@ -1387,10 +1443,10 @@ func runEndToEnd(t *testing.T, newStore NewStore) {
 		oversized := bytes.Repeat([]byte("p"), st.MaxPayloadBytes*64)
 
 		// Global order: before < poison < after1 < after2.
-		before := st.Append(ctx, t, e2eScope, testStream(t, "poison-e2e-a"), 0, typPoison, []byte("ok"))
+		before := st.Append(ctx, t, e2eScope, testStream(t, "poison-e2e-a"), 0, typPoison, []byte("ok"), es.SpanContext{})
 		poisonGP := st.PlantOverCap(ctx, t, e2eScope, testStream(t, "poison-e2e"), 1, typPoison, oversized)
-		after1 := st.Append(ctx, t, e2eScope, testStream(t, "poison-e2e-b"), 0, typPoison, []byte("after-1"))
-		after2 := st.Append(ctx, t, e2eScope, testStream(t, "poison-e2e-b"), 1, typPoison, []byte("after-2"))
+		after1 := st.Append(ctx, t, e2eScope, testStream(t, "poison-e2e-b"), 0, typPoison, []byte("after-1"), es.SpanContext{})
+		after2 := st.Append(ctx, t, e2eScope, testStream(t, "poison-e2e-b"), 1, typPoison, []byte("after-2"), es.SpanContext{})
 		if !(before.GlobalPosition < poisonGP && poisonGP < after1.GlobalPosition && after1.GlobalPosition < after2.GlobalPosition) {
 			t.Fatalf("feedtest: insert order: before=%d poison=%d after=%d,%d, want the poison between the normal rows",
 				before.GlobalPosition, poisonGP, after1.GlobalPosition, after2.GlobalPosition)
@@ -1552,7 +1608,7 @@ func runCrossWorkspace(t *testing.T, newStore NewStore) {
 		})
 
 		t.Run("dead letter enrichment never names a foreign event", func(t *testing.T) {
-			own := st.Append(ctx, t, wsA, testStream(t, "cross-ws"), 0, typHappened, []byte("own"))
+			own := st.Append(ctx, t, wsA, testStream(t, "cross-ws"), 0, typHappened, []byte("own"), es.SpanContext{})
 			if err := st.DeadLetters.Record(ctx, feed.DeadLetter{
 				Scope: wsB, Projection: "dl", Instance: "live",
 				Position: own.GlobalPosition, Reason: "probe", Actor: "feedtest",
