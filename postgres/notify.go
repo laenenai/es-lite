@@ -205,7 +205,7 @@ func (l *NotifyListener) Run(ctx context.Context) error {
 			// connection is finished. Close it on a detached context,
 			// so a cancelled ctx cannot block the socket close, report
 			// disconnected, and either return or reconnect.
-			conn.Close(context.WithoutCancel(ctx))
+			_ = conn.Close(context.WithoutCancel(ctx))
 			l.pid.Store(0)
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -232,7 +232,7 @@ func (l *NotifyListener) connectListening(ctx context.Context, cfg *pgx.ConnConf
 		return nil, err
 	}
 	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{l.channel}.Sanitize()); err != nil {
-		conn.Close(context.WithoutCancel(ctx))
+		_ = conn.Close(context.WithoutCancel(ctx))
 		return nil, err
 	}
 	return conn, nil
