@@ -467,10 +467,14 @@ that is not what makes C2 safe; the precondition above is.
   listener: the connection count scales with processes, not workspaces. The
   listener sets an `application_name`, so it is identifiable in
   `pg_stat_activity`.
-- **Reconnect backoff floor ≥ `Poll`.** On connection loss the listener
-  reconnects with jittered backoff floored at the feed's `Poll`, re-issues
-  `LISTEN`, and fires `OnReconnected` — wired to `hub.WakeAll()` to repair
-  hints missed while it was down. A missed wake is indistinguishable from a
+- **Reconnect backoff starts at `Poll`.** On connection loss the listener
+  reconnects with jittered backoff — the schedule starts at the feed's
+  default `Poll` (250 ms) with ±20% jitter, doubling to 30 s. The floor is
+  the schedule's, not each draw's: a draw may fall below `Poll`, and
+  clamping every draw at `Poll` would re-herd a fleet of listeners that
+  lost their connections together. The listener then re-issues `LISTEN`
+  and fires `OnReconnected`, wired to `hub.WakeAll()` to repair hints
+  missed while it was down. A missed wake is indistinguishable from a
   slow poll: delivery falls back to the fence-bounded poll, so the failure
   mode is delay, never loss.
 - **Alert on `pg_notification_queue_usage()`.** Postgres's async notification

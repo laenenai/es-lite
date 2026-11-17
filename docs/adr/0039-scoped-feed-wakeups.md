@@ -253,9 +253,12 @@ events the gateway cares most about, and no existing signal distinguishes a
 missing wake from a blocked fence (`Observer.OnStall` covers only the
 latter). Phase A/B therefore ships a cheap wake diagnostic — Hub counters
 (`Wake`/`WakeAll`, and wake-driven reads where observable) — so an operator
-can answer "are wakes arriving for this scope?". C2, whose notify commits
-with the caller's transaction, is the only zero-call-site coverage for the
-caller-owned path.
+can answer "are wakes arriving at all?". The counters are global on
+purpose: the Hub deliberately refuses unbounded per-scope state (§2
+anti-goals, §3.2 invariant 3), so the sharper question — "are wakes
+arriving for this scope?" — is future work, not shipped. C2, whose notify
+commits with the caller's transaction, is the only zero-call-site coverage
+for the caller-owned path.
 
 The recommended gateway wiring is unchanged from the brief's intent, with the
 scope closed over rather than read from the result:
@@ -306,8 +309,11 @@ The channel is validated as a strict PostgreSQL identifier at `Open`
 (length ≤ `NAMEDATALEN−1`) and quoted with `pgx.Identifier.Sanitize` for
 `LISTEN`; it is a security capability (see §6), is never logged, and must be
 high-entropy. On connection loss the listener reconnects with jittered
-backoff whose floor is `Poll`, re-issues `LISTEN`, and calls
-`OnReconnected`. It throttles per scope: a notification for a scope already
+backoff — the schedule starts at `Poll` with ±20% jitter, doubling to
+30 s; the floor is the schedule's, not each draw's, so a draw may fall
+below `Poll` (clamping every draw at `Poll` would re-herd a fleet) —
+then re-issues `LISTEN` and calls `OnReconnected`. It throttles per
+scope: a notification for a scope already
 woken within a small window is dropped, because parked waiters already
 received the close. That bounds spoofed or duplicated notification
 amplification without touching the hub's semantics or the latency claim.
@@ -335,6 +341,21 @@ Costs, stated plainly and carried into the runbook:
   "failure-free"; it is failure-contained and operationalised.
 - `pg_notify` is not RLS-filtered, and any role that can `CONNECT` can
   `LISTEN` or spoof a notification. See §6 for the hard precondition.
+
+> **Erratum (2026-11-17):** the payload-bound bullet above misstates the
+> mechanism. The bound is not rejected when the `*Workspace` is created; as
+> shipped it is enforced at append time, inside the opt-in path
+> (`Workspace.notifyAppend`, `postgres/wsstore.go`): with `WithAppendNotify`
+> set, every non-empty append checks the workspace ID and fails before the
+> `pg_notify` statement is issued, so an oversized payload is never sent.
+> Creation-time enforcement was considered and not taken: an unconditional
+> bound at `WorkspaceStore` creation would change the default path (an
+> over-long ID stays legal on every non-notify path), and an
+> option-conditional one would make the store validate, at construction,
+> IDs it never carries into a payload — `WorkspaceStore` is also the read
+> and feed adapters' handle constructor. The observable guarantee is
+> unchanged: the 8000-byte NOTIFY limit is unreachable with the option on,
+> and the default append path is byte-for-byte untouched.
 
 SQLite is unchanged: in-process apps call `hub.Wake(scope)` after append (C1),
 the same pattern ADR 0002 already describes for `delivery.Signal`.
@@ -427,7 +448,11 @@ These are load-bearing for the panel review, not afterthoughts.
   treats workspace IDs as non-secret metadata; the *new* exposure is
   cross-workspace correlation and per-token volume/timing, not the ID itself.
   Bound workspace IDs at `WorkspaceStore` creation (for example 512 bytes) so
-  the 8000-byte NOTIFY limit is unreachable. An optional opaque mode (an
+  the 8000-byte NOTIFY limit is unreachable. (**Erratum 2026-11-17:** the
+  bound as shipped is enforced at append time inside the opt-in path, not at
+  creation — creation-time enforcement would either change the default path
+  or validate IDs the store never carries into a payload; see §3.3's
+  erratum. The guarantee is unchanged.) An optional opaque mode (an
   HMAC of the scope) is defense-in-depth only: the appender emits the
   payload, so the key must be shared by the appender and the listener; the
   listener needs a token→scope directory; token equality still correlates a

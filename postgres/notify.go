@@ -90,7 +90,9 @@ const (
 // channel is a capability: NewNotifyListener validates it with the
 // WithAppendNotify validator (a strict PostgreSQL identifier) and
 // panics on anything else; production names are high-entropy, and the
-// channel is never logged or echoed in an error.
+// channel is never logged or echoed in an error. A valid channel never
+// appears in any error: only a rejected candidate is ever named, by the
+// construction panic or the Open-time option validation.
 type NotifyListener struct {
 	dsn     string
 	channel string
