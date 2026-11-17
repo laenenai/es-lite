@@ -192,15 +192,30 @@ The feed carries none of the three today. Field numbers must be checked against
 the live contract; reusing a tag assigned to a removed field is the one mistake
 that is unrecoverable on the wire.
 
-The handler fills them from the envelope. The client is tolerant, per §4: a
-missing, empty or malformed id drops that value and reports through the feed
-observer; the event is always delivered.
+The handler fills them from the envelope. The two value classes fail
+differently, and as built (platform v0.9.1) that difference is deliberate:
+
+- **Span context is telemetry**, so it is tolerant per §4: a missing, empty or
+  malformed `trace_id`/`span_id` drops the context and reports through the feed
+  observer; the event is always delivered.
+- **Correlation and causation are audit facts**, so a malformed value fails the
+  event with an error naming the position and field rather than being silently
+  zeroed. Absence — an older server sending neither — is still `uuid.Nil` and
+  delivers.
+
+> **Amendment (2026-11-17, as built).** The design originally said all three
+> ids degrade. The platform implementation draws the line above instead: a
+> malformed audit id can only come from a defective peer, and zeroing it would
+> forge an audit trail, so it fails loudly. Accepted, with the residual risk
+> that such a defect wedges that subscription until the producer is fixed. The
+> span context, which nothing attests, keeps the tolerant rule.
 
 `trace_flags` above 255 is masked to the low byte; only bit 0 (sampled) is
 defined today and the rest are preserved for W3C.
 
 Optional fields keep old servers and old clients compatible: absent means zero,
-which means no link. Contracts tag **alpha.36**.
+which means no link. Contracts tag **alpha.37** (as built; the design predicted
+alpha.36).
 
 A second wire path needs checking in the platform: `delivery.Relay` publishes
 `[]es.Envelope` through an application-supplied function
@@ -281,7 +296,8 @@ So the rule is asymmetric, and deliberately so:
 - A latent mislabel: a `CHECK` violation during the events INSERT would be
   classified as a conflict (`sqlite/store.go:350`). The Go writer cannot produce
   one, so this is unreachable today.
-- The library ships a schema with no producer until platform v0.9.0. The
+- The library ships a schema with no producer until platform v0.9.1 (as built;
+  the design predicted v0.9.0). The
   migration is therefore the only chance to get it right before data exists.
 
 ## 6. Security and tenancy
@@ -352,8 +368,9 @@ So the rule is asymmetric, and deliberately so:
 4. `feedtest` conformance assertions.
 5. `projection.IsReplaying` and its test.
 6. Docs: README delivery guarantees, migration notes.
-7. Release v0.15.0. Contracts, platform and portal follow in their own
-   repositories against this ADR.
+7. Release v0.15.0 (patched to v0.15.1). Contracts, platform and portal follow
+   in their own repositories against this ADR — as built: contracts `alpha.37`,
+   platform `v0.9.1`, portal pinned to both.
 
 ## 10. Questions resolved at design review
 
@@ -363,9 +380,13 @@ So the rule is asymmetric, and deliberately so:
    `SpanContext` at its caller-owned-transaction sites; the ADR says so instead
    of claiming "every append path".
 3. **SQLite parity**: a rebuild migration, not behavioural parity only (§3.3).
-4. **Feed correlation/causation**: new string fields; empty or malformed
-   becomes `uuid.Nil`, and the event is delivered.
+4. **Feed correlation/causation**: new string fields; absence becomes
+   `uuid.Nil` and the event is delivered. A malformed value fails the event —
+   amended in §3.5 to match the as-built platform.
 5. **Replay detection**: `projection.IsReplaying` is added to v0.15.0; a
    call-site marker was rejected as silently forgettable.
 6. **Scope**: the plan in the es-lite repository covers v0.15.0 only; the
    contract, platform and portal work are separate plans against this ADR.
+7. **As-built releases**: contracts `alpha.37` and platform `v0.9.1`, not the
+   predicted `alpha.36`/`v0.9.0`; the wire fields and the append seam are
+   otherwise as designed, including the `AppendTx` wrap.
