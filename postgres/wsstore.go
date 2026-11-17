@@ -363,6 +363,16 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		return zero, err
 	}
 
+	// The opt-in append hint (ADR 0039 C2), deliberately the transaction's
+	// last statement: after the events, the log_order row and the claims.
+	// notifyAppend's first check is the option, so with WithAppendNotify
+	// unset — the default — this adds no statement and no lock to the
+	// append path; a notify error aborts the transaction rather than
+	// committing a broken hint.
+	if err := w.notifyAppend(ctx, db, p); err != nil {
+		return zero, err
+	}
+
 	return es.AppendResult{
 		FromVersion: p.ExpectedVersion,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
@@ -427,6 +437,44 @@ func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, o
 			}
 			return fmt.Errorf("claim %s: %w", op.Scope, err)
 		}
+	}
+	return nil
+}
+
+// maxNotifyWorkspaceBytes bounds the workspace ID the notify path will
+// carry as a NOTIFY payload: 512 bytes, far under the 8000-byte NOTIFY
+// limit, so the limit cannot be hit — an oversized ID is rejected here
+// instead, as an error that aborts the append (ADR 0039 C2). Enforced
+// only when WithAppendNotify is set; the default append path stays
+// byte-for-byte unchanged.
+const maxNotifyWorkspaceBytes = 512
+
+// notifyAppend emits the opt-in append hint (ADR 0039 C2): one
+// SELECT pg_notify($1, $2) with the channel and this workspace's ID, as
+// the append transaction's last statement — after the events, the
+// log_order row and the claims, so everything durable is written before
+// the hint. With the option off (an empty channel) or a claim-only
+// batch (no events) it issues no statement at all, which is what keeps
+// the default append path free of extra statements and extra locks.
+//
+// The statement is transactional: a rolled-back append notifies nobody,
+// and a caller-owned transaction (AppendTx) notifies exactly when the
+// caller commits. A notify error fails the append rather than being
+// swallowed: the statement runs inside the transaction, whose COMMIT
+// can already fail on an exhausted async notification queue — the
+// runbook's failure-contained model, where the operator alerts on
+// pg_notification_queue_usage() and es-lite never silently commits a
+// broken hint. The workspace ID is the payload and the payload is
+// nothing else; the channel is a capability and is never logged.
+func (w *Workspace) notifyAppend(ctx context.Context, db DBTX, p es.AppendParams) error {
+	if w.store.notifyChannel == "" || len(p.Events) == 0 {
+		return nil
+	}
+	if len(w.ws) > maxNotifyWorkspaceBytes {
+		return fmt.Errorf("postgres: workspace id is %d bytes, over the %d-byte notify bound", len(w.ws), maxNotifyWorkspaceBytes)
+	}
+	if _, err := db.Exec(ctx, `SELECT pg_notify($1, $2)`, w.store.notifyChannel, w.ws); err != nil {
+		return fmt.Errorf("notify append: %w", err)
 	}
 	return nil
 }

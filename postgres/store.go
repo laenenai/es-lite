@@ -51,6 +51,7 @@ const defaultMaxPayloadBytes = 8 << 20
 type openConfig struct {
 	autoMigrate     bool
 	maxPayloadBytes int
+	notifyChannel   string
 }
 
 // WithoutAutoMigrate skips applying migrations on Open. Application replicas
@@ -64,6 +65,98 @@ func WithoutAutoMigrate() Option { return func(c *openConfig) { c.autoMigrate = 
 // write time instead of wedging feed subscriptions later. n == 0 selects
 // the default (8 MiB); n < 0 lifts the cap entirely.
 func WithMaxPayloadBytes(n int) Option { return func(c *openConfig) { c.maxPayloadBytes = n } }
+
+// WithAppendNotify opts the Postgres append path into emitting a
+// pg_notify hint per append (ADR 0039 C2). It is OFF by default and
+// deliberately opt-in: with it unset the append path issues no
+// additional statement and takes no additional lock. With it set, every
+// non-empty append transaction runs
+//
+//	SELECT pg_notify($1, $2)
+//
+// as its last statement — after the events, the log_order row and the
+// claims — with the channel and the workspace ID as parameters, so an
+// idle feed subscriber can be woken in single-digit milliseconds on a
+// clean fence instead of after a poll. NOTIFY is transactional: a
+// rolled-back append sends nothing, a claim-only append (no events)
+// sends nothing, and an AppendTx notifies exactly when the caller's
+// transaction commits.
+//
+// channel must be a strict PostgreSQL identifier — non-empty, at most 63
+// bytes (NAMEDATALEN−1), starting with a letter or underscore, then
+// letters, digits and underscores — and both Open and OpenWithPool
+// reject anything else before connecting. The channel name is a
+// capability: choose a high-entropy unguessable name, never log it, and
+// enable C2 only when every role that can CONNECT to the database is
+// trusted or the database is dedicated (LISTEN and pg_notify are not
+// RLS-filtered — see docs/deploy/README.md for the precondition and the
+// operating model).
+//
+// Costs, stated plainly: one extra statement and round trip per
+// non-empty append, plus the commit-time notify-queue lock that briefly
+// serialises committing notifiers; a transaction that executed NOTIFY
+// cannot be prepared for two-phase commit; and an exhausted async
+// notification queue fails the append's COMMIT — the runbook
+// operationalises exactly these (pg_notification_queue_usage()
+// alerting, 2PC exclusion, when to prefer the application hint). A
+// workspace ID over 512 bytes is rejected on the append path, so the
+// 8000-byte NOTIFY payload limit is unreachable.
+func WithAppendNotify(channel string) Option {
+	return func(c *openConfig) { c.notifyChannel = channel }
+}
+
+// validate fails fast on options that cannot work, so a misconfigured
+// Open surfaces here — before any connection, probe or migration —
+// instead of on the first append.
+func (c openConfig) validate() error {
+	// An empty notify channel is the option being off, not a
+	// misconfiguration; anything set must be a usable identifier.
+	if c.notifyChannel == "" {
+		return nil
+	}
+	return validNotifyChannel(c.notifyChannel)
+}
+
+// maxNotifyChannelBytes is the longest notify channel accepted: 63
+// bytes, NAMEDATALEN−1, the identifier limit PostgreSQL stores without
+// silent truncation.
+const maxNotifyChannelBytes = 63
+
+// validNotifyChannel reports whether channel is a strict PostgreSQL
+// identifier: non-empty, at most maxNotifyChannelBytes long, starting
+// with a letter or underscore, then letters, digits and underscores. A
+// keyword like "select" passes — LISTEN quotes the channel with
+// pgx.Identifier.Sanitize — but the conservative ASCII-identifier rule
+// keeps the name predictable for operators and impossible to smuggle
+// syntax through. Both constructors run this at Open time, and the
+// NotifyListener (ADR 0039 C2) reuses it, so one validator decides
+// everywhere. The error names the channel — Open-time feedback on a
+// misconfiguration; no other path ever puts it in a message or a log.
+func validNotifyChannel(s string) error {
+	if s == "" {
+		return fmt.Errorf("postgres: WithAppendNotify: channel must not be empty")
+	}
+	if len(s) > maxNotifyChannelBytes {
+		return fmt.Errorf("postgres: WithAppendNotify: channel %q is %d bytes, over the %d-byte identifier limit", s, len(s), maxNotifyChannelBytes)
+	}
+	if !isIdentStart(s[0]) {
+		return fmt.Errorf("postgres: WithAppendNotify: channel %q is not a valid identifier: it must start with a letter or underscore", s)
+	}
+	for i := 1; i < len(s); i++ {
+		if !isIdentPart(s[i]) {
+			return fmt.Errorf("postgres: WithAppendNotify: channel %q is not a valid identifier: only letters, digits and underscores are allowed", s)
+		}
+	}
+	return nil
+}
+
+func isIdentStart(b byte) bool {
+	return b == '_' || 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z'
+}
+
+func isIdentPart(b byte) bool {
+	return isIdentStart(b) || '0' <= b && b <= '9'
+}
 
 func newOpenConfig(opts []Option) openConfig {
 	c := openConfig{autoMigrate: true, maxPayloadBytes: defaultMaxPayloadBytes}
@@ -97,6 +190,12 @@ type Store struct {
 	// with es.ErrPayloadTooLarge before any insert. Negative means no cap.
 	maxPayloadBytes int
 
+	// notifyChannel is the opt-in pg_notify channel (WithAppendNotify,
+	// ADR 0039 C2). Empty — the default — means the append path emits no
+	// hint statement at all. It is a capability: never logged, never
+	// echoed into an error outside Open-time validation.
+	notifyChannel string
+
 	// relayRoleMu guards the es_relay membership verdict below — the
 	// startup check every RLS-bypass path shares — Drain and the anchor
 	// path's bypassTx (checkRelayRole). Migration 0005 gates the RLS
@@ -125,6 +224,13 @@ type Store struct {
 // a pgx.QueryTracer for OpenTelemetry, an AfterConnect hook — should build the
 // pool itself and use OpenWithPool.
 func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
+	// Fail fast: options are validated before any connection is opened,
+	// so a misconfigured Open (a bad notify channel) surfaces as this
+	// error — not as a first-append failure or a confusing connect error.
+	cfg := newOpenConfig(opts)
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: connect: %w", err)
@@ -133,8 +239,7 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	cfg := newOpenConfig(opts)
-	s := &Store{pool: pool, ownsPool: true, maxPayloadBytes: cfg.maxPayloadBytes}
+	s := &Store{pool: pool, ownsPool: true, maxPayloadBytes: cfg.maxPayloadBytes, notifyChannel: cfg.notifyChannel}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		pool.Close()
 		return nil, err
@@ -161,11 +266,17 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 	if pool == nil {
 		return nil, fmt.Errorf("postgres: open with pool: pool is nil")
 	}
+	// Fail fast like Open: a misconfigured option (a bad notify channel)
+	// is rejected before the version probe, which would otherwise be a
+	// round trip wasted on a doomed Open.
+	cfg := newOpenConfig(opts)
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	if err := probePostgresFloor(ctx, pool); err != nil {
 		return nil, err
 	}
-	cfg := newOpenConfig(opts)
-	s := &Store{pool: pool, ownsPool: false, maxPayloadBytes: cfg.maxPayloadBytes}
+	s := &Store{pool: pool, ownsPool: false, maxPayloadBytes: cfg.maxPayloadBytes, notifyChannel: cfg.notifyChannel}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		return nil, err
 	}
