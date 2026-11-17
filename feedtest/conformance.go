@@ -781,9 +781,13 @@ func RunLog(t *testing.T, newLog NewStore) {
 				Consumer:   "feedtest",
 				Definition: projection.Definition{Name: "p", Consumes: []string{typHappened}},
 			}
+			// The 5s timeout is a safety bound only: cancelSink ends
+			// the subscription the moment both envelopes arrive,
+			// instead of idling to the timeout an ackingSink would
+			// force.
 			ctx1, cancel1 := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel1()
-			sink := &ackingSink{}
+			sink := &cancelSink{want: 2, cancel: cancel1}
 			if err := srv.Subscribe(ctx1, req, sink); err != nil &&
 				!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("feedtest: subscribe: %v", err)

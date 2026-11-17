@@ -32,7 +32,9 @@ type Apply func(ctx context.Context, batch []es.Envelope) error
 // Replay pages src.ReadAll from `from` (exclusive) in global order, applying
 // each batch, and returns the last global_position applied. This is the
 // authoritative rebuild source — the DB log, not an external retention window
-// (ADR 0005). Apply must be idempotent; pair it with a Marker so a rebuild
+// (ADR 0005). The ctx Replay passes to apply — and to src.ReadAll — is
+// marked as a replay; IsReplaying reports true inside both. Apply must be
+// idempotent; pair it with a Marker so a rebuild
 // can cut over to live delivery at exactly the returned position. The
 // returned position is the last position a batch actually applied — the
 // rebuild's own log end, not a store-wide head: save it to the Marker (or
