@@ -1,6 +1,6 @@
 # ADR 0039: Scoped Feed Wake-Ups
 
-- **Status:** Proposed (panel review complete; revision 2; not implemented)
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-17
 - **Related:** ADR 0002 (delivery topology; its "no push source ships"
   statement is amended here), ADR 0035 (caller-owned transactions), ADR 0036
@@ -603,6 +603,78 @@ failure model is in the runbook.
    measured and the C2 security/failure model is in the runbook. Its real
    advantage — zero per-call-site wiring, including caller-owned commits — is
    why it is worth gating properly rather than shipping half-specified.
+
+## Measurements (2026-11-17)
+
+Recorded from the implementation branch. Environment: local Docker
+`postgres:17` (the `task test:pg` shape, localhost), macOS host, `-race`
+builds for the latency runs. Latency shapes are 50 iterations each
+(30 ms parks between appends, a matching and a non-matching subscription
+per shape); the benchmark is `-benchtime=2s` with single-event batches.
+The `notify` shape wires `postgres.WithAppendNotify` + `NotifyListener`
+with the gateway wiring (`OnNotify` → `hub.Wake(scope)`,
+`OnReconnected` → `hub.WakeAll()`); `poll` is the no-waiter baseline,
+`hub` the in-process `WithAfterAppend` → `hub.Wake` hint, `contended`
+the hub shape with a fence pinned ~50 ms per append.
+
+### Wake latency and fence draws (p50 / p99, append → delivery)
+
+| shape      | p50       | p99      | fence draws/append (steady-state) |
+|------------|-----------|----------|------------------------------------|
+| poll       | 219.7 ms  | 272.7 ms | 2.08 (2.00)                        |
+| hub        | 7.03 ms   | 22.99 ms | 2.08 (2.00)                        |
+| notify     | 7.09 ms   | 8.84 ms  | 2.08 (2.00)                        |
+| contended  | 264.5 ms  | 309.5 ms | 2.08 (2.00)                        |
+
+- The clean-fence gate holds: `hub` p50 7.03 ms and `notify` p50 7.09 ms,
+  both under the 10 ms criterion, and essentially identical to each other —
+  the `pg_notify` round trip costs nothing measurable over the in-process
+  hint. The poll baseline is real (~`Poll`), and the contended shape
+  confirms §5: a pinned fence costs ~`Poll` (264.5 ms ≈ 250 ms), with p99
+  bounded (309.5 ms, well under 2×`Poll`+150 ms) — delivery falls back to
+  the poll, never stalls.
+- **Read amplification, measured and framed honestly.** All four shapes
+  draw ~2 fences per append in steady state — 2.00 draws/append is one
+  fence draw per subscription of the scope per append (two subscriptions
+  in the harness). The wake does *not* add a net draw over the poll
+  baseline in this test: the poll shape already burns the same ~2
+  draws/append on its own schedule (the never-acking non-matching
+  subscription draws a fence on every idle poll cycle). What the wake
+  contributes structurally is the non-matching subscription's empty-fence
+  draw per append — an empty page read for a type filter that never
+  matches — and that draw is the same one the poll baseline was already
+  paying. So the measured amplification delta is ~0, not a win: the wake
+  buys 219.7 ms → ~7 ms latency at no additional steady-state fence-draw
+  cost, and §5's "one fenced page read per stream of the scope per wake"
+  is the per-append structure, confirmed at 2.00 steady-state.
+
+### Append benchmark (opt-in C2 on vs off, single-event batches)
+
+| appenders | notify=off appends/s | notify=on appends/s | on vs off |
+|-----------|----------------------|---------------------|-----------|
+| 1         | 980.0                | 795.6               | −18.8%    |
+| 8         | 2,718                | 2,313               | −14.9%    |
+| 32        | 4,375                | 2,273               | −48.0%    |
+
+- The `notify=off` rows are the no-regression evidence: the default
+  append path is untouched, and `WithAppendNotify` is opt-in.
+- The `notify=on` cost is real and recorded honestly: ~19% at 1 appender,
+  ~15% at 8, and it flattens at 32 appenders (~2,273/s vs ~4,375/s off).
+  The per-append `pg_notify` statement plus its queue drain appears to
+  serialise above ~2.3k notifications/s. This is the measured opt-in
+  cost §3.3 warns about ("suitable for moderate append rates; above
+  that, C1") — not a default-path regression, and the reason C1 stays
+  the recommended source at high append concurrency.
+
+### Chaos (listener kill mid-run)
+
+The feedgate chaos run with `WithAppendNotify` wired: a real listener
+backend was killed with `pg_terminate_backend` at event 60 of 200 while
+the producer kept appending through the reconnect outage. Result: 201/201
+events delivered exactly (set equality against the appended set), 0
+duplicates, 1 reconnect with `OnReconnected` → `WakeAll`. §4 holds under
+a real connection loss: the outage cost delay only, never loss, because
+the missed hints fell back to the poll.
 
 ## Appendix: panel review changes (2026-11-17)
 

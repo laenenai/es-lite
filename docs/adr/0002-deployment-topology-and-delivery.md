@@ -86,6 +86,15 @@ never load-bearing for completeness. The `feed` package exposes the same
 seam one level up (`feed.Waiter`, consumed by the subscribe loop's idle
 wait) — see ADR 0037 for the deferred LISTEN/NOTIFY question there.
 
+> **Erratum (ADR 0039, 2026-11-17):** this section's "no push source
+> ships" statement is amended in part. The core still ships no broker and
+> no default push source, but ADR 0039 adds the scoped `Waiter`/`Hub`
+> wake-up seam, an opt-in Postgres LISTEN/NOTIFY source
+> (`postgres.WithAppendNotify` + `NotifyListener`), and the
+> application-hint decorator (`es.WithAfterAppend`). Delivery semantics
+> are unchanged: a wake remains a best-effort hint, and the poll stays
+> the safety net that guarantees no event is ever skipped.
+
 ## Consequences
 
 - **Writes scale by adding replicas.** No leader election on the hot
