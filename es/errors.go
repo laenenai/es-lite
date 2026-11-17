@@ -97,6 +97,13 @@ var (
 	// version the event would have taken, the event's type URL and the
 	// payload's size in bytes — never the payload bytes themselves.
 	ErrPayloadTooLarge = errors.New("es-lite: payload too large")
+
+	// ErrMalformedSpanContext reports that a caller supplied
+	// span-context metadata (ADR 0040) that does not parse: one id
+	// present without the other, an id of the wrong length, an all-zero
+	// id, or flags with no ids. Nothing was written; the caller should
+	// fix the producer.
+	ErrMalformedSpanContext = errors.New("es-lite: malformed span context")
 )
 
 // DecidedAtSkewError is the structured form of ErrDecidedAtSkew: it carries
