@@ -654,6 +654,15 @@ func (w *Workspace) drawFence(ctx context.Context) (uint64, error) {
 	return r, err
 }
 
+// FenceDraws reports the fence transaction ids this Workspace's rounds have
+// drawn (the F9 counter). It is diagnostic only: reading it takes the same
+// mutex a read round does, and it changes no read or append behaviour.
+func (w *Workspace) FenceDraws() uint64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.draws
+}
+
 func (w *Workspace) fenceCleared(ctx context.Context, r uint64) (bool, error) {
 	return w.store.fenceCleared(ctx, r)
 }
