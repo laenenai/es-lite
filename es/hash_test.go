@@ -2,6 +2,7 @@ package es_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"testing"
 	"time"
@@ -41,6 +42,15 @@ const (
 	goldenV2Hash      = "9bfcdff651e5d56dca6bda50f294a4c2f7b56fd1296a73d7428107d7ff2b539b"
 	goldenWSHash      = "57e2901d2e5cd1bef47267971a47dbaf7043b85cbf42fdb0e1792b9a9b27f3f8"
 	goldenUnchained   = "17d28c6596c090407641f11ce7c3e902d16ca979d422522862a423ab4337a7f9"
+
+	// Delegated golden vector (ADR 0041 §3.2): goldenV1's actor acting
+	// through the service "agent-runner". The bytes are the v1 golden
+	// bytes ‖ the delegation block appended after prev_hash, produced
+	// by the same independent reimplementation as the v1 goldens and
+	// frozen the same way — changing them means changing the chain
+	// format.
+	goldenDelegatedCanonical = "0000001365732d6c6974652e656e76656c6f70652e7631000000000000000c636f756e7465723a6d61696e00000000000000010192f3a000007000800000000000000100000016636f756e7465722e76312e496e697469616c697a65640000000100064c1bc4386a4000064c1bc44fc6310192f3a00000700080000000000000c0000000000000000000000000000000000192f3a00000700080000000000000c1000000047573657200000005616c696365000000040805106400000000000000000000000000000000000000000000000000000000000000000000001565732d6c6974652e64656c65676174696f6e2e763100000007736572766963650000000c6167656e742d72756e6e6572"
+	goldenDelegatedHash      = "2730d5c4c6ac4d2ac0c61419609d8fb93ac5bd220f31f2469712dae6538d8919"
 )
 
 func TestCanonicalEnvelopeGolden(t *testing.T) {
@@ -50,6 +60,109 @@ func TestCanonicalEnvelopeGolden(t *testing.T) {
 	}
 	if len(es.CanonicalEnvelope(goldenV1)) != 218 {
 		t.Fatalf("canonical length = %d, want 218", len(es.CanonicalEnvelope(goldenV1)))
+	}
+}
+
+// TestCanonicalEnvelopeDelegatedGolden pins the delegated encoding
+// (ADR 0041 §3.2): goldenV1's canonical bytes with the delegation block
+// appended after prev_hash — and nothing before it moves.
+func TestCanonicalEnvelopeDelegatedGolden(t *testing.T) {
+	delegated := goldenV1
+	delegated.Actor.Via = es.ActorRef{Type: "service", ID: "agent-runner"}
+
+	got := es.CanonicalEnvelope(delegated)
+	if gotHex := hex.EncodeToString(got); gotHex != goldenDelegatedCanonical {
+		t.Fatalf("delegated canonical encoding drifted:\n got %s\nwant %s", gotHex, goldenDelegatedCanonical)
+	}
+	gotHash := es.EnvelopeHash(delegated)
+	if gotHex := hex.EncodeToString(gotHash[:]); gotHex != goldenDelegatedHash {
+		t.Fatalf("delegated hash = %s, want %s", gotHex, goldenDelegatedHash)
+	}
+
+	// The structure, pinned twice over: the delegated bytes are exactly
+	// the v1 bytes plus the block, so everything up to and including
+	// prev_hash is untouched — and the block is the three
+	// length-prefixed strings an auditor can append by hand.
+	prefix := es.CanonicalEnvelope(goldenV1)
+	if !bytes.Equal(got[:len(prefix)], prefix) {
+		t.Fatal("the delegation block must append after prev_hash, leaving every earlier byte untouched")
+	}
+	var wantBlock []byte
+	for _, s := range []string{"es-lite.delegation.v1", "service", "agent-runner"} {
+		wantBlock = binary.BigEndian.AppendUint32(wantBlock, uint32(len(s)))
+		wantBlock = append(wantBlock, s...)
+	}
+	if !bytes.Equal(got[len(prefix):], wantBlock) {
+		t.Fatalf("delegation block = %x, want %x", got[len(prefix):], wantBlock)
+	}
+}
+
+// TestZeroViaKeepsPreChangeBytes is ADR 0041 §3.2's third golden vector:
+// an event with a zero Via is byte-identical to the old encoding, not
+// merely equal in hash. goldenV1Canonical was frozen before ADR 0041,
+// so byte equality with it is the proof; the Via is set explicitly to
+// show the field's zero value appends nothing.
+func TestZeroViaKeepsPreChangeBytes(t *testing.T) {
+	e := goldenV1
+	e.Actor.Via = es.ActorRef{} // explicit: the actor acted for itself
+	got := es.CanonicalEnvelope(e)
+	want, err := hex.DecodeString(goldenV1Canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("zero-Via encoding is not the pre-change encoding:\n got %x\nwant %x", got, want)
+	}
+}
+
+// TestDelegationMarkerNotAmbiguous pins why the block lives after the
+// fixed trailer (ADR 0041 §3.2): the marker is only ever read after the
+// 32-byte prev_hash, never scanned. A payload that starts with the
+// marker bytes therefore encodes and verifies like any other — the
+// marker inside the payload stays payload data, and a delegated copy of
+// the same event gains exactly the block after the trailer.
+func TestDelegationMarkerNotAmbiguous(t *testing.T) {
+	marker := "es-lite.delegation.v1"
+
+	zeroVia := goldenV1
+	zeroVia.Payload = append([]byte(marker), goldenV1.Payload...)
+
+	delegated := zeroVia
+	delegated.Actor.Via = es.ActorRef{Type: "service", ID: "svc"}
+
+	zeroBytes := es.CanonicalEnvelope(zeroVia)
+	viaBytes := es.CanonicalEnvelope(delegated)
+
+	// In the zero-Via encoding the marker appears exactly once — inside
+	// the payload — so no block was appended.
+	if n := bytes.Count(zeroBytes, []byte(marker)); n != 1 {
+		t.Fatalf("marker appears %d times in the zero-Via encoding, want exactly 1 (payload only)", n)
+	}
+	// The delegated encoding is the zero-Via encoding plus the block:
+	// the payload's marker never moves or merges with it.
+	if !bytes.Equal(viaBytes[:len(zeroBytes)], zeroBytes) {
+		t.Fatal("delegation block did not append cleanly after the fixed trailer")
+	}
+	if n := bytes.Count(viaBytes, []byte(marker)); n != 2 {
+		t.Fatalf("marker appears %d times in the delegated encoding, want exactly 2 (payload + block)", n)
+	}
+	var wantBlock []byte
+	for _, s := range []string{marker, "service", "svc"} {
+		wantBlock = binary.BigEndian.AppendUint32(wantBlock, uint32(len(s)))
+		wantBlock = append(wantBlock, s...)
+	}
+	if !bytes.Equal(viaBytes[len(zeroBytes):], wantBlock) {
+		t.Fatalf("delegation block = %x, want %x", viaBytes[len(zeroBytes):], wantBlock)
+	}
+
+	// Both variants hash normally, and distinctly: the payload's marker
+	// is attested as payload, the Via as the block.
+	zeroHash := es.EnvelopeHash(zeroVia)
+	if zeroHash == es.EnvelopeHash(goldenV1) {
+		t.Fatal("marker-prefixed payload did not change the hash; payload bytes are attested")
+	}
+	if zeroHash == es.EnvelopeHash(delegated) {
+		t.Fatal("setting Via did not change the hash of a marker-prefixed event; delegation is attested")
 	}
 }
 
@@ -107,6 +220,7 @@ func TestHashSensitivity(t *testing.T) {
 		"actor id":         func(e *es.Envelope) { e.Actor.ID = "bob" },
 		"prev hash":        func(e *es.Envelope) { e.PrevHash = append([]byte{1}, e.PrevHash[1:]...) },
 		"workspace":        func(e *es.Envelope) { e.Workspace = "w" },
+		"via id":           func(e *es.Envelope) { e.Actor.Via = es.ActorRef{Type: "service", ID: "x"} },
 		"nil prev == zero": nil, // control: a nil PrevHash encodes as ZeroHash
 	}
 	for name, mut := range mutations {

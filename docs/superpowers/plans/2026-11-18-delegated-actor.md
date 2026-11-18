@@ -135,14 +135,16 @@ ALTER TABLE events
 
 ALTER TABLE events VALIDATE CONSTRAINT events_via_complete;
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS events_via_idx
+CREATE INDEX IF NOT EXISTS events_via_idx
     ON events (workspace_id, via_principal)
     WHERE via_principal IS NOT NULL;
 ```
 
-If the migration runner forbids `CONCURRENTLY` inside its transaction, create
-the index in a separate migration or drop `CONCURRENTLY` — check
-`postgres/migrate` at implementation time.
+Migrations run in one transaction (ADR 0010), which forbids `CONCURRENTLY` —
+the same constraint `0003` documents. On a large table, build the index
+per-partition with `CONCURRENTLY` and attach it before the migration runs (the
+"Index build order" runbook in `docs/deploy/README.md`); the `IF NOT EXISTS`
+statement is then an instant no-op.
 
 - [ ] **Step 2: Write the failing tests** (`PG_DSN`-gated)
 

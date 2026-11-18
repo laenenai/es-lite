@@ -21,6 +21,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -497,7 +498,8 @@ const envelopeCols = `
 	type_url, schema_version, occurred_at, recorded_at,
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, workspace_id, prev_hash, hash,
-	trace_id, span_id, trace_flags`
+	trace_id, span_id, trace_flags,
+	via_type, via_id, via_principal`
 
 // parseStoredUUID parses one stored audit-UUID column (event_id,
 // correlation_id, causation_id, command_id). A value that does not parse
@@ -526,6 +528,7 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		workspaceID                           string
 		traceID, spanID                       []byte
 		flags                                 *int16
+		viaType, viaID, viaPrincipal          *string
 	)
 	if err := row.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -533,6 +536,7 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &payload, &workspaceID, &e.PrevHash, &e.Hash,
 		&traceID, &spanID, &flags,
+		&viaType, &viaID, &viaPrincipal,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -561,6 +565,13 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		return es.Envelope{}, err
 	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
+	// The delegated actor (ADR 0041) is an audit fact like the UUIDs
+	// above, and is reconstructed strictly: a row carrying only some of
+	// the three columns fails the read instead of silently reading as a
+	// zero Via, which would forge an actor that acted for itself.
+	if e.Actor.Via, err = decodeVia(viaType, viaID, viaPrincipal); err != nil {
+		return es.Envelope{}, err
+	}
 	e.Payload = payload
 	// The span context is the one deliberate exception to the
 	// load-bearing-UUID rule above: a stored value that does not parse
@@ -569,6 +580,40 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	// store.
 	e.SpanContext = decodeSpanContext(traceID, spanID, flags)
 	return e, nil
+}
+
+// decodeVia reconstructs the delegated actor (ADR 0041) from the three
+// stored columns — the via_type, via_id and via_principal text values,
+// each nil for NULL — into an es.ActorRef. Via is an audit fact, the
+// deliberate opposite of the span context's telemetry tolerance above:
+// a row with only some of the three set is a partially recorded
+// delegation and fails the read, naming the NULL columns, instead of
+// silently reading as a zero Via that would forge an actor acting for
+// itself (ADR 0041 §4). The events_via_complete CHECK keeps every such
+// shape out of the store; this strictness is the second line of
+// defence, for a restored dump or a constraint bypassed during a
+// migration. Three NULLs read as the zero ref; three values read as
+// the ref they record (via_principal is the derived "type:id" form the
+// via index keys on and is not re-derived or cross-checked here).
+func decodeVia(viaType, viaID, viaPrincipal *string) (es.ActorRef, error) {
+	switch {
+	case viaType == nil && viaID == nil && viaPrincipal == nil:
+		return es.ActorRef{}, nil
+	case viaType != nil && viaID != nil && viaPrincipal != nil:
+		return es.ActorRef{Type: *viaType, ID: *viaID}, nil
+	default:
+		var missing []string
+		if viaType == nil {
+			missing = append(missing, "via_type")
+		}
+		if viaID == nil {
+			missing = append(missing, "via_id")
+		}
+		if viaPrincipal == nil {
+			missing = append(missing, "via_principal")
+		}
+		return es.ActorRef{}, fmt.Errorf("stored delegation is incomplete: %s NULL with the rest set", strings.Join(missing, ", "))
+	}
 }
 
 // decodeSpanContext decodes the three stored span-context columns — the

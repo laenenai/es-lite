@@ -61,13 +61,16 @@ func openFeedStoreAt(t *testing.T, path string) *sqlite.Store {
 
 // appendFeedEvent appends one event to sid at the given expected version and
 // returns the committed envelope. sc is the producer's span context (ADR
-// 0040) persisted with the event; the zero value means absent.
-func appendFeedEvent(t testing.TB, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext) es.Envelope {
+// 0040) persisted with the event; the zero value means absent. actor is the
+// audited actor (ADR 0041) persisted with the event; a delegated actor (Via
+// set) must round-trip through the log.
+func appendFeedEvent(t testing.TB, s *sqlite.Store, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext, actor es.Actor) es.Envelope {
 	t.Helper()
 	res, err := s.Append(context.Background(), es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: version,
 		SpanContext:     sc,
+		Actor:           actor,
 		Events: []es.EventData{{
 			TypeURL:       typeURL,
 			SchemaVersion: 1,
@@ -155,8 +158,8 @@ func newSqliteFeedStore(ctx context.Context, t testing.TB) (feedtest.Store, func
 		Leases:          sqlite.NewLeaseStore(s),
 		DeadLetters:     sqlite.NewDeadLetterStore(s),
 		MaxPayloadBytes: 64,
-		Append: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext) es.Envelope {
-			return appendFeedEvent(t, s, sid, version, typeURL, payload, sc)
+		Append: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte, sc es.SpanContext, actor es.Actor) es.Envelope {
+			return appendFeedEvent(t, s, sid, version, typeURL, payload, sc, actor)
 		},
 		PlantOverCap: func(ctx context.Context, t testing.TB, scope string, sid es.StreamID, version uint64, typeURL string, payload []byte) uint64 {
 			return insertFeedRowDirect(t, s, sid, version, typeURL, payload)
@@ -215,9 +218,9 @@ func TestMatchingHeadIsTheFilteredMax(t *testing.T) {
 	sid := mustStreamID(t, "thing", "matching-head")
 	ctx := context.Background()
 
-	a1 := appendFeedEvent(t, s, sid, 0, "thing.v1.Happened", []byte("a"), es.SpanContext{})
-	b1 := appendFeedEvent(t, s, sid, 1, "thing.v1.Ignored", []byte("b"), es.SpanContext{})
-	a2 := appendFeedEvent(t, s, sid, 2, "thing.v1.Happened", []byte("c"), es.SpanContext{})
+	a1 := appendFeedEvent(t, s, sid, 0, "thing.v1.Happened", []byte("a"), es.SpanContext{}, es.Actor{})
+	b1 := appendFeedEvent(t, s, sid, 1, "thing.v1.Ignored", []byte("b"), es.SpanContext{}, es.Actor{})
+	a2 := appendFeedEvent(t, s, sid, 2, "thing.v1.Happened", []byte("c"), es.SpanContext{}, es.Actor{})
 	if !(a1.GlobalPosition < b1.GlobalPosition && b1.GlobalPosition < a2.GlobalPosition) {
 		t.Fatalf("insert order: %d, %d, %d, want ascending", a1.GlobalPosition, b1.GlobalPosition, a2.GlobalPosition)
 	}
@@ -686,7 +689,7 @@ func TestFeedEndToEndResumesFromCheckpoint(t *testing.T) {
 	// checkpoint survived.
 	s2 := openFeedStoreAt(t, path)
 	t.Cleanup(func() { _ = s2.Close() })
-	next := appendFeedEvent(t, s2, sid, 3, consumed, []byte("a3"), es.SpanContext{})
+	next := appendFeedEvent(t, s2, sid, 3, consumed, []byte("a3"), es.SpanContext{}, es.Actor{})
 	srv2 := newServer(s2)
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)

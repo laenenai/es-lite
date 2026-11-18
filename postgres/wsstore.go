@@ -181,6 +181,15 @@ func validateAppend(p es.AppendParams) error {
 	if p.SpanContext != (es.SpanContext{}) && !p.SpanContext.IsValid() {
 		return fmt.Errorf("%w: %s", es.ErrMalformedSpanContext, p.StreamID)
 	}
+	// The delegated actor (ADR 0041 §3.4) is refused the same way, on
+	// the same terms: Actor.Validate enforces the delegation rules — a
+	// Via must be complete and must accompany an accountable actor —
+	// and a rejection means nothing was written. Like the span context,
+	// the events table's CHECK would abort the insert anyway; this
+	// surfaces es.ErrInvalidDelegation at the API instead.
+	if err := p.Actor.Validate(); err != nil {
+		return fmt.Errorf("%w: %s", err, p.StreamID)
+	}
 	for _, op := range p.Constraints {
 		if err := op.Validate(); err != nil {
 			return err
@@ -201,6 +210,20 @@ func spanContextArgs(sc es.SpanContext) (traceID, spanID []byte, flags *int16) {
 	}
 	f := int16(sc.Flags)
 	return sc.TraceID[:], sc.SpanID[:], &f
+}
+
+// viaArgs maps a delegated actor (ADR 0041) onto the events table's
+// three nullable columns (via_type, via_id, via_principal): the zero
+// ref — "not delegated" — writes NULL, NULL, NULL, and a populated one
+// writes the type, the id and the canonical "type:id" principal the
+// via index keys on. validateAppend has already rejected non-zero
+// invalid values, so the populated arm only ever sees a complete ref.
+func viaArgs(ref es.ActorRef) (viaType, viaID, viaPrincipal *string) {
+	if ref.IsZero() {
+		return nil, nil, nil
+	}
+	t, id, principal := ref.Type, ref.ID, ref.Principal()
+	return &t, &id, &principal
 }
 
 // append is the shared append body. The caller has validated p, set the
@@ -277,6 +300,10 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 	// The span context is a property of the append (the producing trace),
 	// not of an individual event, so one mapping covers the whole batch.
 	traceID, spanID, flags := spanContextArgs(p.SpanContext)
+	// The delegated actor (ADR 0041) is likewise a property of the
+	// append — the actor acting through the service — so one mapping
+	// covers the batch too.
+	viaType, viaID, viaPrincipal := viaArgs(p.Actor.Via)
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
 		eventID := ev.EventID
@@ -310,15 +337,17 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 				workspace_id, event_id, stream_type, stream_id, version,
 				type_url, schema_version, occurred_at, recorded_at,
 				correlation_id, causation_id, command_id,
-				actor_type, actor_id, actor_principal, payload,
+				actor_type, actor_id, actor_principal,
+				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
 				trace_id, span_id, trace_flags
-			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15,$16, $17,$18, $19,$20,$21)
+			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24)
 			RETURNING global_position`,
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, occurred, recorded,
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
-			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
+			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
+			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
 			traceID, spanID, flags,
 		).Scan(&gp)
