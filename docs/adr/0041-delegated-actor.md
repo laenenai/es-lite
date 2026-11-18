@@ -28,6 +28,10 @@ Putting it anywhere else splits the trail from the log:
 This ADR records the shape for a future release. It is deliberately not
 implemented yet: it belongs with the agent API, not the MVP identity work.
 
+> **Update (2026-11-18):** it was deliberately deferred while the identity MVP
+> shipped; the agent-API work implemented it on 2026-11-18, one level as
+> designed.
+
 ## 2. Goals, non-goals, anti-goals
 
 **Goals**
