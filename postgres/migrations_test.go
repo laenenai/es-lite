@@ -301,7 +301,7 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("read schema_migrations: %v", err)
 	}
-	if v != 11 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 11 (every embedded migration applied)", v)
+	if v != 12 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 12 (every embedded migration applied)", v)
 	}
 }
