@@ -23,6 +23,12 @@ const HashSize = sha256.Size
 const (
 	envelopeDomain      = "es-lite.envelope.v1"
 	unchainedHeadDomain = "es-lite.unchained-head.v1"
+
+	// delegationDomain marks the optional delegation block (ADR 0041),
+	// appended after prev_hash only when the actor acted through a
+	// service. It carries a version so a later optional block could
+	// follow it without ambiguity.
+	delegationDomain = "es-lite.delegation.v1"
 )
 
 // ZeroHash is the prev_hash of version 1 of every stream: 32 zero bytes.
@@ -41,6 +47,17 @@ var ZeroHash [HashSize]byte
 //	actor_type, actor_id               len-prefixed strings
 //	payload                            len-prefixed, the sealed bytes as stored
 //	prev_hash                          32 bytes
+//	[optional delegation block, ADR 0041]  only when Actor.Via is set,
+//	  appended after prev_hash:
+//	  "es-lite.delegation.v1"         marker, versioned (len-prefixed)
+//	  via_type, via_id               len-prefixed strings
+//
+// The delegation block sits after the fixed 32-byte trailer because the
+// prefix up to there is length-deterministic: a verifier knows exactly
+// where prev_hash ends, and anything after it is the optional block —
+// no peek-ahead, and a payload that happens to contain the marker can
+// never be mistaken for it. An event with a zero Via produces exactly
+// the bytes it produced before ADR 0041.
 //
 // GlobalPosition is excluded (assigned during the INSERT; attested instead by
 // the per-batch log_order rows and the anchor's order root over them —
@@ -67,6 +84,15 @@ func CanonicalEnvelope(e Envelope) []byte {
 	b = appendString(b, e.Actor.ID)
 	b = appendBytes(b, e.Payload)
 	b = appendFixedHash(b, e.PrevHash)
+	// The delegation block (ADR 0041 §3.2): appended only when the actor
+	// acted through a service, so an event with a zero Via keeps the
+	// exact pre-change bytes. Delegation is an audit fact — unlike the
+	// SpanContext excluded above — so it is attested.
+	if !e.Actor.Via.IsZero() {
+		b = appendString(b, delegationDomain)
+		b = appendString(b, e.Actor.Via.Type)
+		b = appendString(b, e.Actor.Via.ID)
+	}
 	return b
 }
 

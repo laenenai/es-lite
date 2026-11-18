@@ -104,6 +104,14 @@ var (
 	// id, or flags with no ids. Nothing was written; the caller should
 	// fix the producer.
 	ErrMalformedSpanContext = errors.New("es-lite: malformed span context")
+
+	// ErrInvalidDelegation reports that an appended event carried a
+	// malformed actor under ADR 0041: a Via with only one of its fields
+	// set (a partially recorded delegation), or a Via with no
+	// accountable actor. Delegation is an audit fact, not telemetry, so
+	// the append fails and nothing is written. Both stores return it
+	// from Actor.Validate at the append seam; match it with errors.Is.
+	ErrInvalidDelegation = errors.New("es-lite: invalid delegation")
 )
 
 // DecidedAtSkewError is the structured form of ErrDecidedAtSkew: it carries
