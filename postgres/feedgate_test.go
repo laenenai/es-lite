@@ -1014,7 +1014,7 @@ const fgPageQuery = `SELECT global_position, type_url, octet_length(payload) FRO
 const fgFetchQuery = `SELECT global_position, event_id, stream_type, stream_id, version,
 	type_url, schema_version, occurred_at, recorded_at, correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, workspace_id, prev_hash, hash,
-	via_type, via_id, via_principal FROM events
+	trace_id, span_id, trace_flags, via_type, via_id, via_principal FROM events
 	  WHERE workspace_id = $1 AND global_position = ANY($2)
 	  ORDER BY global_position ASC`
 
