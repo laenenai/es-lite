@@ -1,7 +1,6 @@
 # ADR 0041: Delegated Actor (One Level)
 
-- **Status:** Proposed — deferred to the agent-API work; no implementation
-  scheduled
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-18
 - **Related:** ADR 0001 (auditability is non-negotiable), ADR 0029 (the
   tamper-evident hash and its canonical encoding), ADR 0040 (the optional-hash

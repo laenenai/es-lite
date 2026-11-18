@@ -38,7 +38,7 @@ than editing history.
 | 0038 | [Log-Order Attestation (Per-Batch `log_order` Rows)](./0038-log-order-attestation.md) | Accepted (implemented); makes ADR 0029 §2's ordering claim true |
 | 0039 | [Scoped Feed Wake-Ups](./0039-scoped-feed-wakeups.md) | Accepted (implemented) |
 | 0040 | [Producer Span Context in the Event Envelope](./0040-producer-span-context.md) | Accepted (implemented) |
-| 0041 | [Delegated Actor (One Level)](./0041-delegated-actor.md) | Proposed; deferred to the agent API |
+| 0041 | [Delegated Actor (One Level)](./0041-delegated-actor.md) | Accepted (implemented) |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in

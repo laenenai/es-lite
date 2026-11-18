@@ -366,6 +366,13 @@ are client responsibilities (ADR 0025).
 - **Metadata is visible.** Stream IDs, actors, type URLs and claim scopes are
   not encrypted by the store. Use TLS and authenticate at the application's API
   boundary; the library does not wire transport security for you.
+- **Delegation is recorded on the event, not in a side channel.** `Actor` is
+  the accountable subject; when a service executes on its behalf, `Actor.Via`
+  names that service. `actor_principal` and the partial `via_principal` index
+  answer "everything this actor did" and "everything this service did"
+  respectively. The fact is attested by the chain, so a pre-v0.16 verifier
+  reports a delegated event as a broken chain — upgrade auditors before
+  producers write one.
 
 ## Projections and reactions
 
