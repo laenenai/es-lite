@@ -269,6 +269,21 @@ func TestSpanContextRebuild(t *testing.T) {
 		tx.Rollback()
 		t.Fatalf("re-run 0009: %v", err)
 	}
+	// 0010's via columns live on the table this script DROPs, and
+	// events_new is built to the 0009 column set — the re-run reverts
+	// the table to the 0009 shape (0009's header warns against re-runs
+	// on a database already migrated past it). A real rebuild runbook
+	// re-applies every migration that came after the script it reruns;
+	// mirror that here, or the store's next append finds no via_type.
+	viaText, err := os.ReadFile("migrations/0010_delegated_actor.sql")
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("read 0010_delegated_actor.sql: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, string(viaText)); err != nil {
+		tx.Rollback()
+		t.Fatalf("re-apply 0010: %v", err)
+	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit rebuild: %v", err)
 	}
@@ -419,9 +434,10 @@ func TestSpanContextRebuild(t *testing.T) {
 		t.Fatalf("duplicate (stream_id, version) insert: error = %v, want the events.stream_id, events.version UNIQUE", err)
 	}
 
-	// Exactly the 21 expected columns, each with its declared type and
-	// nullability: 0001's sixteen, 0002's prev_hash/hash, the three new
-	// ones — no more, no fewer. global_position is the rowid alias,
+	// Exactly the 24 expected columns, each with its declared type and
+	// nullability: 0001's sixteen, 0002's prev_hash/hash, the three
+	// span-context ones, and 0010's three via columns re-applied above
+	// — no more, no fewer. global_position is the rowid alias,
 	// which table_info reports as notnull=0, pk=1.
 	type colSpec struct {
 		typ         string
@@ -449,6 +465,9 @@ func TestSpanContextRebuild(t *testing.T) {
 		"trace_id":        {"BLOB", 0, 0},
 		"span_id":         {"BLOB", 0, 0},
 		"trace_flags":     {"INTEGER", 0, 0},
+		"via_type":        {"TEXT", 0, 0},
+		"via_id":          {"TEXT", 0, 0},
+		"via_principal":   {"TEXT", 0, 0},
 	}
 	seen := make(map[string]bool, len(wantCols))
 	colRows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(events)`)

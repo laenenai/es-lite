@@ -263,6 +263,18 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	if p.SpanContext != (es.SpanContext{}) && !p.SpanContext.IsValid() {
 		return zero, fmt.Errorf("%w: %s", es.ErrMalformedSpanContext, p.StreamID)
 	}
+	// The delegated actor (ADR 0041 §3.4) is refused the same way, on
+	// the same terms: Actor.Validate enforces the delegation rules — a
+	// Via must be complete and must accompany an accountable actor —
+	// and a rejection means nothing was written. Postgres gets this
+	// from validateAppend, which both Append and AppendTx share;
+	// SQLite's single append path calls it inline, as it does for the
+	// checks above. There is no CHECK behind it here (ADR 0041 §3.3:
+	// enforcing one needs another events rebuild), so this call is the
+	// all-or-nothing enforcement. The error names the stream.
+	if err := p.Actor.Validate(); err != nil {
+		return zero, fmt.Errorf("%w: %s", err, p.StreamID)
+	}
 
 	// Payload cap (production review): reject the whole batch before the
 	// transaction is even opened — nothing is inserted, no position drawn.
@@ -317,6 +329,10 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	// The span context is a property of the append (the producing trace),
 	// not of an individual event, so one mapping covers the whole batch.
 	traceID, spanID, flags := spanContextArgs(p.SpanContext)
+	// The delegated actor (ADR 0041) is likewise a property of the
+	// append — the actor acting through the service — so one mapping
+	// covers the batch too.
+	viaType, viaID, viaPrincipal := viaArgs(p.Actor.Via)
 	envs := make([]es.Envelope, len(p.Events))
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
@@ -349,14 +365,16 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 				event_id, stream_type, stream_id, version,
 				type_url, schema_version, occurred_at, recorded_at,
 				correlation_id, causation_id, command_id,
-				actor_type, actor_id, actor_principal, payload,
+				actor_type, actor_id, actor_principal,
+				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
 				trace_id, span_id, trace_flags
-			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?)`,
+			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?)`,
 			eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, formatTS(occurred), formatTS(recorded),
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
-			p.Actor.Type, p.Actor.ID, p.Actor.Principal(), ev.Payload,
+			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
+			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
 			traceID, spanID, flags,
 		)
@@ -445,6 +463,25 @@ func spanContextArgs(sc es.SpanContext) (traceID, spanID []byte, flags *int16) {
 	}
 	f := int16(sc.Flags)
 	return sc.TraceID[:], sc.SpanID[:], &f
+}
+
+// viaArgs maps a delegated actor (ADR 0041) onto the events table's
+// three nullable columns (via_type, via_id, via_principal): the zero
+// ref — "not delegated" — writes NULL, NULL, NULL, and a populated one
+// writes the type, the id and the canonical "type:id" principal the
+// via index keys on. Append has already rejected non-zero invalid
+// values, so the populated arm only ever sees a complete ref — and
+// unlike Postgres there is no CHECK behind it (ADR 0041 §3.3), which
+// makes the validation above the all-or-nothing enforcement. Like
+// spanContextArgs, deliberately duplicated from the Postgres adapter
+// rather than shared through es (plan ruling R1): a six-line helper
+// twice beats putting SQL NULL semantics in the domain package.
+func viaArgs(ref es.ActorRef) (viaType, viaID, viaPrincipal *string) {
+	if ref.IsZero() {
+		return nil, nil, nil
+	}
+	t, id, principal := ref.Type, ref.ID, ref.Principal()
+	return &t, &id, &principal
 }
 
 // readHead returns the stream's current version and the prev_hash the next
@@ -632,7 +669,8 @@ const envelopeCols = `
 	type_url, schema_version, occurred_at, recorded_at,
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, prev_hash, hash,
-	trace_id, span_id, trace_flags`
+	trace_id, span_id, trace_flags,
+	via_type, via_id, via_principal`
 
 func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -659,9 +697,11 @@ func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es
 // column list/scan pairing shared by every read, including the feed page.
 // The audit UUIDs are load-bearing (F34): a stored event_id,
 // correlation_id, causation_id or command_id that does not parse fails the
-// read rather than being silently zeroed into a forged envelope. The span
-// context is the one deliberate exception: a value that does not parse
-// reads as absent, never a read error (ADR 0040 §4).
+// read rather than being silently zeroed into a forged envelope. The
+// delegated actor (ADR 0041) is reconstructed just as strictly — a
+// half-recorded delegation fails the read. The span context is the one
+// deliberate exception: a value that does not parse reads as absent,
+// never a read error (ADR 0040 §4).
 func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	var (
 		e                                     es.Envelope
@@ -671,6 +711,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		actorType, actorID                    string
 		traceID, spanID                       []byte
 		flags                                 any
+		viaType, viaID, viaPrincipal          *string
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -678,6 +719,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
 		&traceID, &spanID, &flags,
+		&viaType, &viaID, &viaPrincipal,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -704,8 +746,50 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		return es.Envelope{}, err
 	}
 	e.Actor = es.Actor{Type: actorType, ID: actorID}
+	// The delegated actor (ADR 0041) is an audit fact like the UUIDs
+	// above, and is reconstructed strictly: a row carrying only some of
+	// the three columns fails the read instead of silently reading as a
+	// zero Via, which would forge an actor that acted for itself.
+	if e.Actor.Via, err = decodeVia(viaType, viaID, viaPrincipal); err != nil {
+		return es.Envelope{}, err
+	}
 	e.SpanContext = decodeSpanContext(traceID, spanID, flags)
 	return e, nil
+}
+
+// decodeVia reconstructs the delegated actor (ADR 0041) from the three
+// stored columns — the via_type, via_id and via_principal text values,
+// each nil for NULL — into an es.ActorRef. Via is an audit fact, the
+// deliberate opposite of the span context's telemetry tolerance above:
+// a row with only some of the three set is a partially recorded
+// delegation and fails the read, naming the NULL columns, instead of
+// silently reading as a zero Via that would forge an actor acting for
+// itself (ADR 0041 §3.3). Postgres backs this with an all-or-nothing
+// CHECK; SQLite has none (ADR 0041 §3.3: enforcing one needs another
+// events rebuild), so this strict read is what keeps a restored dump or
+// an out-of-band write honest. Three NULLs read as the zero ref; three
+// values read as the ref they record (via_principal is the derived
+// "type:id" form the via index keys on and is not re-derived or
+// cross-checked here).
+func decodeVia(viaType, viaID, viaPrincipal *string) (es.ActorRef, error) {
+	switch {
+	case viaType == nil && viaID == nil && viaPrincipal == nil:
+		return es.ActorRef{}, nil
+	case viaType != nil && viaID != nil && viaPrincipal != nil:
+		return es.ActorRef{Type: *viaType, ID: *viaID}, nil
+	default:
+		var missing []string
+		if viaType == nil {
+			missing = append(missing, "via_type")
+		}
+		if viaID == nil {
+			missing = append(missing, "via_id")
+		}
+		if viaPrincipal == nil {
+			missing = append(missing, "via_principal")
+		}
+		return es.ActorRef{}, fmt.Errorf("stored delegation is incomplete: %s NULL with the rest set", strings.Join(missing, ", "))
+	}
 }
 
 // decodeSpanContext decodes the three stored span-context columns — the
