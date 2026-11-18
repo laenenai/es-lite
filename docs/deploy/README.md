@@ -92,6 +92,81 @@ Once this runbook step is done, migration 0003 is a **no-op**: its
 place. Databases that skip the manual step pay a blocking build inside the
 migration — acceptable only for small databases.
 
+## Index build order (migration 0012)
+
+Migration 0012 adds one more partial index, `events_via_idx` on
+`(workspace_id, via_principal) WHERE via_principal IS NOT NULL` — the
+reverse audit query's index (ADR 0041: "everything service S did, across
+users"). The same lock arithmetic as above applies, and this section is
+deliberately its own: **do not follow the migration 0003 section for this
+index.** That section is keyed to 0003 — its "skip this section entirely if
+migration 0003 has already run" rule says nothing about 0012, and its
+two-index lists and child-name formulas would build the wrong indexes
+here. Like the 0003 runbook, this one is needed only for databases where
+`events` holds **≥10M rows**; on smaller databases migration 0012's plain
+`CREATE INDEX IF NOT EXISTS` finishes fast enough to run inside the
+migration.
+
+Migrations run in one transaction (ADR 0010), so they cannot use
+`CREATE INDEX CONCURRENTLY`, and Postgres cannot `CREATE INDEX CONCURRENTLY`
+on a partitioned parent at all (all versions through 18) — so the build is
+per partition: build the index on each partition with `CONCURRENTLY`, then
+create the parent index with `ONLY` and attach the partition indexes —
+the last two steps are metadata-only and instant. The partial predicate
+must be repeated in **both** the child build and the parent statement:
+`ATTACH PARTITION` requires identical definitions, and a parent built
+without the predicate cannot adopt children built with it. Run this
+through `psql` (`\gexec` runs one statement per row; `CREATE INDEX
+CONCURRENTLY` cannot run inside a transaction block):
+
+```sql
+-- 1. Build the index on every events partition, without blocking appends.
+SELECT format('CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I %s',
+              p.relname || '_workspace_id_via_principal_idx', p.relname,
+              '(workspace_id, via_principal) WHERE via_principal IS NOT NULL')
+FROM (SELECT c.relname FROM pg_inherits g
+      JOIN pg_class c ON c.oid = g.inhrelid
+      WHERE g.inhparent = 'events'::regclass) AS p
+\gexec
+
+-- 2. Create the parent index (metadata only, instant; marked invalid
+--    until every partition index is attached in step 3). The predicate
+--    must match step 1 exactly.
+CREATE INDEX IF NOT EXISTS events_via_idx
+    ON ONLY events (workspace_id, via_principal)
+    WHERE via_principal IS NOT NULL;
+
+-- 3. Attach the partition indexes (metadata only, instant). Once all are
+--    attached, the parent index becomes valid on its own.
+SELECT format('ALTER INDEX events_via_idx ATTACH PARTITION %I',
+              p.relname || '_workspace_id_via_principal_idx')
+FROM (SELECT c.relname FROM pg_inherits g
+      JOIN pg_class c ON c.oid = g.inhrelid
+      WHERE g.inhparent = 'events'::regclass) AS p
+\gexec
+```
+
+A `CONCURRENTLY` build that fails or is cancelled leaves an `INVALID` index
+behind; drop it (`DROP INDEX CONCURRENTLY <index name>;`) and re-run step 1.
+Before upgrading, confirm the parent index is valid — the expected result
+is **one row, `t`**. Zero rows means the manual build was skipped: expect
+migration 0012 to take the blocking-build path instead (acceptable only on
+small databases). An `f` row means the parent is not fully attached yet: a
+partition's child index is missing or itself invalid — find it
+(`SELECT ... FROM pg_index WHERE NOT indisvalid`, or re-run the step-3
+attach), fix or rebuild that child, and attach:
+
+```sql
+SELECT c.relname, i.indisvalid FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relname = 'events_via_idx';
+```
+
+Once this runbook step is done, migration 0012 is a **no-op** for the
+index: its `CREATE INDEX IF NOT EXISTS` finds the parent index already in
+place. Databases that skip the manual step pay a blocking build inside the
+migration — acceptable only for small databases.
+
 ## Relay role and RLS bypass (migration 0005)
 
 `Drain` — the delivery relay — and the anchor/verify path (`Anchor`,

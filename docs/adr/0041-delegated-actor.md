@@ -25,8 +25,8 @@ Putting it anywhere else splits the trail from the log:
 - a header or side table separates the fact from the event it belongs to, and
   cannot be verified with the chain.
 
-This ADR records the shape for a future release. It is deliberately not
-implemented yet: it belongs with the agent API, not the MVP identity work.
+This ADR records the shape for a future release. It was deliberately
+deferred: it belonged with the agent API, not the MVP identity work.
 
 > **Update (2026-11-18):** it was deliberately deferred while the identity MVP
 > shipped; the delegated-actor work implemented it on 2026-11-18, one level as

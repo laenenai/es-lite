@@ -23,14 +23,25 @@
 -- ("everything service S did, across users") is cheap. Unlike the two
 -- id columns it is a derived value, which is why the index keys on it.
 --
--- NOT VALID + VALIDATE CONSTRAINT keeps adding the check short-lock on
--- a live table, exactly as 0011 documents: the ALTER takes only the
--- brief ACCESS EXCLUSIVE lock to register the constraint without
--- scanning, and the validation scan — the only long step — runs
--- afterwards under the weaker lock. The events table is
--- HASH-partitioned (ADR 0004), so both ALTERs target the parent and
--- Postgres propagates the columns and the constraint to every
--- partition.
+-- NOT VALID is kept; VALIDATE CONSTRAINT is deliberately omitted, and
+-- the one-transaction rule (ADR 0010) is why. The ADD CONSTRAINT takes
+-- its ACCESS EXCLUSIVE lock only to register the check — no scan — but
+-- the migration's transaction holds that lock to commit, so a
+-- following VALIDATE CONSTRAINT, the one long scanning step, would run
+-- while the exclusive lock is still held and block appends for its
+-- whole duration — it never gets the weaker lock a standalone
+-- session's VALIDATE would take. The scan would also be pure cost: the
+-- three columns are added in this same transaction, so every
+-- pre-existing row is NULL and the CHECK cannot fail on any of them.
+-- NOT VALID alone already enforces the all-or-nothing shape on every
+-- new write — the store's 23514 test proves it — so the constraint is
+-- left unvalidated: convalidated=false in the catalog is expected, and
+-- an operator who cares about that state may run VALIDATE CONSTRAINT
+-- events_via_complete later, in a maintenance window, where the
+-- scan's lock lives and dies in that session's own transaction. The
+-- events table is HASH-partitioned (ADR 0004), so both ALTERs target
+-- the parent and Postgres propagates the columns and the constraint
+-- to every partition.
 --
 -- No grants are issued here, like every migration before this one: the
 -- columns inherit the table's existing grants, so no new privilege is
@@ -45,11 +56,11 @@
 -- appends BEFORE this migration is allowed to run (per-partition
 -- CONCURRENTLY builds, then ON ONLY + ATTACH PARTITION — Postgres cannot
 -- build a partitioned parent index concurrently at all; see
--- docs/deploy/README.md, "Index build order"). The IF NOT EXISTS
--- statement is the enforcement net — an instant no-op when the runbook
--- was followed, a blocking build only on small databases that skipped
--- it. A CREATE INDEX on the partitioned parent creates one child index
--- per partition under the named parent index.
+-- docs/deploy/README.md, "Index build order (migration 0012)"). The IF
+-- NOT EXISTS statement is the enforcement net — an instant no-op when
+-- the runbook was followed, a blocking build only on small databases
+-- that skipped it. A CREATE INDEX on the partitioned parent creates
+-- one child index per partition under the named parent index.
 
 ALTER TABLE events
     ADD COLUMN via_type      text,
@@ -61,8 +72,6 @@ ALTER TABLE events
         (via_type IS NULL) = (via_id IS NULL)
         AND (via_id IS NULL) = (via_principal IS NULL)
     ) NOT VALID;
-
-ALTER TABLE events VALIDATE CONSTRAINT events_via_complete;
 
 CREATE INDEX IF NOT EXISTS events_via_idx
     ON events (workspace_id, via_principal)
