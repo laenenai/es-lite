@@ -116,14 +116,15 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 			GRANT SELECT ON unique_claims, log_order TO ` + lpRelay},
 		// Anchor job: heads + log_order under the bypass, anchors rows
 		// (RETURNING created_at and the job's ListAnchors verify pass
-		// need SELECT too), schema_migrations for ChainedSince, the
+		// need SELECT too), the shared ledger for ChainedSince, the
 		// sequence USAGE the anchor fence's pg_sequences read needs
 		// (without it the bound folds to 0 over a non-empty log and
 		// the tripwire refuses the anchor with ErrAnchorSequenceMasked),
 		// es_relay for the bypass.
 		{lpAnchor, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAnchor + `;
-			GRANT SELECT ON events, log_order, schema_migrations TO ` + lpAnchor + `;
+			GRANT USAGE ON SCHEMA migrations TO ` + lpAnchor + `;
+			GRANT SELECT ON events, log_order, migrations.goose_migrations TO ` + lpAnchor + `;
 			GRANT SELECT, INSERT ON anchors TO ` + lpAnchor + `;
 			GRANT USAGE ON SEQUENCE events_global_position_seq TO ` + lpAnchor + `;
 			GRANT es_relay TO ` + lpAnchor},
@@ -351,7 +352,8 @@ func TestAnchorRefusesMaskedSequence(t *testing.T) {
 	})
 	if _, err := s.Pool().Exec(ctx, `
 		GRANT USAGE ON SCHEMA public TO `+lpAnchorMasked+`;
-		GRANT SELECT ON events, log_order, schema_migrations TO `+lpAnchorMasked+`;
+		GRANT USAGE ON SCHEMA migrations TO `+lpAnchorMasked+`;
+		GRANT SELECT ON events, log_order, migrations.goose_migrations TO `+lpAnchorMasked+`;
 		GRANT SELECT, INSERT ON anchors TO `+lpAnchorMasked+`;
 		GRANT es_relay TO `+lpAnchorMasked); err != nil {
 		t.Fatalf("grant the anchor job's runbook grants minus the sequence USAGE: %v", err)

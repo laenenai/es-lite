@@ -160,6 +160,34 @@ version that carries the feed indexes, follow the runbook's
 [index build order](./docs/deploy/README.md#index-build-order-migration-0003)
 — migration transactions cannot build indexes concurrently.
 
+### Shared migration ledger
+
+Postgres records applied versions in `migrations.goose_migrations`:
+
+```sql
+create table migrations.goose_migrations (
+    module     text        not null,
+    version    bigint      not null,
+    applied_at timestamptz not null default now(),
+    primary key (module, version)
+);
+```
+
+The default module is `eventstore`; `WithModule` names a different one and
+`WithLedgerSchema` moves the table. The ledger is outside the event-store
+schema, so resetting that schema does not erase its history, and it belongs
+to the database the DSN names — a store pointed at another database gets that
+database's ledger. A legacy `schema_migrations` is adopted once, under the
+migration lock, so an upgrade does not re-run migrations. The anchor job needs
+`USAGE` on `migrations` and `SELECT` on `migrations.goose_migrations`; the
+deploy runbook carries the grants. SQLite keeps its private history table.
+
+On the first run after upgrading, `Migrate` creates `migrations` and the table
+when they are absent. A migration role that is not the database owner can have
+maintenance pre-create them and grant only DML; the migrator then performs no
+DDL, because it checks `to_regclass` before anything is created. The runbook's
+"Migration role and the shared ledger" section has the exact SQL.
+
 ## Delivery guarantees
 
 The `feed` package is the production delivery path (the design is ADR 0037;

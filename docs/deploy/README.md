@@ -250,6 +250,31 @@ Every principal needs schema access to name the objects at all:
 GRANT USAGE ON SCHEMA public TO <role>;
 ```
 
+**Migration role and the shared ledger** — `Migrate` writes
+`migrations.goose_migrations`. On the first run after upgrading, it creates
+`migrations` and the table when they are absent. A least-privilege deployment
+pre-creates them with a maintenance role and grants the migration role DML
+only; the migrator then performs no DDL (`to_regclass` proves the table exists
+before anything is created):
+
+```sql
+CREATE SCHEMA IF NOT EXISTS migrations;
+
+CREATE TABLE IF NOT EXISTS migrations.goose_migrations (
+    module     text        NOT NULL,
+    version    bigint      NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (module, version)
+);
+
+GRANT USAGE ON SCHEMA migrations TO <migration role>;
+GRANT SELECT, INSERT, UPDATE, DELETE ON migrations.goose_migrations TO <migration role>;
+```
+
+The table belongs to the database the DSN names. A module pointed at another
+database gets its own ledger under the same module name. SQLite keeps its
+private `schema_migrations`.
+
 **Appender** — the process calling `Workspace.Append` (or `AppendTx`): it
 draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1), and
@@ -288,7 +313,8 @@ GRANT SELECT ON unique_claims, log_order TO <relay>;
 **Anchor job** — the `es-verify anchor` CronJob (`Anchor`,
 `CheckAnchor`, `ListAnchors`): it reads heads and the per-batch `log_order`
 rows across workspaces under the role-gated bypass, records anchors, and
-reads `schema_migrations` for the chain's `ChainedSince`. The `SELECT` on
+reads the shared migration ledger (`migrations.goose_migrations`) for the
+chain's `ChainedSince`. The `SELECT` on
 `anchors` serves the job's read-back of recorded rows — `es-verify
 anchor list` (`ListAnchors`) — and `Anchor`'s `RETURNING created_at`
 (the database-clock stamp it reports); `es-verify anchor --check`
@@ -302,7 +328,8 @@ bound to 0 over a non-empty log. `Anchor` refuses that shape loudly with
 instead of recording a root over zero heads as a real anchor:
 
 ```sql
-GRANT SELECT ON events, log_order, schema_migrations TO <anchor job>;
+GRANT USAGE ON SCHEMA migrations TO <anchor job>;
+GRANT SELECT ON events, log_order, migrations.goose_migrations TO <anchor job>;
 GRANT SELECT, INSERT ON anchors TO <anchor job>;
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <anchor job>;
 GRANT es_relay TO <anchor job>;
