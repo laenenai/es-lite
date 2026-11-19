@@ -182,6 +182,12 @@ migration lock, so an upgrade does not re-run migrations. The anchor job needs
 `USAGE` on `migrations` and `SELECT` on `migrations.goose_migrations`; the
 deploy runbook carries the grants. SQLite keeps its private history table.
 
+On the first run after upgrading, `Migrate` creates `migrations` and the table
+when they are absent. A migration role that is not the database owner can have
+maintenance pre-create them and grant only DML; the migrator then performs no
+DDL, because it checks `to_regclass` before anything is created. The runbook's
+"Migration role and the shared ledger" section has the exact SQL.
+
 ## Delivery guarantees
 
 The `feed` package is the production delivery path (the design is ADR 0037;
