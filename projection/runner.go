@@ -140,10 +140,17 @@ type Runner struct {
 	// Generated; nil means "dispatch everything".
 	Filter func(e es.Envelope) bool
 	// OnApplied, when set, is called after the marker for e has been saved.
-	// It is best-effort: its work must not be required for projection
-	// correctness, it cannot fail the projection and it is not retried. It is
-	// called for filtered envelopes too, after their marker advance; it is not
-	// called for skipped positions or when dispatch or the marker save fails.
+	// "Saved" means Marker.Save returned; a buffering Marker (such as
+	// BufferedMarker) may not have made the position durable yet, so a caller
+	// that needs a queryable checkpoint must use a write-through marker or
+	// flush before publishing. It is best-effort: its work must not be
+	// required for projection correctness, it cannot fail the projection and
+	// it is not retried. It runs synchronously on the apply path, so it must
+	// be set before Run/Apply, must not panic, and must bound its own work (a
+	// publish timeout or a buffered hand-off) or it will stall the projector.
+	// It is called for filtered envelopes too, after their marker advance; it
+	// is not called for skipped positions or when dispatch or the marker save
+	// fails.
 	OnApplied func(ctx context.Context, e es.Envelope, position uint64)
 
 	once   sync.Once
