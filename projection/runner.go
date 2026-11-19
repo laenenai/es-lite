@@ -139,6 +139,12 @@ type Runner struct {
 	// delivers everything; a filtered feed delivers only matching types).
 	// Generated; nil means "dispatch everything".
 	Filter func(e es.Envelope) bool
+	// OnApplied, when set, is called after the marker for e has been saved.
+	// It is best-effort: its work must not be required for projection
+	// correctness, it cannot fail the projection and it is not retried. It is
+	// called for filtered envelopes too, after their marker advance; it is not
+	// called for skipped positions or when dispatch or the marker save fails.
+	OnApplied func(ctx context.Context, e es.Envelope, position uint64)
 
 	once   sync.Once
 	mu     sync.Mutex
@@ -184,12 +190,28 @@ func (r *Runner) apply(ctx context.Context, e es.Envelope) error {
 		return nil
 	}
 	if r.Filter != nil && !r.Filter(e) {
-		return r.advance(ctx, e.GlobalPosition)
+		if err := r.advance(ctx, e.GlobalPosition); err != nil {
+			return err
+		}
+		r.notifyApplied(ctx, e)
+		return nil
 	}
 	if err := r.Dispatch(ctx, e); err != nil {
 		return err
 	}
-	return r.advance(ctx, e.GlobalPosition)
+	if err := r.advance(ctx, e.GlobalPosition); err != nil {
+		return err
+	}
+	r.notifyApplied(ctx, e)
+	return nil
+}
+
+// notifyApplied calls the optional post-apply hook only after advance has
+// committed the marker. A nil hook is the pre-existing behaviour.
+func (r *Runner) notifyApplied(ctx context.Context, e es.Envelope) {
+	if r.OnApplied != nil {
+		r.OnApplied(ctx, e, e.GlobalPosition)
+	}
 }
 
 func (r *Runner) advance(ctx context.Context, pos uint64) error {
