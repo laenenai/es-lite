@@ -19,7 +19,9 @@ var _ es.Anchorer = (*Store)(nil)
 // es.VerifyOptions.ChainedSince. The zero time means it has not run.
 func (s *Store) ChainedSince(ctx context.Context) (time.Time, error) {
 	var applied time.Time
-	err := s.pool.QueryRow(ctx, `SELECT applied_at FROM schema_migrations WHERE version = 2`).Scan(&applied)
+	err := s.pool.QueryRow(ctx,
+		`SELECT applied_at FROM `+s.ledgerTable()+` WHERE module = $1 AND version = 2`,
+		s.module).Scan(&applied)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, nil
 	}

@@ -288,7 +288,8 @@ GRANT SELECT ON unique_claims, log_order TO <relay>;
 **Anchor job** — the `es-verify anchor` CronJob (`Anchor`,
 `CheckAnchor`, `ListAnchors`): it reads heads and the per-batch `log_order`
 rows across workspaces under the role-gated bypass, records anchors, and
-reads `schema_migrations` for the chain's `ChainedSince`. The `SELECT` on
+reads the shared migration ledger (`migrations.goose_migrations`) for the
+chain's `ChainedSince`. The `SELECT` on
 `anchors` serves the job's read-back of recorded rows — `es-verify
 anchor list` (`ListAnchors`) — and `Anchor`'s `RETURNING created_at`
 (the database-clock stamp it reports); `es-verify anchor --check`
@@ -302,7 +303,8 @@ bound to 0 over a non-empty log. `Anchor` refuses that shape loudly with
 instead of recording a root over zero heads as a real anchor:
 
 ```sql
-GRANT SELECT ON events, log_order, schema_migrations TO <anchor job>;
+GRANT USAGE ON SCHEMA migrations TO <anchor job>;
+GRANT SELECT ON events, log_order, migrations.goose_migrations TO <anchor job>;
 GRANT SELECT, INSERT ON anchors TO <anchor job>;
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <anchor job>;
 GRANT es_relay TO <anchor job>;

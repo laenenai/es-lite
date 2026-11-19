@@ -49,16 +49,40 @@ type Option func(*openConfig)
 // can wedge a feed subscription that would otherwise materialize it.
 const defaultMaxPayloadBytes = 8 << 20
 
+const (
+	// defaultLedgerSchema and defaultLedgerModule are the shared-ledger
+	// defaults. The table is migrations.goose_migrations, outside every
+	// module schema, so a migration that drops its own schema cannot erase
+	// the history. It is per database: a store pointed at another DSN gets
+	// that database's ledger under the same module name.
+	defaultLedgerSchema = "migrations"
+	defaultLedgerModule = "eventstore"
+)
+
 type openConfig struct {
 	autoMigrate     bool
 	maxPayloadBytes int
 	notifyChannel   string
+	module          string
+	ledgerSchema    string
 }
 
 // WithoutAutoMigrate skips applying migrations on Open. Application replicas
 // use this and rely on a separate Migrate step / init container (ADR 0010);
 // the default auto-migrates so dev/single-node stays zero-config.
 func WithoutAutoMigrate() Option { return func(c *openConfig) { c.autoMigrate = false } }
+
+// WithModule names this store's rows in the shared migration ledger. The
+// default is "eventstore". The name is the stable key when a module moves to
+// another database: the ledger moves with the database, the name does not.
+func WithModule(name string) Option { return func(c *openConfig) { c.module = name } }
+
+// WithLedgerSchema names the schema holding the shared ledger table. The
+// default is "migrations". The schema is created only when it is absent, so a
+// maintenance role can pre-create it and grant DML only.
+func WithLedgerSchema(schema string) Option {
+	return func(c *openConfig) { c.ledgerSchema = schema }
+}
 
 // WithMaxPayloadBytes caps the payload size Append may write: a batch
 // holding an event whose payload exceeds n bytes is rejected whole with
@@ -112,10 +136,37 @@ func WithAppendNotify(channel string) Option {
 func (c openConfig) validate() error {
 	// An empty notify channel is the option being off, not a
 	// misconfiguration; anything set must be a usable identifier.
-	if c.notifyChannel == "" {
-		return nil
+	if c.notifyChannel != "" {
+		if err := validNotifyChannel(c.notifyChannel); err != nil {
+			return err
+		}
 	}
-	return validNotifyChannel(c.notifyChannel)
+	if err := validLedgerIdentifier("WithModule", c.module); err != nil {
+		return err
+	}
+	return validLedgerIdentifier("WithLedgerSchema", c.ledgerSchema)
+}
+
+// validLedgerIdentifier applies the same conservative ASCII-identifier rule
+// as the notify channel to the two ledger identifiers. Both reach SQL as
+// text (CREATE SCHEMA cannot bind an identifier), and both are validated
+// before any connection is opened.
+func validLedgerIdentifier(option, name string) error {
+	if name == "" {
+		return fmt.Errorf("postgres: %s: identifier must not be empty", option)
+	}
+	if len(name) > maxNotifyChannelBytes {
+		return fmt.Errorf("postgres: %s: identifier %q is %d bytes, over the %d-byte identifier limit", option, name, len(name), maxNotifyChannelBytes)
+	}
+	if !isIdentStart(name[0]) {
+		return fmt.Errorf("postgres: %s: identifier %q is not a valid identifier: it must start with a letter or underscore", option, name)
+	}
+	for i := 1; i < len(name); i++ {
+		if !isIdentPart(name[i]) {
+			return fmt.Errorf("postgres: %s: identifier %q is not a valid identifier: only letters, digits and underscores are allowed", option, name)
+		}
+	}
+	return nil
 }
 
 // maxNotifyChannelBytes is the longest notify channel accepted: 63
@@ -160,7 +211,12 @@ func isIdentPart(b byte) bool {
 }
 
 func newOpenConfig(opts []Option) openConfig {
-	c := openConfig{autoMigrate: true, maxPayloadBytes: defaultMaxPayloadBytes}
+	c := openConfig{
+		autoMigrate:     true,
+		maxPayloadBytes: defaultMaxPayloadBytes,
+		module:          defaultLedgerModule,
+		ledgerSchema:    defaultLedgerSchema,
+	}
 	for _, o := range opts {
 		o(&c)
 	}
@@ -196,6 +252,12 @@ type Store struct {
 	// hint statement at all. It is a capability: never logged, never
 	// echoed into an error outside Open-time validation.
 	notifyChannel string
+
+	// module and ledgerSchema identify this store's rows in the shared
+	// migration ledger. The ledger lives in the database the DSN names,
+	// outside the event-store schema, so a schema reset cannot erase it.
+	module       string
+	ledgerSchema string
 
 	// relayRoleMu guards the es_relay membership verdict below — the
 	// startup check every RLS-bypass path shares — Drain and the anchor
@@ -240,7 +302,14 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	s := &Store{pool: pool, ownsPool: true, maxPayloadBytes: cfg.maxPayloadBytes, notifyChannel: cfg.notifyChannel}
+	s := &Store{
+		pool:            pool,
+		ownsPool:        true,
+		maxPayloadBytes: cfg.maxPayloadBytes,
+		notifyChannel:   cfg.notifyChannel,
+		module:          cfg.module,
+		ledgerSchema:    cfg.ledgerSchema,
+	}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		pool.Close()
 		return nil, err
@@ -277,7 +346,14 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 	if err := probePostgresFloor(ctx, pool); err != nil {
 		return nil, err
 	}
-	s := &Store{pool: pool, ownsPool: false, maxPayloadBytes: cfg.maxPayloadBytes, notifyChannel: cfg.notifyChannel}
+	s := &Store{
+		pool:            pool,
+		ownsPool:        false,
+		maxPayloadBytes: cfg.maxPayloadBytes,
+		notifyChannel:   cfg.notifyChannel,
+		module:          cfg.module,
+		ledgerSchema:    cfg.ledgerSchema,
+	}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -319,10 +395,122 @@ func (s *Store) migrateIfConfigured(ctx context.Context, cfg openConfig) error {
 	return s.Migrate(ctx)
 }
 
+// ledgerTable is the shared migration ledger as SQL: one table, outside the
+// event-store schema, with a row per module and version.
+func (s *Store) ledgerTable() string {
+	return pgx.Identifier{s.ledgerSchema, "goose_migrations"}.Sanitize()
+}
+
+// ensureLedger creates the shared table only when it is physically absent.
+// The schema is created only when it is absent too: CREATE ... IF NOT EXISTS
+// checks the CREATE privilege even when the object exists, so a pre-created
+// ledger owned by a maintenance role must not run DDL at all.
+func (s *Store) ensureLedger(ctx context.Context, tx pgx.Tx) error {
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`,
+		s.ledgerSchema+".goose_migrations").Scan(&exists); err != nil {
+		return fmt.Errorf("postgres: probe ledger: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	var schemaExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = $1)`,
+		s.ledgerSchema).Scan(&schemaExists); err != nil {
+		return fmt.Errorf("postgres: probe ledger schema: %w", err)
+	}
+	if !schemaExists {
+		if _, err := tx.Exec(ctx, `CREATE SCHEMA `+pgx.Identifier{s.ledgerSchema}.Sanitize()); err != nil {
+			return fmt.Errorf("postgres: create ledger schema: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS `+s.ledgerTable()+` (
+		module     text        NOT NULL,
+		version    bigint      NOT NULL,
+		applied_at timestamptz NOT NULL DEFAULT now(),
+		PRIMARY KEY (module, version)
+	)`); err != nil {
+		return fmt.Errorf("postgres: create ledger: %w", err)
+	}
+	return nil
+}
+
+// adoptLegacyLedger carries a private schema_migrations history into the
+// shared table exactly once. It runs under the migration lock and after
+// ensureLedger, so a concurrent migrator cannot copy the same rows twice.
+//
+// The legacy table is unqualified on purpose: the connection's search_path
+// is what makes it the event store's own history (eventstore.schema_migrations
+// in a deployment that moved the store out of public, or public in an older
+// one). A database that never had one is a fresh install, not an upgrade.
+func (s *Store) adoptLegacyLedger(ctx context.Context, tx pgx.Tx) error {
+	var hasRows bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM `+s.ledgerTable()+` WHERE module = $1)`,
+		s.module).Scan(&hasRows); err != nil {
+		return fmt.Errorf("postgres: check ledger rows: %w", err)
+	}
+	if hasRows {
+		return nil
+	}
+
+	var legacy bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&legacy); err != nil {
+		return fmt.Errorf("postgres: probe legacy ledger: %w", err)
+	}
+	if !legacy {
+		return nil
+	}
+
+	if _, err := tx.Exec(ctx, `INSERT INTO `+s.ledgerTable()+` (module, version, applied_at)
+		SELECT $1, version, applied_at FROM schema_migrations
+		ON CONFLICT (module, version) DO NOTHING`, s.module); err != nil {
+		return fmt.Errorf("postgres: adopt legacy ledger: %w", err)
+	}
+	return nil
+}
+
+// isDuplicateLedgerObject reports the catalog races a second process can
+// lose while creating the ledger. The whole bootstrap transaction is retried
+// rather than swallowing the error: a failed statement aborts the
+// transaction, so continuing inside it would only produce a second error.
+func isDuplicateLedgerObject(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "42P06", "42P07", "23505": // duplicate_schema, duplicate_table, unique_violation
+		return true
+	default:
+		return false
+	}
+}
+
+// bootstrapLedger creates or adopts the shared ledger inside the migration
+// lock. A concurrent pgmigrate module can create the same schema and table,
+// so a lost race is retried; the next attempt sees the winner's objects.
+func (s *Store) bootstrapLedger(ctx context.Context) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = s.migrateInLock(ctx, func(tx pgx.Tx) error {
+			if err := s.ensureLedger(ctx, tx); err != nil {
+				return err
+			}
+			return s.adoptLegacyLedger(ctx, tx)
+		})
+		if err == nil || !isDuplicateLedgerObject(err) {
+			return err
+		}
+	}
+	return err
+}
+
 // Migrate applies pending versioned migrations (ADR 0010). Each pending
 // migration runs in exactly one transaction — BEGIN; SELECT
 // pg_advisory_xact_lock($1); re-check the recorded version; apply;
-// record; COMMIT — and the schema_migrations bootstrap runs inside a
+// record; COMMIT — and the shared-ledger bootstrap runs inside a
 // transaction of the same shape.
 //
 // The lock is transaction-scoped on purpose (F10): the session-scoped
@@ -346,19 +534,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Bootstrap the history table in its own xact-locked transaction,
-	// shaped exactly like a migration's: concurrent migrators may all
-	// reach this on a fresh database, and CREATE TABLE IF NOT EXISTS is
-	// idempotent under the lock.
-	if err := s.migrateInLock(ctx, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx,
-			`CREATE TABLE IF NOT EXISTS schema_migrations (
-				version    int         PRIMARY KEY,
-				applied_at timestamptz NOT NULL DEFAULT now()
-			)`)
-		return err
-	}); err != nil {
-		return fmt.Errorf("postgres: schema_migrations: %w", err)
+	// Create or adopt the shared ledger in its own xact-locked
+	// transaction, shaped exactly like a migration's: concurrent
+	// migrators may all reach this on a fresh database.
+	if err := s.bootstrapLedger(ctx); err != nil {
+		return fmt.Errorf("postgres: migration ledger: %w", err)
 	}
 	// The recorded versions, read once as a fast path: a version listed
 	// here is applied, and a version missing here may since have been
@@ -366,21 +546,22 @@ func (s *Store) Migrate(ctx context.Context) error {
 	// read marks pending is re-checked under the lock below. The read
 	// can be stale only towards "pending", and a stale miss costs an
 	// empty locked skip, never a double apply.
-	rows, err := s.pool.Query(ctx, `SELECT version FROM schema_migrations`)
+	rows, err := s.pool.Query(ctx,
+		`SELECT version FROM `+s.ledgerTable()+` WHERE module = $1`, s.module)
 	if err != nil {
-		return fmt.Errorf("postgres: read schema_migrations: %w", err)
+		return fmt.Errorf("postgres: read ledger: %w", err)
 	}
 	defer rows.Close()
 	applied := map[int]bool{}
 	for rows.Next() {
 		var v int
 		if err := rows.Scan(&v); err != nil {
-			return fmt.Errorf("postgres: read schema_migrations: %w", err)
+			return fmt.Errorf("postgres: read ledger: %w", err)
 		}
 		applied[v] = true
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("postgres: read schema_migrations: %w", err)
+		return fmt.Errorf("postgres: read ledger: %w", err)
 	}
 
 	for _, m := range migs {
@@ -394,7 +575,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 			// authoritative.
 			var exists bool
 			if err := tx.QueryRow(ctx,
-				`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&exists); err != nil {
+				`SELECT EXISTS(SELECT 1 FROM `+s.ledgerTable()+` WHERE module = $1 AND version = $2)`,
+				s.module, m.Version).Scan(&exists); err != nil {
 				return fmt.Errorf("postgres: check migration %d: %w", m.Version, err)
 			}
 			if exists {
@@ -404,7 +586,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 				return fmt.Errorf("postgres: migration %04d_%s: %w", m.Version, m.Name, err)
 			}
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO schema_migrations (version) VALUES ($1)`, m.Version); err != nil {
+				`INSERT INTO `+s.ledgerTable()+` (module, version) VALUES ($1, $2)`,
+				s.module, m.Version); err != nil {
 				return fmt.Errorf("postgres: record migration %d: %w", m.Version, err)
 			}
 			return nil

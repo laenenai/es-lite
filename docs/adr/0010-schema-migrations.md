@@ -140,3 +140,15 @@ transactions) is unchanged:
    rival migrators, and the loser sees the primary-key violation and skips
    (`sqlite/store.go` `Migrate`) — the lock was always there; the code just
    wasn't the one taking it.
+
+## Errata (2026-11-19)
+
+Postgres now records migrations in the shared
+`migrations.goose_migrations(module, version, applied_at)` table, so every
+module sharing one database shares one ledger and a module can reset its own
+schema without erasing its history. The store adopts a legacy
+`schema_migrations` once, under the migration lock, so upgrading does not
+re-run migrations. The module defaults to `eventstore` and is configurable
+with `WithModule`; the ledger schema defaults to `migrations` and is
+configurable with `WithLedgerSchema`. SQLite keeps its private
+`schema_migrations` table: the shared ledger is a Postgres concern.

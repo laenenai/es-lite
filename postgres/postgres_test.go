@@ -394,8 +394,8 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	s := openStore(t) // auto-migrated on Open
 
 	var v int
-	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
-		t.Fatalf("schema_migrations: %v", err)
+	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
+		t.Fatalf("shared ledger: %v", err)
 	}
 	// Every embedded migration is applied on Open; 0012 (delegated
 	// actor) made it twelve.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -298,10 +299,153 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 		t.Fatalf("Migrate after a cancelled run: %v — the cancelled run's lock is blocking every future migration", err)
 	}
 	var v int
-	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v); err != nil {
-		t.Fatalf("read schema_migrations: %v", err)
+	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
+		t.Fatalf("read shared ledger: %v", err)
 	}
 	if v != 12 {
 		t.Fatalf("after the second Migrate the applied version is %d, want 12 (every embedded migration applied)", v)
+	}
+}
+
+// openScratchStore creates a uniquely-named, empty database and opens a store
+// against it without auto-migrating, so a test can put the database into the
+// state it needs before calling Migrate. Cleanup closes the store before
+// dropping the database, because t.Cleanup is LIFO.
+func openScratchStore(t *testing.T, opts ...postgres.Option) *postgres.Store {
+	t.Helper()
+
+	dsn := os.Getenv("PG_DSN")
+	if dsn == "" {
+		t.Skip("set PG_DSN to run the Postgres integration tests")
+	}
+	ctx := context.Background()
+
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect for admin: %v", err)
+	}
+	name := "eslite_ledger_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
+		t.Fatalf("create scratch database %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(ctx, `DROP DATABASE `+name+` WITH (FORCE)`); err != nil {
+			t.Errorf("drop scratch database %s: %v", name, err)
+		}
+		admin.Close(ctx)
+	})
+
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	u.Path = "/" + name
+
+	all := append([]postgres.Option{postgres.WithoutAutoMigrate()}, opts...)
+	s, err := postgres.Open(ctx, u.String(), all...)
+	if err != nil {
+		t.Fatalf("open store on %s: %v", name, err)
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
+func TestMigrateWritesTheSharedLedger(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	var n int
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT count(*) FROM migrations.goose_migrations WHERE module = 'eventstore'
+	`).Scan(&n); err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+	if n != 12 {
+		t.Fatalf("eventstore ledger rows = %d, want 12", n)
+	}
+
+	var legacy bool
+	if err := s.Pool().QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&legacy); err != nil {
+		t.Fatalf("probe legacy ledger: %v", err)
+	}
+	if legacy {
+		t.Fatal("Migrate still created schema_migrations")
+	}
+}
+
+func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
+	s := openScratchStore(t)
+	ctx := context.Background()
+
+	// Build the schema exactly as versions 1-3 left it, then record those
+	// versions in the legacy ledger. This is the shape an upgraded database
+	// has: real tables, a private history table, and no shared ledger.
+	for _, name := range []string{"0001_initial_schema.sql", "0002_hash_chain.sql", "0003_feed_indexes.sql"} {
+		sql, err := os.ReadFile(filepath.Join("migrations", name))
+		if err != nil {
+			t.Fatalf("read legacy migration %s: %v", name, err)
+		}
+		if _, err := s.Pool().Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("apply legacy migration %s: %v", name, err)
+		}
+	}
+	if _, err := s.Pool().Exec(ctx, `
+		CREATE TABLE schema_migrations (
+			version    int         PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		);
+		INSERT INTO schema_migrations (version) VALUES (1), (2), (3);
+	`); err != nil {
+		t.Fatalf("seed legacy ledger: %v", err)
+	}
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	var adopted, total int
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT count(*) FROM migrations.goose_migrations
+		WHERE module = 'eventstore' AND version <= 3
+	`).Scan(&adopted); err != nil {
+		t.Fatalf("read adopted rows: %v", err)
+	}
+	if adopted != 3 {
+		t.Fatalf("adopted rows = %d, want 3: the legacy history was not carried over", adopted)
+	}
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT count(*) FROM migrations.goose_migrations WHERE module = 'eventstore'
+	`).Scan(&total); err != nil {
+		t.Fatalf("read ledger total: %v", err)
+	}
+	if total != 12 {
+		t.Fatalf("ledger rows = %d, want 12 after applying versions 4-12", total)
+	}
+}
+
+func TestLedgerModuleNameUsesTheOption(t *testing.T) {
+	s := openScratchStore(t, postgres.WithModule("custom"))
+	ctx := context.Background()
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	var custom, eventstore int
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT count(*) FROM migrations.goose_migrations WHERE module = 'custom'
+	`).Scan(&custom); err != nil {
+		t.Fatalf("read custom rows: %v", err)
+	}
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT count(*) FROM migrations.goose_migrations WHERE module = 'eventstore'
+	`).Scan(&eventstore); err != nil {
+		t.Fatalf("read eventstore rows: %v", err)
+	}
+	if custom != 12 {
+		t.Fatalf("custom ledger rows = %d, want 12", custom)
+	}
+	if eventstore != 0 {
+		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)
 	}
 }
