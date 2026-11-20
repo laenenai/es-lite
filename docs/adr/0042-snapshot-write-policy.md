@@ -1,6 +1,6 @@
 # ADR 0042: Snapshot Write Policy and In-Tree Snapshot Caches
 
-- **Status:** Proposed
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-20
 - **Related:** ADR 0007 (snapshots: the trigger, the discipline, the design
   sketch, and an errata this ADR corrects), ADR 0025 (crypto and erasure are

@@ -39,7 +39,7 @@ than editing history.
 | 0039 | [Scoped Feed Wake-Ups](./0039-scoped-feed-wakeups.md) | Accepted (implemented) |
 | 0040 | [Producer Span Context in the Event Envelope](./0040-producer-span-context.md) | Accepted (implemented) |
 | 0041 | [Delegated Actor (One Level)](./0041-delegated-actor.md) | Accepted (implemented) |
-| 0042 | [Snapshot Write Policy and In-Tree Snapshot Caches](./0042-snapshot-write-policy.md) | Proposed |
+| 0042 | [Snapshot Write Policy and In-Tree Snapshot Caches](./0042-snapshot-write-policy.md) | Accepted (implemented) |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in

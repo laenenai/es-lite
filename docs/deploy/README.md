@@ -278,14 +278,19 @@ private `schema_migrations`.
 **Appender** — the process calling `Workspace.Append` (or `AppendTx`): it
 draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1), and
-applies uniqueness constraints. `Release` is the only `DELETE` es-lite
-ever issues, and it is on the claims index, never on the log:
+applies uniqueness constraints. It is also the process running
+`aggregate.Runtime`, so with a snapshot cache configured (ADR 0042) it
+both reads and writes `snapshots` — the same role as for `events`.
+`Release` is the only `DELETE` the append path ever issues, and it is on
+the claims index, never on the log (`Purge` on the snapshot cache, below,
+is the one other `DELETE`):
 
 ```sql
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;
 GRANT SELECT, INSERT ON events, unique_claims TO <appender>;
 GRANT DELETE ON unique_claims TO <appender>;
 GRANT INSERT ON log_order TO <appender>;
+GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO <appender>;
 ```
 
 **Feed process** — `feed.Server` over the Postgres adapters: the
@@ -387,6 +392,37 @@ workspaces under the bypass. Treat their DSNs accordingly:
 - One login role per principal (relay, anchor job, each appender, each
   feed process) — a leaked credential then reaches exactly the grants its
   owner needs and nothing wider.
+
+## Snapshot cache (ADR 0042)
+
+Migration 0013 adds a `snapshots` table: the folded state of long streams,
+one row per (workspace, stream), written by `aggregate.Runtime` outside the
+append transaction and read back on the next load. It is pure cache state —
+always re-derivable from the log — and it is workspace-private: its RLS
+policy has no bypass arm, so no relay, anchor or feed principal gets any
+privilege on it, and the appender grant above is the whole contract.
+
+**The name is reserved.** An adopter may already own a table called
+`snapshots`; if its shape differs, rename it before upgrading — the
+migration refuses an incompatible shape loudly instead of recording itself
+as applied, because the runtime ignores `Load`/`Save` errors and a silently
+skipped migration would degrade every load to a permanent full fold with no
+signal. (SQLite's 0011 is a plain `CREATE TABLE` and refuses a foreign
+table the same way.)
+
+**Backups.** Snapshots are derived state, so a logical backup may exclude
+them when size matters: `pg_dump --exclude-table=snapshots …`. A physical
+restore that leaves the table empty or missing needs no recovery step:
+missing snapshots rebuild lazily — the next append past the runtime's gap
+rewrites the row, and `Runtime.WarmSnapshot` repopulates a stream
+explicitly, archived aggregates nothing appends to included.
+
+**Erasure.** Both adapters expose `Purge(ctx)` — delete every snapshot the
+cache holds, workspace-scoped on Postgres. It is best-effort and
+application-coordinated, like the projection purge (ADR 0004 §4): a command
+in flight, or one starting immediately after, can re-insert a row. Quiesce
+the workspace before running it — or, for sealed state, destroy the key
+first, which makes any racing re-insert inert.
 
 ## Feed operations (ADR 0037)
 
