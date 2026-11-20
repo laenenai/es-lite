@@ -22,8 +22,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 10 {
-		t.Fatalf("applied version = %d, want 10 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor; no 0005 — Postgres's is RLS-role-specific)", v)
+	if v != 11 {
+		t.Fatalf("applied version = %d, want 11 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache; no 0005 — Postgres's is RLS-role-specific)", v)
 	}
 	// Re-running is a no-op, not an error.
 	if err := s.Migrate(ctx); err != nil {
@@ -136,8 +136,60 @@ func TestConcurrentMigrateSameFile(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate schema_migrations: %v", err)
 	}
-	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10}
+	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11}
 	if !slices.Equal(got, want) {
 		t.Fatalf("recorded versions = %v, want each of %v exactly once", got, want)
+	}
+}
+
+// TestSnapshotsTableColumns pins the snapshot cache table's shape (ADR
+// 0042 §3.2): exactly five columns, in the declared order, with
+// stream_id as the sole primary key — one SQLite database is one
+// workspace, so the row key is the canonical stream id alone.
+func TestSnapshotsTableColumns(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.Open(ctx, "file:"+t.Name()+"?mode=memory&cache=shared") // auto-migrates
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	rows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(snapshots)`)
+	if err != nil {
+		t.Fatalf("table_info(snapshots): %v", err)
+	}
+	defer rows.Close()
+
+	type col struct {
+		name string
+		pk   int
+	}
+	var got []col
+	for rows.Next() {
+		var cid int
+		var c col
+		var typ string
+		var notNull int
+		var dflt any // NULL for every column here; must not scan into a typed value
+		if err := rows.Scan(&cid, &c.name, &typ, &notNull, &dflt, &c.pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
+		}
+		got = append(got, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info: %v", err)
+	}
+
+	wantNames := []string{"stream_id", "version", "fold_version", "recorded_at", "state"}
+	if len(got) != len(wantNames) {
+		t.Fatalf("snapshots columns = %+v, want exactly %v", got, wantNames)
+	}
+	for i, c := range got {
+		if c.name != wantNames[i] {
+			t.Fatalf("snapshots column %d = %q, want %q (order matters)", i, c.name, wantNames[i])
+		}
+	}
+	if got[0].pk != 1 {
+		t.Fatalf("stream_id pk = %d, want 1 (the primary key)", got[0].pk)
 	}
 }
