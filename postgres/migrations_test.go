@@ -110,6 +110,64 @@ func TestAllBypassPoliciesRoleGated(t *testing.T) {
 	}
 }
 
+// TestSnapshotsRLSShape pins the snapshots table's isolation shape
+// (ADR 0042 §3.2): RLS enabled and forced, with exactly one
+// workspace-only policy — the feed tables' shape (0004, 0010), not the
+// log tables'. The relay never reads snapshots, and a snapshot is the
+// workspace's own derived state, so the policy carries no bypass arm:
+// even es_relay under app.bypass_rls must be refused. Catalog queries,
+// per the TestAllBypassPoliciesRoleGated ruling: pg_policies, not file
+// greps, which would false-positive on comments.
+func TestSnapshotsRLSShape(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	rows, err := s.Pool().Query(ctx, `
+		SELECT policyname, qual, with_check FROM pg_policies
+		WHERE schemaname = 'public' AND tablename = 'snapshots'`)
+	if err != nil {
+		t.Fatalf("read policies for snapshots: %v", err)
+	}
+	var policies []struct{ name, qual, withCheck string }
+	for rows.Next() {
+		var name, qual, withCheck string
+		if err := rows.Scan(&name, &qual, &withCheck); err != nil {
+			rows.Close()
+			t.Fatalf("scan policy for snapshots: %v", err)
+		}
+		policies = append(policies, struct{ name, qual, withCheck string }{name, qual, withCheck})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("policies rows for snapshots: %v", err)
+	}
+	if len(policies) != 1 {
+		t.Fatalf("snapshots: %d policies, want exactly 1", len(policies))
+	}
+	p := policies[0]
+	if p.name != "snapshots_workspace_isolation" {
+		t.Errorf("snapshots: policy %q, want snapshots_workspace_isolation", p.name)
+	}
+	for _, def := range []string{p.qual, p.withCheck} {
+		if strings.Contains(def, "app.bypass_rls") {
+			t.Errorf("snapshots: policy %q references app.bypass_rls (%q) — the policy must have no bypass arm", p.name, def)
+		}
+		if !strings.Contains(def, "app.workspace_id") {
+			t.Errorf("snapshots: policy %q does not key on app.workspace_id (%q)", p.name, def)
+		}
+	}
+	var enabled, forced bool
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = $1::regclass`,
+		"public.snapshots",
+	).Scan(&enabled, &forced); err != nil {
+		t.Fatalf("read pg_class flags for snapshots: %v", err)
+	}
+	if !enabled || !forced {
+		t.Fatalf("snapshots: RLS enabled=%v forced=%v, want both true (FORCE keeps the table owner subject)", enabled, forced)
+	}
+}
+
 // TestCheckpointsTableDropped pins migration 0008: the bare checkpoints
 // table 0001 created is gone. It was dead on Postgres — only SQLite
 // implements delivery.Checkpoints, and the feed's per-subscription
@@ -302,8 +360,44 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("read shared ledger: %v", err)
 	}
+	if v != 13 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 13 (every embedded migration applied)", v)
+	}
+}
+
+// TestSnapshotMigrationRefusesForeignTable pins ADR 0042 §3.2's refusal.
+// snapshot.Cache has been public while unimplemented, so an adopter may
+// already own a "snapshots" table of a different shape; the migration's
+// CREATE TABLE IF NOT EXISTS would silently adopt it and record 0013 as
+// applied — and because the runtime ignores Load/Save errors, a
+// wrong-shaped table would degrade to permanent full folds with no
+// signal. So 0013 carries a shape assertion that fails the migration
+// loudly, and a failed migration must not be recorded: the ledger stays
+// at the pre-0013 history until the adopter renames their table.
+func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
+	s := openScratchStore(t)
+	ctx := context.Background()
+
+	if _, err := s.Pool().Exec(ctx, `CREATE TABLE snapshots (x int)`); err != nil {
+		t.Fatalf("create foreign snapshots table: %v", err)
+	}
+
+	err := s.Migrate(ctx)
+	if err == nil {
+		t.Fatal("Migrate succeeded over a foreign snapshots table — 0013 must refuse loudly (ADR 0042 §3.2)")
+	}
+	if !strings.Contains(err.Error(), "snapshots") {
+		t.Fatalf("Migrate error %q does not name snapshots — the refusal must point at the reserved table", err)
+	}
+
+	// Migrations run one transaction each (ADR 0010), so 0001-0012 stand
+	// and only 0013 is absent: the refused version must not be recorded.
+	var v int
+	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
+		t.Fatalf("read shared ledger: %v", err)
+	}
 	if v != 12 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 12 (every embedded migration applied)", v)
+		t.Fatalf("after the refused Migrate the applied version is %d, want 12 — the failed migration must not be recorded", v)
 	}
 }
 
@@ -360,8 +454,8 @@ func TestMigrateWritesTheSharedLedger(t *testing.T) {
 	`).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if n != 12 {
-		t.Fatalf("eventstore ledger rows = %d, want 12", n)
+	if n != 13 {
+		t.Fatalf("eventstore ledger rows = %d, want 13", n)
 	}
 
 	var legacy bool
@@ -418,8 +512,8 @@ func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
 	`).Scan(&total); err != nil {
 		t.Fatalf("read ledger total: %v", err)
 	}
-	if total != 12 {
-		t.Fatalf("ledger rows = %d, want 12 after applying versions 4-12", total)
+	if total != 13 {
+		t.Fatalf("ledger rows = %d, want 13 after applying versions 4-13", total)
 	}
 }
 
@@ -442,8 +536,8 @@ func TestLedgerModuleNameUsesTheOption(t *testing.T) {
 	`).Scan(&eventstore); err != nil {
 		t.Fatalf("read eventstore rows: %v", err)
 	}
-	if custom != 12 {
-		t.Fatalf("custom ledger rows = %d, want 12", custom)
+	if custom != 13 {
+		t.Fatalf("custom ledger rows = %d, want 13", custom)
 	}
 	if eventstore != 0 {
 		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)
