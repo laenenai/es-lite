@@ -895,8 +895,28 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	if len(types) == 0 {
 		return nil, false, nil
 	}
+	return w.readSettled(ctx, from, limit, maxBytes, types)
+}
+
+// ReadAllSettled is ReadAllBounded without the type filter: every event in
+// the workspace up to the same settled bound, with the same payload budget
+// and truncation contract. It is the change feed's read. The filter is
+// omitted rather than expressed as an empty type list, so the unfiltered
+// page cannot be mistaken for the filtered port's "an empty set matches
+// nothing" rule.
+func (w *Workspace) ReadAllSettled(ctx context.Context, from uint64, limit, maxBytes int) ([]es.Envelope, bool, error) {
+	return w.readSettled(ctx, from, limit, maxBytes, nil)
+}
+
+func (w *Workspace) readSettled(ctx context.Context, from uint64, limit, maxBytes int, types []string) ([]es.Envelope, bool, error) {
 	if limit <= 0 {
 		limit = 100
+	}
+	// A nil filter is "every type". The cast fixes the parameter's array
+	// type; cardinality(empty) is 0, so the OR makes the predicate true.
+	typesArg := types
+	if typesArg == nil {
+		typesArg = []string{}
 	}
 	bound, err := w.fenceBound(ctx, from)
 	if err != nil {
@@ -918,10 +938,11 @@ func (w *Workspace) ReadAllBounded(ctx context.Context, from uint64, limit, maxB
 	// the database, so an over-cap row costs one integer, not its payload.
 	rows, err := tx.Query(ctx,
 		`SELECT global_position, type_url, octet_length(payload) FROM events
-	      WHERE workspace_id = $1 AND global_position > $2 AND type_url = ANY($4)
+	      WHERE workspace_id = $1 AND global_position > $2
+	          AND (cardinality($4::text[]) = 0 OR type_url = ANY($4))
 	          AND global_position <= $5
 	      ORDER BY global_position ASC LIMIT $3`,
-		w.ws, from, limit, types, bound)
+		w.ws, from, limit, typesArg, bound)
 	if err != nil {
 		return nil, false, err
 	}

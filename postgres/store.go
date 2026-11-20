@@ -142,7 +142,10 @@ func WithAppendNotify(channel string) Option {
 // takes no additional statement and no additional lock. The channel rules are
 // exactly WithAppendNotify's — a strict PostgreSQL identifier, a high-entropy
 // capability, never logged, enabled only under the same trust precondition,
-// and unusable through PgBouncer transaction pooling on the LISTEN side.
+// and unusable through PgBouncer transaction pooling on the LISTEN side. It
+// must differ from the append channel. A scope over 512 bytes fails the save
+// before it starts, and an exhausted async notification queue fails the save's
+// commit; alert on pg_notification_queue_usage() as for the append channel.
 func WithCheckpointNotify(channel string) Option {
 	return func(c *openConfig) { c.markerNotifyChannel = channel }
 }
@@ -162,6 +165,9 @@ func (c openConfig) validate() error {
 		if err := validNotifyChannel("WithCheckpointNotify", c.markerNotifyChannel); err != nil {
 			return err
 		}
+	}
+	if c.notifyChannel != "" && c.notifyChannel == c.markerNotifyChannel {
+		return fmt.Errorf("postgres: WithCheckpointNotify: channel must differ from WithAppendNotify's: the two wakes mean different things")
 	}
 	if err := validLedgerIdentifier("WithModule", c.module); err != nil {
 		return err

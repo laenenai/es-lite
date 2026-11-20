@@ -24,6 +24,7 @@ import (
 
 var (
 	_ feed.Log             = (*Workspace)(nil)
+	_ feed.ChangeLog       = (*Workspace)(nil)
 	_ feed.Logs            = (*Logs)(nil)
 	_ feed.CheckpointStore = (*CheckpointStore)(nil)
 	_ feed.LeaseStore      = (*LeaseStore)(nil)

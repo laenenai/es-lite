@@ -54,7 +54,7 @@ func TestCheckpointNotifyOffDoesNotFire(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	assertNoNotification(t, lc, 100*time.Millisecond)
+	assertNoNotification(t, lc, 2*time.Second)
 }
 
 // TestCheckpointResetDoesNotFire pins the boundary: Reset is a deliberate
@@ -71,7 +71,7 @@ func TestCheckpointResetDoesNotFire(t *testing.T) {
 		t.Fatalf("reset: %v", err)
 	}
 
-	assertNoNotification(t, lc, 100*time.Millisecond)
+	assertNoNotification(t, lc, 2*time.Second)
 }
 
 // TestCheckpointNotifyRejectsAnOversizedScope pins the payload bound and
@@ -89,7 +89,7 @@ func TestCheckpointNotifyRejectsAnOversizedScope(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "notify bound") {
 		t.Fatalf("save = %v, want a notify-bound error", err)
 	}
-	assertNoNotification(t, lc, 100*time.Millisecond)
+	assertNoNotification(t, lc, 2*time.Second)
 
 	_, found, err := checkpoints.Checkpoint(ctx, scope, "iam.tenant", "live")
 	if err != nil {

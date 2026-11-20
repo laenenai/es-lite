@@ -12,15 +12,25 @@ import (
 	"github.com/laenenai/es-lite/es"
 )
 
-// ChangeLog is the unfiltered log read a change feed needs. It is
-// deliberately narrower than Log: a change feed consumes every event in
-// the workspace, not a projection's filtered type set, so it has no
-// definition to hash or manifest to maintain. *postgres.WorkspaceStore
-// implements it.
+// ChangeLog is the unfiltered, commit-safe log read a change feed needs.
+// It is deliberately narrower than Log: a change feed consumes every
+// event in the workspace, not a projection's filtered type set, so it has
+// no definition to hash or manifest to maintain. *postgres.Workspace
+// implements it with the same horizon fence as ReadAllBounded: a page
+// never contains a live hole, so the checkpoint can never pass an event
+// that commits later. The raw, unfenced Workspace.ReadAll is not
+// sufficient and must not be used here.
+//
+// The workspace must be unsealed: Keys receives the stored payload, and a
+// sealed workspace stores ciphertext. A sealed deployment that needs
+// signals derives keys in the sealing adapter instead.
 type ChangeLog interface {
-	// ReadAll returns up to limit events with GlobalPosition > from,
-	// ordered ascending.
-	ReadAll(ctx context.Context, from uint64, limit int) ([]es.Envelope, error)
+	// ReadAllSettled returns up to limit events with GlobalPosition >
+	// from, ordered ascending, bounded by the settled horizon and by
+	// maxBytes of stored payload. truncated reports that the budget
+	// stopped the page and more events remain, so the caller reads again
+	// instead of waiting.
+	ReadAllSettled(ctx context.Context, from uint64, limit, maxBytes int) ([]es.Envelope, bool, error)
 }
 
 // ChangeFeedConfig configures one change feed. A change feed reads the
@@ -28,6 +38,9 @@ type ChangeLog interface {
 // publishes a change set, and advances. It is best-effort: a publish
 // failure is reported and dropped, and a crash between publishing and
 // advancing may duplicate a change set, which the hub coalesces.
+//
+// The workspace must be unsealed: Keys receives the stored payload, and a
+// sealed workspace stores ciphertext.
 type ChangeFeedConfig struct {
 	// Scope is the workspace id. Required.
 	Scope string
@@ -56,6 +69,9 @@ type ChangeFeedConfig struct {
 	OnError func(error)
 
 	// Waiter is the optional wake source. A nil Waiter polls every Poll.
+	// It must follow the Waiter contract and return false on a timeout: a
+	// waiter that always returns true spins this loop, and the feed does
+	// not floor a wake because a genuine wake must read immediately.
 	Waiter Waiter
 
 	// Poll is the idle wait and the fallback clock. Default 1 s.
@@ -67,6 +83,11 @@ type ChangeFeedConfig struct {
 	RenewEvery time.Duration
 	// Batch is the page size. Default 500.
 	Batch int
+	// MaxBatchBytes bounds one page's stored payload bytes. Default
+	// 16 MiB; a truncated page is read again immediately. The first event
+	// of a page is always included, so an oversized event is visible to
+	// Keys rather than silently skipped.
+	MaxBatchBytes int
 }
 
 // ChangeFeed is a leased, checkpointed reader over the unfiltered log.
@@ -108,9 +129,15 @@ func NewChangeFeed(cfg ChangeFeedConfig) (*ChangeFeed, error) {
 	}
 	if cfg.RenewEvery >= cfg.LeaseTTL {
 		cfg.RenewEvery = cfg.LeaseTTL / 3
+		if cfg.RenewEvery <= 0 {
+			return nil, fmt.Errorf("%w: change feed LeaseTTL %v is too small to renew safely", ErrInvalidRequest, cfg.LeaseTTL)
+		}
 	}
 	if cfg.Batch <= 0 {
 		cfg.Batch = 500
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		cfg.MaxBatchBytes = 16 << 20
 	}
 	if cfg.OnError == nil {
 		cfg.OnError = func(err error) {
@@ -167,8 +194,11 @@ func (f *ChangeFeed) Run(ctx context.Context) error {
 }
 
 func (f *ChangeFeed) release(ctx context.Context, owner string) {
-	// Detached: cancellation must not leak the lease.
-	if err := f.cfg.Leases.Release(context.WithoutCancel(ctx), f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner); err != nil {
+	// Detached from cancellation, but bounded: a hung Release must not
+	// block shutdown forever.
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := f.cfg.Leases.Release(releaseCtx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner); err != nil {
 		slog.Warn("feed: change feed release lease", "err", err)
 	}
 }
@@ -181,6 +211,11 @@ func (f *ChangeFeed) acquire(ctx context.Context, owner string) error {
 	for {
 		ok, err := f.cfg.Leases.Acquire(ctx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner, f.cfg.Consumer, f.cfg.LeaseTTL)
 		if err != nil {
+			// A store may report an error after taking the lease; release
+			// it rather than leaving the key held until its TTL.
+			if ok {
+				f.release(ctx, owner)
+			}
 			return fmt.Errorf("feed: change feed acquire lease: %w", err)
 		}
 		if ok {
@@ -212,6 +247,10 @@ func (f *ChangeFeed) renew(ctx context.Context, owner string, lost chan<- error,
 			return
 		case <-ticker.C:
 			ok, err := f.cfg.Leases.Renew(ctx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner, f.cfg.LeaseTTL)
+			if ctx.Err() != nil {
+				// A shutdown cancelling an in-flight Renew is not a loss.
+				return
+			}
 			if err == nil && ok {
 				continue
 			}
@@ -237,7 +276,7 @@ func (f *ChangeFeed) stream(ctx context.Context, pos uint64) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		envs, err := f.cfg.Log.ReadAll(ctx, pos, f.cfg.Batch)
+		envs, truncated, err := f.cfg.Log.ReadAllSettled(ctx, pos, f.cfg.Batch, f.cfg.MaxBatchBytes)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -251,7 +290,7 @@ func (f *ChangeFeed) stream(ctx context.Context, pos uint64) error {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
-					f.cfg.OnError(err)
+					f.cfg.OnError(fmt.Errorf("feed: publish change set at %d: %w", e.GlobalPosition, err))
 				}
 			}
 			pos = e.GlobalPosition
@@ -264,7 +303,7 @@ func (f *ChangeFeed) stream(ctx context.Context, pos uint64) error {
 				return fmt.Errorf("feed: change feed save checkpoint: %w", err)
 			}
 		}
-		if len(envs) < f.cfg.Batch {
+		if len(envs) < f.cfg.Batch && !truncated {
 			if err := f.wait(ctx); err != nil {
 				return err
 			}

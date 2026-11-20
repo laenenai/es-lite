@@ -14,21 +14,22 @@ import (
 // changeLog is an unfiltered in-memory log: the change feed reads every
 // event, not a projection's consumed types.
 type changeLog struct {
-	mu     sync.Mutex
-	events []es.Envelope
-	reads  []uint64
-	err    error
+	mu            sync.Mutex
+	events        []es.Envelope
+	reads         []uint64
+	err           error
+	truncateAfter int
 }
 
-func (l *changeLog) ReadAll(ctx context.Context, from uint64, limit int) ([]es.Envelope, error) {
+func (l *changeLog) ReadAllSettled(ctx context.Context, from uint64, limit, maxBytes int) ([]es.Envelope, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.reads = append(l.reads, from)
 	if l.err != nil {
-		return nil, l.err
+		return nil, false, l.err
 	}
 	var out []es.Envelope
 	for _, e := range l.events {
@@ -40,7 +41,10 @@ func (l *changeLog) ReadAll(ctx context.Context, from uint64, limit int) ([]es.E
 			break
 		}
 	}
-	return out, nil
+	if l.truncateAfter > 0 && len(out) > l.truncateAfter {
+		return out[:l.truncateAfter], true, nil
+	}
+	return out, false, nil
 }
 
 func (l *changeLog) append(envs ...es.Envelope) {
@@ -375,5 +379,105 @@ func TestChangeFeedStopsAndReleasesTheLease(t *testing.T) {
 	}
 	if leases.releaseCount() != 1 {
 		t.Fatalf("releases = %d, want 1", leases.releaseCount())
+	}
+}
+
+func TestChangeFeedStopsOnALostLease(t *testing.T) {
+	log := &changeLog{}
+	log.append(envelope(1))
+	leases := newMemLeases()
+	cfg := baseConfig(log, leases, newMemCheckpoints(time.Now()), newPublisher().publish)
+	cfg.RenewEvery = 10 * time.Millisecond
+	cfg.Poll = time.Hour
+	cancel, done := runChangeFeed(t, cfg)
+	waitFor(t, "the first event", func() bool { return log.readCount() >= 1 })
+	n := leases.failRenewalsFromNow()
+	waitFor(t, "the failed renewal", func() bool { return leases.renewCount() >= n })
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, feed.ErrLeaseLost) {
+			t.Fatalf("Run = %v, want ErrLeaseLost", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the feed kept running after losing its lease")
+	}
+	cancel()
+	if leases.releaseCount() != 1 {
+		t.Fatalf("releases = %d, want 1", leases.releaseCount())
+	}
+}
+
+func TestChangeFeedAdvancesPastAFinalEmptyKeyEvent(t *testing.T) {
+	log := &changeLog{}
+	log.append(envelope(1), envelope(2))
+	checkpoints := newMemCheckpoints(time.Now())
+	pub := newPublisher()
+	cancel, done := runChangeFeed(t, baseConfig(log, newMemLeases(), checkpoints, pub.publish))
+
+	// Event 2 has no keys and is last in the page: a feed that only
+	// advanced its cursor on a publish would re-read it forever.
+	waitCheckpoint(t, checkpoints, 2)
+	stop(t, cancel, done)
+	if pub.count() != 1 {
+		t.Fatalf("published %d change sets, want 1", pub.count())
+	}
+}
+
+func TestChangeFeedUsesTheScopedWaiter(t *testing.T) {
+	log := &changeLog{}
+	log.append(envelope(1))
+	waiter := &scopedWakingWaiter{delay: 5 * time.Millisecond}
+	cfg := baseConfig(log, newMemLeases(), newMemCheckpoints(time.Now()), newPublisher().publish)
+	cfg.Waiter = waiter
+	cfg.Poll = time.Hour
+	cancel, done := runChangeFeed(t, cfg)
+
+	waitFor(t, "a scoped wait", func() bool { return len(waiter.scopesSnapshot()) >= 1 })
+	stop(t, cancel, done)
+	if waiter.waitCalls() != 0 {
+		t.Fatalf("the unscoped Wait was called %d times, want 0", waiter.waitCalls())
+	}
+	for _, scope := range waiter.scopesSnapshot() {
+		if scope != "s1" {
+			t.Fatalf("WaitScope scope = %q, want s1", scope)
+		}
+	}
+}
+
+func TestChangeFeedReleasesALeaseTakenWithAnError(t *testing.T) {
+	log := &changeLog{}
+	leases := newMemLeases()
+	leases.acquireErr = errors.New("store committed then failed")
+	leases.acquireTrueOnErr = true
+	cfg := baseConfig(log, leases, newMemCheckpoints(time.Now()), newPublisher().publish)
+
+	cf, err := feed.NewChangeFeed(cfg)
+	if err != nil {
+		t.Fatalf("new feed: %v", err)
+	}
+	if err := cf.Run(context.Background()); err == nil {
+		t.Fatal("Run = nil, want the acquire error")
+	}
+	if leases.releaseCount() != 1 {
+		t.Fatalf("releases = %d, want 1: the lease taken with the error must not leak", leases.releaseCount())
+	}
+}
+
+func TestChangeFeedReadsAgainAfterATruncatedPage(t *testing.T) {
+	log := &changeLog{}
+	log.append(envelope(1), envelope(2), envelope(3))
+	log.truncateAfter = 1
+	waiter := newWaiter()
+	cfg := baseConfig(log, newMemLeases(), newMemCheckpoints(time.Now()), newPublisher().publish)
+	cfg.Waiter = waiter
+	cfg.Poll = time.Hour
+	cancel, done := runChangeFeed(t, cfg)
+
+	waitFor(t, "a wait after the last event", func() bool { return len(waiter.timeoutsSnapshot()) >= 1 })
+	stop(t, cancel, done)
+	reads := log.readsSnapshot()
+	if len(reads) < 3 || reads[0] != 0 || reads[1] != 1 || reads[2] != 2 {
+		t.Fatalf("reads = %v, want 0,1,2: a truncated page is followed immediately", reads)
 	}
 }

@@ -204,6 +204,14 @@ func TestOpenConfigRejectsInvalidNotifyChannel(t *testing.T) {
 	if err := bad.validate(); err == nil {
 		t.Fatal("validate accepted an invalid notify channel, want error")
 	}
+	badMarker := newOpenConfig([]Option{WithCheckpointNotify("bad-name")})
+	if err := badMarker.validate(); err == nil || !strings.Contains(err.Error(), "WithCheckpointNotify") {
+		t.Fatalf("validate(marker) = %v, want an error naming WithCheckpointNotify", err)
+	}
+	same := newOpenConfig([]Option{WithAppendNotify("es_lite_same"), WithCheckpointNotify("es_lite_same")})
+	if err := same.validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("validate(same channel) = %v, want a must-differ error", err)
+	}
 	good := newOpenConfig([]Option{WithAppendNotify("es_lite_appended")})
 	if err := good.validate(); err != nil {
 		t.Fatalf("validate rejected a valid channel: %v", err)
