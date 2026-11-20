@@ -19,6 +19,17 @@ type changeLog struct {
 	reads         []uint64
 	err           error
 	truncateAfter int
+
+	// head/rawHead default to the highest appended position. Setting them
+	// pins the two regimes align must tell apart: a restored log (both
+	// below the checkpoint) and a blocked fence (settled head low, raw
+	// head still at or above the checkpoint).
+	headSet      bool
+	head         uint64
+	rawHeadSet   bool
+	rawHead      uint64
+	headCalls    int
+	rawHeadCalls int
 }
 
 func (l *changeLog) ReadAllSettled(ctx context.Context, from uint64, limit, maxBytes int) ([]es.Envelope, bool, error) {
@@ -45,6 +56,53 @@ func (l *changeLog) ReadAllSettled(ctx context.Context, from uint64, limit, maxB
 		return out[:l.truncateAfter], true, nil
 	}
 	return out, false, nil
+}
+
+func (l *changeLog) Head(context.Context) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.headCalls++
+	if l.headSet {
+		return l.head, nil
+	}
+	return l.maxPosition(), nil
+}
+
+func (l *changeLog) RawHead(context.Context) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rawHeadCalls++
+	if l.rawHeadSet {
+		return l.rawHead, nil
+	}
+	if l.headSet {
+		return l.head, nil
+	}
+	return l.maxPosition(), nil
+}
+
+func (l *changeLog) maxPosition() uint64 {
+	var max uint64
+	for _, e := range l.events {
+		if e.GlobalPosition > max {
+			max = e.GlobalPosition
+		}
+	}
+	return max
+}
+
+// setHeads pins the settled and raw heads.
+func (l *changeLog) setHeads(head, raw uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.headSet, l.head = true, head
+	l.rawHeadSet, l.rawHead = true, raw
+}
+
+func (l *changeLog) headsSnapshot() (headCalls, rawHeadCalls int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.headCalls, l.rawHeadCalls
 }
 
 func (l *changeLog) append(envs ...es.Envelope) {
@@ -144,6 +202,26 @@ func (w *recordingWaiter) signal() {
 	case w.wake <- struct{}{}:
 	default:
 	}
+}
+
+// immediateWaiter returns a non-wake at once, the buggy shape a caller's
+// non-blocking receive can produce. The feed must floor it to Poll.
+type immediateWaiter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (w *immediateWaiter) Wait(context.Context, time.Duration) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.calls++
+	return false, nil
+}
+
+func (w *immediateWaiter) callCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.calls
 }
 
 func keysOf(e es.Envelope) []string {
@@ -479,5 +557,103 @@ func TestChangeFeedReadsAgainAfterATruncatedPage(t *testing.T) {
 	reads := log.readsSnapshot()
 	if len(reads) < 3 || reads[0] != 0 || reads[1] != 1 || reads[2] != 2 {
 		t.Fatalf("reads = %v, want 0,1,2: a truncated page is followed immediately", reads)
+	}
+}
+
+func TestChangeFeedResetsARestoredCheckpoint(t *testing.T) {
+	// The event log was restored to an earlier point: the stored
+	// checkpoint (20) is beyond both the settled and the raw head, so the
+	// position it names no longer exists. The feed must reset it to the
+	// settled head and keep streaming, not poll empty forever.
+	log := &changeLog{}
+	log.append(envelope(1), envelope(2))
+	log.setHeads(2, 2)
+	checkpoints := newMemCheckpoints(time.Now())
+	if err := checkpoints.Save(context.Background(), "s1", "iam.changes", "live", "", 20); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	waiter := newWaiter()
+	pub := newPublisher()
+	cfg := baseConfig(log, newMemLeases(), checkpoints, pub.publish)
+	cfg.Waiter = waiter
+	cfg.Poll = time.Hour
+	cancel, done := runChangeFeed(t, cfg)
+
+	waitCheckpoint(t, checkpoints, 2)
+	log.append(envelope(3))
+	log.setHeads(3, 3)
+	waiter.signal()
+	waitFor(t, "the event after the reset", func() bool { return pub.count() >= 1 })
+	stop(t, cancel, done)
+
+	records := pub.snapshot()
+	if len(records) != 1 || records[0].position != 3 {
+		t.Fatalf("published = %+v, want the single position 3 after the reset", records)
+	}
+}
+
+func TestChangeFeedWaitsWhileTheFenceBlocks(t *testing.T) {
+	// The settled head is low because a transaction blocks the fence, but
+	// the raw head still proves the checkpoint's position is in the
+	// committed log. Resetting here would replay the whole log below the
+	// checkpoint; the feed must wait and re-head instead.
+	log := &changeLog{}
+	log.append(envelope(1), envelope(2))
+	log.setHeads(2, 20)
+	checkpoints := newMemCheckpoints(time.Now())
+	if err := checkpoints.Save(context.Background(), "s1", "iam.changes", "live", "", 20); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	waiter := newWaiter()
+	pub := newPublisher()
+	cfg := baseConfig(log, newMemLeases(), checkpoints, pub.publish)
+	cfg.Waiter = waiter
+	cfg.Poll = 5 * time.Millisecond
+	// Every event in this test maps to a key, so the resumed event must
+	// publish rather than advance silently.
+	cfg.Keys = func(es.Envelope) []string { return []string{"tenant:t1"} }
+	cancel, done := runChangeFeed(t, cfg)
+
+	waitFor(t, "the feed to re-head a blocked fence", func() bool {
+		headCalls, rawHeadCalls := log.headsSnapshot()
+		return headCalls >= 2 && rawHeadCalls >= 1
+	})
+	if got, err := checkpoints.Load(context.Background(), "s1", "iam.changes", "live"); err != nil || got != 20 {
+		t.Fatalf("checkpoint = %d, %v; want 20: a blocked fence must not reset it", got, err)
+	}
+
+	// The fence clears and new work arrives: the feed resumes at the
+	// checkpoint with no replay and no loss.
+	log.append(envelope(21))
+	log.setHeads(21, 21)
+	waitFor(t, "the resumed event", func() bool { return pub.count() >= 1 })
+	stop(t, cancel, done)
+
+	records := pub.snapshot()
+	if len(records) != 1 || records[0].position != 21 {
+		t.Fatalf("published = %+v, want the single position 21", records)
+	}
+}
+
+func TestChangeFeedFloorsANonWake(t *testing.T) {
+	// A waiter that returns (false, nil) at once must not spin the read
+	// loop: a non-wake spends at least Poll per iteration.
+	log := &changeLog{}
+	waiter := &immediateWaiter{}
+	cfg := baseConfig(log, newMemLeases(), newMemCheckpoints(time.Now()), newPublisher().publish)
+	cfg.Waiter = waiter
+	cfg.Poll = 40 * time.Millisecond
+	cancel, done := runChangeFeed(t, cfg)
+
+	time.Sleep(200 * time.Millisecond)
+	stop(t, cancel, done)
+
+	// ~5 iterations in 200 ms. Without the floor an immediate waiter
+	// would read thousands of times.
+	if reads := log.readCount(); reads > 10 || reads < 2 {
+		t.Fatalf("reads = %d in 200 ms at Poll=40ms, want about 5: a non-wake must be floored", reads)
+	}
+	if calls := waiter.callCount(); calls > 10 {
+		t.Fatalf("waiter calls = %d, want about 5: the loop must be paced", calls)
 	}
 }

@@ -31,6 +31,12 @@ type ChangeLog interface {
 	// stopped the page and more events remain, so the caller reads again
 	// instead of waiting.
 	ReadAllSettled(ctx context.Context, from uint64, limit, maxBytes int) ([]es.Envelope, bool, error)
+	// Head returns the settled log head. A checkpoint above it is either
+	// a restored log or a transiently blocked fence.
+	Head(ctx context.Context) (uint64, error)
+	// RawHead returns the raw committed maximum, without the settle
+	// bound: raw < checkpoint proves the checkpoint's position is gone.
+	RawHead(ctx context.Context) (uint64, error)
 }
 
 // ChangeFeedConfig configures one change feed. A change feed reads the
@@ -172,6 +178,13 @@ func (f *ChangeFeed) Run(ctx context.Context) error {
 		f.release(ctx, owner)
 		return fmt.Errorf("feed: change feed load checkpoint: %w", err)
 	}
+	pos, err = f.align(runCtx, pos)
+	if err != nil {
+		cancel()
+		renewals.Wait()
+		f.release(ctx, owner)
+		return err
+	}
 
 	streamErr := f.stream(runCtx, pos)
 	cancel()
@@ -271,11 +284,52 @@ func (f *ChangeFeed) renew(ctx context.Context, owner string, lost chan<- error,
 	}
 }
 
+// align recovers a checkpoint ahead of the log. A restored log leaves the
+// checkpoint above the settled head; a blocked fence reports a transient
+// low head with the raw position still present. RawHead separates them:
+// raw < checkpoint means the position is gone, so reset the checkpoint to
+// the settled head (the signal feed owns it) and continue; raw >=
+// checkpoint means wait and re-head.
+func (f *ChangeFeed) align(ctx context.Context, pos uint64) (uint64, error) {
+	for {
+		iterStart := time.Now()
+		head, err := f.cfg.Log.Head(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("feed: change feed head: %w", err)
+		}
+		if pos <= head {
+			return pos, nil
+		}
+		raw, err := f.cfg.Log.RawHead(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("feed: change feed raw head: %w", err)
+		}
+		if raw < pos {
+			if err := f.cfg.Checkpoints.Reset(ctx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, "", head); err != nil {
+				return 0, fmt.Errorf("feed: change feed reset restored checkpoint: %w", err)
+			}
+			slog.Warn("feed: change feed checkpoint ahead of the log; reset to the settled head",
+				"scope", f.cfg.Scope, "name", f.cfg.Name, "from", pos, "to", head)
+			return head, nil
+		}
+		woke, err := f.wait(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if !woke {
+			if err := f.floor(ctx, iterStart); err != nil {
+				return 0, err
+			}
+		}
+	}
+}
+
 func (f *ChangeFeed) stream(ctx context.Context, pos uint64) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		iterStart := time.Now()
 		envs, truncated, err := f.cfg.Log.ReadAllSettled(ctx, pos, f.cfg.Batch, f.cfg.MaxBatchBytes)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -304,30 +358,53 @@ func (f *ChangeFeed) stream(ctx context.Context, pos uint64) error {
 			}
 		}
 		if len(envs) < f.cfg.Batch && !truncated {
-			if err := f.wait(ctx); err != nil {
+			woke, err := f.wait(ctx)
+			if err != nil {
 				return err
+			}
+			if !woke {
+				if err := f.floor(ctx, iterStart); err != nil {
+					return err
+				}
 			}
 		}
 	}
 }
 
-// wait parks until a wake, the poll expires, or ctx ends. A wake is a
-// latency hint: whether it fired or not, the next iteration reads.
-func (f *ChangeFeed) wait(ctx context.Context) error {
-	if scoped, ok := f.cfg.Waiter.(ScopedWaiter); ok {
-		_, err := scoped.WaitScope(ctx, f.cfg.Scope, f.cfg.Poll)
-		return err
+// floor spends the remainder of Poll since since, so a waiter that returns
+// a non-wake at once cannot spin the loop. A genuine wake never floors.
+func (f *ChangeFeed) floor(ctx context.Context, since time.Time) error {
+	rem := f.cfg.Poll - time.Since(since)
+	if rem <= 0 {
+		return nil
 	}
-	if f.cfg.Waiter != nil {
-		_, err := f.cfg.Waiter.Wait(ctx, f.cfg.Poll)
-		return err
-	}
-	timer := time.NewTimer(f.cfg.Poll)
+	timer := time.NewTimer(rem)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
 		return nil
+	}
+}
+
+// wait parks until a wake, the poll expires, or ctx ends. A wake is a
+// latency hint: whether it fired or not, the next iteration reads. woke is
+// false for a timeout (and for the no-waiter timer), so the caller can
+// floor a non-wake.
+func (f *ChangeFeed) wait(ctx context.Context) (bool, error) {
+	if scoped, ok := f.cfg.Waiter.(ScopedWaiter); ok {
+		return scoped.WaitScope(ctx, f.cfg.Scope, f.cfg.Poll)
+	}
+	if f.cfg.Waiter != nil {
+		return f.cfg.Waiter.Wait(ctx, f.cfg.Poll)
+	}
+	timer := time.NewTimer(f.cfg.Poll)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+		return false, nil
 	}
 }
