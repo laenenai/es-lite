@@ -39,13 +39,22 @@ type Runtime[S, C, E any] struct {
 	codec    es.Codec[E]
 	upcaster es.Upcaster[E] // optional; applied after decode on the read path
 
-	// Optional snapshot cache (ADR 0007/0009). When set, Load seeds from a
+	// Optional snapshot cache (ADR 0007/0042). When set, Load seeds from a
 	// cached state and folds only the tail, and Handle writes the state
-	// through after appending. foldVersion invalidates snapshots on a
+	// through after appending — every append unless WithSnapshotEvery
+	// narrows it to a version gap. foldVersion invalidates snapshots on a
 	// decider/upcaster/state-shape change.
 	cache       snapshot.Cache
 	stateCodec  es.StateCodec[S]
 	foldVersion uint32
+
+	// Snapshot write policy (ADR 0042 §3.1). snapshotEvery is the gap n in
+	// stream versions an append must cover past the snapshot its load
+	// seeded from before a snapshot is written; snapshotEverySet
+	// distinguishes an unset policy (write-through on every append) from
+	// an explicit n == 0 (disable automatic writes — a read-only cache).
+	snapshotEvery    uint64
+	snapshotEverySet bool
 
 	// Bounded conflict retry (ADR 0032). retries is the number of ADDITIONAL
 	// Handle attempts after an es.ErrConflict; 0 (the default) surfaces the
@@ -83,17 +92,84 @@ func (r *Runtime[S, C, E]) WithUpcaster(u es.Upcaster[E]) *Runtime[S, C, E] {
 
 // WithSnapshots enables the snapshot cache: Load (and its version-bounded
 // form, LoadAsOfVersion) seeds from a cached state and folds only the tail,
-// and Handle writes the new state through after append. A time-travel-by-
-// time load (LoadAsOfTime) never seeds. stateCodec serializes S;
-// foldVersion is a monotonic counter you bump when a
-// decider/upcaster/state-shape change makes old snapshots wrong (they are then
-// ignored and refolded — snapshots are a pure cache). Returns the runtime for
-// chaining.
+// and Handle writes the new state through after every append unless
+// WithSnapshotEvery narrows that to a version gap. A time-travel-by-time
+// load (LoadAsOfTime) never seeds. stateCodec serializes S; foldVersion is
+// a monotonic counter you bump when a decider/upcaster/state-shape change
+// makes old snapshots wrong (they are then ignored and refolded —
+// snapshots are a pure cache). LoadStale's maxAge is measured against
+// Snapshot.RecordedAt. Returns the runtime for chaining.
+//
+// The cache is trusted infrastructure, as protected as the log (ADR 0042
+// §3.3): the lineage guard proves the seed's version exists, not that its
+// state matches the log. A cache kept somewhere less trusted needs a
+// stateCodec that MACs (or seals) state on Encode and verifies on Decode —
+// a forged row then fails at Decode and the load falls through to a full
+// fold.
 func (r *Runtime[S, C, E]) WithSnapshots(cache snapshot.Cache, stateCodec es.StateCodec[S], foldVersion uint32) *Runtime[S, C, E] {
 	r.cache = cache
 	r.stateCodec = stateCodec
 	r.foldVersion = foldVersion
 	return r
+}
+
+// WithSnapshotEvery writes a snapshot only when an append carries the
+// stream far enough past the snapshot the command loaded (the seed):
+// to-seed >= n. Not calling it keeps the per-append write-through.
+// n == 0 disables automatic writes (a read-only cache).
+func (r *Runtime[S, C, E]) WithSnapshotEvery(n uint64) *Runtime[S, C, E] {
+	r.snapshotEvery, r.snapshotEverySet = n, true
+	return r
+}
+
+// snapshotDue reports whether a successful append to version `to`, on a
+// command whose load seeded at `seed`, should write a snapshot (ADR 0042
+// §3.1). An unset policy keeps today's write-through; an explicit 0
+// disables automatic writes; otherwise the write is due once the gap
+// since the seed reaches n. The to > seed arm keeps the subtraction from
+// wrapping on a no-op (to == seed).
+func (r *Runtime[S, C, E]) snapshotDue(seed, to uint64) bool {
+	switch {
+	case !r.snapshotEverySet:
+		return true
+	case r.snapshotEvery == 0:
+		return false
+	default:
+		return to > seed && to-seed >= r.snapshotEvery
+	}
+}
+
+// WarmSnapshot folds a stream once and writes its snapshot at the head,
+// bypassing the write policy. It is the explicit path for streams the
+// append path cannot reach: enabling a cache on an existing long stream,
+// an archived aggregate that no longer appends, and a post-restore or
+// fold-version warm-up. It never runs from a read path. It errors when no
+// cache (or state codec) is configured, and it returns Save errors —
+// unlike Handle, which treats the cache as best-effort.
+func (r *Runtime[S, C, E]) WarmSnapshot(ctx context.Context, sid es.StreamID) (uint64, error) {
+	if err := sid.Validate(); err != nil {
+		return 0, err
+	}
+	if r.cache == nil || r.stateCodec == nil {
+		return 0, fmt.Errorf("aggregate: WarmSnapshot requires a snapshot cache: configure one with WithSnapshots before warming %s", sid)
+	}
+	state, version, _, err := r.loadSeeded(ctx, sid, 0, time.Time{})
+	if err != nil {
+		return 0, err
+	}
+	b, err := r.stateCodec.Encode(state)
+	if err != nil {
+		return 0, fmt.Errorf("aggregate: WarmSnapshot encode %s: %w", sid, err)
+	}
+	if err := r.cache.Save(ctx, sid.Canonical(), snapshot.Snapshot{
+		Version:     version,
+		FoldVersion: r.foldVersion,
+		RecordedAt:  time.Now().UTC(),
+		State:       b,
+	}); err != nil {
+		return 0, fmt.Errorf("aggregate: WarmSnapshot save %s: %w", sid, err)
+	}
+	return version, nil
 }
 
 // WithConflictRetry makes Handle repeat load → IsTerminal → Decide → Append up
@@ -352,7 +428,7 @@ func (r *Runtime[S, C, E]) sleep(ctx context.Context, d time.Duration) error {
 func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd C, meta es.Meta, expected uint64, now time.Time, ho handleOptions) (Result[S, E], error) {
 	var zero Result[S, E]
 
-	state, version, err := r.load(ctx, sid, 0, time.Time{})
+	state, version, seed, err := r.loadSeeded(ctx, sid, 0, time.Time{})
 	if err != nil {
 		return zero, err
 	}
@@ -422,8 +498,13 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 	}
 
 	// Write the new state through to the snapshot cache (best-effort: a
-	// failure only costs a longer fold next time — snapshots are a pure cache).
-	if r.cache != nil {
+	// failure only costs a longer fold next time — snapshots are a pure
+	// cache, and Handle never fails because of it). WithSnapshotEvery
+	// gates the write on the gap since the seed — the snapshot version
+	// this command's load actually seeded from, 0 for a full fold — and
+	// the gate runs BEFORE stateCodec.Encode, so a not-due append never
+	// pays the marshal (ADR 0042 §3.1).
+	if r.cache != nil && r.snapshotDue(seed, res.ToVersion) {
 		if b, encErr := r.stateCodec.Encode(state); encErr == nil {
 			_ = r.cache.Save(ctx, sid.Canonical(), snapshot.Snapshot{
 				Version:     res.ToVersion,
@@ -498,6 +579,18 @@ func (r *Runtime[S, C, E]) LoadStale(ctx context.Context, sid es.StreamID, maxAg
 // bounds the fold: upToVersion>0 caps by version, a non-zero asOf caps
 // by RecordedAt, and neither means "the whole stream".
 func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersion uint64, asOf time.Time) (S, uint64, error) {
+	state, version, _, err := r.loadSeeded(ctx, sid, upToVersion, asOf)
+	return state, version, err
+}
+
+// loadSeeded is load that also reports the seed: the version the fold
+// actually started from after the lineage guard — 0 for a full fold, 0 on
+// the asOf path (which never seeds), the snapshot version otherwise (which
+// a version-bounded load may hold at or below its bound). Handle gates
+// snapshot writes on the gap from the seed (ADR 0042 §3.1); the public
+// Load variants keep their signatures and drop it. On error the seed is
+// whatever the fold had reached and must be ignored along with the state.
+func (r *Runtime[S, C, E]) loadSeeded(ctx context.Context, sid es.StreamID, upToVersion uint64, asOf time.Time) (S, uint64, uint64, error) {
 	state := r.decider.Initial()
 
 	// Snapshot seed — never on the time-travel-by-time (asOf) path: a
@@ -529,7 +622,7 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 	if from > 0 {
 		probe, perr := r.store.ReadStream(ctx, sid, from-1, from)
 		if perr != nil && !errors.Is(perr, es.ErrStreamNotFound) {
-			return state, 0, perr
+			return state, 0, from, perr
 		}
 		if len(probe) == 0 {
 			state = r.decider.Initial()
@@ -548,7 +641,7 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 		envs, err = r.store.ReadStream(ctx, sid, from, upToVersion)
 	}
 	if err != nil && !errors.Is(err, es.ErrStreamNotFound) {
-		return state, 0, err
+		return state, 0, from, err
 	}
 
 	var checker *es.ChainChecker
@@ -559,7 +652,7 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 	for _, env := range envs {
 		if checker != nil {
 			if err := checker.Next(env); err != nil {
-				return state, 0, err
+				return state, 0, from, err
 			}
 		}
 		ev, err := r.codec.Decode(es.EncodedEvent{
@@ -568,22 +661,22 @@ func (r *Runtime[S, C, E]) load(ctx context.Context, sid es.StreamID, upToVersio
 			Payload:       env.Payload,
 		})
 		if err != nil {
-			return state, 0, fmt.Errorf("decode event %s v%d: %w", sid, env.Version, err)
+			return state, 0, from, fmt.Errorf("decode event %s v%d: %w", sid, env.Version, err)
 		}
 		if r.upcaster != nil {
 			ev, err = r.upcaster.Upcast(env.TypeURL, env.SchemaVersion, ev)
 			if err != nil {
-				return state, 0, fmt.Errorf("upcast event %s v%d: %w", sid, env.Version, err)
+				return state, 0, from, fmt.Errorf("upcast event %s v%d: %w", sid, env.Version, err)
 			}
 		}
 		state = r.decider.Evolve(state, ev)
 		version = env.Version
 	}
 	if upToVersion > 0 && version != upToVersion {
-		return state, version, fmt.Errorf("%w: stream %s has version %d, want %d",
+		return state, version, from, fmt.Errorf("%w: stream %s has version %d, want %d",
 			es.ErrVersionOutOfRange, sid, version, upToVersion)
 	}
-	return state, version, nil
+	return state, version, from, nil
 }
 
 // newV7 generates a UUIDv7 (time-ordered). Falls back to v4 only if the

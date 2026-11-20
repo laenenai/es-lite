@@ -293,15 +293,41 @@ state, version, fresh, err := rt.LoadStale(ctx, sid, 5*time.Minute)
 runtime seeds folding from a cached state at version N and folds only the tail.
 Current loads and `LoadAsOfVersion` calls at or above the cached version seed
 from it; `LoadAsOfTime` never seeds, because a snapshot newer than the target
-would swallow the requested past. The library ships the interface, not a
-storage implementation; implement it over your own database and opt in with:
+would swallow the requested past. The library ships two adapters for it
+(ADR 0042) — `postgres.NewSnapshotCache(store, workspace)` and
+`sqlite.NewSnapshotCache(store)` — dumb keyed stores over a `snapshots` table
+the shared migrations create. Enable one with:
 
 ```go
-rt.WithSnapshots(cache, stateCodec, foldVersion)
+cache := postgres.NewSnapshotCache(store, "ws_123") // or sqlite.NewSnapshotCache(store)
+rt.WithSnapshots(cache, stateCodec, foldVersion).WithSnapshotEvery(100)
 ```
 
-The cache stores opaque state bytes. Seal them client-side if they contain
-sensitive data, and purge them when the corresponding key is destroyed.
+**The write policy.** Without `WithSnapshotEvery`, every successful append
+writes the folded state through. With `n`, a snapshot is written only when the
+append carries the stream to `seed + n` or beyond, where `seed` is the
+snapshot version the command's load used — `0` whenever the load folded from
+scratch. `WithSnapshotEvery(0)` disables automatic writes: a read-only cache
+that only seeds. The threshold is safe because the seed bounds the cost — a
+load folds at most `n` events past its snapshot even after a lost write (the
+next append past the gap retries), and a seed discarded by a log reset makes
+the first append past `n` rewrite the row. A stream that never crosses a gap
+(an archived aggregate nothing appends to, or every stream just after enabling
+the cache) stays on full folds; `WarmSnapshot(ctx, sid)` writes one snapshot
+at the stream's head explicitly, ignoring the threshold (even `0`) and
+surfacing cache errors instead of dropping them.
+
+**The trust boundary.** The cache is trusted infrastructure, as protected as
+the log: same database, same RLS, same grant discipline. `WithChainVerification`
+recomputes the chain only over the envelopes a load folds, so a seeded load
+verifies the tail and trusts the seed — a store you trust less needs a
+`stateCodec` that MACs (or seals) state on encode and verifies on decode
+(ADR 0025), so a forged row fails at decode and the load falls through to a
+full fold. Either way the bytes are opaque to the adapters: seal them
+client-side when they carry sensitive data. For erasure, both adapters expose
+`Purge(ctx)` (workspace-scoped on Postgres), matching the other erasure
+surfaces: run it on a quiesced workspace, or destroy the key first for
+sealed state.
 
 **Caller-owned transactions (ADR 0035).** When an append must share a
 transaction with another write — for example an audit record in a

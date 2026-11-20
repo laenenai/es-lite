@@ -3,7 +3,17 @@
 - **Status:** Implemented (snapshot cache; sealing is client-owned per ADR 0025)
 - **Date:** 2026-08-01
 
-> Errata (2026-10-28): snapshots are implemented as `snapshot`/`snapshot/natskv`; sealing and erasure of snapshot state are client-owned (ADR 0025).
+> Errata (2026-11-20), correcting the note of 2026-10-28: that note claimed
+> snapshots were implemented as `snapshot`/`snapshot/natskv` — false; the
+> package held only the interface. The implementation is
+> `postgres.NewSnapshotCache` and `sqlite.NewSnapshotCache`, with the write
+> policy on `Runtime` (`WithSnapshotEvery`, `WarmSnapshot`) per ADR 0042.
+> Sealing and erasure of snapshot state remain client-owned (ADR 0025); the
+> adapters add a workspace-scoped `Purge` for the erasure half. Nothing else
+> in this ADR changes: the trigger still governs whether an adopter enables
+> the cache, the four invalidation surfaces and the non-goals stand, and
+> ADR 0042 supersedes only the "write no code until a measured need appears"
+> clause, for the implementation and its write policy.
 
 ## Context
 
