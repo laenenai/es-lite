@@ -2,8 +2,10 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -161,17 +163,17 @@ func TestSnapshotsTableColumns(t *testing.T) {
 	defer rows.Close()
 
 	type col struct {
-		name string
-		pk   int
+		name    string
+		notNull int
+		pk      int
 	}
 	var got []col
 	for rows.Next() {
 		var cid int
 		var c col
 		var typ string
-		var notNull int
 		var dflt any // NULL for every column here; must not scan into a typed value
-		if err := rows.Scan(&cid, &c.name, &typ, &notNull, &dflt, &c.pk); err != nil {
+		if err := rows.Scan(&cid, &c.name, &typ, &c.notNull, &dflt, &c.pk); err != nil {
 			t.Fatalf("scan table_info: %v", err)
 		}
 		got = append(got, c)
@@ -188,8 +190,58 @@ func TestSnapshotsTableColumns(t *testing.T) {
 		if c.name != wantNames[i] {
 			t.Fatalf("snapshots column %d = %q, want %q (order matters)", i, c.name, wantNames[i])
 		}
+		if c.notNull != 1 {
+			t.Fatalf("snapshots column %d (%s) notnull = %d, want 1 (every column is NOT NULL)", i, c.name, c.notNull)
+		}
+		if i > 0 && c.pk != 0 {
+			t.Fatalf("snapshots column %d (%s) pk = %d, want 0 (stream_id is the sole primary key — no composite)", i, c.name, c.pk)
+		}
 	}
 	if got[0].pk != 1 {
 		t.Fatalf("stream_id pk = %d, want 1 (the primary key)", got[0].pk)
+	}
+}
+
+// TestSnapshotMigrationRefusesForeignTable proves 0011 refuses loudly
+// when a "snapshots" table already exists with a different shape (ADR
+// 0042 §3.2). The Cache interface has been public while unimplemented,
+// so an adopter may own such a table; a silent IF NOT EXISTS no-op
+// would record 0011 as applied and leave aggregate.Runtime's swallowed
+// Load/Save errors hiding a permanently dead cache. The migration is
+// the only loud place: it must fail, and its version must not be
+// recorded — the database stays at the pre-0011 ledger.
+func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file:"+t.Name()+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// A foreign table squatting on the reserved name, wrong shape.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE snapshots (x int)`); err != nil {
+		t.Fatalf("seed foreign snapshots table: %v", err)
+	}
+
+	s, err := sqlite.NewWithDB(ctx, db, sqlite.WithoutAutoMigrate())
+	if err != nil {
+		t.Fatalf("NewWithDB: %v", err)
+	}
+
+	if err := s.Migrate(ctx); err == nil {
+		t.Fatal("Migrate over a foreign snapshots table: err = nil, want failure (the refusal must be loud, ADR 0042 §3.2)")
+	} else if !strings.Contains(err.Error(), "snapshots") {
+		t.Fatalf("Migrate err = %v, want text naming the colliding table (snapshots)", err)
+	}
+
+	// The failed 0011 must not be recorded: every earlier migration
+	// commits in its own transaction, so the ledger stays exactly where
+	// it was before 0011 was attempted.
+	var v int
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
+		t.Fatalf("schema_migrations: %v", err)
+	}
+	if v != 10 {
+		t.Fatalf("schema_migrations max version = %d, want 10 (a failed 0011 must not record itself)", v)
 	}
 }
