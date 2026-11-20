@@ -1,6 +1,7 @@
 package postgres_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/laenenai/es-lite/feed"
 	"github.com/laenenai/es-lite/postgres"
 	"github.com/laenenai/es-lite/projection"
+	"github.com/laenenai/es-lite/snapshot"
 )
 
 // The least-privilege privilege contract (F5): the runbook's grant block
@@ -92,14 +94,18 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 	t.Helper()
 	for _, g := range []struct{ role, grants string }{
 		// Appender: draw positions, chain events, attest batch order,
-		// apply uniqueness constraints (Release is the only DELETE,
-		// on the claims index).
+		// apply uniqueness constraints (Release is the only DELETE the
+		// append path issues on the log, on the claims index; Purge on
+		// the snapshot cache is the one other DELETE). It is also the
+		// process running aggregate.Runtime, so with a snapshot cache
+		// it reads and writes snapshots.
 		{lpAppender, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAppender + `;
 			GRANT USAGE ON SEQUENCE events_global_position_seq TO ` + lpAppender + `;
 			GRANT SELECT, INSERT ON events, unique_claims TO ` + lpAppender + `;
 			GRANT DELETE ON unique_claims TO ` + lpAppender + `;
-			GRANT INSERT ON log_order TO ` + lpAppender},
+			GRANT INSERT ON log_order TO ` + lpAppender + `;
+			GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO ` + lpAppender},
 		// Feed process: the horizon fence (pg_sequences needs USAGE on
 		// the sequence, never SELECT) + the feed's own state tables.
 		{lpFeed, `
@@ -196,6 +202,36 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 		t.Fatalf("claim after Release under the appender grants: found=%v err=%v, want absent", found, err)
 	}
 	pos1, pos2 := res1.Envelopes[0].GlobalPosition, res2.Envelopes[0].GlobalPosition
+
+	// The appender is also the process running aggregate.Runtime: with
+	// a snapshot cache configured it reads and writes snapshots under
+	// the same role. The second Save is the upsert's ON CONFLICT DO
+	// UPDATE — the statement that pins UPDATE — and Purge is the one
+	// DELETE off the claims index.
+	cache := postgres.NewSnapshotCache(appender, lpWS)
+	fixed := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	v2 := snapshot.Snapshot{Version: 2, FoldVersion: 1, RecordedAt: fixed, State: []byte("lp-state-v2")}
+	if err := cache.Save(ctx, sid.Canonical(), v2); err != nil {
+		t.Fatalf("snapshot save under the appender grants: %v", err)
+	}
+	v3 := snapshot.Snapshot{Version: 3, FoldVersion: 1, RecordedAt: fixed, State: []byte("lp-state-v3")}
+	if err := cache.Save(ctx, sid.Canonical(), v3); err != nil {
+		t.Fatalf("snapshot upsert under the appender grants: %v", err)
+	}
+	got, ok, err := cache.Load(ctx, sid.Canonical())
+	if err != nil || !ok {
+		t.Fatalf("snapshot load under the appender grants: ok=%v err=%v, want ok", ok, err)
+	}
+	if got.Version != 3 || got.FoldVersion != 1 || !bytes.Equal(got.State, v3.State) {
+		t.Fatalf("snapshot load under the appender grants = (v%d fold%d %q), want (v3 fold1 %q)",
+			got.Version, got.FoldVersion, got.State, v3.State)
+	}
+	if err := cache.Purge(ctx); err != nil {
+		t.Fatalf("snapshot purge under the appender grants: %v", err)
+	}
+	if _, ok, err := cache.Load(ctx, sid.Canonical()); ok || err != nil {
+		t.Fatalf("snapshot load after Purge under the appender grants: ok=%v err=%v, want absent", ok, err)
+	}
 
 	// Facet 2 — feed process: the fenced page read, then subscribe/ack.
 	feedStore := drainStoreAs(t, lpFeed)
