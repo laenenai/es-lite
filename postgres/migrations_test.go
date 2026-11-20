@@ -371,33 +371,114 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 // CREATE TABLE IF NOT EXISTS would silently adopt it and record 0013 as
 // applied — and because the runtime ignores Load/Save errors, a
 // wrong-shaped table would degrade to permanent full folds with no
-// signal. So 0013 carries a shape assertion that fails the migration
-// loudly, and a failed migration must not be recorded: the ledger stays
-// at the pre-0013 history until the adopter renames their table.
+// signal. Shape is the columns, not just their names: the assertion
+// refuses a missing or mistyped required column and an extra NOT NULL
+// column with no default (the adapter's INSERT names only its own six
+// columns, so the extra one has no value to take), and tolerates an
+// extra nullable column, which breaks nothing. A refusal must fail the
+// migration loudly and must not be recorded: the ledger stays at the
+// pre-0013 history until the adopter renames their table.
 func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
-	s := openScratchStore(t)
-	ctx := context.Background()
+	for _, tt := range []struct {
+		name    string
+		ddl     string
+		wantErr bool
+		wantV   int
+	}{
+		{
+			name:    "bare foreign table",
+			ddl:     `CREATE TABLE snapshots (x int)`,
+			wantErr: true,
+			wantV:   12,
+		},
+		{
+			// Right names, one wrong type: state text instead of
+			// bytea. Name-only adoption would pass this and then fail
+			// every Save at runtime, swallowed by the runtime.
+			name: "wrong type",
+			ddl: `CREATE TABLE snapshots (
+				workspace_id text        NOT NULL,
+				stream_id    text        NOT NULL,
+				version      bigint      NOT NULL,
+				fold_version bigint      NOT NULL,
+				recorded_at  timestamptz NOT NULL,
+				state        text        NOT NULL,
+				PRIMARY KEY (workspace_id, stream_id)
+			)`,
+			wantErr: true,
+			wantV:   12,
+		},
+		{
+			// An extra NOT NULL column with no default breaks the
+			// adapter's INSERT, which names only its own columns.
+			name: "extra not-null column",
+			ddl: `CREATE TABLE snapshots (
+				workspace_id text        NOT NULL,
+				stream_id    text        NOT NULL,
+				version      bigint      NOT NULL,
+				fold_version bigint      NOT NULL,
+				recorded_at  timestamptz NOT NULL,
+				state        bytea       NOT NULL,
+				extra        text        NOT NULL,
+				PRIMARY KEY (workspace_id, stream_id)
+			)`,
+			wantErr: true,
+			wantV:   12,
+		},
+		{
+			// The tolerant case: an extra nullable column breaks
+			// nothing, so the migration must go through — this keeps
+			// the check from being over-strict.
+			name: "extra nullable column",
+			ddl: `CREATE TABLE snapshots (
+				workspace_id text        NOT NULL,
+				stream_id    text        NOT NULL,
+				version      bigint      NOT NULL,
+				fold_version bigint      NOT NULL,
+				recorded_at  timestamptz NOT NULL,
+				state        bytea       NOT NULL,
+				extra        text,
+				PRIMARY KEY (workspace_id, stream_id)
+			)`,
+			wantErr: false,
+			wantV:   13,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := openScratchStore(t)
+			ctx := context.Background()
 
-	if _, err := s.Pool().Exec(ctx, `CREATE TABLE snapshots (x int)`); err != nil {
-		t.Fatalf("create foreign snapshots table: %v", err)
-	}
+			if _, err := s.Pool().Exec(ctx, tt.ddl); err != nil {
+				t.Fatalf("create foreign snapshots table: %v", err)
+			}
 
-	err := s.Migrate(ctx)
-	if err == nil {
-		t.Fatal("Migrate succeeded over a foreign snapshots table — 0013 must refuse loudly (ADR 0042 §3.2)")
-	}
-	if !strings.Contains(err.Error(), "snapshots") {
-		t.Fatalf("Migrate error %q does not name snapshots — the refusal must point at the reserved table", err)
-	}
+			err := s.Migrate(ctx)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("Migrate: %v — a table the adapter can use must not be refused (ADR 0042 §3.2)", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("Migrate succeeded over a foreign snapshots table — 0013 must refuse loudly (ADR 0042 §3.2)")
+				}
+				for _, want := range []string{"snapshots", "incompatible shape"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Fatalf("Migrate error %q does not name %q — the refusal must point at the reserved table and its shape", err, want)
+					}
+				}
+			}
 
-	// Migrations run one transaction each (ADR 0010), so 0001-0012 stand
-	// and only 0013 is absent: the refused version must not be recorded.
-	var v int
-	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
-		t.Fatalf("read shared ledger: %v", err)
-	}
-	if v != 12 {
-		t.Fatalf("after the refused Migrate the applied version is %d, want 12 — the failed migration must not be recorded", v)
+			// Migrations run one transaction each (ADR 0010), so a
+			// refusal leaves 0001-0012 standing with only 0013 absent:
+			// the refused version must not be recorded.
+			var v int
+			if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
+				t.Fatalf("read shared ledger: %v", err)
+			}
+			if v != tt.wantV {
+				t.Fatalf("after Migrate the applied version is %d, want %d", v, tt.wantV)
+			}
+		})
 	}
 }
 

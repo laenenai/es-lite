@@ -22,19 +22,52 @@ CREATE TABLE IF NOT EXISTS snapshots (
     PRIMARY KEY (workspace_id, stream_id)
 );
 
--- Refuse a pre-existing table of the same name with an incompatible shape.
+-- Refuse a pre-existing table of the same name with an incompatible
+-- shape. The columns are the shape, not just their names: a required
+-- column of the wrong type breaks every Save (and Load), and an extra
+-- NOT NULL column with no default breaks the adapter's INSERT, which
+-- names only its own six columns — the runtime ignores those errors,
+-- which is exactly the silent degradation this refusal exists to
+-- prevent. An extra nullable column, one with a default, or an
+-- identity/generated one, breaks neither and is tolerated.
 DO $$
-DECLARE missing text;
+DECLARE problems text;
 BEGIN
-    SELECT string_agg(c, ', ') INTO missing
-    FROM unnest(ARRAY['workspace_id','stream_id','version','fold_version','recorded_at','state']) AS c
-    WHERE NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
+    WITH required(name, type) AS (
+        VALUES ('workspace_id', 'text'),
+               ('stream_id',    'text'),
+               ('version',      'bigint'),
+               ('fold_version', 'bigint'),
+               ('recorded_at',  'timestamp with time zone'),
+               ('state',        'bytea')
+    ),
+    existing AS (
+        SELECT column_name, data_type, is_nullable, column_default,
+               is_identity, is_generated
+        FROM information_schema.columns
         WHERE table_schema = current_schema()
           AND table_name = 'snapshots'
-          AND column_name = c);
-    IF missing IS NOT NULL THEN
-        RAISE EXCEPTION 'snapshots exists with an incompatible shape (missing columns: %) — rename it (the name is reserved by ADR 0042) and re-run the migration', missing;
+    )
+    SELECT string_agg(problem, '; ') INTO problems
+    FROM (
+        SELECT CASE
+                   WHEN e.column_name IS NULL THEN r.name || ' missing'
+                   WHEN r.name IS NULL THEN
+                       CASE WHEN e.is_nullable = 'NO'
+                                 AND e.column_default IS NULL
+                                 AND e.is_identity <> 'YES'
+                                 AND e.is_generated <> 'ALWAYS'
+                               THEN e.column_name || ' is NOT NULL with no default'
+                       END
+                   WHEN e.data_type <> r.type THEN
+                       r.name || ' is ' || e.data_type || ', want ' || r.type
+               END AS problem
+        FROM required r
+        FULL JOIN existing e ON e.column_name = r.name
+    ) v
+    WHERE problem IS NOT NULL;
+    IF problems IS NOT NULL THEN
+        RAISE EXCEPTION 'snapshots exists with an incompatible shape (%) — rename it (the name is reserved by ADR 0042) and re-run the migration', problems;
     END IF;
 END $$;
 
