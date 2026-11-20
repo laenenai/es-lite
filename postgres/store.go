@@ -60,11 +60,12 @@ const (
 )
 
 type openConfig struct {
-	autoMigrate     bool
-	maxPayloadBytes int
-	notifyChannel   string
-	module          string
-	ledgerSchema    string
+	autoMigrate         bool
+	maxPayloadBytes     int
+	notifyChannel       string
+	markerNotifyChannel string
+	module              string
+	ledgerSchema        string
 }
 
 // WithoutAutoMigrate skips applying migrations on Open. Application replicas
@@ -130,6 +131,22 @@ func WithAppendNotify(channel string) Option {
 	return func(c *openConfig) { c.notifyChannel = channel }
 }
 
+// WithCheckpointNotify opts the Postgres checkpoint store into emitting a
+// pg_notify hint on each committed Save (ADR 0039 C2). The checkpoint save
+// transaction runs SELECT pg_notify(channel, scope) after the upsert, so the
+// hint commits with the checkpoint and a rolled-back save notifies nobody.
+// The payload is the scope (the workspace id), never the projection or a
+// position: a waiter re-reads its own status and decides.
+//
+// It is OFF by default and deliberately opt-in; with it unset the save path
+// takes no additional statement and no additional lock. The channel rules are
+// exactly WithAppendNotify's — a strict PostgreSQL identifier, a high-entropy
+// capability, never logged, enabled only under the same trust precondition,
+// and unusable through PgBouncer transaction pooling on the LISTEN side.
+func WithCheckpointNotify(channel string) Option {
+	return func(c *openConfig) { c.markerNotifyChannel = channel }
+}
+
 // validate fails fast on options that cannot work, so a misconfigured
 // Open surfaces here — before any connection, probe or migration —
 // instead of on the first append.
@@ -137,7 +154,12 @@ func (c openConfig) validate() error {
 	// An empty notify channel is the option being off, not a
 	// misconfiguration; anything set must be a usable identifier.
 	if c.notifyChannel != "" {
-		if err := validNotifyChannel(c.notifyChannel); err != nil {
+		if err := validNotifyChannel("WithAppendNotify", c.notifyChannel); err != nil {
+			return err
+		}
+	}
+	if c.markerNotifyChannel != "" {
+		if err := validNotifyChannel("WithCheckpointNotify", c.markerNotifyChannel); err != nil {
 			return err
 		}
 	}
@@ -184,19 +206,19 @@ const maxNotifyChannelBytes = 63
 // NotifyListener (ADR 0039 C2) reuses it, so one validator decides
 // everywhere. The error names the channel — Open-time feedback on a
 // misconfiguration; no other path ever puts it in a message or a log.
-func validNotifyChannel(s string) error {
+func validNotifyChannel(option, s string) error {
 	if s == "" {
-		return fmt.Errorf("postgres: WithAppendNotify: channel must not be empty")
+		return fmt.Errorf("postgres: %s: channel must not be empty", option)
 	}
 	if len(s) > maxNotifyChannelBytes {
-		return fmt.Errorf("postgres: WithAppendNotify: channel %q is %d bytes, over the %d-byte identifier limit", s, len(s), maxNotifyChannelBytes)
+		return fmt.Errorf("postgres: %s: channel %q is %d bytes, over the %d-byte identifier limit", option, s, len(s), maxNotifyChannelBytes)
 	}
 	if !isIdentStart(s[0]) {
-		return fmt.Errorf("postgres: WithAppendNotify: channel %q is not a valid identifier: it must start with a letter or underscore", s)
+		return fmt.Errorf("postgres: %s: channel %q is not a valid identifier: it must start with a letter or underscore", option, s)
 	}
 	for i := 1; i < len(s); i++ {
 		if !isIdentPart(s[i]) {
-			return fmt.Errorf("postgres: WithAppendNotify: channel %q is not a valid identifier: only letters, digits and underscores are allowed", s)
+			return fmt.Errorf("postgres: %s: channel %q is not a valid identifier: only letters, digits and underscores are allowed", option, s)
 		}
 	}
 	return nil
@@ -253,6 +275,12 @@ type Store struct {
 	// echoed into an error outside Open-time validation.
 	notifyChannel string
 
+	// markerNotifyChannel is the opt-in pg_notify channel for checkpoint
+	// saves (WithCheckpointNotify, ADR 0039 C2). Empty means no hint. It is
+	// a separate channel from notifyChannel so a marker wake cannot be
+	// mistaken for an append wake, and it is a capability like the other.
+	markerNotifyChannel string
+
 	// module and ledgerSchema identify this store's rows in the shared
 	// migration ledger. The ledger lives in the database the DSN names,
 	// outside the event-store schema, so a schema reset cannot erase it.
@@ -303,12 +331,13 @@ func Open(ctx context.Context, dsn string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		pool:            pool,
-		ownsPool:        true,
-		maxPayloadBytes: cfg.maxPayloadBytes,
-		notifyChannel:   cfg.notifyChannel,
-		module:          cfg.module,
-		ledgerSchema:    cfg.ledgerSchema,
+		pool:                pool,
+		ownsPool:            true,
+		maxPayloadBytes:     cfg.maxPayloadBytes,
+		notifyChannel:       cfg.notifyChannel,
+		markerNotifyChannel: cfg.markerNotifyChannel,
+		module:              cfg.module,
+		ledgerSchema:        cfg.ledgerSchema,
 	}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		pool.Close()
@@ -347,12 +376,13 @@ func OpenWithPool(ctx context.Context, pool *pgxpool.Pool, opts ...Option) (*Sto
 		return nil, err
 	}
 	s := &Store{
-		pool:            pool,
-		ownsPool:        false,
-		maxPayloadBytes: cfg.maxPayloadBytes,
-		notifyChannel:   cfg.notifyChannel,
-		module:          cfg.module,
-		ledgerSchema:    cfg.ledgerSchema,
+		pool:                pool,
+		ownsPool:            false,
+		maxPayloadBytes:     cfg.maxPayloadBytes,
+		notifyChannel:       cfg.notifyChannel,
+		markerNotifyChannel: cfg.markerNotifyChannel,
+		module:              cfg.module,
+		ledgerSchema:        cfg.ledgerSchema,
 	}
 	if err := s.migrateIfConfigured(ctx, cfg); err != nil {
 		return nil, err

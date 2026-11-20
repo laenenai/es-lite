@@ -177,7 +177,7 @@ func TestNotifyChannelValidator(t *testing.T) {
 		{"leading underscore", "_es_lite", false},
 		{"digit inside", "es_lite_2", false},
 	} {
-		err := validNotifyChannel(tc.channel)
+		err := validNotifyChannel("WithAppendNotify", tc.channel)
 		if tc.wantErr && err == nil {
 			t.Errorf("%s: channel %q accepted, want error", tc.name, tc.channel)
 		}

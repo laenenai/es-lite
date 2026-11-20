@@ -112,6 +112,9 @@ func (c *CheckpointStore) Load(ctx context.Context, scope, projection, instance 
 // that carries no identity cannot clear what a previous one recorded.
 // updated_at is clock_timestamp(): the DB clock, not the writer's.
 func (c *CheckpointStore) Save(ctx context.Context, scope, projection, instance, definition string, position uint64) error {
+	if c.store.markerNotifyChannel != "" && len(scope) > maxNotifyWorkspaceBytes {
+		return fmt.Errorf("postgres: checkpoints: save: workspace id is %d bytes, over the %d-byte notify bound", len(scope), maxNotifyWorkspaceBytes)
+	}
 	err := c.store.runWorkspace(ctx, scope, func(tx DBTX) error {
 		_, err := tx.Exec(ctx,
 			`INSERT INTO feed_checkpoints (workspace_id, projection, instance, position, definition_hash, updated_at)
@@ -122,7 +125,19 @@ func (c *CheckpointStore) Save(ctx context.Context, scope, projection, instance,
 			     updated_at = clock_timestamp()`,
 			scope, projection, instance, int64(position), definition,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		if c.store.markerNotifyChannel == "" {
+			return nil
+		}
+		// Same transaction as the upsert: the hint can only describe an
+		// advance that commits. A notify error fails the save, matching
+		// the append path's queue-boundary contract.
+		if _, err := tx.Exec(ctx, `SELECT pg_notify($1, $2)`, c.store.markerNotifyChannel, scope); err != nil {
+			return fmt.Errorf("checkpoints: notify: %w", err)
+		}
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("postgres: checkpoints: save: %w", err)

@@ -531,7 +531,10 @@ configured behaviour is exactly the polling described above.
   `NotifyListener` in the feed process receives it and wakes the hub. NOTIFY
   is transactional, so the hint commits with the append — including
   caller-owned transactions, which C1 cannot cover without touching every
-  call site.
+  call site. `WithCheckpointNotify(channel)` is the same hint for checkpoint
+  saves: `CheckpointStore.Save` emits it in the save transaction, so a
+  committed advance wakes the readers waiting on it. Use a second channel;
+  the append and checkpoint wakes mean different things.
 
 ### C2's trust precondition
 
@@ -562,12 +565,14 @@ that is not what makes C2 safe; the precondition above is.
   it**: roles holding `pg_read_all_stats` can read other sessions' query text
   and thereby learn the name. An unguessable name mitigates eavesdropping and
   injection, but it is not a substitute for the trust precondition.
-- **One listener connection per process, dedicated.** The listener owns one
+- **One listener connection per channel, dedicated.** The listener owns one
   connection that is never returned to a pool — a direct or session-pooled
   connection only, because **PgBouncer transaction pooling breaks `LISTEN`**
-  (the session must outlive the `LISTEN`). Every gateway replica runs its own
-  listener: the connection count scales with processes, not workspaces. The
-  listener sets an `application_name`, so it is identifiable in
+  (the session must outlive the `LISTEN`). A deployment may run a listener in
+  every process (the connection count scales with processes, not workspaces),
+  or elect one gateway that receives both channels and relays the wake over
+  its own bus; the second shape keeps the direct connection to one process.
+  The listener sets an `application_name`, so it is identifiable in
   `pg_stat_activity`.
 - **Reconnect backoff starts at `Poll`.** On connection loss the listener
   reconnects with jittered backoff — the schedule starts at the feed's
@@ -590,9 +595,10 @@ that is not what makes C2 safe; the precondition above is.
   prepared for two-phase commit: `PREPARE TRANSACTION` fails for it. Do not
   enable C2 on an append path that flows through a 2PC preparer.
 
-The cost when enabled: one extra statement per non-empty append plus the
-commit-time notify-queue lock, which briefly serialises committing notifiers
-— the price of the hint riding the append's own commit.
+The cost when enabled: one extra statement per non-empty append (and per
+checkpoint save, when the marker channel is on) plus the commit-time
+notify-queue lock, which briefly serialises committing notifiers — the price of
+the hint riding the write's own commit.
 
 ### When to prefer C1
 
