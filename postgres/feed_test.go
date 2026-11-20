@@ -308,3 +308,63 @@ func insertPoisonRow(t testing.TB, ctx context.Context, s *postgres.Store, ws st
 	}
 	return gp
 }
+
+// TestReadAllSettledWaitsForOutOfOrderCommit is the change feed's version
+// of the fence test: the unfiltered read must not deliver the higher
+// position alone while the lower one is still in flight, or the feed's
+// checkpoint would pass an event that commits later.
+func TestReadAllSettledWaitsForOutOfOrderCommit(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_settled_ooc")
+
+	tx1, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	gpA := feedAppendTx(t, ctx, ws, tx1, feedStream(t, "settled-ooc-a"), 0, "settled.v1.E1")
+
+	tx2, err := s.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx2: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+	gpB := feedAppendTx(t, ctx, ws, tx2, feedStream(t, "settled-ooc-b"), 0, "settled.v1.E2")
+	if gpA >= gpB {
+		t.Fatalf("insert order: tx1 gp=%d, tx2 gp=%d, want tx1 lower", gpA, gpB)
+	}
+	if err := tx2.Commit(ctx); err != nil {
+		t.Fatalf("commit tx2: %v", err)
+	}
+
+	page, truncated, err := ws.ReadAllSettled(ctx, 0, 100, 0)
+	if err != nil {
+		t.Fatalf("read settled page: %v", err)
+	}
+	if len(page) != 0 || truncated {
+		t.Fatalf("settled page while gp=%d is in flight = %v truncated=%v, want empty: delivering gp=%d alone would pass the cursor",
+			gpA, positions(page), truncated, gpB)
+	}
+
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit tx1: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		page, _, err = ws.ReadAllSettled(ctx, 0, 100, 0)
+		if err != nil {
+			t.Fatalf("read settled page: %v", err)
+		}
+		if len(page) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("settled page stayed empty after both commits")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got, want := positions(page), []uint64{gpA, gpB}; !slices.Equal(got, want) {
+		t.Fatalf("settled page = %v, want %v", got, want)
+	}
+}

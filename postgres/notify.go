@@ -133,7 +133,7 @@ func NewNotifyListener(dsn, channel string, handler NotifyHandler) *NotifyListen
 	if handler == nil {
 		panic("postgres: NewNotifyListener: handler is nil")
 	}
-	if err := validNotifyChannel(channel); err != nil {
+	if err := validNotifyChannel("NotifyListener", channel); err != nil {
 		panic(err)
 	}
 	return &NotifyListener{

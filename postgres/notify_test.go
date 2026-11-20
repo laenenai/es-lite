@@ -177,7 +177,7 @@ func TestNotifyChannelValidator(t *testing.T) {
 		{"leading underscore", "_es_lite", false},
 		{"digit inside", "es_lite_2", false},
 	} {
-		err := validNotifyChannel(tc.channel)
+		err := validNotifyChannel("WithAppendNotify", tc.channel)
 		if tc.wantErr && err == nil {
 			t.Errorf("%s: channel %q accepted, want error", tc.name, tc.channel)
 		}
@@ -203,6 +203,14 @@ func TestOpenConfigRejectsInvalidNotifyChannel(t *testing.T) {
 	bad := newOpenConfig([]Option{WithAppendNotify("bad-name")})
 	if err := bad.validate(); err == nil {
 		t.Fatal("validate accepted an invalid notify channel, want error")
+	}
+	badMarker := newOpenConfig([]Option{WithCheckpointNotify("bad-name")})
+	if err := badMarker.validate(); err == nil || !strings.Contains(err.Error(), "WithCheckpointNotify") {
+		t.Fatalf("validate(marker) = %v, want an error naming WithCheckpointNotify", err)
+	}
+	same := newOpenConfig([]Option{WithAppendNotify("es_lite_same"), WithCheckpointNotify("es_lite_same")})
+	if err := same.validate(); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("validate(same channel) = %v, want a must-differ error", err)
 	}
 	good := newOpenConfig([]Option{WithAppendNotify("es_lite_appended")})
 	if err := good.validate(); err != nil {
