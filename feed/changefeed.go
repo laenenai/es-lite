@@ -1,0 +1,294 @@
+package feed
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/laenenai/es-lite/es"
+)
+
+// ChangeLog is the unfiltered log read a change feed needs. It is
+// deliberately narrower than Log: a change feed consumes every event in
+// the workspace, not a projection's filtered type set, so it has no
+// definition to hash or manifest to maintain. *postgres.WorkspaceStore
+// implements it.
+type ChangeLog interface {
+	// ReadAll returns up to limit events with GlobalPosition > from,
+	// ordered ascending.
+	ReadAll(ctx context.Context, from uint64, limit int) ([]es.Envelope, error)
+}
+
+// ChangeFeedConfig configures one change feed. A change feed reads the
+// unfiltered log from its own checkpoint, maps each envelope to keys,
+// publishes a change set, and advances. It is best-effort: a publish
+// failure is reported and dropped, and a crash between publishing and
+// advancing may duplicate a change set, which the hub coalesces.
+type ChangeFeedConfig struct {
+	// Scope is the workspace id. Required.
+	Scope string
+	// Name is the subscription key (for example "iam.changes") and the
+	// checkpoint identity. Required.
+	Name string
+	// Instance defaults to "live".
+	Instance string
+	// Consumer names the worker in the lease row, for Status. Defaults
+	// to Name.
+	Consumer string
+
+	// Log, Leases and Checkpoints are required.
+	Log         ChangeLog
+	Leases      LeaseStore
+	Checkpoints CheckpointStore
+
+	// Keys and Publish are required. Keys returns the keys an event
+	// touched, in the order they should be published; it owns any
+	// de-duplication. An empty result publishes nothing.
+	Keys    func(es.Envelope) []string
+	Publish func(ctx context.Context, keys []string, position uint64) error
+
+	// OnError receives a publish failure. It must not block; nil logs a
+	// warning. The feed advances regardless: a failed hint is dropped.
+	OnError func(error)
+
+	// Waiter is the optional wake source. A nil Waiter polls every Poll.
+	Waiter Waiter
+
+	// Poll is the idle wait and the fallback clock. Default 1 s.
+	Poll time.Duration
+	// LeaseTTL is the lease lifetime. Default 30 s.
+	LeaseTTL time.Duration
+	// RenewEvery is the lease renewal interval. Default 10 s, kept below
+	// LeaseTTL.
+	RenewEvery time.Duration
+	// Batch is the page size. Default 500.
+	Batch int
+}
+
+// ChangeFeed is a leased, checkpointed reader over the unfiltered log.
+// One instance runs per (scope, name, instance) key; standbys retry with
+// backoff and take over when the lease is released or expires.
+type ChangeFeed struct {
+	cfg ChangeFeedConfig
+}
+
+// NewChangeFeed validates cfg, applies defaults, and returns a feed that
+// has not touched the database. Run does the I/O.
+func NewChangeFeed(cfg ChangeFeedConfig) (*ChangeFeed, error) {
+	if cfg.Scope == "" {
+		return nil, fmt.Errorf("%w: change feed scope is required", ErrInvalidRequest)
+	}
+	if cfg.Name == "" {
+		return nil, fmt.Errorf("%w: change feed name is required", ErrInvalidRequest)
+	}
+	if cfg.Log == nil || cfg.Leases == nil || cfg.Checkpoints == nil {
+		return nil, fmt.Errorf("%w: change feed log, leases and checkpoints are required", ErrInvalidRequest)
+	}
+	if cfg.Keys == nil || cfg.Publish == nil {
+		return nil, fmt.Errorf("%w: change feed keys and publish are required", ErrInvalidRequest)
+	}
+	if cfg.Instance == "" {
+		cfg.Instance = "live"
+	}
+	if cfg.Consumer == "" {
+		cfg.Consumer = cfg.Name
+	}
+	if cfg.Poll <= 0 {
+		cfg.Poll = time.Second
+	}
+	if cfg.LeaseTTL <= 0 {
+		cfg.LeaseTTL = 30 * time.Second
+	}
+	if cfg.RenewEvery <= 0 {
+		cfg.RenewEvery = 10 * time.Second
+	}
+	if cfg.RenewEvery >= cfg.LeaseTTL {
+		cfg.RenewEvery = cfg.LeaseTTL / 3
+	}
+	if cfg.Batch <= 0 {
+		cfg.Batch = 500
+	}
+	if cfg.OnError == nil {
+		cfg.OnError = func(err error) {
+			slog.Warn("feed: publish change set", "err", err)
+		}
+	}
+	return &ChangeFeed{cfg: cfg}, nil
+}
+
+// Run acquires the lease, then reads and publishes until ctx ends or the
+// lease is lost. A held lease is retried with jittered backoff; the
+// caller does not implement its own standby loop.
+func (f *ChangeFeed) Run(ctx context.Context) error {
+	owner := uuid.NewString()
+	if err := f.acquire(ctx, owner); err != nil {
+		return err
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	lost := make(chan error, 1)
+	var renewals sync.WaitGroup
+	renewals.Add(1)
+	go func() {
+		defer renewals.Done()
+		f.renew(runCtx, owner, lost, cancel)
+	}()
+
+	pos, err := f.cfg.Checkpoints.Load(runCtx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance)
+	if err != nil {
+		cancel()
+		renewals.Wait()
+		f.release(ctx, owner)
+		return fmt.Errorf("feed: change feed load checkpoint: %w", err)
+	}
+
+	streamErr := f.stream(runCtx, pos)
+	cancel()
+	renewals.Wait()
+
+	var lostErr error
+	select {
+	case lostErr = <-lost:
+	default:
+	}
+	f.release(ctx, owner)
+
+	if lostErr != nil {
+		return lostErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return streamErr
+}
+
+func (f *ChangeFeed) release(ctx context.Context, owner string) {
+	// Detached: cancellation must not leak the lease.
+	if err := f.cfg.Leases.Release(context.WithoutCancel(ctx), f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner); err != nil {
+		slog.Warn("feed: change feed release lease", "err", err)
+	}
+}
+
+// acquire retries a held lease with the same schedule as the projection
+// reconnect loop: 250 ms doubling to 30 s, with jitter.
+func (f *ChangeFeed) acquire(ctx context.Context, owner string) error {
+	delay := 250 * time.Millisecond
+	const maxDelay = 30 * time.Second
+	for {
+		ok, err := f.cfg.Leases.Acquire(ctx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner, f.cfg.Consumer, f.cfg.LeaseTTL)
+		if err != nil {
+			return fmt.Errorf("feed: change feed acquire lease: %w", err)
+		}
+		if ok {
+			return nil
+		}
+		timer := time.NewTimer(defaultJitter(delay))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+}
+
+// renew extends the lease until ctx ends. The first failed renewal
+// cancels the stream and reports a *LeaseLostError; another subscriber
+// may already own the key, so continuing would risk two publishers.
+func (f *ChangeFeed) renew(ctx context.Context, owner string, lost chan<- error, cancel context.CancelFunc) {
+	ticker := time.NewTicker(f.cfg.RenewEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			ok, err := f.cfg.Leases.Renew(ctx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, owner, f.cfg.LeaseTTL)
+			if err == nil && ok {
+				continue
+			}
+			if err == nil {
+				err = errLeaseExpired
+			}
+			select {
+			case lost <- &LeaseLostError{
+				Key:   f.cfg.Scope + "/" + f.cfg.Name + "/" + f.cfg.Instance,
+				Owner: owner,
+				Err:   err,
+			}:
+			default:
+			}
+			cancel()
+			return
+		}
+	}
+}
+
+func (f *ChangeFeed) stream(ctx context.Context, pos uint64) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		envs, err := f.cfg.Log.ReadAll(ctx, pos, f.cfg.Batch)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("feed: change feed read: %w", err)
+		}
+		for _, e := range envs {
+			keys := f.cfg.Keys(e)
+			if len(keys) > 0 {
+				if err := f.cfg.Publish(ctx, keys, e.GlobalPosition); err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					f.cfg.OnError(err)
+				}
+			}
+			pos = e.GlobalPosition
+		}
+		if len(envs) > 0 {
+			if err := f.cfg.Checkpoints.Save(ctx, f.cfg.Scope, f.cfg.Name, f.cfg.Instance, "", pos); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("feed: change feed save checkpoint: %w", err)
+			}
+		}
+		if len(envs) < f.cfg.Batch {
+			if err := f.wait(ctx); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// wait parks until a wake, the poll expires, or ctx ends. A wake is a
+// latency hint: whether it fired or not, the next iteration reads.
+func (f *ChangeFeed) wait(ctx context.Context) error {
+	if scoped, ok := f.cfg.Waiter.(ScopedWaiter); ok {
+		_, err := scoped.WaitScope(ctx, f.cfg.Scope, f.cfg.Poll)
+		return err
+	}
+	if f.cfg.Waiter != nil {
+		_, err := f.cfg.Waiter.Wait(ctx, f.cfg.Poll)
+		return err
+	}
+	timer := time.NewTimer(f.cfg.Poll)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
