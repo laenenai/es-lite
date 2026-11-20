@@ -4,18 +4,26 @@ package postgres_test
 // §3.2): the round trip preserves every field (Postgres keeps
 // microseconds), absent is ok=false with no error, Save is
 // last-writer-wins by design — no monotonic guard, a stale row costs at
-// most n extra folded events — Purge empties the workspace's rows, RLS
-// isolates workspaces for reads, saves and purges alike, and a store
-// opened without the table (WithoutAutoMigrate) fails Load and Save
+// most n extra folded events — Purge empties the workspace's rows, and a
+// store opened without the table (WithoutAutoMigrate) fails Load and Save
 // observably instead of silently reading as empty: the runtime ignores
 // these errors, so silence would degrade to permanent full folds with no
 // signal.
+//
+// Workspace isolation has two layers and the tests keep them straight:
+// the superuser pool bypasses row security entirely, so the adapter tests
+// pin the explicit workspace_id predicate every statement carries, and
+// TestSnapshotCacheRLSIsolatesWorkspaces is the only place claiming RLS
+// enforcement — as the NOBYPASSRLS probe role the policies bind.
 
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/postgres"
@@ -129,7 +137,9 @@ func TestSnapshotCacheWorkspaceIsolation(t *testing.T) {
 		t.Fatalf("save via a: %v", err)
 	}
 
-	// RLS hides ws_a's row from b's read even for the identical stream id.
+	// The explicit workspace_id predicate hides ws_a's row from b's read
+	// even for the identical stream id (the superuser pool bypasses RLS;
+	// the policy itself is proven by TestSnapshotCacheRLSIsolatesWorkspaces).
 	if _, ok, err := b.Load(ctx, sid); ok || err != nil {
 		t.Fatalf("b.Load: ok=%v err=%v, want absent — RLS must hide ws_a's row", ok, err)
 	}
@@ -154,6 +164,123 @@ func TestSnapshotCacheWorkspaceIsolation(t *testing.T) {
 	}
 	if n := rawSnapshotCount(t, s, "ws_a"); n != 1 {
 		t.Fatalf("raw count under ws_a = %d, want 1 — b's purge must not cross the workspace", n)
+	}
+}
+
+// TestSnapshotCacheRLSIsolatesWorkspaces is the behavioural half of the
+// adapter acceptance criterion (ADR 0042 §7): 0013's policy — not the
+// adapter's predicates — is what isolates workspaces, and only a role it
+// binds can prove it, because the test pool's login user is the
+// table-owning SUPERUSER, whom PostgreSQL exempts from row security even
+// under FORCE (feed_stores_test.go's probe rationale). Delete the policy
+// and every other test in this file still passes; this one must not.
+//
+// The composition is the suite's established one: ensureRLSProbeRole
+// creates the NOBYPASSRLS probe, and the test grants it snapshots locally
+// and revokes on cleanup — migrations issue no grants by design (spec
+// §5.7), so RLS probes always grant as superuser (dedup_test.go's
+// command_dedup grant is the precedent), leaving the role exactly as the
+// feed tests expect it. The adapter path runs through a drainStoreAs
+// store, every pooled session SET ROLE; the raw probes reuse probePinned,
+// which decides with no workspace_id filter anywhere in the statement.
+func TestSnapshotCacheRLSIsolatesWorkspaces(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ensureRLSProbeRole(t, ctx, s)
+
+	// The probe must be exactly the shape the policies bind: a superuser
+	// or BYPASSRLS probe would pass every assertion below with the policy
+	// dropped, proving nothing.
+	var super, bypass bool
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1`, rlsProbeRole,
+	).Scan(&super, &bypass); err != nil {
+		t.Fatalf("read %s's role flags: %v", rlsProbeRole, err)
+	}
+	if super || bypass {
+		t.Fatalf("%s: rolsuper=%v rolbypassrls=%v, want false/false — the probe must be a role the policies bind", rlsProbeRole, super, bypass)
+	}
+
+	// The probe's reach: schema USAGE is already ensureRLSProbeRole's;
+	// the snapshots DML is this test's own grant (the runbook's app line),
+	// so refusals below are decided BY the policy, not by a permission
+	// wall.
+	if _, err := s.Pool().Exec(ctx,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO `+rlsProbeRole); err != nil {
+		t.Fatalf("grant %s on snapshots: %v", rlsProbeRole, err)
+	}
+	t.Cleanup(func() {
+		if _, err := s.Pool().Exec(context.Background(), `REVOKE SELECT, INSERT, UPDATE, DELETE ON snapshots FROM `+rlsProbeRole); err != nil {
+			t.Errorf("revoke snapshots from %s: %v", rlsProbeRole, err)
+		}
+	})
+
+	const (
+		wsA = "ws_rls_a"
+		wsB = "ws_rls_b"
+	)
+
+	// The adapter path, as the probe (drainStoreAs: every pooled session
+	// SET ROLE, migrations off — the database is already migrated and the
+	// probe has no DDL privileges). A missing grant or a policy that
+	// refuses the legitimate write fails HERE, loudly.
+	probe := drainStoreAs(t, rlsProbeRole)
+	a := postgres.NewSnapshotCache(probe, wsA)
+	b := postgres.NewSnapshotCache(probe, wsB)
+	sid := snapStream(t, "rls")
+
+	if err := a.Save(ctx, sid, snapshot.Snapshot{Version: 3, FoldVersion: 1, RecordedAt: time.Now().UTC(), State: []byte("a-state")}); err != nil {
+		t.Fatalf("save via %s as the probe: %v", wsA, err)
+	}
+
+	// B's read is absent and B's purge erases nothing: the policy admits
+	// neither the row nor its deletion across the workspace line, and a's
+	// row survives, still a's.
+	if _, ok, err := b.Load(ctx, sid); ok || err != nil {
+		t.Fatalf("b.Load: ok=%v err=%v, want absent", ok, err)
+	}
+	if err := b.Purge(ctx); err != nil {
+		t.Fatalf("b.Purge: %v", err)
+	}
+	if got, ok, err := a.Load(ctx, sid); err != nil || !ok || string(got.State) != "a-state" {
+		t.Fatalf("a.Load after b.Purge: ok=%v err=%v state=%q, want the row intact", ok, err, got.State)
+	}
+
+	// The policies alone decide, with no workspace_id filter anywhere in
+	// the statement (the dedup probe's move): pinned to B the probe counts
+	// 0 — drop 0013's policy and this counts 1 — while pinned to A it
+	// counts 1, so the probe is proven able to read somewhere. A GUC-name
+	// mismatch between the policy and runWorkspace resolves NULL here and
+	// refuses everything, failing the pair in either direction.
+	for _, tc := range []struct {
+		ws   string
+		want int64
+	}{{wsB, 0}, {wsA, 1}} {
+		var n int64
+		err := probePinned(t, ctx, s, tc.ws, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT count(*) FROM snapshots`).Scan(&n)
+		})
+		if err != nil {
+			t.Fatalf("raw count pinned to %s: %v", tc.ws, err)
+		}
+		if n != tc.want {
+			t.Fatalf("raw count pinned to %s = %d, want %d — the policy alone must show the pinned workspace only its own rows", tc.ws, n, tc.want)
+		}
+	}
+
+	// WITH CHECK, behaviourally: pinned to B, writing A's workspace_id is
+	// refused at the policy with the row-level-security violation — no
+	// adapter Save can land a row outside the GUC's workspace.
+	err := probePinned(t, ctx, s, wsB, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO snapshots (workspace_id, stream_id, version, fold_version, recorded_at, state)
+			 VALUES ($1, $2, 1, 1, now(), 'x')`,
+			wsA, "counter:foreign",
+		)
+		return err
+	})
+	if err == nil || !strings.Contains(err.Error(), "row-level security") {
+		t.Fatalf("cross-workspace insert pinned to %s: got %v, want a row-level security policy violation", wsB, err)
 	}
 }
 

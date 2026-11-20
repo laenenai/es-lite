@@ -59,6 +59,10 @@ func (c *SnapshotCache) Load(ctx context.Context, streamID string) (snapshot.Sna
 	if err != nil {
 		return snapshot.Snapshot{}, false, fmt.Errorf("postgres: snapshots: load: %w", err)
 	}
+	// The uint64→int64 narrowing (the columns are bigint) wraps above
+	// 2^63 — unreachable for real stream versions; feed.go's
+	// int64(position) is the same cast. fold_version's uint32→int64 is
+	// lossless.
 	snap.Version = uint64(version)
 	snap.FoldVersion = uint32(foldVersion)
 	return snap, true, nil
@@ -76,6 +80,9 @@ func (c *SnapshotCache) Load(ctx context.Context, streamID string) (snapshot.Sna
 // database's clock.
 func (c *SnapshotCache) Save(ctx context.Context, streamID string, snap snapshot.Snapshot) error {
 	err := c.store.runWorkspace(ctx, c.workspace, func(tx DBTX) error {
+		// The int64 narrowing (the columns are bigint) wraps above 2^63 —
+		// unreachable for real stream versions; feed.go's int64(position)
+		// is the same cast.
 		_, err := tx.Exec(ctx,
 			`INSERT INTO snapshots (workspace_id, stream_id, version, fold_version, recorded_at, state)
 			 VALUES ($1, $2, $3, $4, $5, $6)
