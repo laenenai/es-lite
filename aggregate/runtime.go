@@ -139,6 +139,39 @@ func (r *Runtime[S, C, E]) snapshotDue(seed, to uint64) bool {
 	}
 }
 
+// WarmSnapshot folds a stream once and writes its snapshot at the head,
+// bypassing the write policy. It is the explicit path for streams the
+// append path cannot reach: enabling a cache on an existing long stream,
+// an archived aggregate that no longer appends, and a post-restore or
+// fold-version warm-up. It never runs from a read path. It errors when no
+// cache (or state codec) is configured, and it returns Save errors —
+// unlike Handle, which treats the cache as best-effort.
+func (r *Runtime[S, C, E]) WarmSnapshot(ctx context.Context, sid es.StreamID) (uint64, error) {
+	if err := sid.Validate(); err != nil {
+		return 0, err
+	}
+	if r.cache == nil || r.stateCodec == nil {
+		return 0, fmt.Errorf("aggregate: WarmSnapshot requires a snapshot cache: configure one with WithSnapshots before warming %s", sid)
+	}
+	state, version, _, err := r.loadSeeded(ctx, sid, 0, time.Time{})
+	if err != nil {
+		return 0, err
+	}
+	b, err := r.stateCodec.Encode(state)
+	if err != nil {
+		return 0, fmt.Errorf("aggregate: WarmSnapshot encode %s: %w", sid, err)
+	}
+	if err := r.cache.Save(ctx, sid.Canonical(), snapshot.Snapshot{
+		Version:     version,
+		FoldVersion: r.foldVersion,
+		RecordedAt:  time.Now().UTC(),
+		State:       b,
+	}); err != nil {
+		return 0, fmt.Errorf("aggregate: WarmSnapshot save %s: %w", sid, err)
+	}
+	return version, nil
+}
+
 // WithConflictRetry makes Handle repeat load → IsTerminal → Decide → Append up
 // to n additional times when Append returns es.ErrConflict, sleeping
 // backoff(attempt) (attempt is 1-based; ctx cancellation cuts the sleep short)

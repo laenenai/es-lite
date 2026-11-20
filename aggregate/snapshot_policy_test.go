@@ -3,6 +3,7 @@ package aggregate_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/laenenai/es-lite/aggregate"
@@ -297,5 +298,148 @@ func TestNoOpCommandWritesNoSnapshot(t *testing.T) {
 	}
 	if _, ok, _ := cache.Load(ctx, sid.Canonical()); ok {
 		t.Fatal("cache holds a snapshot after a no-op command")
+	}
+}
+
+// TestWarmSnapshotWritesAtHead pins the explicit warm-up (ADR 0042 §3.1):
+// a stream the policy would never write automatically — five appends, all
+// below n=100 — gets a snapshot at its head when the caller asks for one.
+// The warm writes the head fold's state, not a stale one.
+func TestWarmSnapshotWritesAtHead(t *testing.T) {
+	ctx := context.Background()
+	cache, rt := newSnapshotRuntime(t, openStore(t))
+	rt.WithSnapshotEvery(100)
+	sid, _ := es.NewStreamID("counter", "warm")
+
+	mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5})
+	for i := 0; i < 4; i++ {
+		mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+	}
+	if _, ok, _ := cache.Load(ctx, sid.Canonical()); ok {
+		t.Fatal("cache holds a snapshot before the warm (the n=100 policy must not have written)")
+	}
+
+	version, err := rt.WarmSnapshot(ctx, sid)
+	if err != nil {
+		t.Fatalf("WarmSnapshot: %v", err)
+	}
+	if version != 5 {
+		t.Fatalf("WarmSnapshot version = %d, want 5 (the stream's head)", version)
+	}
+	snap, ok, err := cache.Load(ctx, sid.Canonical())
+	if err != nil || !ok || snap.Version != 5 {
+		t.Fatalf("cache after the warm: ok=%v version=%d err=%v, want the head snapshot at v5", ok, snap.Version, err)
+	}
+	warm, err := counterStateCodec{}.Decode(snap.State)
+	if err != nil || warm.GetCount() != 45 {
+		t.Fatalf("warmed state: count=%d err=%v, want the head fold's 45", warm.GetCount(), err)
+	}
+}
+
+// TestWarmSnapshotWithZeroPolicyStillWrites pins that the warm-up
+// deliberately bypasses the threshold: even with automatic writes disabled
+// (n == 0, a read-only cache) an explicit warm writes the head snapshot —
+// the caller is asking for a write, so the policy does not apply.
+func TestWarmSnapshotWithZeroPolicyStillWrites(t *testing.T) {
+	ctx := context.Background()
+	cache, rt := newSnapshotRuntime(t, openStore(t))
+	rt.WithSnapshotEvery(0)
+	sid, _ := es.NewStreamID("counter", "warm-zero")
+
+	mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5})
+	mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+	mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+	if _, ok, _ := cache.Load(ctx, sid.Canonical()); ok {
+		t.Fatal("cache holds a snapshot before the warm (n=0 disables automatic writes)")
+	}
+
+	version, err := rt.WarmSnapshot(ctx, sid)
+	if err != nil {
+		t.Fatalf("WarmSnapshot: %v", err)
+	}
+	if version != 3 {
+		t.Fatalf("WarmSnapshot version = %d, want 3", version)
+	}
+	snap, ok, err := cache.Load(ctx, sid.Canonical())
+	if err != nil || !ok || snap.Version != 3 {
+		t.Fatalf("cache after the warm: ok=%v version=%d err=%v, want the n=0 policy bypassed with a v3 snapshot", ok, snap.Version, err)
+	}
+}
+
+// TestWarmSnapshotWithoutCacheErrors pins the guard: a runtime with no
+// snapshot cache configured cannot warm — it returns an error naming the
+// method instead of panicking on the nil cache.
+func TestWarmSnapshotWithoutCacheErrors(t *testing.T) {
+	ctx := context.Background()
+	rt := aggregate.NewRuntime(openStore(t), counter.Decider, counterv1.EventCodec{})
+	sid, _ := es.NewStreamID("counter", "warm-nocache")
+
+	version, err := rt.WarmSnapshot(ctx, sid)
+	if err == nil {
+		t.Fatal("WarmSnapshot without a cache returned nil error, want an error")
+	}
+	if version != 0 {
+		t.Fatalf("WarmSnapshot without a cache returned version %d, want 0", version)
+	}
+	if !strings.Contains(err.Error(), "WarmSnapshot") {
+		t.Fatalf("error %q does not name WarmSnapshot", err)
+	}
+}
+
+// TestWarmSnapshotSurfacesSaveError pins the difference from Handle: the
+// append path treats a cache failure as best-effort and discards Save's
+// error, but an explicit warm IS the caller asking for the write — the
+// failure must come back, not vanish.
+func TestWarmSnapshotSurfacesSaveError(t *testing.T) {
+	ctx := context.Background()
+	cache := &flakyCache{testCache: newTestCache(), failNext: true}
+	rt := aggregate.NewRuntime(openStore(t), counter.Decider, counterv1.EventCodec{}).
+		WithSnapshots(cache, counterStateCodec{}, 1).
+		WithSnapshotEvery(0) // keep Handle off the cache so the staged failure survives for the warm
+	sid, _ := es.NewStreamID("counter", "warm-fail")
+
+	mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 100, Initial: 5})
+
+	version, err := rt.WarmSnapshot(ctx, sid)
+	if err == nil {
+		t.Fatal("WarmSnapshot returned nil error after the staged Save failure, want the error surfaced")
+	}
+	if version != 0 {
+		t.Fatalf("WarmSnapshot returned version %d with the Save error, want 0", version)
+	}
+	if !strings.Contains(err.Error(), "staged Save failure") {
+		t.Fatalf("error %q is not the staged Save failure", err)
+	}
+}
+
+// TestWarmSnapshotThenLoadSeeds pins the point of the warm-up: after an
+// explicit warm, a load seeds from the head snapshot and reads at most one
+// envelope — the lineage probe — instead of re-folding the whole stream,
+// and it still returns the stream's full state.
+func TestWarmSnapshotThenLoadSeeds(t *testing.T) {
+	ctx := context.Background()
+	cs := &countingStore{Store: openStore(t)}
+	_, rt := newSnapshotRuntime(t, cs)
+	rt.WithSnapshotEvery(0) // the warm below is the stream's only snapshot write
+	sid, _ := es.NewStreamID("counter", "warm-seed")
+
+	mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5})
+	mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+	mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 10})
+
+	if _, err := rt.WarmSnapshot(ctx, sid); err != nil {
+		t.Fatalf("WarmSnapshot: %v", err)
+	}
+
+	cs.rows = 0
+	st, v, err := rt.Load(ctx, sid)
+	if err != nil {
+		t.Fatalf("load after the warm: %v", err)
+	}
+	if v != 3 || st.GetCount() != 25 {
+		t.Fatalf("load after the warm = (count %d, v%d), want the full state (25 at v3)", st.GetCount(), v)
+	}
+	if cs.rows > 1 {
+		t.Fatalf("load after the warm read %d envelopes, want at most the 1 lineage-probe row off the head snapshot", cs.rows)
 	}
 }
