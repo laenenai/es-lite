@@ -9,6 +9,14 @@
 // A Cache is workspace-scoped and stores opaque state bytes. In the
 // client-owned-crypto model (ADR 0025) the caller seals state before Save if it
 // contains sensitive data; the cache implementation does not encrypt.
+//
+// Runtime wiring (ADR 0042): aggregate's WithSnapshots enables seeding and
+// WithSnapshotEvery narrows automatic writes to the gap since the seed — 0
+// disables automatic writes, and WarmSnapshot writes explicitly. The in-tree
+// adapters are postgres.NewSnapshotCache and sqlite.NewSnapshotCache. The
+// cache is trusted infrastructure, as protected as the log: the chain
+// attests the log, not these bytes, so a store less protected than the log
+// needs a sealing/MAC'ing stateCodec (ADR 0042 §3.3, ADR 0025).
 package snapshot
 
 import (

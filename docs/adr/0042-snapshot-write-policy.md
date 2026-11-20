@@ -311,10 +311,14 @@ the caller's decision and needs the MAC.
 
 - **Policy.** With the method uncalled, every successful append writes. With
   `0`, none does. With `n`, writes land at the first append whose version is
-  `>= seed+n`; a batch that jumps the boundary writes once; no-op and
-  constraint-only appends never write; a lost write is retried at the next
-  append past the gap; a seed discarded by the lineage guard leads to a write
-  at the first append with `to >= n`.
+  `>= seed+n`; a batch that jumps the boundary writes once; a no-op command
+  (no events, no constraints) never reaches the write path; a
+  constraint-only append is measured by the same gap rule — with no seed
+  and a head already `>= n` it writes a snapshot at the unchanged head,
+  which is correct (it never writes a stale version), and under the default
+  write-through it writes on every successful append; a lost write is
+  retried at the next append past the gap; a seed discarded by the lineage
+  guard leads to a write at the first append with `to >= n`.
 - **Warm-up.** `WarmSnapshot` writes a snapshot at the stream's head even when
   the threshold says no, and even for a short stream; it errors without a
   cache; no read path calls it.
