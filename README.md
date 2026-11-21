@@ -388,25 +388,24 @@ are client responsibilities (ADR 0025).
   if you actually encrypt client-side.
 - **Erasure is client-owned.** There is no server-side crypto-shredding and no
   `ForgetWorkspace`. If you need key-destruction erasure, keep keys outside
-  es-lite and account for snapshots, unique-claim values **and their
-  append-decision copies**, read models and database backups when you destroy
-  them. A workspace purge deletes both sides of the claims record; deleting one
-  side alone either resurrects the value on the next rebuild or fails
-  verification forever ([ADR 0043](docs/adr/0043-append-decisions-and-restore.md#34-erasure-and-why-the-row-is-deletable)).
+  es-lite and account for snapshots, unique-claim values (which live in the
+  immutable event log), read models and database backups when you destroy them.
+  Deleting `unique_claims` is a cache wipe, not erasure: the next rebuild
+  resurrects the value from its event. For personal data, pass a keyed MAC and
+  destroy the key ([ADR 0043 §2.4](docs/adr/0043-constraint-ops-on-events.md#24-erasure)).
 - **Uniqueness values are opaque.** `Claim`/`Release` store the exact value you
-  provide. For personal data, pass a keyed hash/MAC you control, never the raw
-  value; `LookupClaim` must receive the same value. There is no PII flag.
-- **Backups and replay.** The authoritative set is `events` (all partitions),
-  `log_order` and `append_decisions`. For any store written with v0.21+,
-  `unique_claims` is derived and rebuilds from the decision log, and a logical
-  backup or CDC stream of those three tables is a complete restore — see the
-  [deployment runbook](docs/deploy/README.md) for the restore and clone
-  procedures. A store whose claims have no decision history is inconsistent,
-  and the tools refuse it rather than guess or delete ([ADR
-  0043](docs/adr/0043-append-decisions-and-restore.md#35-no-legacy-path-inconsistency-is-refused)).
-  The stream restores to a consistent cut, not arbitrary point-in-time recovery,
-  and it does not carry `command_dedup`: a retry across a restore may
-  re-handle its command (ADR 0043).
+  provide, on the append's first event. For personal data, pass a keyed
+  hash/MAC you control, never the raw value; `LookupClaim` must receive the same
+  value. There is no PII flag, and a plaintext claim value cannot be erased.
+- **Backups and replay.** The functional source is `events` (all partitions):
+  aggregates, the chain, positions, and — because the append's constraint ops
+  ride on the first event of the batch — the claims index all rebuild from it.
+  `log_order` is the order witness: stream it too if you want to re-verify the
+  global append order on the restored database. `command_dedup` is not carried.
+  A store whose claims have no ops in the event log is inconsistent, and the
+  tools refuse it rather than guess or delete ([ADR
+  0043](docs/adr/0043-constraint-ops-on-events.md#25-no-legacy-path)). The
+  stream restores to a consistent cut, not arbitrary point-in-time recovery.
 - **Per-workspace isolation (Postgres).** RLS scopes rows to the workspace the
   caller supplies. That is isolation, not authentication: the application must
   authenticate callers and derive the workspace from trusted identity, never
