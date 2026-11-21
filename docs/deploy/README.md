@@ -279,18 +279,20 @@ private `schema_migrations`.
 draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1),
 applies uniqueness constraints and records their decisions in
-`append_decisions` (ADR 0043). It is also the process running
-`aggregate.Runtime`, so with a snapshot cache configured (ADR 0042) it
-both reads and writes `snapshots` — the same role as for `events`.
-`Release` is the only `DELETE` the append path ever issues, and it is on
-the claims index, never on the log (`Purge` on the snapshot cache, below,
-is the one other `DELETE`):
+`append_decisions` (ADR 0043), reads that log to rebuild or verify the
+claims index after a restore, and deletes decision rows when a workspace
+is erased. It is also the process running `aggregate.Runtime`, so with a
+snapshot cache configured (ADR 0042) it both reads and writes `snapshots`
+— the same role as for `events`. `Release` is the only `DELETE` the
+append path ever issues, and it is on the claims index, never on the log
+(`Purge` on the snapshot cache, below, is the one other `DELETE`):
 
 ```sql
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;
 GRANT SELECT, INSERT ON events, unique_claims TO <appender>;
 GRANT DELETE ON unique_claims TO <appender>;
-GRANT INSERT ON log_order, append_decisions TO <appender>;
+GRANT INSERT ON log_order TO <appender>;
+GRANT SELECT, INSERT, DELETE ON append_decisions TO <appender>;
 GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO <appender>;
 ```
 
@@ -470,7 +472,6 @@ claims missing.
    `es_relay` and the appender's grants, including:
    ```sql
    GRANT SELECT, INSERT, DELETE ON append_decisions TO <appender>;
-   GRANT USAGE ON SEQUENCE append_decisions_id_seq TO <appender>;
    ```
 3. Load `events` (all partitions), `log_order` and `append_decisions` into that
    cut. There are no foreign keys; one transaction is still preferred. For a
