@@ -483,7 +483,15 @@ claims missing.
 5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
    The second command must report `claims OK`. Rebuilding needs the
    appender/owner connection; deleting and reinserting `unique_claims` is the
-   one place a restore writes that table.
+   one place a restore writes that table. **A cut from before the one-time
+   cutover** has no decision history: load `unique_claims` with the other
+   tables (the old four-table rule), and before rebuilding run
+   `es-verify claims --adopt-existing` with writers quiesced. The adopt must
+   happen **before the first constraint-bearing append**: that append writes
+   the first decision row, the adopt then refuses, and the rebuild guard is
+   closed — a later `--rebuild` would replay only the post-restore decisions
+   and drop the pre-cutover claims. (`--rebuild` before the adopt refuses for
+   exactly this reason.)
 6. Run `es-verify all` (every stream chain) and `es-verify order` (every batch
    hash recomputed from the events).
 7. Optionally restore `anchors` (or let roots recompute) and
@@ -499,9 +507,11 @@ cut was mixed, not that data was lost. Re-cut and redo the load.
 `es-verify claims` exits 0 when the index matches the decision log
 (`claims OK: N decisions`), 1 on a divergence (`DIVERGED:`, naming the first
 divergent `(scope, value_key, stream_id)`), and 2 on a connection, usage or
-refusal error — nothing was audited, so a 2 is never a pass. The mutating
-modes (`--rebuild`, `--adopt-existing`) exit 0 or 2 only: a rebuild that
-cannot replay the log refuses instead of leaving a partial index.
+refusal error — the errored workspace was not audited, and a 2 is never a
+pass, even when earlier workspaces completed (a confirmed divergence
+dominates a later error). The mutating modes (`--rebuild`, `--adopt-existing`)
+exit 0 or 2 only: a rebuild that cannot replay the log refuses instead of
+leaving a partial index.
 
 ### Clones
 
@@ -564,7 +574,8 @@ history. With writers quiesced:
 
 From that point the three-table set is sufficient and no pre-cutover copy has
 to be retained. A restore from a stream older than the cutover is a pre-0043
-state: use the old four-table rule.
+state: use the old four-table rule, then run this cutover again (with writers
+quiesced) before they resume.
 
 ## Feed operations (ADR 0037)
 

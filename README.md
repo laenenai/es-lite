@@ -394,13 +394,14 @@ are client responsibilities (ADR 0025).
   provide. For personal data, pass a keyed hash/MAC you control, never the raw
   value; `LookupClaim` must receive the same value. There is no PII flag.
 - **Backups and replay.** The authoritative set is `events` (all partitions),
-  `log_order` and `append_decisions`; `unique_claims` is derived and rebuilds
-  from the decision log. A logical backup or CDC stream of those three tables
-  is a complete restore — see the [deployment
-  runbook](docs/deploy/README.md) for the restore, clone and cutover
-  procedures. The stream restores to a consistent cut, not arbitrary
-  point-in-time recovery, and it does not carry `command_dedup`: a retry
-  across a restore may re-handle its command (ADR 0043).
+  `log_order` and `append_decisions`. After the one-time
+  [cutover](docs/deploy/README.md#one-time-cutover), `unique_claims` is derived
+  and rebuilds from the decision log, and a logical backup or CDC stream of
+  those three tables is a complete restore — see the [deployment
+  runbook](docs/deploy/README.md) for the restore and clone procedures. The
+  stream restores to a consistent cut, not arbitrary point-in-time recovery,
+  and it does not carry `command_dedup`: a retry across a restore may
+  re-handle its command (ADR 0043).
 - **Per-workspace isolation (Postgres).** RLS scopes rows to the workspace the
   caller supplies. That is isolation, not authentication: the application must
   authenticate callers and derive the workspace from trusted identity, never

@@ -697,7 +697,7 @@ UUID `Correlation-Id`, which still passes through byte-for-byte.
 **What changes.** Migration 0014 (Postgres) and 0012 (SQLite) add
 `append_decisions`, written inside the append transaction for every append
 that carries at least one constraint op — including a claim-only append,
-which previously left no trace anywhere. The row records the ops `Decide`
+which previously left no log record. The row records the ops `Decide`
 returned and `applyClaims` applied, so `unique_claims` becomes a derived
 index: `es-verify claims --rebuild` replays the table into it. The appender
 role needs `SELECT, INSERT, DELETE` on the new table (the
@@ -729,6 +729,15 @@ row, so it cannot run twice. Verify with `es-verify claims` (it must report
 
 A restore from a stream older than the cutover is a pre-0043 state: it has
 no decision history and needs the old four-table rule (`unique_claims` in
-the backup set). Rolling back — dropping `append_decisions` — loses only the
-rebuild path; the live index and every append it serves are unchanged. See
-`docs/deploy/README.md` for the backup, restore and clone contract.
+the backup set). Run `es-verify claims --adopt-existing` on it, with writers
+quiesced, before they resume: pre-cutover claims have no decision rows, and
+the first constraint-bearing append closes the rebuild guard — from then on
+`--rebuild` would replay only the post-restore decisions and drop the
+pre-cutover claims. `--adopt-existing` refuses once any decision row exists,
+so it must run before that first append.
+
+Roll back by redeploying the pre-0043 binary, then dropping
+`append_decisions`; dropping it while the new binary runs fails every
+constraint-bearing append (the decision INSERT is in the append transaction,
+and erasure's DELETE targets the same table). See `docs/deploy/README.md`
+for the backup, restore and clone contract.

@@ -248,7 +248,7 @@ any row, so it cannot run twice — a duplicate Claim row would make the rebuild
 fail. From that point the log is self-sufficient and no pre-cutover copy has to
 be kept. "Log-only" is true forward from the cutover, not retroactively: a
 restore from a stream older than it is a restore to a pre-0043 state and must
-use the old four-table rule.
+use the old four-table rule and run this cutover again before writers resume.
 
 ### 3.6 Idempotency stays out
 
