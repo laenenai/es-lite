@@ -76,3 +76,32 @@ Full matrix, hardware and caveats:
 The earlier 1M warm probe established the plan shape: global index + filter →
 **index-only scan, zero heap fetches** after `events_ops_idx`; page cost
 739 → 93, 2.06 ms → 0.14 ms.
+
+## Before 500M events in one tenant
+
+500M in a single workspace is **extrapolated, not measured**: ~350 GB, ~5M
+claims at 1%, and a ~10–11 min quiesced rebuild. It is not a wall, but these
+unknowns must be closed on a 100M pilot before calling it production-ready:
+
+- **Relay churn and autovacuum.** The relay flips `published_at` on every
+  event; the benchmark seed never did. Run the pilot with the relay active,
+  tune `autovacuum_vacuum_scale_factor` and `autovacuum_vacuum_cost_limit`
+  per table (the default 20% dead-tuple threshold on a 350 GB partition
+  permits tens of GB of bloat), and confirm the visibility map keeps the
+  replay index-only.
+- **Restore drill.** Take a logical cut of the pilot (events plus optional
+  `log_order`), `setval`, `claims --rebuild`, `all --chains-only`, and record
+  the wall time.
+- **Chain verification.** `es-verify all` is O(events) and unmeasured at this
+  size; the seeded benchmark is unchained, so the chain path was not exercised
+  at all.
+- **`log_order` growth.** One row per append and currently unpartitioned:
+  50M rows at 10 events/batch, 500M at 1/batch. If the pilot's batch size is
+  small, decide range partitioning by `to_position` before the tenant grows.
+- **Rebuild window.** Confirm the ~10-minute quiesced window and its vacuum
+  horizon fit the tenant's maintenance policy.
+
+Decision: keep `HASH (workspace_id)`. A tenant heading past ~250–500M events
+gets a dedicated shard (its own log), not a different partition key: more hash
+partitions do not split one tenant, and a stream or type key breaks workspace
+pruning and the unique constraints.

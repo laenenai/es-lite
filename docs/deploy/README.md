@@ -531,6 +531,14 @@ index set. See [the results](../benchmarks/2026-11-21-results.md) for the
 matrix, hardware and caveats. These are local, single-writer, warm-OS-cache
 numbers; re-run on your storage before quoting an SLA.
 
+**Before ~500M events in one tenant.** That case is extrapolated (~350 GB,
+~5M claims, ~10–11 min quiesced rebuild). The benchmark did not exercise the
+relay's `published_at` churn, a restore drill, chain verification, or
+`log_order` growth; close those on a 100M pilot with the relay active before
+treating 500M as production-ready. A tenant heading past ~250–500M events gets
+a dedicated shard; more hash partitions do not split one tenant. See
+[the backlog](../backlog/2026-11-21_events-scale-benchmark.md#before-500m-events-in-one-tenant).
+
 **PITR.** If arbitrary point-in-time recovery is the requirement, use physical
 backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
 The whole database returns — the events *and* the index — and nothing needs
