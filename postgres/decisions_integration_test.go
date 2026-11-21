@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -219,6 +220,208 @@ func TestClaimOnlyAppendWritesDecision(t *testing.T) {
 	}
 	if n := countPinned(t, s, ws, `SELECT count(*) FROM events`); n != 0 {
 		t.Errorf("events rows = %d, want 0", n)
+	}
+}
+
+// appendWithOps is the decision tests' shortcut: one event and the given
+// constraint ops at the stream's current version.
+func appendWithOps(t *testing.T, s *postgres.Store, ws string, sid es.StreamID, version uint64, ops ...es.ConstraintOp) {
+	t.Helper()
+	if _, err := s.Workspace(ws).Append(context.Background(), es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: version,
+		Events:          eventData("decision"),
+		Constraints:     ops,
+	}); err != nil {
+		t.Fatalf("append %+v at v%d under %s: %v", ops, version, ws, err)
+	}
+}
+
+// TestRebuildClaimsFromDecisions rebuilds a damaged index from the log alone:
+// three recorded decisions (claim A, claim B, release A) replay into exactly
+// the one claim still held, and a verify of the rebuilt index agrees.
+func TestRebuildClaimsFromDecisions(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_rebuild"
+	sidA := decisionStream(t, "a")
+	sidB := decisionStream(t, "b")
+
+	appendWithOps(t, s, ws, sidA, 0, es.Claim("email", "rebuild-a@b"))
+	appendWithOps(t, s, ws, sidB, 0, es.Claim("email", "rebuild-b@b"))
+	appendWithOps(t, s, ws, sidA, 1, es.Release("email", "rebuild-a@b"))
+
+	if got := len(decisionRows(t, s, ws)); got != 3 {
+		t.Fatalf("append_decisions rows = %d, want 3", got)
+	}
+	// Damage the live index directly, as a lost restore would: the rebuild
+	// must reconstruct it from append_decisions, not trust what it finds.
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`DELETE FROM unique_claims WHERE workspace_id = $1`, ws); err != nil {
+		t.Fatalf("delete unique_claims: %v", err)
+	}
+	if n := countPinned(t, s, ws, `SELECT count(*) FROM unique_claims`); n != 0 {
+		t.Fatalf("unique_claims rows before rebuild = %d, want 0", n)
+	}
+
+	wsStore := s.WorkspaceStore(ws)
+	rep, err := wsStore.RebuildClaims(ctx)
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if rep.Decisions != 3 || rep.Claims != 1 {
+		t.Errorf("rebuild report = %+v, want {Decisions:3 Claims:1}", rep)
+	}
+
+	if sid, found, err := wsStore.LookupClaim(ctx, "email", "rebuild-b@b"); err != nil || !found || sid != sidB.Canonical() {
+		t.Errorf("lookup of B = (%q, %v, %v), want (%q, true, nil)", sid, found, err, sidB.Canonical())
+	}
+	if _, found, err := wsStore.LookupClaim(ctx, "email", "rebuild-a@b"); err != nil || found {
+		t.Errorf("lookup of released A = found=%v err=%v, want absent", found, err)
+	}
+
+	verify, err := wsStore.VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !verify.OK {
+		t.Errorf("verify after rebuild = %+v, want OK", verify)
+	}
+}
+
+// TestRebuildRefusesPreCutoverState pins the mandatory guard: live claims
+// with no decision history mean the one-time adoption never ran, and a
+// rebuild must refuse rather than delete an index it cannot reconstruct.
+func TestRebuildRefusesPreCutoverState(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_precutover"
+	sid := decisionStream(t, "a")
+
+	appendWithOps(t, s, ws, sid, 0, es.Claim("email", "precutover@b"))
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`DELETE FROM append_decisions WHERE workspace_id = $1`, ws); err != nil {
+		t.Fatalf("delete append_decisions: %v", err)
+	}
+
+	_, err := s.WorkspaceStore(ws).RebuildClaims(ctx)
+	if !errors.Is(err, es.ErrClaimsNotAdopted) {
+		t.Fatalf("rebuild with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	}
+	if _, found, err := s.WorkspaceStore(ws).LookupClaim(ctx, "email", "precutover@b"); err != nil || !found {
+		t.Fatalf("claim after refused rebuild = found=%v err=%v, want still present", found, err)
+	}
+}
+
+// TestVerifyClaimsReportsDivergence proves the oracle notices an index row
+// the log does not license and names it.
+func TestVerifyClaimsReportsDivergence(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_verify"
+	sid := decisionStream(t, "a")
+	bogus := decisionStream(t, "bogus")
+
+	appendWithOps(t, s, ws, sid, 0, es.Claim("email", "verify@b"))
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
+		ws, "bogus.scope", []byte("bogus"), bogus.Canonical()); err != nil {
+		t.Fatalf("insert bogus claim: %v", err)
+	}
+
+	rep, err := s.WorkspaceStore(ws).VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if rep.OK {
+		t.Fatal("verify = OK, want a divergence")
+	}
+	if rep.FirstDivergence == "" {
+		t.Fatal("FirstDivergence is empty, want the bogus scope and stream")
+	}
+	for _, want := range []string{"bogus.scope", bogus.Canonical()} {
+		if !strings.Contains(rep.FirstDivergence, want) {
+			t.Errorf("FirstDivergence = %q, want it to name %q", rep.FirstDivergence, want)
+		}
+	}
+}
+
+// TestAdoptExistingClaims pins the one-time cutover: a synthetic Claim per
+// live index row is enough to reproduce that index from an empty one.
+func TestAdoptExistingClaims(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_adopt"
+	sid := decisionStream(t, "a")
+
+	appendWithOps(t, s, ws, sid, 0,
+		es.Claim("email", "adopt-a@b"), es.Claim("email", "adopt-b@b"))
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`DELETE FROM append_decisions WHERE workspace_id = $1`, ws); err != nil {
+		t.Fatalf("delete append_decisions: %v", err)
+	}
+
+	wsStore := s.WorkspaceStore(ws)
+	n, err := wsStore.AdoptClaims(ctx)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("adopted rows = %d, want 2", n)
+	}
+	rows := decisionRows(t, s, ws)
+	if len(rows) != 2 {
+		t.Fatalf("append_decisions rows after adopt = %d, want 2", len(rows))
+	}
+	for _, r := range rows {
+		if r.fromVersion != 0 || r.toVersion != 0 {
+			t.Errorf("adopted span = [%d,%d), want [0,0)", r.fromVersion, r.toVersion)
+		}
+		if r.commandID != "" {
+			t.Errorf("adopted command_id = %q, want NULL", r.commandID)
+		}
+		if r.streamID != sid.Canonical() {
+			t.Errorf("adopted stream_id = %q, want %q", r.streamID, sid.Canonical())
+		}
+	}
+
+	// Lose the index: the adopted log alone must bring both values back.
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`DELETE FROM unique_claims WHERE workspace_id = $1`, ws); err != nil {
+		t.Fatalf("delete unique_claims: %v", err)
+	}
+	rep, err := wsStore.RebuildClaims(ctx)
+	if err != nil {
+		t.Fatalf("rebuild after adopt: %v", err)
+	}
+	if rep.Decisions != 2 || rep.Claims != 2 {
+		t.Errorf("rebuild report after adopt = %+v, want {Decisions:2 Claims:2}", rep)
+	}
+	for _, v := range []string{"adopt-a@b", "adopt-b@b"} {
+		if _, found, err := wsStore.LookupClaim(ctx, "email", v); err != nil || !found {
+			t.Errorf("lookup after adopt+rebuild of %q = found=%v err=%v, want present", v, found, err)
+		}
+	}
+	verify, err := wsStore.VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("verify after adopt+rebuild: %v", err)
+	}
+	if !verify.OK {
+		t.Errorf("verify after adopt+rebuild = %+v, want OK", verify)
+	}
+}
+
+// TestAdoptRefusesWhenDecisionsExist pins the one-time property: adoption
+// over recorded history would duplicate a Claim and break every rebuild.
+func TestAdoptRefusesWhenDecisionsExist(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_adopt_twice"
+
+	appendWithOps(t, s, ws, decisionStream(t, "a"), 0, es.Claim("email", "adopt-twice@b"))
+
+	if _, err := s.WorkspaceStore(ws).AdoptClaims(ctx); !errors.Is(err, es.ErrClaimsAlreadyAdopted) {
+		t.Fatalf("adopt with existing decisions: got %v, want ErrClaimsAlreadyAdopted", err)
 	}
 }
 
