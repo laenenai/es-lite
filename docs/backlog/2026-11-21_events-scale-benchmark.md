@@ -2,7 +2,7 @@
 
 - **Filed:** 2026-11-21 (after the op-bearing replay index, PR #37)
 - **Area:** postgres storage / claims replay / capacity
-- **Status:** Open — required before the scale envelope is called production-proven
+- **Status:** Partially resolved 2026-11-21 — 10M and 50M measured, plus the 8-partition spread; 100M/1% is extrapolated (seeding it is a multi-hour write) and the logical restore drill remains open. Results: [2026-11-21-results.md](../benchmarks/2026-11-21-results.md).
 
 ## Problem
 
@@ -59,10 +59,20 @@ first pass) and record the hardware and Postgres version:
 - Changing the partition count before the measurement.
 - Benchmarking SQLite (single-writer, not the scale path).
 
-## Baseline already known (1M rows, warm, one partition)
+## Measured (2026-11-21)
 
-- Replay plan: global index + filter → **index-only scan, zero heap fetches**
-  after `events_ops_idx`; page cost 739 → 93, 2.06 ms → 0.14 ms.
-- Rebuild: 1.37 s at 1% op density (10k claims), 11.7 s at 10% (100k claims);
-  the difference is the claim inserts.
-- Verify: ~1.1 s at 1% op density.
+Full matrix, hardware and caveats:
+[2026-11-21-results.md](../benchmarks/2026-11-21-results.md).
+
+- 10M events / 100k claims: rebuild 13.0 s cold, 11.8 s warm; verify ~11.5 s.
+- 10M / 1M claims: rebuild 121 s cold, 129 s warm; verify ~120 s.
+- 50M / 500k claims: rebuild 56 s cold, 66 s warm; verify ~64 s.
+- 10M over 8 partitions (1.25M/partition, 12.5k claims): rebuild 1.4 s.
+- Append p50 ~2.5 ms, p99 ~4–6 ms for a 10-event batch with one claim.
+- Footprint ~0.7 KB/event; the op-bearing index is 15–151 MB.
+- 100M/1% is extrapolated from the 1M-claim run (~2 min rebuild, ~70 GB), not
+  run: the seed's write time grows superlinearly with the index set.
+
+The earlier 1M warm probe established the plan shape: global index + filter →
+**index-only scan, zero heap fetches** after `events_ops_idx`; page cost
+739 → 93, 2.06 ms → 0.14 ms.

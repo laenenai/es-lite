@@ -521,12 +521,15 @@ ephemeral. `command_dedup` is a post-commit response cache: exclude it, and read
 the dedup note below before deciding otherwise. There is no second state table
 and no second sequence: one table carries the events and the ops.
 
-**Scale evidence is pending.** The replay index makes rebuild and verify
-index-only and linear in claim-bearing batches, but the envelope so far is
-extrapolated from a 1M-row warm-cache probe. The 10M–100M benchmark — matrix,
-hardware and acceptance criteria — is tracked in
-[the backlog](../backlog/2026-11-21_events-scale-benchmark.md). Do not quote a
-capacity number as measured until it lands.
+**Measured envelope (2026-11-21).** Rebuild and verify are linear in
+claim-bearing rows, not events: ~8k claims/s (100k ≈ 13 s, 500k ≈ 56 s, 1M ≈
+2 min), measured on 10M and 50M event logs. The op-bearing index is 15–151 MB,
+the footprint is ~0.7 KB/event at a 32-byte payload, and a 12.5M-per-partition
+spread rebuilds in ~1.4 s. The 100M/1% case is extrapolated from the 1M-claim
+measurement rather than run: seeding it is a multi-hour write through the
+index set. See [the results](../benchmarks/2026-11-21-results.md) for the
+matrix, hardware and caveats. These are local, single-writer, warm-OS-cache
+numbers; re-run on your storage before quoting an SLA.
 
 **PITR.** If arbitrary point-in-time recovery is the requirement, use physical
 backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
