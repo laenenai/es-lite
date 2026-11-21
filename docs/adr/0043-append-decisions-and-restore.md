@@ -1,6 +1,6 @@
 # ADR 0043: Append Decisions and Log-Only Restore
 
-- **Status:** Accepted (implementation pending)
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-21
 - **Related:** ADR 0008 (uniqueness as a first-class constraint), ADR 0025
   (client-owned crypto and erasure), ADR 0029 (the chain attests the log, not
@@ -382,7 +382,8 @@ Costs:
 
 ## 6. Rollout
 
-This ADR is accepted; the implementation is the next work item.
+This ADR is implemented in this branch; the list below is the record of what
+shipped.
 
 - Migration `postgres/migrations/0014_append_decisions.sql` and
   `sqlite/migrations/0012_append_decisions.sql` (numbers may shift if another
