@@ -2,6 +2,7 @@
 
 - **Status:** Accepted (amends ADR 0003 — Decider signature).
 - **Amended by:** ADR 0025 (PII flag removed; callers pre-hash).
+- **Amended by:** ADR 0043 (`unique_claims` is a projection of the event log; every claim or release carries an event).
 - **Date:** 2026-08-02
 
 > Errata (2026-10-28): the `PII` flag and server-side HMAC are removed; callers supply an opaque, pre-hashed value (ADR 0025). The transactional uniqueness design remains accepted.

@@ -167,6 +167,80 @@ index: its `CREATE INDEX IF NOT EXISTS` finds the parent index already in
 place. Databases that skip the manual step pay a blocking build inside the
 migration — acceptable only for small databases.
 
+## Index build order (migration 0015)
+
+Migration 0015 adds the partial index the claims replay needs,
+`events_ops_idx` on `(workspace_id, global_position) INCLUDE (stream_id,
+constraint_ops) WHERE constraint_ops IS NOT NULL` (ADR 0043 §2.2). It is the
+difference between a rebuild scanning every event in the workspace's partition
+and scanning only the op-bearing batches, so it is worth building without
+blocking appends on a large store. The `INCLUDE` is deliberate: it covers the
+replay's `SELECT`, making it an index-only scan. Without it the default
+`random_page_cost` makes the planner prefer the global position index and pay
+a heap fetch per candidate row. The `INCLUDE` duplicates `stream_id` and the
+ops blob on op-bearing rows only; that is one row per claim-bearing batch, so
+the index stays small relative to the log.
+The same lock arithmetic as the sections above applies, and this section is
+deliberately its own: **do not follow the 0003 or 0012 section for this
+index.** Like them, it is needed only for databases where `events` holds
+**≥10M rows**; on smaller databases migration 0015's plain `CREATE INDEX IF
+NOT EXISTS` finishes fast enough inside the migration.
+
+Migrations run in one transaction (ADR 0010), so they cannot use `CREATE
+INDEX CONCURRENTLY`, and Postgres cannot use it on a partitioned parent at
+all — so build per partition, create the parent with `ONLY`, then attach. The
+partial predicate must be repeated in **both** the child build and the parent
+statement: `ATTACH PARTITION` requires identical definitions. Run this through
+`psql` (`\gexec` runs one statement per row; `CREATE INDEX CONCURRENTLY`
+cannot run inside a transaction block):
+
+```sql
+-- 1. Build the index on every events partition, without blocking appends.
+SELECT format('CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I %s',
+              p.relname || '_ops_idx', p.relname,
+              '(workspace_id, global_position) INCLUDE (stream_id, constraint_ops) WHERE constraint_ops IS NOT NULL')
+FROM (SELECT c.relname FROM pg_inherits g
+      JOIN pg_class c ON c.oid = g.inhrelid
+      WHERE g.inhparent = 'events'::regclass) AS p
+\gexec
+
+-- 2. Create the parent index (metadata only, instant; marked invalid until
+--    every partition index is attached in step 3). The predicate and the
+--    INCLUDE must match step 1 exactly.
+CREATE INDEX IF NOT EXISTS events_ops_idx
+    ON ONLY events (workspace_id, global_position)
+    INCLUDE (stream_id, constraint_ops)
+    WHERE constraint_ops IS NOT NULL;
+
+-- 3. Attach the partition indexes (metadata only, instant).
+SELECT format('ALTER INDEX events_ops_idx ATTACH PARTITION %I',
+              p.relname || '_ops_idx')
+FROM (SELECT c.relname FROM pg_inherits g
+      JOIN pg_class c ON c.oid = g.inhrelid
+      WHERE g.inhparent = 'events'::regclass) AS p
+\gexec
+```
+
+A failed or cancelled `CONCURRENTLY` build leaves an `INVALID` index behind;
+drop it (`DROP INDEX CONCURRENTLY <index name>;`) and re-run step 1. Before
+upgrading, confirm the parent index is valid — the expected result is **one
+row, `t`**:
+
+```sql
+SELECT c.relname, i.indisvalid FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relname = 'events_ops_idx';
+```
+
+Once this step is done, migration 0015 is a **no-op** for the index: its
+`CREATE INDEX IF NOT EXISTS` finds the parent already in place. Databases
+that skip the manual step pay a blocking build inside the migration —
+acceptable only on small databases.
+
+SQLite needs no manual step: migration 0013's plain build runs inside the
+migration transaction, and the single-connection store is quiescent while it
+runs.
+
 ## Relay role and RLS bypass (migration 0005)
 
 `Drain` — the delivery relay — and the anchor/verify path (`Anchor`,
@@ -486,12 +560,14 @@ event are one row, so an event cut is internally consistent; loading
    Skip it only when the restored log is empty. There is no second sequence.
    SQLite's `AUTOINCREMENT` tracks explicit-id inserts itself, so this step is
    Postgres-only.
-5. **Stop writers.** Verify the index first: `es-verify claims` is
-   non-destructive and must report `claims OK` (exit 0; 1 names the first
-   divergence, 2 is a refusal or error). Rebuild only if you intend to replace
-   the index, after exporting any divergent claims: `es-verify claims
-   --rebuild`, then `es-verify claims` again (the second command must report
-   `claims OK`). `--rebuild`
+5. **Stop writers.** Run `es-verify claims` first; it is non-destructive.
+   On a pure events-only restore the live index is empty while the log has
+   ops, so it reports `DIVERGED` (exit 1) — that is the rebuild's prompt, not
+   a lost restore. Exit 0 means the index already matches (a physical restore,
+   or a clone that applied the ops): skip the rebuild. Exit 2 is a refusal or
+   error. Rebuild only if you intend to replace the index, after exporting any
+   divergent claims: `es-verify claims --rebuild`, then `es-verify claims`
+   again, which must now report `claims OK`. `--rebuild`
    replaces the index with what the log can prove, and an op committed after
    its snapshot cannot be replayed; Postgres runs it in one Repeatable Read
    transaction, so a writer racing the snapshot may surface as a

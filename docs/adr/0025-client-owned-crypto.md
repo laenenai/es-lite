@@ -2,6 +2,7 @@
 
 - **Status:** Accepted (supersedes the crypto/erasure portions of ADRs 0004
   and 0006; amends ADR 0008's PII handling)
+- **Amended by:** ADR 0043 (claim values live on the immutable event log, so erasure is a keyed MAC plus key destruction, not row deletion)
 - **Date:** 2026-10-28
 
 ## Context

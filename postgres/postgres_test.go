@@ -400,9 +400,9 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 		t.Fatalf("shared ledger: %v", err)
 	}
 	// Every embedded migration is applied on Open; 0014 (event constraint ops)
-	// made it fourteen.
-	if v != 14 {
-		t.Fatalf("applied version = %d, want 14", v)
+	// and 0015 (the op-bearing partial index) made it fifteen.
+	if v != 15 {
+		t.Fatalf("applied version = %d, want 15", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.

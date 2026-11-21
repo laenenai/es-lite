@@ -24,8 +24,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 12 {
-		t.Fatalf("applied version = %d, want 12 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache + 0012 event constraint ops; no 0005 — Postgres's is RLS-role-specific)", v)
+	if v != 13 {
+		t.Fatalf("applied version = %d, want 13 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache + 0012 event constraint ops + 0013 event ops index; no 0005 — Postgres's is RLS-role-specific)", v)
 	}
 	// Re-running is a no-op, not an error.
 	if err := s.Migrate(ctx); err != nil {
@@ -35,6 +35,27 @@ func TestMigrateIdempotent(t *testing.T) {
 	var n int
 	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM events`).Scan(&n); err != nil {
 		t.Fatalf("events table missing: %v", err)
+	}
+}
+
+// TestEventOpsIndexExists pins migration 0013's partial index (ADR 0043
+// §2.2): SQLite is single-workspace, so the replay orders on global_position
+// alone; the predicate keeps the index to op-bearing rows.
+func TestEventOpsIndexExists(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.Open(ctx, "file:"+t.Name()+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	var sqlText string
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT sql FROM sqlite_master WHERE type='index' AND name='events_ops_idx'`).Scan(&sqlText); err != nil {
+		t.Fatalf("events_ops_idx missing: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(sqlText), "WHERE CONSTRAINT_OPS IS NOT NULL") {
+		t.Fatalf("events_ops_idx is not partial: %s", sqlText)
 	}
 }
 
@@ -138,7 +159,7 @@ func TestConcurrentMigrateSameFile(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate schema_migrations: %v", err)
 	}
-	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12}
+	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13}
 	if !slices.Equal(got, want) {
 		t.Fatalf("recorded versions = %v, want each of %v exactly once", got, want)
 	}
