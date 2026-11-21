@@ -276,6 +276,34 @@ func TestReadCorruptConstraintOpsFailsLoudly(t *testing.T) {
 	}
 }
 
+// TestReadEmptyConstraintOpsFailsLoudly pins the other corrupt shape: a
+// zero-length but non-NULL bytea (out-of-band SQL; the store never writes one)
+// must fail the read as corrupt rather than read as "no ops". The rebuild
+// counts it with IS NOT NULL and fails decoding it, so the read must agree.
+func TestReadEmptyConstraintOpsFailsLoudly(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_ops_empty"
+	sid := opsStream(t, "empty")
+
+	appendWithOps(t, s, ws, sid, 0, es.Claim("email", "empty@b"))
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`UPDATE events SET constraint_ops = ''::bytea WHERE workspace_id = $1 AND stream_id = $2 AND version = 1`,
+		ws, sid.Canonical()); err != nil {
+		t.Fatalf("set empty constraint_ops: %v", err)
+	}
+
+	if _, err := s.Workspace(ws).ReadStream(ctx, sid, 0, 0); err == nil {
+		t.Fatal("ReadStream accepted a zero-length non-NULL constraint_ops blob")
+	} else {
+		for _, want := range []string{sid.Canonical(), "v1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("read error = %q, want it to name %q", err, want)
+			}
+		}
+	}
+}
+
 // TestTamperedConstraintOpsDoesNotBreakChain pins the documented behavior: the
 // chain attests the event, not the ops, so a decodable tampered ops blob still
 // verifies. The index it feeds is trusted infrastructure, like unique_claims.
@@ -475,6 +503,50 @@ func TestVerifyClaimsReportsDivergence(t *testing.T) {
 		if !strings.Contains(rep.FirstDivergence, want) {
 			t.Errorf("FirstDivergence = %q, want it to name %q", rep.FirstDivergence, want)
 		}
+	}
+}
+
+// TestVerifyClaimsReplaysEventBearingOrder is the replay-order regression for
+// the removed advisory lock: every op rides an event-bearing append, and the
+// ops must replay in global position order across streams. A claim on A, a
+// release on A that matches nothing (still valid and event-bearing), a claim
+// on B, then release A and claim A on B verify cleanly at each stage. The
+// claim-only race the lock guarded is impossible by construction now —
+// ErrConstraintWithoutEvent rejects a constraint-bearing append with no event
+// (see TestAppendRejectsConstraintsWithoutEvent) — so replay order is the one
+// remaining ordering property to pin.
+func TestVerifyClaimsReplaysEventBearingOrder(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_ops_replay_order"
+	sidA := opsStream(t, "order-a")
+	sidB := opsStream(t, "order-b")
+	wsStore := s.WorkspaceStore(ws)
+
+	claimA := es.Claim("email", "order-a@b")
+	appendWithOps(t, s, ws, sidA, 0, claimA)
+	appendWithOps(t, s, ws, sidA, 1, es.Release("email", "never-claimed@b"))
+	appendWithOps(t, s, ws, sidB, 0, es.Claim("email", "order-b@b"))
+
+	if rep, err := wsStore.VerifyClaims(ctx); err != nil || !rep.OK {
+		t.Fatalf("verify after claim/no-op-release/claim = %+v, err %v, want OK", rep, err)
+	}
+	if sid, found, err := wsStore.LookupClaim(ctx, "email", "order-a@b"); err != nil || !found || sid != sidA.Canonical() {
+		t.Fatalf("claim A after the no-op release = (%q, %v, %v), want (%q, true, nil)", sid, found, err, sidA.Canonical())
+	}
+
+	appendWithOps(t, s, ws, sidA, 2, es.Release("email", "order-a@b"))
+	appendWithOps(t, s, ws, sidB, 1, claimA)
+
+	rep, err := wsStore.VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("verify after release/claim on one stream: %v", err)
+	}
+	if !rep.OK {
+		t.Fatalf("verify after release/claim = %+v, want OK", rep)
+	}
+	if sid, found, err := wsStore.LookupClaim(ctx, "email", "order-a@b"); err != nil || !found || sid != sidB.Canonical() {
+		t.Errorf("claim A after release/claim = (%q, %v, %v), want (%q, true, nil)", sid, found, err, sidB.Canonical())
 	}
 }
 
