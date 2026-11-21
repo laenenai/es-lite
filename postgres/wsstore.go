@@ -417,8 +417,20 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		}
 	}
 
-	if err := w.applyClaims(ctx, db, canonical, p.Constraints); err != nil {
+	if err := w.applyOps(ctx, db, "unique_claims", canonical, p.Constraints); err != nil {
 		return zero, err
+	}
+
+	// The append-decision record (ADR 0043) is written after the claim
+	// index has been updated, in the same transaction: a collision above
+	// has already aborted the append, and a commit below can only succeed
+	// with both the claim effects and their record. A claim-only append
+	// (no events) still records one row — the empty span [v,v) — because
+	// the decision is then the append's only durable effect.
+	if len(p.Constraints) > 0 {
+		if err := w.recordDecision(ctx, db, canonical, p); err != nil {
+			return zero, err
+		}
 	}
 
 	// The opt-in append hint (ADR 0039 C2), deliberately the transaction's
@@ -465,18 +477,20 @@ func (w *Workspace) readHead(ctx context.Context, tx DBTX, sid es.StreamID) (uin
 	}
 }
 
-// applyClaims applies uniqueness ops in the append transaction (ADR 0008):
+// applyOps applies uniqueness ops in the append transaction (ADR 0008):
 // releases first (so a same-value rename does not self-collide), then claims.
-// The value_key is stored opaquely (ADR 0025): for personal data the caller
-// supplies a keyed MAC as the value; es-lite stores whatever bytes it is given.
-// A colliding claim returns es.ErrConstraintViolated, rolling back the append.
-func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, ops []es.ConstraintOp) error {
+// table is a closed set — "unique_claims" on the append path; the claims
+// rebuild's temporary index is the other (ADR 0043). The value_key is stored
+// opaquely (ADR 0025): for personal data the caller supplies a keyed MAC as
+// the value; es-lite stores whatever bytes it is given. A colliding claim
+// returns es.ErrConstraintViolated, rolling back the append.
+func (w *Workspace) applyOps(ctx context.Context, tx DBTX, table, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
 			continue
 		}
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM unique_claims WHERE workspace_id=$1 AND scope=$2 AND value_key=$3 AND stream_id=$4`,
+			`DELETE FROM `+table+` WHERE workspace_id=$1 AND scope=$2 AND value_key=$3 AND stream_id=$4`,
 			w.ws, op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			return fmt.Errorf("release claim %s: %w", op.Scope, err)
@@ -487,7 +501,7 @@ func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, o
 			continue
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
+			`INSERT INTO `+table+` (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
 			w.ws, op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			if isUniqueViolation(err) {
@@ -495,6 +509,26 @@ func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, o
 			}
 			return fmt.Errorf("claim %s: %w", op.Scope, err)
 		}
+	}
+	return nil
+}
+
+// recordDecision records the append's constraint decisions in
+// append_decisions (ADR 0043), inside the append transaction and after
+// applyOps has updated the live claim index. The row holds the original op
+// sequence (es.EncodeDecisionOps), not its effects, and the span
+// [ExpectedVersion, ExpectedVersion+len(events)) — an empty span for a
+// claim-only append. command_id is the CommandID string events stores,
+// including the zero UUID when the caller left it unset.
+func (w *Workspace) recordDecision(ctx context.Context, tx DBTX, streamID string, p es.AppendParams) error {
+	_, err := tx.Exec(ctx,
+		`INSERT INTO append_decisions (workspace_id, stream_id, from_version, to_version, command_id, ops)
+		 VALUES ($1,$2,$3,$4,$5,$6)`,
+		w.ws, streamID, p.ExpectedVersion, p.ExpectedVersion+uint64(len(p.Events)),
+		p.CommandID.String(), es.EncodeDecisionOps(p.Constraints),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: append decision: %w", err)
 	}
 	return nil
 }
@@ -1189,7 +1223,7 @@ func (w *Workspace) MatchingRawHead(ctx context.Context, types []string) (uint64
 }
 
 // LookupClaim reads the uniqueness index (unique_claims) for the stream holding
-// (scope, value). The value is keyed exactly as applyClaims stores it — opaque
+// (scope, value). The value is keyed exactly as applyOps stores it — opaque
 // bytes as given (ADR 0025) — so writes and lookups agree. A personal-data
 // lookup must pass the same caller-computed MAC the write used.
 func (w *Workspace) LookupClaim(ctx context.Context, scope, value string) (string, bool, error) {

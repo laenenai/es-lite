@@ -94,17 +94,18 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 	t.Helper()
 	for _, g := range []struct{ role, grants string }{
 		// Appender: draw positions, chain events, attest batch order,
-		// apply uniqueness constraints (Release is the only DELETE the
-		// append path issues on the log, on the claims index; Purge on
-		// the snapshot cache is the one other DELETE). It is also the
-		// process running aggregate.Runtime, so with a snapshot cache
-		// it reads and writes snapshots.
+		// apply uniqueness constraints and record their decisions
+		// (Release is the only DELETE the append path issues on the log,
+		// on the claims index; Purge on the snapshot cache is the one
+		// other DELETE). It is also the process running
+		// aggregate.Runtime, so with a snapshot cache it reads and
+		// writes snapshots.
 		{lpAppender, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAppender + `;
 			GRANT USAGE ON SEQUENCE events_global_position_seq TO ` + lpAppender + `;
 			GRANT SELECT, INSERT ON events, unique_claims TO ` + lpAppender + `;
 			GRANT DELETE ON unique_claims TO ` + lpAppender + `;
-			GRANT INSERT ON log_order TO ` + lpAppender + `;
+			GRANT INSERT ON log_order, append_decisions TO ` + lpAppender + `;
 			GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO ` + lpAppender},
 		// Feed process: the horizon fence (pg_sequences needs USAGE on
 		// the sequence, never SELECT) + the feed's own state tables.

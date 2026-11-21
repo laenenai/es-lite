@@ -61,19 +61,19 @@ func TestFeedIndexesExist(t *testing.T) {
 	}
 }
 
-// TestAllBypassPoliciesRoleGated pins migrations 0007/0009's policy
+// TestAllBypassPoliciesRoleGated pins migrations 0007/0009/0014's policy
 // shape (review F8/F12) through pg_policies — not file greps, which
 // would false-positive on comments (the Task 13 review ruling). All
-// four policies that carry a bypass arm — events, unique_claims,
-// anchors and log_order — must keep the arm (app.bypass_rls), gate it
-// on es_relay membership (pg_has_role), and guard that test with
+// five policies that carry a bypass arm — events, unique_claims, anchors,
+// log_order and append_decisions — must keep the arm (app.bypass_rls),
+// gate it on es_relay membership (pg_has_role), and guard that test with
 // EXISTS so it cannot hard-fail (pg_has_role errors) on a database
 // where the role has not been created yet.
 func TestAllBypassPoliciesRoleGated(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
-	for _, table := range []string{"events", "unique_claims", "anchors", "log_order"} {
+	for _, table := range []string{"events", "unique_claims", "anchors", "log_order", "append_decisions"} {
 		rows, err := s.Pool().Query(ctx, `
 			SELECT policyname, qual FROM pg_policies
 			WHERE schemaname = 'public' AND tablename = $1`, table)
@@ -360,8 +360,8 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("read shared ledger: %v", err)
 	}
-	if v != 13 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 13 (every embedded migration applied)", v)
+	if v != 14 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 14 (every embedded migration applied)", v)
 	}
 }
 
@@ -441,7 +441,7 @@ func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
 				PRIMARY KEY (workspace_id, stream_id)
 			)`,
 			wantErr: false,
-			wantV:   13,
+			wantV:   14,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -535,8 +535,8 @@ func TestMigrateWritesTheSharedLedger(t *testing.T) {
 	`).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if n != 13 {
-		t.Fatalf("eventstore ledger rows = %d, want 13", n)
+	if n != 14 {
+		t.Fatalf("eventstore ledger rows = %d, want 14", n)
 	}
 
 	var legacy bool
@@ -593,8 +593,8 @@ func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
 	`).Scan(&total); err != nil {
 		t.Fatalf("read ledger total: %v", err)
 	}
-	if total != 13 {
-		t.Fatalf("ledger rows = %d, want 13 after applying versions 4-13", total)
+	if total != 14 {
+		t.Fatalf("ledger rows = %d, want 14 after applying versions 4-14", total)
 	}
 }
 
@@ -617,8 +617,8 @@ func TestLedgerModuleNameUsesTheOption(t *testing.T) {
 	`).Scan(&eventstore); err != nil {
 		t.Fatalf("read eventstore rows: %v", err)
 	}
-	if custom != 13 {
-		t.Fatalf("custom ledger rows = %d, want 13", custom)
+	if custom != 14 {
+		t.Fatalf("custom ledger rows = %d, want 14", custom)
 	}
 	if eventstore != 0 {
 		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)
