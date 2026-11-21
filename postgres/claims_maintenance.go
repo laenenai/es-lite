@@ -13,10 +13,16 @@ import (
 // The claims index is derived state (ADR 0043): the append path keeps
 // unique_claims authoritative and records each append's constraint ops on its
 // first event row, so these two operations can reconstruct the index after a
-// restore and prove a live index matches its log. Each runs in one transaction
-// with app.workspace_id set, and every statement carries the explicit
-// workspace_id predicate — row security is the second line, not the only one
-// (the login role may be exempt from it).
+// restore and prove a live index matches its log. Each runs in one Repeatable
+// Read transaction with app.workspace_id set, so the guard, the delete, the
+// replay and the count all see one snapshot; every statement also carries the
+// explicit workspace_id predicate — row security is the second line, not the
+// only one (the login role may be exempt from it).
+//
+// Repeatable Read is not a substitute for quiescing writers. A rebuild is a
+// restore operation: an op committed after the snapshot cannot be replayed, so
+// stop writers first. A writer racing a rebuild may surface as a serialization
+// error — loud and retryable — never as a silent divergence.
 
 var _ es.ClaimsMaintainer = (*Workspace)(nil)
 
@@ -33,12 +39,21 @@ const opPageSize = 1000
 // ErrClaimsWithoutDecisions without deleting anything, because the log cannot
 // reconstruct that index.
 //
-// One transaction, one commit: the guard, the delete, the replay and the final
-// count all see the same snapshot, and a decode or apply failure rolls the
-// whole rebuild back, leaving the live index as it was.
+// One Repeatable Read transaction, one commit: the guard, the delete, the
+// replay and the final count all see the same snapshot, and a decode or apply
+// failure rolls the whole rebuild back, leaving the live index as it was.
+//
+// The rebuild replaces the index with what the log can prove. It refuses only
+// the fully unbacked store (live claims with zero op-bearing events); on a
+// partially inconsistent store — some claims with ops and some without — it
+// succeeds and deletes every live claim the log does not license. Run
+// VerifyClaims first, and on a mixed store export the divergent claims before
+// rebuilding (the rollback window in
+// docs/migration/2026-11-07-breaking-changes.md explains how that store
+// arises).
 func (w *Workspace) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, error) {
 	var zero es.ClaimsRebuildReport
-	tx, err := w.store.pool.Begin(ctx)
+	tx, err := w.store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return zero, fmt.Errorf("postgres: rebuild claims: begin: %w", err)
 	}
@@ -94,9 +109,14 @@ func (w *Workspace) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, 
 //
 // A failed read or decode is an error, never an OK report: silence from a
 // broken read would be indistinguishable from a matching index.
+//
+// The whole verify runs in one Repeatable Read transaction so the live index,
+// the replay and the diff read one snapshot: a live append during verify
+// cannot manufacture a false divergence. A writer racing the snapshot may
+// still surface as a serialization error, which is loud and retryable.
 func (w *Workspace) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error) {
 	var zero es.ClaimsVerifyReport
-	tx, err := w.store.pool.Begin(ctx)
+	tx, err := w.store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
 	if err != nil {
 		return zero, fmt.Errorf("postgres: verify claims: begin: %w", err)
 	}
