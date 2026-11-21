@@ -22,6 +22,10 @@
 //	es-verify order [--upto N]
 //	  deep-verify the log order: recompute every log_order batch hash
 //	  from the events at or below the bound (0 = the log head)
+//	es-verify claims [--rebuild | --adopt-existing] [<workspace>]
+//	  verify the unique-claims index against its append decision log;
+//	  --rebuild replays the log over the live index, --adopt-existing
+//	  performs the one-time cutover backfill (writers must be stopped)
 //
 // Config (env), as es-migrate: BACKEND (postgres|sqlite), PG_DSN, SQLITE_DSN.
 package main
@@ -57,8 +61,10 @@ type backend struct {
 	// here) is surfaced loudly by the order stage — its own OrderRows
 	// error, exit 2 — never a silent skip, never a vacuous pass.
 	verifyOrder func(context.Context, uint64) (*es.OrderVerifyReport, error)
-	multiWS     bool
-	close       func()
+	// claims is the per-workspace claims index maintainer (ADR 0043).
+	claims  func(workspace string) es.ClaimsMaintainer
+	multiWS bool
+	close   func()
 }
 
 func main() {
@@ -87,6 +93,8 @@ func run(args []string) int {
 		return cmdAnchor(ctx, b, args[1:])
 	case "order":
 		return cmdOrder(ctx, b, args[1:])
+	case "claims":
+		return cmdClaims(ctx, b, args[1:])
 	default:
 		usage()
 		return exitUsage
@@ -98,7 +106,8 @@ func usage() {
   es-verify stream [--allow-empty] [<workspace>] <type:id>
   es-verify all [--strict]
   es-verify anchor [--upto N] | --check <anchor.json> | list
-  es-verify order [--upto N]`)
+  es-verify order [--upto N]
+  es-verify claims [--rebuild | --adopt-existing] [<workspace>]`)
 }
 
 func cmdStream(ctx context.Context, b *backend, args []string) int {
@@ -258,6 +267,118 @@ func cmdOrder(ctx context.Context, b *backend, args []string) int {
 	}
 }
 
+// cmdClaims maintains and audits the unique-claims index against the append
+// decision log recorded beside the events (ADR 0043). The default is the
+// oracle: rebuild into a temporary index and compare, without touching the
+// live index. --rebuild replays the log over the live index; --adopt-existing
+// is the one-time cutover backfill and refuses once any decision exists. The
+// two mutating modes are mutually exclusive. The refusal sentinels —
+// ErrClaimsNotAdopted for a rebuild before the cutover, ErrClaimsAlreadyAdopted
+// for a second adopt — and connection errors all exit 2: nothing was audited.
+func cmdClaims(ctx context.Context, b *backend, args []string) int {
+	fs := flag.NewFlagSet("claims", flag.ContinueOnError)
+	rebuild := fs.Bool("rebuild", false, "replace the live claims index by replaying the append decision log")
+	adopt := fs.Bool("adopt-existing", false, "backfill one decision per live claim (one-time cutover; writers must be stopped)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	rest := fs.Args()
+	if len(rest) > 1 || (*rebuild && *adopt) {
+		usage()
+		return exitUsage
+	}
+	workspaces, err := claimWorkspaces(ctx, b, rest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "es-verify: %v\n", err)
+		return exitUsage
+	}
+
+	switch {
+	case *adopt:
+		// The header is the operator's instruction, not decoration: the
+		// backfill reads the live index and must not race a writer.
+		fmt.Fprintln(os.Stderr, "es-verify: adopt the claims cutover with writers stopped")
+		var adopted int64
+		for _, ws := range workspaces {
+			n, err := b.claims(ws).AdoptClaims(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
+				return exitUsage
+			}
+			adopted += n
+		}
+		fmt.Printf("claims adopted: %d decisions\n", adopted)
+		return exitIntact
+
+	case *rebuild:
+		var decisions, claims int64
+		for _, ws := range workspaces {
+			rep, err := b.claims(ws).RebuildClaims(ctx)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
+				return exitUsage
+			}
+			decisions += rep.Decisions
+			claims += rep.Claims
+		}
+		fmt.Printf("claims rebuilt: %d decisions, %d claims\n", decisions, claims)
+		return exitIntact
+	}
+
+	code := exitIntact
+	var decisions int64
+	for _, ws := range workspaces {
+		rep, err := b.claims(ws).VerifyClaims(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
+			return exitUsage
+		}
+		decisions += rep.Decisions
+		if !rep.OK {
+			fmt.Printf("DIVERGED: %s\n", rep.FirstDivergence)
+			code = exitBroken
+		}
+	}
+	if code == exitIntact {
+		fmt.Printf("claims OK: %d decisions\n", decisions)
+	}
+	return code
+}
+
+// claimWorkspaces resolves the workspaces a claims command runs over: an
+// explicit argument wins; on Postgres with no argument, the distinct
+// workspaces of the existing streams; SQLite is one empty workspace.
+func claimWorkspaces(ctx context.Context, b *backend, args []string) ([]string, error) {
+	if len(args) == 1 {
+		return []string{args[0]}, nil
+	}
+	if !b.multiWS {
+		return []string{""}, nil
+	}
+	refs, err := b.ListStreams(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list streams: %w", err)
+	}
+	seen := make(map[string]bool, len(refs))
+	workspaces := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if !seen[ref.Workspace] {
+			seen[ref.Workspace] = true
+			workspaces = append(workspaces, ref.Workspace)
+		}
+	}
+	return workspaces, nil
+}
+
+// wsPrefix labels a per-workspace error; SQLite's single empty workspace
+// stays unlabeled.
+func wsPrefix(ws string) string {
+	if ws == "" {
+		return ""
+	}
+	return ws + ": "
+}
+
 func cmdAnchor(ctx context.Context, b *backend, args []string) int {
 	if len(args) > 0 && args[0] == "list" {
 		anchors, err := b.ListAnchors(ctx)
@@ -329,6 +450,7 @@ func openBackend(ctx context.Context) (*backend, error) {
 			scope:        store.Workspace,
 			chainedSince: store.ChainedSince,
 			verifyOrder:  store.VerifyOrder,
+			claims:       func(ws string) es.ClaimsMaintainer { return store.WorkspaceStore(ws) },
 			multiWS:      true,
 			close:        store.Close,
 		}, nil
@@ -349,6 +471,7 @@ func openBackend(ctx context.Context) (*backend, error) {
 			scope:        func(string) es.Store { return store },
 			chainedSince: store.ChainedSince,
 			verifyOrder:  store.VerifyOrder,
+			claims:       func(string) es.ClaimsMaintainer { return store },
 			close:        func() { _ = store.Close() },
 		}, nil
 	default:

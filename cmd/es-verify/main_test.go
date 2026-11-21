@@ -333,6 +333,129 @@ func TestAllExitCodePrecedence(t *testing.T) {
 	})
 }
 
+// seedClaim appends one event carrying one Claim constraint, so the store
+// also records an append decision — the row the claims cutover and the
+// claims commands operate on.
+func seedClaim(t *testing.T, s *sqlite.Store, sid es.StreamID, scope, value string) {
+	t.Helper()
+	if _, err := s.Append(context.Background(), es.AppendParams{
+		StreamID:    sid,
+		Events:      []es.EventData{seedEvent(0)},
+		Constraints: []es.ConstraintOp{es.Claim(scope, value)},
+	}); err != nil {
+		t.Fatalf("append with claim: %v", err)
+	}
+}
+
+// countDecisions counts append_decisions rows through a fresh handle (the
+// store under test is closed before run opens its own).
+func countDecisions(t *testing.T) int {
+	t.Helper()
+	s, err := sqlite.Open(context.Background(), os.Getenv("SQLITE_DSN"))
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	defer s.Close()
+	var n int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM append_decisions`).Scan(&n); err != nil {
+		t.Fatalf("count decisions: %v", err)
+	}
+	return n
+}
+
+// TestClaimsCommandEmpty pins the claims oracle's empty case: a fresh
+// database has no decisions and no claims, so the verify reports OK with
+// zero decisions and exits 0 — the index and its log agree trivially.
+func TestClaimsCommandEmpty(t *testing.T) {
+	s := newTestDB(t)
+	closeDB(t, s)
+	var code int
+	stdout, _ := captureOutput(t, func() { code = run([]string{"claims"}) })
+	if code != exitIntact {
+		t.Errorf("claims on an empty db: exit %d, want %d", code, exitIntact)
+	}
+	if !strings.Contains(stdout, "claims OK: 0 decisions") {
+		t.Errorf("claims on an empty db: stdout %q, want the zero-decision OK", stdout)
+	}
+}
+
+// TestClaimsCommandRebuildAndVerify pins the rebuild/verify pair: a seeded
+// claim rebuilds to exactly one decision and one claim, verifies OK, and
+// rebuilding again is idempotent — the same decision log replays to the
+// same index and still verifies.
+func TestClaimsCommandRebuildAndVerify(t *testing.T) {
+	s := newTestDB(t)
+	sid, err := es.NewStreamID("thing", "a")
+	if err != nil {
+		t.Fatalf("stream id: %v", err)
+	}
+	seedClaim(t, s, sid, "thing.slug", "a")
+	closeDB(t, s)
+
+	for i := 0; i < 2; i++ {
+		var code int
+		stdout, _ := captureOutput(t, func() { code = run([]string{"claims", "--rebuild"}) })
+		if code != exitIntact {
+			t.Fatalf("claims --rebuild (run %d): exit %d, want %d", i+1, code, exitIntact)
+		}
+		if !strings.Contains(stdout, "claims rebuilt: 1 decisions, 1 claims") {
+			t.Errorf("claims --rebuild (run %d): stdout %q, want the seeded claim rebuilt", i+1, stdout)
+		}
+
+		stdout, _ = captureOutput(t, func() { code = run([]string{"claims"}) })
+		if code != exitIntact {
+			t.Fatalf("claims after rebuild (run %d): exit %d, want %d", i+1, code, exitIntact)
+		}
+		if !strings.Contains(stdout, "claims OK: 1 decisions") {
+			t.Errorf("claims after rebuild (run %d): stdout %q, want the rebuilt index verified", i+1, stdout)
+		}
+	}
+}
+
+// TestClaimsCommandAdoptRefuses pins the cutover guard: once any append
+// decision exists, adoption refuses — exit 2, stderr names the cutover —
+// and writes no row, because a duplicate Claim would break every rebuild.
+func TestClaimsCommandAdoptRefuses(t *testing.T) {
+	s := newTestDB(t)
+	sid, err := es.NewStreamID("thing", "a")
+	if err != nil {
+		t.Fatalf("stream id: %v", err)
+	}
+	seedClaim(t, s, sid, "thing.slug", "a")
+	before := countDecisions(t)
+	closeDB(t, s)
+
+	var code int
+	_, stderr := captureOutput(t, func() { code = run([]string{"claims", "--adopt-existing"}) })
+	if code != exitUsage {
+		t.Errorf("claims --adopt-existing with decision history: exit %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "cutover") {
+		t.Errorf("claims --adopt-existing: stderr %q, want the cutover warning", stderr)
+	}
+	if !strings.Contains(stderr, es.ErrClaimsAlreadyAdopted.Error()) {
+		t.Errorf("claims --adopt-existing: stderr %q, want the refusal message", stderr)
+	}
+	if after := countDecisions(t); after != before {
+		t.Errorf("claims --adopt-existing: %d decisions after, want %d (nothing added)", after, before)
+	}
+}
+
+// TestClaimsCommandFlagsConflict pins flag validation: --rebuild and
+// --adopt-existing are different cutovers and must not combine.
+func TestClaimsCommandFlagsConflict(t *testing.T) {
+	s := newTestDB(t)
+	closeDB(t, s)
+	var code int
+	_, stderr := captureOutput(t, func() { code = run([]string{"claims", "--rebuild", "--adopt-existing"}) })
+	if code != exitUsage {
+		t.Errorf("claims --rebuild --adopt-existing: exit %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(stderr, "usage:") {
+		t.Errorf("claims --rebuild --adopt-existing: stderr %q, want the usage text", stderr)
+	}
+}
+
 // TestMergeExitCombinations pins the merge rule itself, over every
 // verdict pair `es-verify all` can fold: broken (1) dominates usage or
 // EMPTY (2) in both orders, intact (0) never overrides anything, and
