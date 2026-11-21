@@ -388,8 +388,11 @@ are client responsibilities (ADR 0025).
   if you actually encrypt client-side.
 - **Erasure is client-owned.** There is no server-side crypto-shredding and no
   `ForgetWorkspace`. If you need key-destruction erasure, keep keys outside
-  es-lite and account for snapshots, unique-claim values, read models and
-  database backups when you destroy them.
+  es-lite and account for snapshots, unique-claim values **and their
+  append-decision copies**, read models and database backups when you destroy
+  them. A workspace purge deletes both sides of the claims record; deleting one
+  side alone either resurrects the value on the next rebuild or fails
+  verification forever ([ADR 0043](docs/adr/0043-append-decisions-and-restore.md#34-erasure-and-why-the-row-is-deletable)).
 - **Uniqueness values are opaque.** `Claim`/`Release` store the exact value you
   provide. For personal data, pass a keyed hash/MAC you control, never the raw
   value; `LookupClaim` must receive the same value. There is no PII flag.

@@ -170,9 +170,10 @@ migration — acceptable only for small databases.
 ## Relay role and RLS bypass (migration 0005)
 
 `Drain` — the delivery relay — and the anchor/verify path (`Anchor`,
-`CheckAnchor`, `ListStreams`, `ListAnchors`) are the only readers that
-work across workspaces, through the `app.bypass_rls` arm of the `events`
-and `unique_claims` policies. Migration 0005 role-gates that arm: it
+`CheckAnchor`, `ListStreams`, `ListAnchors`, `ClaimWorkspaces`) are the only
+readers that work across workspaces, through the `app.bypass_rls` arm of the
+`events`, `unique_claims` and `append_decisions` policies. Migration 0005
+role-gates that arm: it
 additionally requires `pg_has_role(current_user, 'es_relay', 'member')`,
 so the GUC alone — settable by any session — no longer lifts workspace
 isolation. Both paths verify the membership lazily, on the first bypassed
@@ -477,9 +478,21 @@ claims missing.
    cut. There are no foreign keys; one transaction is still preferred. For a
    workspace-scoped restore, filter by `workspace_id` (or run through the relay
    path) — a workspace session sees only its own rows under RLS.
-4. Advance the sequence: `SELECT setval('events_global_position_seq',
-   (SELECT max(global_position) FROM events));` and confirm `CACHE 1` (§ *The
-   `CACHE 1` invariant*). Skip it only when the restored log is empty.
+4. Advance **both** sequences. The event position sequence tracks the log; the
+   decision identity sequence does not follow a data-only load (COPY or CDC with
+   explicit ids), so without the second `setval` the first post-restore
+   constraint-bearing append collides on `append_decisions_pkey`:
+   ```sql
+   SELECT setval('events_global_position_seq',
+                 (SELECT max(global_position) FROM events));
+   SELECT setval('append_decisions_id_seq',
+                 COALESCE((SELECT max(id) FROM append_decisions), 1),
+                 EXISTS (SELECT 1 FROM append_decisions));
+   ```
+   Confirm `CACHE 1` on `events_global_position_seq` (§ *The `CACHE 1`
+   invariant*). Skip the position `setval` only when the restored log is empty;
+   the decision `setval` is safe on an empty table. SQLite's `AUTOINCREMENT`
+   tracks explicit-id inserts itself, so this step is Postgres-only.
 5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
    The second command must report `claims OK`. Rebuilding needs the
    appender/owner connection; deleting and reinserting `unique_claims` is the
@@ -525,10 +538,11 @@ rules:
   can run on a schedule.
   That is the useful property: the DR copy proves itself continuously instead
   of at incident time.
-- **Fork (writable staging).** Seed at a cut, `setval` the sequence, then stop
-  applying and let it diverge. It is a fork: never merge it back and never
-  point it at the backup prefix. Promotion is a cutover — quiesce, take a final
-  cut, repoint — not a merge.
+- **Fork (writable staging).** Seed at a cut, `setval` both sequences (the event
+  position sequence and `append_decisions_id_seq`; an identity sequence does not
+  follow a data-only load), then stop applying and let it diverge. It is a fork:
+  never merge it back and never point it at the backup prefix. Promotion is a
+  cutover — quiesce, take a final cut, repoint — not a merge.
 
 Apply idempotently, because CDC is at-least-once: events dedupe on
 `(workspace, stream, version)` or `event_id`, `log_order` on `from_position`,
@@ -556,6 +570,33 @@ is the same window that already exists between a commit and a failed dedup
 after a restore as a duplicate, not a retryable error. If response replay
 across a restore matters, include `command_dedup` in the backup and accept its
 retention/PII obligations.
+
+### Erasing claims (ADR 0043)
+
+A workspace purge must delete **both** sides of the claims record in one
+transaction: the derived `unique_claims` index and the `append_decisions` log
+that rebuilds it. The appender's grants already cover both — `DELETE` on
+`unique_claims` for `Release`, and `DELETE` on `append_decisions` as the erasure
+arm of ADR 0043 §3.4:
+
+```sql
+BEGIN;
+SELECT set_config('app.workspace_id', '<workspace>', true);
+DELETE FROM append_decisions WHERE workspace_id = '<workspace>';
+DELETE FROM unique_claims    WHERE workspace_id = '<workspace>';
+COMMIT;
+```
+
+Deleting only `unique_claims` lets the next `es-verify claims --rebuild`
+resurrect every claim from the still-present decisions. Deleting only
+`append_decisions` leaves the live index holding claims its log cannot license,
+so `es-verify claims` reports `DIVERGED` forever on a database that is not
+tampered. Delete both, in one transaction, and purge before any rebuild.
+
+Per-value erasure is unchanged from ADR 0025: destroy the MAC key rather than
+searching for the value. A MAC'd claim value is inert without its key, and the
+opaque `ops` blobs cannot be searched for a plaintext value — do not rely on
+`append_decisions` being queryable by the claim it records.
 
 ### One-time cutover
 

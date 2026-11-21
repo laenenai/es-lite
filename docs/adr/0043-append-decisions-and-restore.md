@@ -130,13 +130,20 @@ append_decisions (
   not draw from `events_global_position_seq`: a claim-only append must not burn
   a position, because SQLite's feed contract and regression guard assert that
   event positions are gap-free (`sqlite/store.go:7`, `sqlite/feed_test.go:362`).
-- Two appends that touch the same `(workspace, scope, value)` serialize on the
-  unique index or the row lock: the second one's `applyClaims` cannot finish
-  until the first commits or rolls back, so it inserts its row afterwards.
-  `id` order is therefore an apply order for every pair whose relative order
-  can change the index; appends with no shared key commute. Writing the row
-  after `applyClaims` is what makes that true — a row drawn before the claims
-  could block and be overtaken.
+- Two appends that touch the same `(workspace, scope, value)` must order both
+  their effects and their decision rows. A claim serializes on the unique index,
+  but a `Release` that matches nothing takes no row lock, so two claim-only
+  appends at the same version could otherwise insert their rows in the opposite
+  order to their effects. The Postgres append path therefore takes a
+  transaction-scoped advisory lock, keyed by a hash of each distinct
+  `(workspace, scope, value)` (the value is opaque bytes and need not be valid
+  UTF-8), before applying ops, in sorted key order so concurrent batches cannot
+  deadlock. The lock is held to commit, covering both the effect and the
+  decision-row insert, so `id` order is an apply order for every pair whose
+  relative order can change the index; appends with no shared key commute.
+  SQLite is single-writer, so its append transactions already serialize and
+  need no lock. Writing the row after `applyClaims` is what makes that true — a
+  row drawn before the claims could block and be overtaken.
 - RLS mirrors `unique_claims`: the workspace arm plus the role-gated relay
   bypass arm in its hardened form (`0007_policy_hardening.sql`), with `FORCE ROW
   LEVEL SECURITY`. Grants mirror the index the table derives: the appender gets
@@ -181,10 +188,24 @@ written by the append path, plus the schema:
 
 A restore into an empty database is: run the migrations to head; create the
 roles and grants (they are deployment, not data); load the three tables;
-`setval('events_global_position_seq', max(global_position))` and keep `CACHE 1`;
-rebuild `unique_claims` from `append_decisions`; then run the chain check
-(`es-verify all`), the order check (`es-verify order`), and the index check
-(`es-verify claims`). `anchors` may be restored or left to recompute; the
+advance both sequences — the position sequence and the decision identity
+sequence, because a data-only load (COPY or CDC with explicit ids) does not
+advance an identity sequence, and without the second `setval` the first
+post-restore constraint-bearing append collides on `append_decisions_pkey`:
+
+```sql
+SELECT setval('events_global_position_seq',
+              (SELECT max(global_position) FROM events));
+SELECT setval('append_decisions_id_seq',
+              COALESCE((SELECT max(id) FROM append_decisions), 1),
+              EXISTS (SELECT 1 FROM append_decisions));
+```
+
+`events_global_position_seq` stays `CACHE 1`; skip its `setval` only when the
+restored log is empty (the decision `setval` above is already safe on an empty
+table). Then rebuild `unique_claims` from `append_decisions`; run the chain
+check (`es-verify all`), the order check (`es-verify order`), and the index
+check (`es-verify claims`). `anchors` may be restored or left to recompute; the
 exported anchor JSON is the durable evidence. `feed_checkpoints` and
 `feed_dead_letters` are optional; `snapshots` and `feed_leases` are not
 restored.
@@ -311,10 +332,11 @@ Two clone shapes, with different rules:
   the sequence is irrelevant and `es-verify all` / `order` / `claims` can run
   continuously. This is the useful shape for DR verification: the copy proves
   itself every day instead of at incident time.
-- **Fork (writable).** Seed at a cut, `setval` the sequence, then stop applying
-  and let it diverge. It is a fork: never merge it back, and never point it at
-  the backup prefix. Promotion is a cutover — quiesce, take a final cut,
-  repoint — not a merge.
+- **Fork (writable).** Seed at a cut, `setval` both sequences (the event
+  position sequence and `append_decisions_id_seq` — the identity sequence does
+  not follow a data-only load), then stop applying and let it diverge. It is a
+  fork: never merge it back, and never point it at the backup prefix. Promotion
+  is a cutover — quiesce, take a final cut, repoint — not a merge.
 
 Data governance is part of the design, not an afterthought. A clone moves
 production payloads and claim identifiers into a lower-trust environment. Sealed
