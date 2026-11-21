@@ -188,8 +188,9 @@ func TestAppendRollbackWritesNoConstraintOps(t *testing.T) {
 	}
 }
 
-// TestAppendWithoutConstraintsWritesNoConstraintOps pins the negative: a plain
-// event append leaves the column NULL.
+// TestAppendWithoutConstraintsWritesNoConstraintOps pins the negative: a
+// nil-constraints append leaves constraint_ops NULL on EVERY row of the batch,
+// not just the first.
 func TestAppendWithoutConstraintsWritesNoConstraintOps(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -199,13 +200,22 @@ func TestAppendWithoutConstraintsWritesNoConstraintOps(t *testing.T) {
 	if _, err := s.Workspace(ws).Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 0,
-		Events:          eventData("plain"),
+		Events: []es.EventData{
+			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain-1")},
+			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain-2")},
+			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain-3")},
+		},
 	}); err != nil {
 		t.Fatalf("append without constraints: %v", err)
 	}
 	rows := eventOps(t, s, ws, sid)
-	if len(rows) != 1 || rows[0].ops != nil {
-		t.Fatalf("constraint_ops after a zero-constraint append = %v, want NULL", rows)
+	if len(rows) != 3 {
+		t.Fatalf("event rows = %d, want 3", len(rows))
+	}
+	for _, row := range rows {
+		if row.ops != nil {
+			t.Fatalf("constraint_ops on v%d = %x, want NULL on every row", row.version, row.ops)
+		}
 	}
 }
 
@@ -468,11 +478,12 @@ func TestVerifyClaimsReportsDivergence(t *testing.T) {
 	}
 }
 
-// TestClaimWorkspacesFromEvents pins the workspace discovery for
-// `es-verify claims`: it reads the event log, because claims are a projection
-// of the events (ADR 0043). A workspace with claim state but no op-bearing
-// event is still discovered through its events and its refusal is visible.
-func TestClaimWorkspacesFromEvents(t *testing.T) {
+// TestClaimWorkspacesUnionsEventsAndClaims pins the workspace discovery for
+// `es-verify claims`: it is the union of the event log and the live index
+// (ADR 0043 §2.2). A workspace with claim state but no events at all is the
+// inconsistent store the audit must surface, not skip, so the union is
+// detection — both operations then refuse it with ErrClaimsWithoutDecisions.
+func TestClaimWorkspacesUnionsEventsAndClaims(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	const (
@@ -498,19 +509,16 @@ func TestClaimWorkspacesFromEvents(t *testing.T) {
 		t.Fatalf("claim-bearing append: %v", err)
 	}
 
-	// The inconsistent workspace has an event (so discovery sees it) and a
-	// live claim the event log does not license.
-	if _, err := s.Workspace(noOpsWS).Append(ctx, es.AppendParams{
-		StreamID:        opsStream(t, "no-ops"),
-		ExpectedVersion: 0,
-		Events:          eventData("no ops"),
-	}); err != nil {
-		t.Fatalf("plain append: %v", err)
-	}
+	// The inconsistent workspace has a live claim and NO events at all: only
+	// the unique_claims arm of the union can discover it.
 	if _, err := pinnedConn(t, s, noOpsWS).Exec(ctx,
 		`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
-		noOpsWS, "email", []byte("inconsistent@b"), sid.Canonical()); err != nil {
-		t.Fatalf("insert claim with no op history: %v", err)
+		noOpsWS, "email", []byte("inconsistent@b"), opsStream(t, "no-ops").Canonical()); err != nil {
+		t.Fatalf("insert claim with no events: %v", err)
+	}
+	if n := countPinned(t, s, noOpsWS,
+		`SELECT count(*) FROM events WHERE workspace_id = '`+noOpsWS+`'`); n != 0 {
+		t.Fatalf("inconsistent workspace events = %d, want 0", n)
 	}
 
 	got, err := s.ClaimWorkspaces(ctx)
@@ -540,8 +548,11 @@ func TestClaimWorkspacesFromEvents(t *testing.T) {
 	}
 
 	// Discovery must surface the inconsistent workspace so its refusal is
-	// visible, not skipped: the rebuild declines to guess or delete.
+	// visible, not skipped: both operations decline to guess or delete.
 	if _, err := s.WorkspaceStore(noOpsWS).RebuildClaims(ctx); !errors.Is(err, es.ErrClaimsWithoutDecisions) {
 		t.Errorf("rebuild the inconsistent workspace: got %v, want ErrClaimsWithoutDecisions", err)
+	}
+	if _, err := s.WorkspaceStore(noOpsWS).VerifyClaims(ctx); !errors.Is(err, es.ErrClaimsWithoutDecisions) {
+		t.Errorf("verify the inconsistent workspace: got %v, want ErrClaimsWithoutDecisions", err)
 	}
 }
