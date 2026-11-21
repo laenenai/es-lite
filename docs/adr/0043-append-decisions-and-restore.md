@@ -140,9 +140,7 @@ append_decisions (
 - RLS mirrors `unique_claims`: the workspace arm plus the role-gated relay
   bypass arm in its hardened form (`0007_policy_hardening.sql`), with `FORCE ROW
   LEVEL SECURITY`. Grants mirror the index the table derives: the appender gets
-  `SELECT, INSERT, DELETE`, `USAGE` on the identity sequence (`id` is
-  `GENERATED ... AS IDENTITY`, so the insert draws, not supplies), and no
-  `UPDATE`. The `DELETE` is the erasure arm
+  `SELECT, INSERT, DELETE` and no `UPDATE`. The `DELETE` is the erasure arm
   (§3.4). The least-privilege test must pin the grant and drive a decision row
   through the appender role; v0.20.0 showed what an unpinned grant costs.
 
@@ -235,9 +233,9 @@ invent it — `ops` is binary, so the backfill cannot be a portable SQL
 `INSERT … SELECT`. The cutover is a one-time command, run with writers quiesced:
 
 1. migrate;
-2. grant the appender `SELECT, INSERT, DELETE` on `append_decisions` and
-   `USAGE` on its identity sequence, then deploy the binary — the grant needs
-   the table, and the binary needs the grant;
+2. grant the appender `SELECT, INSERT, DELETE` on `append_decisions`, then
+   deploy the binary — the grant needs the table, and the binary needs the
+   grant;
 3. run `es-verify claims --adopt-existing`, which writes one synthetic `Claim`
    decision row per live `unique_claims` row (`from_version = to_version = 0`,
    `command_id = NULL`, the claim's own `stream_id`);

@@ -691,3 +691,44 @@ become traceable. Already-recorded rows are not rewritten.
 `correlation_id == command_id` (the old fallback shape) for non-UUID
 correlations must match on the header's hash instead — or, better, send a
 UUID `Correlation-Id`, which still passes through byte-for-byte.
+
+## 2026-11-21 — Append decisions: new table, new appender grant, one-time cutover
+
+**What changes.** Migration 0014 (Postgres) and 0012 (SQLite) add
+`append_decisions`, written inside the append transaction for every append
+that carries at least one constraint op — including a claim-only append,
+which previously left no trace anywhere. The row records the ops `Decide`
+returned and `applyClaims` applied, so `unique_claims` becomes a derived
+index: `es-verify claims --rebuild` replays the table into it. The appender
+role needs `SELECT, INSERT, DELETE` on the new table (the
+`GENERATED ... AS IDENTITY` column draws its own value, so its sequence
+needs no grant):
+
+```sql
+GRANT SELECT, INSERT, DELETE ON append_decisions TO <appender>;
+```
+
+There is no Go API break: `es.Store`, `Decide`, `AppendParams`, the chain,
+`log_order`, anchors, the feed and snapshots are unchanged. Every
+constraint-bearing append now costs one more single-row INSERT.
+
+**Who is affected.** Every deployment that calls `Claim`/`Release` or lets
+`aggregate.Runtime` apply constraints: the write path includes the new
+INSERT, and a missing grant fails the append. Postgres least-privilege
+deployments must add the grant above. Deployments that use no constraints
+are unaffected: the migration still lands, and no rows are written.
+
+**What to do.** In this order: **migrate, grant, deploy.** The grant needs
+the table; the binary needs the grant, or every constraint-bearing append
+fails. Quiesce writers before the new binary takes its first append — a
+decision row written ahead of the backfill makes the cutover refuse — then
+run `es-verify claims --adopt-existing` once: it writes one synthetic
+`Claim` row per live claim and refuses if `append_decisions` already holds a
+row, so it cannot run twice. Verify with `es-verify claims` (it must report
+`claims OK`, exit 0) and resume writers.
+
+A restore from a stream older than the cutover is a pre-0043 state: it has
+no decision history and needs the old four-table rule (`unique_claims` in
+the backup set). Rolling back — dropping `append_decisions` — loses only the
+rebuild path; the live index and every append it serves are unchanged. See
+`docs/deploy/README.md` for the backup, restore and clone contract.

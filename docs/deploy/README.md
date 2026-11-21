@@ -481,7 +481,7 @@ claims missing.
    (SELECT max(global_position) FROM events));` and confirm `CACHE 1` (§ *The
    `CACHE 1` invariant*). Skip it only when the restored log is empty.
 5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
-   The second command must report an empty diff. Rebuilding needs the
+   The second command must report `claims OK`. Rebuilding needs the
    appender/owner connection; deleting and reinserting `unique_claims` is the
    one place a restore writes that table.
 6. Run `es-verify all` (every stream chain) and `es-verify order` (every batch
@@ -496,6 +496,13 @@ claims missing.
 An `es-verify claims` diff after an unreconciled cut is expected — it means the
 cut was mixed, not that data was lost. Re-cut and redo the load.
 
+`es-verify claims` exits 0 when the index matches the decision log
+(`claims OK: N decisions`), 1 on a divergence (`DIVERGED:`, naming the first
+divergent `(scope, value_key, stream_id)`), and 2 on a connection, usage or
+refusal error — nothing was audited, so a 2 is never a pass. The mutating
+modes (`--rebuild`, `--adopt-existing`) exit 0 or 2 only: a rebuild that
+cannot replay the log refuses instead of leaving a partial index.
+
 ### Clones
 
 The same three tables are a logical replication feed. Two shapes, different
@@ -504,7 +511,8 @@ rules:
 - **Follow (read-only clone).** Apply later cuts as they arrive. Apply **per
   source transaction**, not per table: an event batch without its decision row
   has a wrong index for a window. The clone never appends, so the sequence is
-  irrelevant, and `es-verify all`, `order` and `claims` can run on a schedule.
+  irrelevant, and `es-verify all`, `es-verify order` and `es-verify claims`
+  can run on a schedule.
   That is the useful property: the DR copy proves itself continuously instead
   of at incident time.
 - **Fork (writable staging).** Seed at a cut, `setval` the sequence, then stop
@@ -552,7 +560,7 @@ history. With writers quiesced:
    `Claim` row per live claim (`from_version = to_version = 0`,
    `command_id = NULL`, the claim's own stream). It refuses when
    `append_decisions` is non-empty, so it cannot run twice.
-4. Run `es-verify claims` (empty diff) and resume writers.
+4. Run `es-verify claims` (it must report `claims OK`) and resume writers.
 
 From that point the three-table set is sufficient and no pre-cutover copy has
 to be retained. A restore from a stream older than the cutover is a pre-0043
