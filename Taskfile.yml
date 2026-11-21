@@ -155,8 +155,9 @@ tasks:
       COVERAGE_FLOOR: "61.3"
     cmds:
       # Unit profile: integration suites skip without their DSNs, exactly
-      # like `task test`.
-      - go test -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      # like `task test`. The benchmark tool is measurement code with no unit
+      # suite; counting it would move the ratchet for the wrong reason.
+      - go test -count=1 -coverprofile=coverage.out -covermode=atomic $(go list ./... | grep -v '/cmd/es-bench$')
       # Postgres profile. One shell block so a container we start is
       # scoped to the suite — the trap fires on exit, including failures,
       # mirroring test:pg's defer.
