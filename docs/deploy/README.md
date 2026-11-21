@@ -280,7 +280,10 @@ draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1), and
 applies uniqueness constraints. It is also the process running
 `aggregate.Runtime`, so with a snapshot cache configured (ADR 0042) it
-both reads and writes `snapshots` — the same role as for `events`.
+both reads and writes `snapshots` — the same role as for `events`, not the
+same posture: `events` is append-only by grant and chain-attested, while
+`snapshots` is read/write and nothing attests its bytes. Treat the appender's
+access to it as trusted infrastructure (see the trust note in the README).
 `Release` is the only `DELETE` the append path ever issues, and it is on
 the claims index, never on the log (`Purge` on the snapshot cache, below,
 is the one other `DELETE`):
@@ -411,18 +414,22 @@ signal. (SQLite's 0011 is a plain `CREATE TABLE` and refuses a foreign
 table the same way.)
 
 **Backups.** Snapshots are derived state, so a logical backup may exclude
-them when size matters: `pg_dump --exclude-table=snapshots …`. A physical
-restore that leaves the table empty or missing needs no recovery step:
-missing snapshots rebuild lazily — the next append past the runtime's gap
-rewrites the row, and `Runtime.WarmSnapshot` repopulates a stream
-explicitly, archived aggregates nothing appends to included.
+them when size matters: `pg_dump --exclude-table=snapshots …`. That is an
+erasure decision as well as a size one: `Purge` cannot reach a dump file, so a
+backup that includes `snapshots` holds a copy of the state that must obey the
+same retention as the log — and, for sealed state, be unreadable once the key
+is destroyed. A physical restore that leaves the table empty or missing needs
+no recovery step: missing snapshots rebuild lazily — the next append past the
+runtime's gap rewrites the row, and `Runtime.WarmSnapshot` repopulates a
+stream explicitly, archived aggregates nothing appends to included.
 
 **Erasure.** Both adapters expose `Purge(ctx)` — delete every snapshot the
 cache holds, workspace-scoped on Postgres. It is best-effort and
 application-coordinated, like the projection purge (ADR 0004 §4): a command
 in flight, or one starting immediately after, can re-insert a row. Quiesce
 the workspace before running it — or, for sealed state, destroy the key
-first, which makes any racing re-insert inert.
+first, which makes any racing re-insert inert. `Purge` does not reach backup
+files; see the backup note above.
 
 ## Feed operations (ADR 0037)
 
