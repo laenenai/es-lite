@@ -1,0 +1,43 @@
+{
+  "workspace": "bench-ws-1",
+  "footprint_before": {
+    "claims": "1002000",
+    "events": "10020000",
+    "heap": "3481 MB",
+    "indexes": "3819 MB",
+    "log_order": "2000",
+    "op_rows": "1002000",
+    "ops_index": "152 MB",
+    "total": "7301 MB"
+  },
+  "appends": {
+    "count": 0,
+    "batch": 10,
+    "claim_every": 1,
+    "p50_ms": 0,
+    "p99_ms": 0,
+    "mean_ms": 0,
+    "max_ms": 0
+  },
+  "rebuild": {
+    "seconds": 128.718282084,
+    "ops": 1002000,
+    "claims": 1002000
+  },
+  "verify": {
+    "seconds": 123.535448667,
+    "ok": true,
+    "ops": 1002000,
+    "claims": 1002000
+  },
+  "footprint_after": {
+    "claims": "1002000",
+    "events": "10020000",
+    "heap": "3481 MB",
+    "indexes": "3819 MB",
+    "log_order": "2000",
+    "op_rows": "1002000",
+    "ops_index": "152 MB",
+    "total": "7301 MB"
+  }
+}

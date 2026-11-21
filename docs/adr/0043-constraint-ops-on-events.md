@@ -274,10 +274,11 @@ arises.
 - Least privilege: the appender already has `SELECT, INSERT` on `events`; the
   new column is covered. There is no new table and no grant change, and the
   superseded table's grants are removed.
-- Validation: the index-only replay plan is measured at 1M rows. The
-  10M–100M benchmark (matrix, hardware and acceptance criteria) is a tracked
-  [backlog item](../backlog/2026-11-21_events-scale-benchmark.md) and is the
-  gate on quoting a capacity number as measured.
+- Validation: measured 2026-11-21 on 10M and 50M event logs and a
+  12.5M-per-partition spread; rebuild and verify are linear in claim-bearing
+  rows (~8k claims/s). The 100M/1% case is extrapolated from the 1M-claim run,
+  not measured. Results, hardware and caveats:
+  [docs/benchmarks/2026-11-21-results.md](../benchmarks/2026-11-21-results.md).
 - Docs: runbook (backup/restore/clone/erasure), migration note (new column, no
   new table, claim-only rejection), README (the events-only rule and the MAC
   obligation).

@@ -11,8 +11,11 @@ graduates into an ADR.
 
 ## Open
 
-- [2026-08-02 — Schema migration strategy](./2026-08-02_migrations.md)
 - [2026-11-05 — Reconnect-swallowed feed errors are unobservable](./2026-11-05_reconnect-swallowed-errors.md)
 - [2026-11-07 — Postgres transaction-scaffolding duplication](./2026-11-07_postgres-tx-scaffolding.md)
-- [2026-11-21 — Events scale benchmark (10M–100M rows)](./2026-11-21_events-scale-benchmark.md)
+- [2026-11-21 — Events scale benchmark (10M–100M rows)](./2026-11-21_events-scale-benchmark.md) — 10M/50M measured; 100M extrapolated, restore drill pending
 - [2026-11-21 — S3 events sink (proposal)](./2026-11-21_s3-events-sink.md)
+
+## Resolved
+
+- [2026-08-02 — Schema migration strategy](./2026-08-02_migrations.md)
