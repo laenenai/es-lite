@@ -62,9 +62,14 @@ type backend struct {
 	// error, exit 2 — never a silent skip, never a vacuous pass.
 	verifyOrder func(context.Context, uint64) (*es.OrderVerifyReport, error)
 	// claims is the per-workspace claims index maintainer (ADR 0043).
-	claims  func(workspace string) es.ClaimsMaintainer
-	multiWS bool
-	close   func()
+	claims func(workspace string) es.ClaimsMaintainer
+	// claimWorkspaces enumerates the workspaces with claim state. It is
+	// not derived from streams: a workspace whose appends were all
+	// claim-only has no event, so a stream-derived list would skip the
+	// only workspace the audit needed to read.
+	claimWorkspaces func(context.Context) ([]string, error)
+	multiWS         bool
+	close           func()
 }
 
 func main() {
@@ -302,6 +307,14 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 		for _, ws := range workspaces {
 			n, err := b.claims(ws).AdoptClaims(ctx)
 			if err != nil {
+				// A workspace already carrying decisions is done, not a
+				// failure: a mixed database (A adopted, B not) must be
+				// able to finish its cutover on a retry. Only a real
+				// error stops the run.
+				if errors.Is(err, es.ErrClaimsAlreadyAdopted) {
+					fmt.Fprintf(os.Stderr, "es-verify: %salready adopted\n", wsPrefix(ws))
+					continue
+				}
 				fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
 				return exitUsage
 			}
@@ -340,7 +353,10 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 		}
 		decisions += rep.Decisions
 		if !rep.OK {
-			fmt.Printf("DIVERGED: %s\n", rep.FirstDivergence)
+			// Name the workspace like verifyOne does: in a multi-workspace
+			// audit the divergence is worthless to an operator who cannot
+			// tell which workspace to rebuild.
+			fmt.Printf("DIVERGED: %s%s\n", wsLabel(ws), rep.FirstDivergence)
 			code = mergeExit(code, exitBroken)
 		}
 	}
@@ -351,28 +367,31 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 }
 
 // claimWorkspaces resolves the workspaces a claims command runs over: an
-// explicit argument wins; on Postgres with no argument, the distinct
-// workspaces of the existing streams; SQLite is one empty workspace.
+// explicit argument scopes the run to one; otherwise the backend enumerates
+// every workspace with claim state. Listing streams would miss a workspace
+// whose appends were all claim-only (ADR 0043): it writes no event, so its
+// claims index would go unaudited while the command exited 0.
 func claimWorkspaces(ctx context.Context, b *backend, args []string) ([]string, error) {
 	if len(args) == 1 {
 		return []string{args[0]}, nil
 	}
-	if !b.multiWS {
-		return []string{""}, nil
+	if b.claimWorkspaces == nil {
+		return nil, errors.New("this backend cannot enumerate claim workspaces")
 	}
-	refs, err := b.ListStreams(ctx)
+	workspaces, err := b.claimWorkspaces(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list streams: %w", err)
-	}
-	seen := make(map[string]bool, len(refs))
-	workspaces := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		if !seen[ref.Workspace] {
-			seen[ref.Workspace] = true
-			workspaces = append(workspaces, ref.Workspace)
-		}
+		return nil, fmt.Errorf("list claim workspaces: %w", err)
 	}
 	return workspaces, nil
+}
+
+// wsLabel prefixes a per-workspace line in a multi-workspace run, in
+// verifyOne's label style; SQLite's single empty workspace stays unlabeled.
+func wsLabel(ws string) string {
+	if ws == "" {
+		return ""
+	}
+	return ws + " "
 }
 
 // wsPrefix labels a per-workspace error; SQLite's single empty workspace
@@ -451,13 +470,14 @@ func openBackend(ctx context.Context) (*backend, error) {
 			return nil, fmt.Errorf("open postgres: %w", err)
 		}
 		return &backend{
-			Anchorer:     store,
-			scope:        store.Workspace,
-			chainedSince: store.ChainedSince,
-			verifyOrder:  store.VerifyOrder,
-			claims:       func(ws string) es.ClaimsMaintainer { return store.WorkspaceStore(ws) },
-			multiWS:      true,
-			close:        store.Close,
+			Anchorer:        store,
+			scope:           store.Workspace,
+			chainedSince:    store.ChainedSince,
+			verifyOrder:     store.VerifyOrder,
+			claims:          func(ws string) es.ClaimsMaintainer { return store.WorkspaceStore(ws) },
+			claimWorkspaces: store.ClaimWorkspaces,
+			multiWS:         true,
+			close:           store.Close,
 		}, nil
 	case "sqlite":
 		dsn := os.Getenv("SQLITE_DSN")
@@ -477,7 +497,10 @@ func openBackend(ctx context.Context) (*backend, error) {
 			chainedSince: store.ChainedSince,
 			verifyOrder:  store.VerifyOrder,
 			claims:       func(string) es.ClaimsMaintainer { return store },
-			close:        func() { _ = store.Close() },
+			claimWorkspaces: func(context.Context) ([]string, error) {
+				return []string{""}, nil
+			},
+			close: func() { _ = store.Close() },
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown BACKEND %q (want postgres|sqlite)", kind)

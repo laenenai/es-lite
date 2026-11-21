@@ -413,10 +413,12 @@ func TestClaimsCommandRebuildAndVerify(t *testing.T) {
 	}
 }
 
-// TestClaimsCommandAdoptRefuses pins the cutover guard: once any append
-// decision exists, adoption refuses — exit 2, stderr names the cutover —
-// and writes no row, because a duplicate Claim would break every rebuild.
-func TestClaimsCommandAdoptRefuses(t *testing.T) {
+// TestClaimsCommandAdoptAlreadyAdopted pins the CLI's side of the once-only
+// cutover: the adapter refuses a second backfill, and the command treats that
+// as "this workspace is done" — exit 0, nothing written — so a mixed database
+// can finish its cutover on a retry. The refusal itself is pinned at the
+// adapter level (TestAdoptRefusesWhenDecisionsExist).
+func TestClaimsCommandAdoptAlreadyAdopted(t *testing.T) {
 	s := newTestDB(t)
 	sid, err := es.NewStreamID("thing", "a")
 	if err != nil {
@@ -428,14 +430,14 @@ func TestClaimsCommandAdoptRefuses(t *testing.T) {
 
 	var code int
 	_, stderr := captureOutput(t, func() { code = run([]string{"claims", "--adopt-existing"}) })
-	if code != exitUsage {
-		t.Errorf("claims --adopt-existing with decision history: exit %d, want %d", code, exitUsage)
+	if code != exitIntact {
+		t.Errorf("claims --adopt-existing with decision history: exit %d, want %d — an adopted workspace is done, not a failure", code, exitIntact)
 	}
 	if !strings.Contains(stderr, "cutover") {
 		t.Errorf("claims --adopt-existing: stderr %q, want the cutover warning", stderr)
 	}
-	if !strings.Contains(stderr, es.ErrClaimsAlreadyAdopted.Error()) {
-		t.Errorf("claims --adopt-existing: stderr %q, want the refusal message", stderr)
+	if !strings.Contains(stderr, "already adopted") {
+		t.Errorf("claims --adopt-existing: stderr %q, want the already-adopted note", stderr)
 	}
 	if after := countDecisions(t); after != before {
 		t.Errorf("claims --adopt-existing: %d decisions after, want %d (nothing added)", after, before)
@@ -457,12 +459,14 @@ func TestClaimsCommandFlagsConflict(t *testing.T) {
 	}
 }
 
-// fakeClaims is a minimal es.ClaimsMaintainer for the precedence test: that
-// test drives VerifyClaims only, and the other methods exist to satisfy the
-// interface.
+// fakeClaims is a minimal es.ClaimsMaintainer for the command tests: they
+// drive VerifyClaims or AdoptClaims, and the other methods exist to satisfy
+// the interface.
 type fakeClaims struct {
-	rep es.ClaimsVerifyReport
-	err error
+	rep      es.ClaimsVerifyReport
+	err      error
+	adoptN   int64
+	adoptErr error
 }
 
 func (f fakeClaims) RebuildClaims(context.Context) (es.ClaimsRebuildReport, error) {
@@ -473,42 +477,34 @@ func (f fakeClaims) VerifyClaims(context.Context) (es.ClaimsVerifyReport, error)
 	return f.rep, f.err
 }
 
-func (f fakeClaims) AdoptClaims(context.Context) (int64, error) { return 0, nil }
-
-// fakeLister supplies ListStreams — the only Anchorer method claimWorkspaces
-// calls — for the Postgres-shaped precedence test. The embedded nil Anchorer
-// makes any accidental call to another method panic, so the fake cannot
-// quietly grow.
-type fakeLister struct {
-	es.Anchorer
-	refs []es.StreamRef
-}
-
-func (f fakeLister) ListStreams(context.Context) ([]es.StreamRef, error) { return f.refs, nil }
+func (f fakeClaims) AdoptClaims(context.Context) (int64, error) { return f.adoptN, f.adoptErr }
 
 // TestClaimsCommandDivergenceDominatesError pins the claims verify exit
 // precedence across workspaces: a divergence already confirmed on one
 // workspace is a tamper, and a later workspace's read/connection error must
 // not mask it as "nothing audited" (exit 2). Both orders must exit 1, per
-// mergeExit's broken-dominates rule.
+// mergeExit's broken-dominates rule, and the divergence names its workspace.
 func TestClaimsCommandDivergenceDominatesError(t *testing.T) {
 	diverged := fakeClaims{rep: es.ClaimsVerifyReport{Decisions: 1, FirstDivergence: "scope=thing.slug value=61 stream=thing:a"}}
 	failed := fakeClaims{err: errors.New("read failed")}
 	for _, tc := range []struct {
 		name          string
 		first, second fakeClaims
+		divergedWS    string
 	}{
-		{"divergence then error", diverged, failed},
-		{"error then divergence", failed, diverged},
+		{"divergence then error", diverged, failed, "a"},
+		{"error then divergence", failed, diverged, "b"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := &backend{
-				Anchorer: fakeLister{refs: []es.StreamRef{{Workspace: "a"}, {Workspace: "b"}}},
 				claims: func(ws string) es.ClaimsMaintainer {
 					if ws == "a" {
 						return tc.first
 					}
 					return tc.second
+				},
+				claimWorkspaces: func(context.Context) ([]string, error) {
+					return []string{"a", "b"}, nil
 				},
 				multiWS: true,
 			}
@@ -517,11 +513,53 @@ func TestClaimsCommandDivergenceDominatesError(t *testing.T) {
 			if code != exitBroken {
 				t.Errorf("claims across a divergence and an error: exit %d, want %d — the divergence must dominate", code, exitBroken)
 			}
-			if !strings.Contains(stdout, "DIVERGED: "+diverged.rep.FirstDivergence) {
-				t.Errorf("claims across a divergence and an error: stdout %q, want the divergence report", stdout)
+			if want := "DIVERGED: " + tc.divergedWS + " " + diverged.rep.FirstDivergence; !strings.Contains(stdout, want) {
+				t.Errorf("claims across a divergence and an error: stdout %q, want %q — the divergence must name its workspace", stdout, want)
 			}
 			if !strings.Contains(stderr, "read failed") {
 				t.Errorf("claims across a divergence and an error: stderr %q, want the workspace error", stderr)
+			}
+		})
+	}
+}
+
+// TestClaimsCommandAdoptContinuesPastAdopted pins the mixed-database cutover:
+// one workspace may already be adopted, and the command must finish the rest
+// instead of aborting on it. Both orders exit 0 and report the already-adopted
+// workspace by name.
+func TestClaimsCommandAdoptContinuesPastAdopted(t *testing.T) {
+	adopted := fakeClaims{adoptErr: es.ErrClaimsAlreadyAdopted}
+	fresh := fakeClaims{adoptN: 2}
+	for _, tc := range []struct {
+		name          string
+		first, second fakeClaims
+	}{
+		{"adopted then fresh", adopted, fresh},
+		{"fresh then adopted", fresh, adopted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &backend{
+				claims: func(ws string) es.ClaimsMaintainer {
+					if ws == "a" {
+						return tc.first
+					}
+					return tc.second
+				},
+				claimWorkspaces: func(context.Context) ([]string, error) {
+					return []string{"a", "b"}, nil
+				},
+				multiWS: true,
+			}
+			var code int
+			stdout, stderr := captureOutput(t, func() { code = cmdClaims(context.Background(), b, []string{"--adopt-existing"}) })
+			if code != exitIntact {
+				t.Errorf("adopt across a mixed database: exit %d, want %d — an already-adopted workspace is not a failure", code, exitIntact)
+			}
+			if !strings.Contains(stdout, "claims adopted: 2 decisions") {
+				t.Errorf("adopt across a mixed database: stdout %q, want the fresh workspace's 2 decisions", stdout)
+			}
+			if !strings.Contains(stderr, "already adopted") {
+				t.Errorf("adopt across a mixed database: stderr %q, want the already-adopted note", stderr)
 			}
 		})
 	}
