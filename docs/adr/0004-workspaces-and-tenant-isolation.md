@@ -5,6 +5,8 @@
 - **Date:** 2026-08-01
 
 > Errata (2026-10-28): server-side crypto-shredding and per-workspace key custody are superseded by ADR 0025. Workspace isolation (RLS/partitioning) remains accepted.
+>
+> Errata (2026-11-21): the "e.g. 64–256" partition-count example below was never the implemented count. The in-repo schema uses **8**, sized by the 2026-11-21 scale benchmark; the hash-by-`workspace_id` decision is unchanged.
 
 ## Context
 
@@ -43,8 +45,9 @@ CREATE TABLE events (
     ...
     PRIMARY KEY (workspace_id, stream_id, version)
 ) PARTITION BY HASH (workspace_id);
--- a FIXED number of hash partitions (e.g. 64–256), NOT one per workspace:
--- 100k partitions would cripple query planning and autovacuum.
+-- a FIXED number of hash partitions, deployment-sized: the in-repo schema
+-- uses 8. NOT one per workspace: 100k partitions would cripple query
+-- planning and autovacuum.
 ```
 
 RLS policies key off a per-transaction session variable the store sets:
@@ -62,6 +65,16 @@ across all workspaces (mirroring the parent's `ReadAll` vs.
 Hash-partitioning by `workspace_id` (fixed count) keeps the single giant
 `events` table's indexes and vacuum tractable without creating
 per-workspace objects.
+
+The count is a sizing decision, not part of the isolation contract. Eight is
+the in-repo default: the 2026-11-21 benchmark measured a 50M-event partition
+at 35 GB with a 56 s claims rebuild, and a 12.5M-per-partition spread at 1.4 s
+([results](../benchmarks/2026-11-21-results.md)). Increase it only when
+measured per-partition maintenance demands it — changing the modulus is a new
+parent table and a copy. A dominant tenant is isolated with a dedicated shard,
+not by re-keying this table by stream or type: those keys break
+workspace-scoped pruning and force themselves into the unique constraints
+([benchmark backlog](../backlog/2026-11-21_events-scale-benchmark.md#before-500m-events-in-one-tenant)).
 
 **SQLite** stays single-workspace per file — the dev/edge backend. The
 two backends deliberately diverge on isolation (ADR 0002): SQLite =
