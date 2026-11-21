@@ -61,6 +61,47 @@ func TestFeedIndexesExist(t *testing.T) {
 	}
 }
 
+// TestEventOpsIndexExists pins migration 0015's partial index (ADR 0043
+// §2.2): the claims replay orders op-bearing events by global position, and
+// without an index whose predicate matches `constraint_ops IS NOT NULL` the
+// planner fetches every event in the partition to test the null. The
+// predicate and INCLUDE are part of the definition, so match the whole
+// indexdef, not just the column list — the plain events_ws_pos_idx has the
+// same key columns, and dropping the INCLUDE would quietly reintroduce a
+// heap fetch per candidate row.
+func TestEventOpsIndexExists(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	rows, err := s.Pool().Query(ctx, `
+		SELECT tablename FROM pg_indexes
+		WHERE tablename LIKE 'events_p%'
+		  AND indexdef ILIKE '%(workspace_id, global_position)%'
+		  AND indexdef ILIKE '%INCLUDE (stream_id, constraint_ops)%'
+		  AND indexdef ILIKE '%constraint_ops IS NOT NULL%'
+		ORDER BY tablename`)
+	if err != nil {
+		t.Fatalf("query events_ops_idx: %v", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			t.Fatalf("scan events_ops_idx: %v", err)
+		}
+		tables = append(tables, table)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows events_ops_idx: %v", err)
+	}
+	for _, p := range []string{"events_p0", "events_p1", "events_p2", "events_p3", "events_p4", "events_p5", "events_p6", "events_p7"} {
+		if !slices.Contains(tables, p) {
+			t.Fatalf("events_ops_idx: no partial (workspace_id, global_position) index WHERE constraint_ops IS NOT NULL on %s (found on %v)", p, tables)
+		}
+	}
+}
+
 // TestAllBypassPoliciesRoleGated pins migrations 0007/0009's policy shape
 // (review F8/F12) through pg_policies — not file greps, which would
 // false-positive on comments (the Task 13 review ruling). All four policies
@@ -390,8 +431,8 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("read shared ledger: %v", err)
 	}
-	if v != 14 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 14 (every embedded migration applied)", v)
+	if v != 15 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 15 (every embedded migration applied)", v)
 	}
 }
 
@@ -471,7 +512,7 @@ func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
 				PRIMARY KEY (workspace_id, stream_id)
 			)`,
 			wantErr: false,
-			wantV:   14,
+			wantV:   15,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -565,8 +606,8 @@ func TestMigrateWritesTheSharedLedger(t *testing.T) {
 	`).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if n != 14 {
-		t.Fatalf("eventstore ledger rows = %d, want 14", n)
+	if n != 15 {
+		t.Fatalf("eventstore ledger rows = %d, want 15", n)
 	}
 
 	var legacy bool
@@ -623,8 +664,8 @@ func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
 	`).Scan(&total); err != nil {
 		t.Fatalf("read ledger total: %v", err)
 	}
-	if total != 14 {
-		t.Fatalf("ledger rows = %d, want 14 after applying versions 4-14", total)
+	if total != 15 {
+		t.Fatalf("ledger rows = %d, want 15 after applying versions 4-15", total)
 	}
 }
 
@@ -647,8 +688,8 @@ func TestLedgerModuleNameUsesTheOption(t *testing.T) {
 	`).Scan(&eventstore); err != nil {
 		t.Fatalf("read eventstore rows: %v", err)
 	}
-	if custom != 14 {
-		t.Fatalf("custom ledger rows = %d, want 14", custom)
+	if custom != 15 {
+		t.Fatalf("custom ledger rows = %d, want 15", custom)
 	}
 	if eventstore != 0 {
 		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)

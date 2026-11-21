@@ -61,14 +61,14 @@ func TestPopulatedStoreChainsFromMigration(t *testing.T) {
 		}
 	}
 
-	// Now the upgrade: Migrate applies every embedded migration through 0012.
+	// Now the upgrade: Migrate applies every embedded migration through 0013.
 	s, err := NewWithDB(ctx, db)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	var version int
-	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 12 {
-		t.Fatalf("schema version = %d err=%v, want 12", version, err)
+	if err := db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 13 {
+		t.Fatalf("schema version = %d err=%v, want 13", version, err)
 	}
 	since, err := s.ChainedSince(ctx)
 	if err != nil || since.IsZero() {
