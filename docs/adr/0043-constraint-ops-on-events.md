@@ -182,6 +182,10 @@ The events table is a logical replication feed. The consumer contract:
   applying; it never merges back, and promotion is a handover, not a merge.
 - **`log_order` is optional for a functional clone** and required to re-verify
   order. `command_dedup` does not travel.
+- **Object storage (S3) is a possible landing zone, not a shipped sink.** A
+  sink would be a consumer of this contract; its shape, object format and cut
+  manifest are an open design question recorded in
+  [the backlog](../backlog/2026-11-21_s3-events-sink.md).
 
 ## 3. Consequences
 
@@ -270,6 +274,10 @@ arises.
 - Least privilege: the appender already has `SELECT, INSERT` on `events`; the
   new column is covered. There is no new table and no grant change, and the
   superseded table's grants are removed.
+- Validation: the index-only replay plan is measured at 1M rows. The
+  10M–100M benchmark (matrix, hardware and acceptance criteria) is a tracked
+  [backlog item](../backlog/2026-11-21_events-scale-benchmark.md) and is the
+  gate on quoting a capacity number as measured.
 - Docs: runbook (backup/restore/clone/erasure), migration note (new column, no
   new table, claim-only rejection), README (the events-only rule and the MAC
   obligation).

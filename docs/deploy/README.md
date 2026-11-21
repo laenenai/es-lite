@@ -521,6 +521,13 @@ ephemeral. `command_dedup` is a post-commit response cache: exclude it, and read
 the dedup note below before deciding otherwise. There is no second state table
 and no second sequence: one table carries the events and the ops.
 
+**Scale evidence is pending.** The replay index makes rebuild and verify
+index-only and linear in claim-bearing batches, but the envelope so far is
+extrapolated from a 1M-row warm-cache probe. The 10M–100M benchmark — matrix,
+hardware and acceptance criteria — is tracked in
+[the backlog](../backlog/2026-11-21_events-scale-benchmark.md). Do not quote a
+capacity number as measured until it lands.
+
 **PITR.** If arbitrary point-in-time recovery is the requirement, use physical
 backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
 The whole database returns — the events *and* the index — and nothing needs
@@ -676,6 +683,13 @@ A clone moves production payloads and claim identifiers into a lower-trust
 environment. Do not share the production sealing key. Claim values are MACs:
 the same key lets the clone match and correlate them; a different key keeps
 uniqueness working but makes them opaque. Choose deliberately.
+
+**Object storage (S3).** S3 or an S3-compatible store is the natural landing
+zone for this stream, but no sink ships today. A sink must preserve the
+per-source-transaction batch, order and dedupe contract above; the open design
+questions and acceptance criteria are in
+[the backlog](../backlog/2026-11-21_s3-events-sink.md). Until then, use a CDC
+tool or the logical restore path above.
 
 ### Dedup on restore
 
