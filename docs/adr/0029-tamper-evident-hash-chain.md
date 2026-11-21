@@ -1,6 +1,7 @@
 # ADR 0029: Tamper-Evident Event Log (Per-Stream Hash Chain)
 
 - **Status:** Accepted (implemented; reverses the "tamper-evident hash chain" cut in ADR 0001)
+- **Amended by:** ADR 0043 (the append's constraint ops are excluded from the canonical encoding, like `SpanContext`)
 - **Date:** 2026-10-30
 
 ## Context

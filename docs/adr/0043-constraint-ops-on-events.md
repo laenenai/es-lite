@@ -70,9 +70,12 @@ for stores written before this model, and no compatibility shims are carried.
 the append transaction. It becomes indistinguishable from any other projection
 of the log:
 
-- `RebuildClaims` reads the workspace's events in **global position order**,
-  decodes `constraint_ops` on each row, applies release-then-claim, and replaces
-  the index in one transaction.
+- `RebuildClaims` reads the workspace's op-bearing events in **global position
+  order**, decodes `constraint_ops` on each row, applies release-then-claim, and
+  replaces the index in one transaction. Migration 0015's partial
+  `events_ops_idx` (`WHERE constraint_ops IS NOT NULL`, with the replay's
+  columns in `INCLUDE`) keeps that scan an index-only scan proportional to
+  claim-bearing batches, not every event in the partition.
 - `VerifyClaims` rebuilds into a temporary table and diffs both directions.
 - `ClaimWorkspaces` is the union of the workspace ids in `events` and
   `unique_claims`:
@@ -249,6 +252,13 @@ arises.
 - Migration `postgres 0014`: `ALTER TABLE events ADD COLUMN constraint_ops
   bytea` (partitioned parent; partitions inherit). `sqlite 0012`: the same as
   `BLOB`. No new table, no new grants.
+- Migration `postgres 0015` / `sqlite 0013`: the partial `events_ops_idx` on
+  `(workspace_id, global_position) INCLUDE (stream_id, constraint_ops) WHERE
+  constraint_ops IS NOT NULL` (SQLite: `(global_position)` without `INCLUDE`,
+  the table being single-workspace), so a rebuild scans claim-bearing batches
+  rather than every event and the Postgres replay is index-only. No new
+  grants; large stores build it per partition before upgrading (deployment
+  runbook).
 - Store insert/scan: write the encoded ops on the first event of the batch, read
   and decode on every envelope scan; `Envelope.ConstraintOps` is excluded from
   the hash.
@@ -263,8 +273,10 @@ arises.
 - Docs: runbook (backup/restore/clone/erasure), migration note (new column, no
   new table, claim-only rejection), README (the events-only rule and the MAC
   obligation).
-- Version: v0.21.0. No Go API break beyond `ErrConstraintWithoutEvent` and the
-  new envelope field; a claim-only command that used to succeed now fails.
+- Version: v0.21.0 for the model; the replay index in `postgres 0015` /
+  `sqlite 0013` lands in v0.22.0. No Go API break beyond
+  `ErrConstraintWithoutEvent` and the new envelope field; a claim-only command
+  that used to succeed now fails.
 
 ## 6. Resolved
 
