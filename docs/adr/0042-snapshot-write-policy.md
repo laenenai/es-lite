@@ -210,10 +210,11 @@ whatever component owns erasure ordering.
 
 ### 3.3 The trust boundary
 
-A snapshot cache is **trusted infrastructure**, as protected as the log. The
-lineage guard proves that the seed's *version* exists, not that its *state*
-matches the log; a forged row at a valid version with a matching `fold_version`
-drives `Decide` on forged state while every chain and anchor stays intact.
+A snapshot cache is **trusted infrastructure**: it must be protected at least
+as well as the log, and unlike the log it is rewritable. The lineage guard
+proves that the seed's *version* exists, not that its *state* matches the log;
+a forged row at a valid version with a matching `fold_version` drives `Decide`
+on forged state while every chain and anchor stays intact.
 `WithChainVerification` recomputes only the envelopes it folds, so a seeded
 load verifies the tail and trusts the seed.
 
@@ -225,9 +226,20 @@ the runtime falls through to a full fold. The README and the knob's doc comment
 say this plainly, and nothing in the audit output claims the chain attests the
 cache.
 
-The shipped default assumes the same protection as `events`: same database,
-same RLS, same grant discipline. A cache that lives somewhere less trusted is
-the caller's decision and needs the MAC.
+The default deployment puts the cache beside the log: same database, same RLS,
+and the same role reading it. That is not an integrity equivalence. `events` is
+append-only by grant and chain-attested; the appender necessarily holds
+`UPDATE` and `DELETE` on `snapshots` (the upsert and `Purge`), and nothing
+attests its bytes. The MAC is therefore the recommended default whenever the
+appender role or the database is inside the threat model — not only for a cache
+hosted somewhere less trusted.
+
+> **Update (2026-11-21):** the original text here said the default assumes "the
+> same grant discipline" as `events`. That is true of confidentiality and false
+> of integrity: the appender can rewrite every snapshot and no chain covers
+> them, so a MAC'ing `stateCodec` is the advised default for any threat model
+> that includes that role. The decision is unchanged; the recommendation is
+> corrected.
 
 ### 3.4 Not chosen, and why
 
@@ -288,6 +300,15 @@ the caller's decision and needs the MAC.
 - **The policy is per runtime**, not per stream: an aggregate type with a
   mixed population of short and long streams pays snapshots only for the long
   ones (short ones never cross), but cannot use different `n` for them.
+
+> **Update (2026-11-21):** one more accepted cost, surfaced by review.
+> `Snapshot.RecordedAt` advances only when a snapshot is written — at gap
+> crossings — so a stream that has appended fewer than `n` events since its
+> last snapshot keeps the older timestamp. `LoadStale(maxAge)` measures that
+> timestamp, so a large `n` paired with a small `maxAge` reports `fresh=false`
+> long before the data is meaningfully behind. The fallback is a seeded strong
+> load: a latency surprise, never a correctness one. Size `maxAge` against `n`,
+> or warm the stream when freshness matters.
 
 ## 6. Consequences
 

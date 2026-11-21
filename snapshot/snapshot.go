@@ -1,10 +1,12 @@
 // Package snapshot is the aggregate-state snapshot cache (ADR 0007/0009): a
 // pure, re-derivable optimization that lets the runtime seed folding from a
 // cached state at version N and fold only the tail (events > N) instead of the
-// whole stream. Correctness always comes from the log: before folding from a
-// seed the runtime verifies the log still contains version N — a snapshot can
-// outlive a log reset or truncation — so a snapshot that is stale, absent,
-// wrong, or ahead of the log only costs a longer fold.
+// whole stream. Correctness comes from the log only while the cached bytes are
+// trustworthy: before folding from a seed the runtime verifies the log still
+// contains version N — a snapshot can outlive a log reset or truncation — but
+// that guard proves the version exists, not that the state matches it. A
+// stale, absent, ahead-of-the-log, or undecodable snapshot costs only a longer
+// fold; a forged one is accepted (see the trust note below).
 //
 // A Cache is workspace-scoped and stores opaque state bytes. In the
 // client-owned-crypto model (ADR 0025) the caller seals state before Save if it
@@ -14,9 +16,10 @@
 // WithSnapshotEvery narrows automatic writes to the gap since the seed — 0
 // disables automatic writes, and WarmSnapshot writes explicitly. The in-tree
 // adapters are postgres.NewSnapshotCache and sqlite.NewSnapshotCache. The
-// cache is trusted infrastructure, as protected as the log: the chain
-// attests the log, not these bytes, so a store less protected than the log
-// needs a sealing/MAC'ing stateCodec (ADR 0042 §3.3, ADR 0025).
+// adapter. The cache is trusted infrastructure: the chain attests the log, not
+// these bytes, and the appender can rewrite them — so a MAC'ing/sealing
+// stateCodec is advised whenever the appender role or the store is inside your
+// threat model (ADR 0042 §3.3, ADR 0025).
 package snapshot
 
 import (

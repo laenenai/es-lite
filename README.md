@@ -315,19 +315,68 @@ the first append past `n` rewrite the row. A stream that never crosses a gap
 (an archived aggregate nothing appends to, or every stream just after enabling
 the cache) stays on full folds; `WarmSnapshot(ctx, sid)` writes one snapshot
 at the stream's head explicitly, ignoring the threshold (even `0`) and
-surfacing cache errors instead of dropping them.
+surfacing cache errors instead of dropping them. The threshold belongs to the
+`Runtime`, so it is chosen per aggregate type; there is no per-stream setting.
 
-**The trust boundary.** The cache is trusted infrastructure, as protected as
-the log: same database, same RLS, same grant discipline. `WithChainVerification`
-recomputes the chain only over the envelopes a load folds, so a seeded load
-verifies the tail and trusts the seed — a store you trust less needs a
-`stateCodec` that MACs (or seals) state on encode and verifies on decode
-(ADR 0025), so a forged row fails at decode and the load falls through to a
-full fold. Either way the bytes are opaque to the adapters: seal them
-client-side when they carry sensitive data. For erasure, both adapters expose
-`Purge(ctx)` (workspace-scoped on Postgres), matching the other erasure
-surfaces: run it on a quiesced workspace, or destroy the key first for
-sealed state.
+**Bounded-staleness reads.** `Snapshot.RecordedAt` advances only when a
+snapshot is written — at gap crossings — so a stream that has appended fewer
+than `n` events since its last snapshot keeps the older timestamp.
+`LoadStale(ctx, sid, maxAge)` measures that timestamp, so a large `n` with a
+small `maxAge` can report `fresh=false` long after the last write. The
+fallback is a seeded strong load: a latency surprise, not a correctness one.
+Size `maxAge` against `n`, or call `WarmSnapshot` when freshness matters.
+
+**The trust boundary.** The cache sits beside the log — same database, same
+RLS — but it is not the log. `events` is append-only by grant and
+chain-attested; the appender necessarily holds `UPDATE` and `DELETE` on
+`snapshots`, and nothing attests its bytes.
+`WithChainVerification` recomputes the chain only over the envelopes a load
+folds, so a seeded load verifies the tail and trusts the seed; the lineage
+guard proves the seed's *version* exists, not that its *state* matches. A
+forged row at a valid version therefore drives `Decide` on forged state while
+every chain stays intact. Make a MAC'ing (or sealing) `stateCodec` the default
+whenever the appender role or the database is inside your threat model — not
+only for a cache you consider less trusted. The recipe is a `stateCodec`
+wrapper: authenticate in `Encode`, verify before `Decode` and return an error
+on mismatch, and the load falls through to a full fold. Crypto is client-owned
+(ADR 0025), and the adapters treat state as opaque bytes. Sealing is a
+confidentiality concern too: the folded state can be richer than any single
+event, so an adopter who seals event payloads must seal snapshots as well. For
+erasure, both adapters expose `Purge(ctx)` (workspace-scoped on Postgres),
+matching the other erasure surfaces: run it on a quiesced workspace, or
+destroy the key first for sealed state — and remember a backup that includes
+`snapshots` is another surface `Purge` cannot reach.
+
+**Is it helping?** The adoption trigger is a measurement, and the runtime
+deliberately swallows cache errors, so instrument the cache itself. This
+decorator works over either adapter and answers the question that matters —
+how often a load is actually seeded:
+
+```go
+type countingCache struct {
+	snapshot.Cache
+	Loads, Hits, Saves atomic.Uint64
+}
+
+func (c *countingCache) Load(ctx context.Context, id string) (snapshot.Snapshot, bool, error) {
+	c.Loads.Add(1)
+	snap, ok, err := c.Cache.Load(ctx, id)
+	if ok && err == nil {
+		c.Hits.Add(1)
+	}
+	return snap, ok, err
+}
+
+func (c *countingCache) Save(ctx context.Context, id string, snap snapshot.Snapshot) error {
+	c.Saves.Add(1)
+	return c.Cache.Save(ctx, id, snap)
+}
+```
+
+A hit rate near zero with a positive threshold means `n` is too coarse for the
+traffic; a `Saves` count that never moves means the cache is failing silently.
+Keep the concrete adapter handle as well: the decorator implements
+`snapshot.Cache`, and `Purge` lives on the adapter, not the interface.
 
 **Caller-owned transactions (ADR 0035).** When an append must share a
 transaction with another write — for example an audit record in a
