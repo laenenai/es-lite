@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Record every append's non-event decision (its `ConstraintOp`s) in the append transaction, make `unique_claims` a rebuildable index, and ship the rebuild/verify/cutover tooling plus the restore and clone contract.
+**Goal:** Record every append's non-event decision (its `ConstraintOp`s) in the append transaction, make `unique_claims` a rebuildable index, and ship the rebuild/verify tooling plus the restore and clone contract.
 
-**Architecture:** A new `append_decisions` table gets one row per constraint-bearing append, written after `applyClaims` inside the existing append transaction (covering claim-only appends that write no events). `unique_claims` remains the live, enforcing index and becomes derivable by replaying those rows in `id` order. A shared binary codec lives in `es`; both adapters implement `es.ClaimsMaintainer` (rebuild, verify, adopt); `es-verify claims` is the operator surface.
+**Architecture:** A new `append_decisions` table gets one row per constraint-bearing append, written after `applyClaims` inside the existing append transaction (covering claim-only appends that write no events). `unique_claims` remains the live, enforcing index and becomes derivable by replaying those rows in `id` order. A shared binary codec lives in `es`; both adapters implement `es.ClaimsMaintainer` (rebuild, verify); `es-verify claims` is the operator surface.
 
 **Tech Stack:** Go 1.27, `pgx`/Postgres 17, `modernc.org/sqlite`.
 
@@ -19,7 +19,7 @@
 - `es.Envelope` and `CanonicalEnvelope` are untouched; the hash chain does not cover the decision row.
 - Postgres RLS mirrors `unique_claims`: workspace arm plus the role-gated `es_relay` bypass arm in the form hardened by `0007_policy_hardening.sql`, `ENABLE` + `FORCE ROW LEVEL SECURITY`. SQLite is single-workspace: no `workspace_id`, no RLS.
 - `ConstraintOp.Value` is an opaque byte string. The ops encoding is binary and versioned; no JSON, no proto.
-- `command_id` on a live append is `p.CommandID.String()` (the zero UUID when unset), matching what `events` stores. `NULL` is reserved for the one-time cutover backfill.
+- `command_id` on a live append is `p.CommandID.String()` (the zero UUID when unset), matching what `events` stores.
 - Conventional commits; `gofmt` clean; `golangci-lint run ./...` clean.
 - Postgres tests: `PG_DSN='postgres://postgres:pw@127.0.0.1:5434/eslite?sslmode=disable'` (port 5434; 5432/5433 belong to other projects).
 
@@ -27,8 +27,8 @@
 
 1. **A missing grant fails every constraint-bearing append.** The decision insert is in the append transaction, so a missing table/grant/sequence privilege rolls the whole append back. That is loud but total. Pinned in Task 8 (least-privilege, including a claim-only append) and in the migration note (Task 9): grant before deploying the binary.
 2. **The claim-only append must be recorded, and a rollback must not be.** Zero events, `from_version == to_version`, exactly one row; a colliding claim must leave the count unchanged. Pinned in Tasks 3 and 4.
-3. **Rebuilding on a pre-cutover database must refuse, not wipe.** Live claims with an empty decision log means "the cutover has not run"; `RebuildClaims` returns `es.ErrClaimsNotAdopted` and deletes nothing. Pinned in Tasks 5, 6, 7.
-4. **The cutover backfill must be once-only.** `AdoptClaims` refuses when `append_decisions` is non-empty, because a duplicate Claim row would make every later rebuild fail on the unique index. Pinned in Tasks 5, 6, and the CLI.
+3. **Live claims with no decisions must refuse, not wipe.** Every append writes its decision row in the same transaction, so that state is inconsistent (a partial restore, or rows written outside the append path); `RebuildClaims` returns `es.ErrClaimsWithoutDecisions` and deletes nothing. Pinned in Tasks 5, 6, 7.
+4. **There is no legacy backfill.** A pre-0043 store is unsupported for rebuild and verify: its claims have no decisions, so the tools refuse rather than guess or delete.
 5. **Replay order is load-bearing.** Rows in `id` order, releases before claims within a row, `id` gaps allowed (a rolled-back append consumes an id). A release that matched nothing replays as a no-op. Pinned in Tasks 5 and 7.
 
 ---
@@ -39,7 +39,7 @@
 - `es/decisions_test.go` (new) — codec round-trip and rejection table.
 - `postgres/migrations/0014_append_decisions.sql` (new) — table, RLS, replay index.
 - `postgres/wsstore.go` — `applyOps` extraction, `recordDecision`, call site.
-- `postgres/decisions.go` (new) — `RebuildClaims`, `VerifyClaims`, `AdoptClaims`.
+- `postgres/decisions.go` (new) — `RebuildClaims`, `VerifyClaims`.
 - `postgres/decisions_integration_test.go` (new) — PG-gated behaviour.
 - `postgres/postgres_test.go` — truncate list, ledger version.
 - `postgres/migrations_test.go` — ledger version assertions.
@@ -66,9 +66,8 @@
   - `func DecodeDecisionOps(b []byte) ([]ConstraintOp, error)`
   - `type ClaimsRebuildReport struct { Decisions, Claims int64 }`
   - `type ClaimsVerifyReport struct { OK bool; Decisions, Claims int64; FirstDivergence string }`
-  - `type ClaimsMaintainer interface { RebuildClaims(context.Context) (ClaimsRebuildReport, error); VerifyClaims(context.Context) (ClaimsVerifyReport, error); AdoptClaims(context.Context) (int64, error) }`
-  - `var ErrClaimsAlreadyAdopted = errors.New("es-lite: append decisions already exist")`
-  - `var ErrClaimsNotAdopted = errors.New("es-lite: live claims have no decision history")`
+  - `type ClaimsMaintainer interface { RebuildClaims(context.Context) (ClaimsRebuildReport, error); VerifyClaims(context.Context) (ClaimsVerifyReport, error) }`
+  - `var ErrClaimsWithoutDecisions = errors.New("es-lite: live claims have no decision history")`
 
 - [ ] **Step 1: Write the failing codec tests**
 
@@ -318,18 +317,17 @@ git commit -m "feat(sqlite): record append decisions in the append transaction"
 
 ---
 
-### Task 4: Rebuild, verify and adopt — Postgres
+### Task 4: Rebuild and verify — Postgres
 
 **Files:**
 - Create: `postgres/decisions.go`
 - Test: extend `postgres/decisions_integration_test.go`
 
 **Interfaces:**
-- Consumes: `es.ClaimsMaintainer`, `es.ClaimsRebuildReport`, `es.ClaimsVerifyReport`, `es.ErrClaimsAlreadyAdopted`, `es.ErrClaimsNotAdopted`, `es.DecodeDecisionOps`, `applyOps`.
+- Consumes: `es.ClaimsMaintainer`, `es.ClaimsRebuildReport`, `es.ClaimsVerifyReport`, `es.ErrClaimsWithoutDecisions`, `es.DecodeDecisionOps`, `applyOps`.
 - Produces: methods on `*postgres.Workspace`:
   - `func (w *Workspace) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, error)`
   - `func (w *Workspace) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error)`
-  - `func (w *Workspace) AdoptClaims(ctx context.Context) (int64, error)`
   - `var _ es.ClaimsMaintainer = (*Workspace)(nil)`
 
 - [ ] **Step 1: Write the failing tests**
@@ -337,23 +335,21 @@ git commit -m "feat(sqlite): record append decisions in the append transaction"
 In `postgres/decisions_integration_test.go`:
 
 - `TestRebuildClaimsFromDecisions`: claim A, claim B, release A; delete every `unique_claims` row directly; `RebuildClaims` returns `Decisions == 3, Claims == 1`; `LookupClaim(B)` finds it and `LookupClaim(A)` does not; `VerifyClaims` reports `OK`.
-- `TestRebuildRefusesPreCutoverState`: claim A; delete the `append_decisions` rows for the workspace; `RebuildClaims` returns `es.ErrClaimsNotAdopted` and the claim row is still there.
+- `TestRebuildRefusesClaimsWithoutDecisions`: claim A; delete the `append_decisions` rows for the workspace; `RebuildClaims` returns `es.ErrClaimsWithoutDecisions`, the zero report, and the claim row is still there.
 - `TestVerifyClaimsReportsDivergence`: claim A; insert a bogus `unique_claims` row directly; `VerifyClaims` returns `OK == false` and a non-empty `FirstDivergence` naming the bogus scope/stream.
-- `TestAdoptExistingClaims`: claim A and B; delete the decision rows; `AdoptClaims` returns 2; delete `unique_claims`; `RebuildClaims` reproduces A and B; `VerifyClaims` is OK.
-- `TestAdoptRefusesWhenDecisionsExist`: after a live append, `AdoptClaims` returns `es.ErrClaimsAlreadyAdopted`.
 
 Use `s.Pool()` for the raw deletes/inserts and `set_config`/`s.Workspace(ws)` as the neighbouring tests do.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `PG_DSN='postgres://postgres:pw@127.0.0.1:5434/eslite?sslmode=disable' GOWORK=off go test ./postgres -run 'TestRebuild|TestVerifyClaims|TestAdopt' -v`
+Run: `PG_DSN='postgres://postgres:pw@127.0.0.1:5434/eslite?sslmode=disable' GOWORK=off go test ./postgres -run 'TestRebuild|TestVerifyClaims' -v`
 Expected: FAIL — the methods are undefined.
 
-- [ ] **Step 3: Implement the three methods in `postgres/decisions.go`**
+- [ ] **Step 3: Implement the two methods in `postgres/decisions.go`**
 
-All three open one transaction, call `setWorkspace(ctx, tx, w.ws)`, and commit at the end.
+Both open one transaction, call `setWorkspace(ctx, tx, w.ws)`, and commit at the end.
 
-- `RebuildClaims`: `SELECT count(*) FROM unique_claims`; `SELECT count(*) FROM append_decisions`; if decisions == 0 && claims > 0, return `es.ErrClaimsNotAdopted`. Then `DELETE FROM unique_claims`, stream `SELECT id, stream_id, ops FROM append_decisions ORDER BY id`, `DecodeDecisionOps`, `applyOps(ctx, tx, "unique_claims", streamID, ops)`, count rows processed. Return `{Decisions, Claims}` where `Claims` is `SELECT count(*) FROM unique_claims` after replay.
+- `RebuildClaims`: `SELECT count(*) FROM unique_claims`; `SELECT count(*) FROM append_decisions`; if decisions == 0 && claims > 0, return `es.ErrClaimsWithoutDecisions`. Then `DELETE FROM unique_claims`, stream `SELECT id, stream_id, ops FROM append_decisions ORDER BY id`, `DecodeDecisionOps`, `applyOps(ctx, tx, "unique_claims", streamID, ops)`, count rows processed. Return `{Decisions, Claims}` where `Claims` is `SELECT count(*) FROM unique_claims` after replay.
 - `VerifyClaims`: `CREATE TEMP TABLE claims_rebuild (LIKE unique_claims INCLUDING ALL) ON COMMIT DROP`; replay the same stream into `"claims_rebuild"`; run
 
   ```sql
@@ -368,23 +364,22 @@ All three open one transaction, call `setWorkspace(ctx, tx, w.ws)`, and commit a
   ```
 
   and format a row as `scope=%s value=%x stream=%s`. An empty result is `OK`. Never return OK when the decision read failed.
-- `AdoptClaims`: `SELECT count(*) FROM append_decisions`; if > 0 return `es.ErrClaimsAlreadyAdopted`. Stream `SELECT scope, value_key, stream_id FROM unique_claims ORDER BY scope, value_key`, and insert one row per claim with `from_version = to_version = 0`, `command_id = NULL`, `ops = es.EncodeDecisionOps([]es.ConstraintOp{es.Claim(scope, string(valueKey))})`, the claim's stream id, and `w.ws`. Return the count.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `PG_DSN='postgres://postgres:pw@127.0.0.1:5434/eslite?sslmode=disable' GOWORK=off go test -count=1 ./postgres -run 'TestRebuild|TestVerifyClaims|TestAdopt' -v`
+Run: `PG_DSN='postgres://postgres:pw@127.0.0.1:5434/eslite?sslmode=disable' GOWORK=off go test -count=1 ./postgres -run 'TestRebuild|TestVerifyClaims' -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add postgres/decisions.go postgres/decisions_integration_test.go
-git commit -m "feat(postgres): rebuild, verify and adopt the claims index"
+git commit -m "feat(postgres): rebuild and verify the claims index"
 ```
 
 ---
 
-### Task 5: Rebuild, verify and adopt — SQLite
+### Task 5: Rebuild and verify — SQLite
 
 **Files:**
 - Create: `sqlite/decisions.go`
@@ -395,7 +390,7 @@ git commit -m "feat(postgres): rebuild, verify and adopt the claims index"
 
 - [ ] **Step 1: Write the failing tests**
 
-Mirror Task 4's five tests without workspaces; use `s.DB()` for the raw deletes/inserts. For the temp table use:
+Mirror Task 4's three tests without workspaces; use `s.DB()` for the raw deletes/inserts. For the temp table use:
 
 ```sql
 CREATE TEMP TABLE claims_rebuild (
@@ -409,22 +404,22 @@ CREATE TEMP TABLE claims_rebuild (
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `GOWORK=off go test ./sqlite -run 'TestRebuild|TestVerifyClaims|TestAdopt' -v`
+Run: `GOWORK=off go test ./sqlite -run 'TestRebuild|TestVerifyClaims' -v`
 Expected: FAIL — undefined methods.
 
-- [ ] **Step 3: Implement the three methods in `sqlite/decisions.go`**
+- [ ] **Step 3: Implement the two methods in `sqlite/decisions.go`**
 
 One `sql.Tx` each; `applyClaims(ctx, tx, "claims_rebuild", ...)` for the replay. Same guards and the same EXCEPT/UNION ALL diff as Task 4. SQLite has no RLS, so no workspace plumbing.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `GOWORK=off go test -count=1 ./sqlite -run 'TestRebuild|TestVerifyClaims|TestAdopt' -v`, then `GOWORK=off go test -count=1 ./sqlite/`.
+Run: `GOWORK=off go test -count=1 ./sqlite -run 'TestRebuild|TestVerifyClaims' -v`, then `GOWORK=off go test -count=1 ./sqlite/`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add sqlite/decisions.go sqlite/decisions_test.go
-git commit -m "feat(sqlite): rebuild, verify and adopt the claims index"
+git commit -m "feat(sqlite): rebuild and verify the claims index"
 ```
 
 ---
@@ -437,7 +432,7 @@ git commit -m "feat(sqlite): rebuild, verify and adopt the claims index"
 
 **Interfaces:**
 - Consumes: `es.ClaimsMaintainer` on `postgres.Workspace` and `sqlite.Store`.
-- Produces: `es-verify claims [--rebuild | --adopt-existing] [<workspace>]`, exit 0 OK/rebuilt, 1 divergence, 2 usage/connection/refusal.
+- Produces: `es-verify claims [--rebuild] [<workspace>]`, exit 0 OK/rebuilt, 1 divergence, 2 error/refusal.
 
 - [ ] **Step 1: Write the failing CLI tests**
 
@@ -445,8 +440,7 @@ In `main_test.go`, using `newTestDB` and public store calls:
 
 - `TestClaimsCommandEmpty`: `run([]string{"claims"})` on a fresh DB returns 0.
 - `TestClaimsCommandRebuildAndVerify`: seed a claim through `s.Append`; run `claims --rebuild` (expect 0, output contains `rebuilt`), then `claims` (expect 0); delete all `unique_claims` rows via `s.RebuildClaims`? No — instead assert rebuild is idempotent by running it twice and verifying OK after each.
-- `TestClaimsCommandAdoptRefuses`: seed a claim (which now writes a decision row); `run([]string{"claims","--adopt-existing"})` returns 2 and stderr mentions the cutover; assert the exit code is 2 and no row was added.
-- `TestClaimsCommandFlagsConflict`: `--rebuild --adopt-existing` returns 2.
+- `TestClaimsCommandDivergenceDominatesError`: drive two fake maintainers, one diverged and one erroring, in both orders; the divergence must dominate and name its workspace.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -457,9 +451,8 @@ Expected: FAIL — the `claims` command is not dispatched.
 
 - Add to `backend`: `claims func(workspace string) es.ClaimsMaintainer`.
 - Postgres wiring: `claims: func(ws string) es.ClaimsMaintainer { return store.Workspace(ws) }`. SQLite: `claims: func(string) es.ClaimsMaintainer { return store }`.
-- `cmdClaims`: flags `--rebuild` and `--adopt-existing` (mutually exclusive). Resolve workspaces exactly like `stream`/`all`: an explicit argument wins; on Postgres with no argument, collect the distinct `ref.Workspace` from `b.ListStreams(ctx)`; SQLite uses one empty workspace.
-- `--adopt-existing` prints `es-verify: adopt the claims cutover with writers stopped` to stderr, calls `AdoptClaims`, prints the count, and returns 0.
-- `--rebuild` calls `RebuildClaims` per workspace, prints `claims rebuilt: N decisions, M claims`, and returns 0; map `es.ErrClaimsNotAdopted` and `es.ErrClaimsAlreadyAdopted` to exit 2 with their message.
+- `cmdClaims`: one flag, `--rebuild`. Resolve workspaces exactly like `stream`/`all`: an explicit argument wins; on Postgres with no argument, enumerate every workspace that holds claim state (`ClaimWorkspaces`); SQLite uses one empty workspace.
+- `--rebuild` calls `RebuildClaims` per workspace, prints `claims rebuilt: N decisions, M claims`, and returns 0; map `es.ErrClaimsWithoutDecisions` to exit 2 with its message.
 - Default calls `VerifyClaims` per workspace; print `claims OK: N decisions` or `DIVERGED: <FirstDivergence>` and return 1 on any divergence.
 - Add the usage lines.
 
@@ -532,12 +525,12 @@ git commit -m "test(postgres): pin the append_decisions appender grant"
 
 - [ ] **Step 1: Write the migration note**
 
-Cover: what changed (new table, new grant, new row per constraint-bearing append; no API break), the required order — **migrate, then grant, then deploy** (the grant needs the table; the deploy needs the grant, or every constraint-bearing append fails) — the once-only cutover, how to verify, and the rollback story (dropping the table loses only rebuildability; the live index is unchanged).
+Cover: what changed (new table, new grant, new row per constraint-bearing append; no API break), the required order — **migrate, then grant, then deploy** (the grant needs the table; the deploy needs the grant, or every constraint-bearing append fails) — the absence of a legacy path (pre-0043 claims have no decisions, so rebuild/verify refuse; start fresh or export and re-claim), how to verify, and the rollback story (dropping the table loses only rebuildability; the live index is unchanged).
 
 - [ ] **Step 2: Reconcile the runbook**
 
 - Add the two grant lines to the **Appender** block (the block is the current contract at v0.21.0), and keep the same two statements in the restore section's step 2 so the operator sees them in both places.
-- Make every command name and flag in the section match the implementation (`es-verify claims`, `--rebuild`, `--adopt-existing`) and every exit code match.
+- Make every command name and flag in the section match the implementation (`es-verify claims`, `--rebuild`) and every exit code match.
 - Confirm the grant statements are byte-identical to `leastpriv_test.go`.
 
 - [ ] **Step 3: README**
@@ -563,6 +556,6 @@ git commit -m "docs: record the append-decisions upgrade and restore contract"
 
 ## Self-Review Notes
 
-- **Spec coverage:** §3.1 table → Tasks 2/3; §3.2 rebuild + oracle → Tasks 4/5/6; §3.3 restore set → Task 8; §3.4 erasure (`DELETE` grant) → Tasks 2/7; §3.5 cutover (`--adopt-existing`, refuse twice) → Tasks 4/5/6; §3.6 dedup stays out → Task 8; §3.7 feed contract → Task 8 (documentation; the applier is deliberately out of tree).
+- **Spec coverage:** §3.1 table → Tasks 2/3; §3.2 rebuild + oracle → Tasks 4/5/6; §3.3 restore set → Task 8; §3.4 erasure (`DELETE` grant) → Tasks 2/7; §3.5 no legacy path (`ErrClaimsWithoutDecisions`, never guess or delete) → Tasks 4/5/6; §3.6 dedup stays out → Task 8; §3.7 feed contract → Task 8 (documentation; the applier is deliberately out of tree).
 - **Deliberately out of scope:** an applier/replication engine, retention for `append_decisions`, proto-typed ops, and any change to `es.Store`.
-- **Naming is fixed across tasks:** `recordDecision`, `applyOps`, `RebuildClaims`, `VerifyClaims`, `AdoptClaims`, `es.ClaimsMaintainer`, `es.ErrClaimsNotAdopted`, `es.ErrClaimsAlreadyAdopted`.
+- **Naming is fixed across tasks:** `recordDecision`, `applyOps`, `RebuildClaims`, `VerifyClaims`, `es.ClaimsMaintainer`, `es.ErrClaimsWithoutDecisions`.

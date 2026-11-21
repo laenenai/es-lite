@@ -173,14 +173,15 @@ matter.
 
 The hot path does not change. `applyClaims` keeps maintaining the live index,
 because the unique index is the serialization point; the decision row is a
-record, not a replacement. The rebuild refuses a pre-cutover state — live claims
-with an empty decision log means the one-time backfill (§3.5) has not run — and
-returns an error instead of deleting an index it cannot reconstruct.
+record, not a replacement. The rebuild refuses an inconsistent state — live
+claims with an empty decision log — and returns
+`ErrClaimsWithoutDecisions` instead of deleting an index it cannot reconstruct
+(§3.5).
 
 ### 3.3 The backup contract
 
-After a one-time cutover (§3.5), the complete mutable truth is three tables
-written by the append path, plus the schema:
+The complete mutable truth is three tables written by the append path, plus
+the schema:
 
 - `events` (all partitions) — stream history, chain, positions;
 - `log_order` — batch identity and the order root's input;
@@ -247,29 +248,21 @@ still enforces uniqueness on the stored bytes, but without the key no one can
 recompute a claim from a plaintext value. Key custody is the adopter's, per
 ADR 0025.
 
-### 3.5 Cutover
+### 3.5 No legacy path: inconsistency is refused
 
-Existing `unique_claims` rows have no decision history, and the migration cannot
-invent it — `ops` is binary, so the backfill cannot be a portable SQL
-`INSERT … SELECT`. The cutover is a one-time command, run with writers quiesced:
+The decision row is written by the same transaction that applies the claim, so
+every claim in a store written by v0.21+ has a decision record by construction.
+A store with claims and no decisions is not "waiting to be adopted"; it is
+**inconsistent** — a partial restore, or rows written outside the append path.
+The tools refuse that state: `RebuildClaims` and `VerifyClaims` return
+`ErrClaimsWithoutDecisions` instead of guessing at a log or deleting an index
+they cannot reconstruct. Never guess, never delete.
 
-1. migrate;
-2. grant the appender `SELECT, INSERT, DELETE` on `append_decisions`, then
-   deploy the binary — the grant needs the table, and the binary needs the
-   grant;
-3. run `es-verify claims --adopt-existing`, which writes one synthetic `Claim`
-   decision row per live `unique_claims` row (`from_version = to_version = 0`,
-   `command_id = NULL`, the claim's own `stream_id`);
-4. resume writers.
-
-The current index is exactly "these values are claimed", so replaying those
-Claims into an empty index reproduces it; released values are absent because
-their rows are absent. The command refuses to run when `append_decisions` holds
-any row, so it cannot run twice — a duplicate Claim row would make the rebuild
-fail. From that point the log is self-sufficient and no pre-cutover copy has to
-be kept. "Log-only" is true forward from the cutover, not retroactively: a
-restore from a stream older than it is a restore to a pre-0043 state and must
-use the old four-table rule and run this cutover again before writers resume.
+There is deliberately no backfill for a pre-0043 store. The cost is explicit: a
+pre-0043 database's claims index cannot be verified or rebuilt. The correct
+upgrade is a fresh database, or an explicit export and re-claim of the values
+the deployment still needs. "Log-only" holds for every store written by v0.21+,
+and no copy of the claims index needs to be retained.
 
 ### 3.6 Idempotency stays out
 
@@ -374,8 +367,9 @@ Costs:
 - A new table, migration, grant, rebuild command, and least-privilege coverage.
 - A feed consumer is a new operational surface: lag, at-least-once apply, and a
   schema/format version it must refuse rather than mis-read (§3.7).
-- The cutover caveat makes "log-only" a forward guarantee, not a retroactive
-  one.
+- The limit is explicit: a pre-0043 database is unsupported for rebuild and
+  verify. Its claims have no decision history, so the tools refuse it; the
+  upgrade is a fresh database, or an explicit export and re-claim (§3.5).
 
 ## 5. Alternatives considered, and why not
 
@@ -414,15 +408,14 @@ shipped.
 - `Workspace.append` writes the row when `len(p.Constraints) > 0`, inside the
   existing transaction, after `applyClaims`.
 - `docs/deploy/README.md`: the appender grant line, the three-table backup rule,
-  the restore and clone procedures, the cutover, and `command_dedup` named as an
-  erasure surface.
+  the restore and clone procedures, and `command_dedup` named as an erasure
+  surface.
 - `postgres/leastpriv_test.go`: pin the grant and drive a claim through the
   appender role, including a claim-only append.
 - `es-verify claims`: rebuild into a temporary table, diff, report the first
-  divergence; `--adopt-existing` is the one-time cutover backfill. Same release
-  as the migration (§3.2, §3.5).
+  divergence. Same release as the migration (§3.2).
 - A migration note for adopters: grant before deploying the binary, and the
-  cutover order.
+  upgrade order.
 - README: the backup rule, the clone mode, and the limits of replay.
 
 Not in scope: an asynchronous decision writer (the row must be transactional),

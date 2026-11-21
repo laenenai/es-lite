@@ -692,7 +692,7 @@ become traceable. Already-recorded rows are not rewritten.
 correlations must match on the header's hash instead — or, better, send a
 UUID `Correlation-Id`, which still passes through byte-for-byte.
 
-## 2026-11-21 — Append decisions: new table, new appender grant, one-time cutover
+## 2026-11-21 — Append decisions: new table, new appender grant, no legacy path
 
 **What changes.** Migration 0014 (Postgres) and 0012 (SQLite) add
 `append_decisions`, written inside the append transaction for every append
@@ -720,21 +720,20 @@ are unaffected: the migration still lands, and no rows are written.
 
 **What to do.** In this order: **migrate, grant, deploy.** The grant needs
 the table; the binary needs the grant, or every constraint-bearing append
-fails. Quiesce writers before the new binary takes its first append — a
-decision row written ahead of the backfill makes the cutover refuse — then
-run `es-verify claims --adopt-existing` once: it writes one synthetic
-`Claim` row per live claim and refuses if `append_decisions` already holds a
-row, so it cannot run twice. Verify with `es-verify claims` (it must report
-`claims OK`, exit 0) and resume writers.
+fails. Verify with `es-verify claims` (it must report `claims OK`, exit 0).
 
-A restore from a stream older than the cutover is a pre-0043 state: it has
-no decision history and needs the old four-table rule (`unique_claims` in
-the backup set). Run `es-verify claims --adopt-existing` on it, with writers
-quiesced, before they resume: pre-cutover claims have no decision rows, and
-the first constraint-bearing append closes the rebuild guard — from then on
-`--rebuild` would replay only the post-restore decisions and drop the
-pre-cutover claims. `--adopt-existing` refuses once any decision row exists,
-so it must run before that first append.
+There is no legacy path. Every claim written by the new binary carries its
+decision row in the same transaction, but pre-0043 claims have none, and the
+migration does not invent one: a store with claims and no decisions is
+inconsistent, and `es-verify claims` / `--rebuild` refuse it
+(`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or delete. A
+pre-0043 database is therefore unsupported for rebuild and verify — start
+fresh, or export the values you still need and re-claim them through the
+append path.
+
+A restore is consistent only if `unique_claims` and `append_decisions` come
+from the same cut; a restored index with no decision history is refused like
+any other inconsistent store — re-cut from a matching set, or start fresh.
 
 Roll back by redeploying the pre-0043 binary, then dropping
 `append_decisions`; dropping it while the new binary runs fails every

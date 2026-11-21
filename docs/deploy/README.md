@@ -445,10 +445,6 @@ recompute (the exported JSON is the durable evidence). `feed_checkpoints` and
 is a post-commit response cache: exclude it, and read the dedup note below
 before deciding otherwise.
 
-**Before v0.21.0** there is no `append_decisions`; keep `unique_claims` in the
-backup set and treat the claims index as primary state. The one-time cutover
-below is what makes it derived.
-
 **PITR.** If arbitrary point-in-time recovery is the requirement, use physical
 backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
 The whole database returns — all three tables *and* the index — and nothing
@@ -496,15 +492,12 @@ claims missing.
 5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
    The second command must report `claims OK`. Rebuilding needs the
    appender/owner connection; deleting and reinserting `unique_claims` is the
-   one place a restore writes that table. **A cut from before the one-time
-   cutover** has no decision history: load `unique_claims` with the other
-   tables (the old four-table rule), and before rebuilding run
-   `es-verify claims --adopt-existing` with writers quiesced. The adopt must
-   happen **before the first constraint-bearing append**: that append writes
-   the first decision row, the adopt then refuses, and the rebuild guard is
-   closed — a later `--rebuild` would replay only the post-restore decisions
-   and drop the pre-cutover claims. (`--rebuild` before the adopt refuses for
-   exactly this reason.)
+   one place a restore writes that table. A restore that loads
+   `unique_claims` directly must load it from the **same consistent cut** as
+   `append_decisions`: a restored database whose claims have no decision
+   history is inconsistent, and both commands refuse it
+   (`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or delete.
+   Re-cut from a matching set, or start fresh. Do not invent a backfill.
 6. Run `es-verify all` (every stream chain) and `es-verify order` (every batch
    hash recomputed from the events).
 7. Optionally restore `anchors` (or let roots recompute) and
@@ -522,9 +515,8 @@ cut was mixed, not that data was lost. Re-cut and redo the load.
 divergent `(scope, value_key, stream_id)`), and 2 on a connection, usage or
 refusal error — the errored workspace was not audited, and a 2 is never a
 pass, even when earlier workspaces completed (a confirmed divergence
-dominates a later error). The mutating modes (`--rebuild`, `--adopt-existing`)
-exit 0 or 2 only: a rebuild that cannot replay the log refuses instead of
-leaving a partial index.
+dominates a later error). The mutating mode (`--rebuild`) exits 0 or 2 only: a
+rebuild that cannot replay the log refuses instead of leaving a partial index.
 
 ### Clones
 
@@ -597,26 +589,6 @@ Per-value erasure is unchanged from ADR 0025: destroy the MAC key rather than
 searching for the value. A MAC'd claim value is inert without its key, and the
 opaque `ops` blobs cannot be searched for a plaintext value — do not rely on
 `append_decisions` being queryable by the claim it records.
-
-### One-time cutover
-
-On the first v0.21.0 upgrade, existing `unique_claims` rows have no decision
-history. With writers quiesced:
-
-1. Apply the migration, then the new grants — in that order. The grant needs the
-   table; the deploy needs the grant, because the decision insert is in the
-   append transaction and a missing grant fails every constraint-bearing append.
-2. Deploy the binary.
-3. Run `es-verify claims --adopt-existing` once. It writes one synthetic
-   `Claim` row per live claim (`from_version = to_version = 0`,
-   `command_id = NULL`, the claim's own stream). It refuses when
-   `append_decisions` is non-empty, so it cannot run twice.
-4. Run `es-verify claims` (it must report `claims OK`) and resume writers.
-
-From that point the three-table set is sufficient and no pre-cutover copy has
-to be retained. A restore from a stream older than the cutover is a pre-0043
-state: use the old four-table rule, then run this cutover again (with writers
-quiesced) before they resume.
 
 ## Feed operations (ADR 0037)
 
