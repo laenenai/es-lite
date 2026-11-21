@@ -500,11 +500,12 @@ event are one row, so an event cut is internally consistent; loading
    refuse it (`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or
    delete. Do not load `unique_claims` from a different cut and do not invent
    a backfill. Re-cut from the events, or start fresh.
-6. Run `es-verify all` (every stream chain). Run `es-verify order` (every batch
-   hash recomputed from the events) only if you loaded `log_order`: an
-   events-only restore has no order witness, so the order check fails `EMPTY`
-   by design (exit 2). Skip it and keep the exported anchor JSON as the order
-   evidence (ADR 0043 §2.3).
+6. Run the chain audit. If you loaded `log_order`, run `es-verify all`: it
+   verifies every stream chain and then the global log order (every batch hash
+   recomputed from the events). An events-only restore has no order witness,
+   so run `es-verify all --chains-only` instead: it verifies every stream and
+   skips the order stage, which would fail `EMPTY` by design (exit 2). Keep the
+   exported anchor JSON as the order evidence (ADR 0043 §2.3).
 7. Optionally restore `anchors` and `feed_checkpoints` (or replay the feed
    from zero). Do not expect a restored database without `log_order` to
    recompute the order root: roots need the witness. Keep the source's

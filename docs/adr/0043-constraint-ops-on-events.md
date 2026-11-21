@@ -98,7 +98,9 @@ sequence needs `setval`.
 working behavior; it is needed to re-verify the global append order on the
 restored database. Stream it alongside the events if you want `es-verify order`
 and historical anchor checks on the clone; otherwise the exported anchor JSON
-is the evidence of the original order. It is small and predates this ADR
+is the evidence of the original order. For that events-only restore, run
+`es-verify all --chains-only`: it verifies every stream chain and skips the
+order stage, which has no witness to check. It is small and predates this ADR
 (ADR 0038).
 
 `command_dedup` is excluded (a post-commit response cache; ADR 0043 §Idempotency

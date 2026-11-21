@@ -328,8 +328,23 @@ func TestAllExitCodePrecedence(t *testing.T) {
 			t.Fatalf("strip log_order rows: %v", err)
 		}
 		closeDB(t, s)
+		// The events-only shape: an intact chain but no order witness.
+		// `all` still includes the order stage, which is EMPTY (exit 2);
+		// --chains-only is the restore path that stops after the chains.
 		if code := run([]string{"all"}); code != exitUsage {
 			t.Errorf("all over intact streams and zero attested batches: exit %d, want %d — EMPTY certifies nothing (F13)", code, exitUsage)
+		}
+		var code int
+		stdout, _ := captureOutput(t, func() { code = run([]string{"all", "--chains-only"}) })
+		if code != exitIntact {
+			t.Errorf("all --chains-only over an intact chain with no log_order: exit %d, want %d", code, exitIntact)
+		}
+		if !strings.Contains(stdout, "ok      thing:a head=v2") ||
+			!strings.Contains(stdout, "es-verify: 1 streams checked") {
+			t.Errorf("all --chains-only: stdout %q, want the stream chain verified", stdout)
+		}
+		if strings.Contains(stdout, "log order") {
+			t.Errorf("all --chains-only: stdout %q, must not run the order stage", stdout)
 		}
 	})
 }

@@ -10,10 +10,11 @@
 //	es-verify stream [--allow-empty] [<workspace>] <type:id>
 //	  verify one stream (workspace required on Postgres; a never-written
 //	  stream is an error unless --allow-empty)
-//	es-verify all [--strict]
+//	es-verify all [--strict] [--chains-only]
 //	  verify every stream (--strict: every row must be chained), then the
 //	  global log order (each log_order batch hash, recomputed from the
-//	  events)
+//	  events). --chains-only stops after the streams: the events-only
+//	  restore path, where no log_order was loaded to attest the order
 //	es-verify anchor [--upto N]
 //	  take an anchor and print it as JSON (export it off-box)
 //	es-verify anchor --check <anchor.json>
@@ -110,7 +111,7 @@ func run(args []string) int {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   es-verify stream [--allow-empty] [<workspace>] <type:id>
-  es-verify all [--strict]
+  es-verify all [--strict] [--chains-only]
   es-verify anchor [--upto N] | --check <anchor.json> | list
   es-verify order [--upto N]
   es-verify claims [--rebuild] [<workspace>]`)
@@ -149,6 +150,7 @@ func cmdStream(ctx context.Context, b *backend, args []string) int {
 func cmdAll(ctx context.Context, b *backend, args []string) int {
 	fs := flag.NewFlagSet("all", flag.ContinueOnError)
 	strict := fs.Bool("strict", false, "require every row to be chained (ChainedFrom == 1)")
+	chainsOnly := fs.Bool("chains-only", false, "verify the stream chains only; skip the log-order stage (an events-only restore has no log_order)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -174,6 +176,12 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 		code = mergeExit(code, verifyOne(ctx, b, ref.Workspace, ref.StreamID, es.VerifyOptions{ChainedSince: since, Strict: *strict}, false))
 	}
 	fmt.Printf("es-verify: %d streams checked\n", len(refs))
+	if *chainsOnly {
+		// The events-only restore path: log_order was not loaded, so the
+		// order stage has no witness to check and would fail EMPTY by
+		// design (exit 2). The stream chains are the whole audit here.
+		return code
+	}
 	// The order stage runs after the stream chains: first what each
 	// stream contains, then how the batches landed in the global log.
 	// A backend that cannot deep-verify order says so loudly here
