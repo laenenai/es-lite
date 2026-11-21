@@ -24,8 +24,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 11 {
-		t.Fatalf("applied version = %d, want 11 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache; no 0005 — Postgres's is RLS-role-specific)", v)
+	if v != 12 {
+		t.Fatalf("applied version = %d, want 12 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache + 0012 append decisions; no 0005 — Postgres's is RLS-role-specific)", v)
 	}
 	// Re-running is a no-op, not an error.
 	if err := s.Migrate(ctx); err != nil {
@@ -138,7 +138,7 @@ func TestConcurrentMigrateSameFile(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate schema_migrations: %v", err)
 	}
-	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11}
+	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12}
 	if !slices.Equal(got, want) {
 		t.Fatalf("recorded versions = %v, want each of %v exactly once", got, want)
 	}
@@ -199,6 +199,81 @@ func TestSnapshotsTableColumns(t *testing.T) {
 	}
 	if got[0].pk != 1 {
 		t.Fatalf("stream_id pk = %d, want 1 (the primary key)", got[0].pk)
+	}
+}
+
+// TestAppendDecisionsTableColumns pins the append-decision table's shape
+// (ADR 0043): exactly seven columns, in the declared order, with id as the
+// sole INTEGER primary key and AUTOINCREMENT deliberately behind it — ids
+// are the replay order, so SQLite must not reuse one after a DELETE. One
+// SQLite database is one workspace, so there is no workspace_id column.
+func TestAppendDecisionsTableColumns(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.Open(ctx, "file:"+t.Name()+"?mode=memory&cache=shared") // auto-migrates
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	rows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(append_decisions)`)
+	if err != nil {
+		t.Fatalf("table_info(append_decisions): %v", err)
+	}
+	defer rows.Close()
+
+	type col struct {
+		name    string
+		typ     string
+		notNull int
+		pk      int
+	}
+	var got []col
+	for rows.Next() {
+		var cid int
+		var c col
+		var dflt any // NULL or a DEFAULT expression; must not scan into a typed value
+		if err := rows.Scan(&cid, &c.name, &c.typ, &c.notNull, &dflt, &c.pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
+		}
+		got = append(got, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info: %v", err)
+	}
+
+	want := []struct {
+		name    string
+		typ     string
+		notNull int
+	}{
+		{"id", "INTEGER", 0}, // INTEGER PRIMARY KEY AUTOINCREMENT; rowid aliases do not imply NOT NULL
+		{"stream_id", "TEXT", 1},
+		{"from_version", "INTEGER", 1},
+		{"to_version", "INTEGER", 1},
+		{"command_id", "TEXT", 0}, // NULL only for the adopt backfill
+		{"ops", "BLOB", 1},
+		{"created_at", "TEXT", 1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("append_decisions columns = %+v, want exactly %d columns", got, len(want))
+	}
+	for i, c := range got {
+		w := want[i]
+		if c.name != w.name {
+			t.Fatalf("append_decisions column %d = %q, want %q (order matters)", i, c.name, w.name)
+		}
+		if c.typ != w.typ {
+			t.Fatalf("append_decisions column %d (%s) type = %q, want %q", i, c.name, c.typ, w.typ)
+		}
+		if c.notNull != w.notNull {
+			t.Fatalf("append_decisions column %d (%s) notnull = %d, want %d", i, c.name, c.notNull, w.notNull)
+		}
+		if i > 0 && c.pk != 0 {
+			t.Fatalf("append_decisions column %d (%s) pk = %d, want 0 (id is the sole primary key)", i, c.name, c.pk)
+		}
+	}
+	if got[0].pk != 1 {
+		t.Fatalf("id pk = %d, want 1 (the primary key)", got[0].pk)
 	}
 }
 

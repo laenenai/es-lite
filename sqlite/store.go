@@ -434,8 +434,13 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		}
 	}
 
-	if err := applyClaims(ctx, tx, canonical, p.Constraints); err != nil {
+	if err := applyClaims(ctx, tx, "unique_claims", canonical, p.Constraints); err != nil {
 		return zero, err
+	}
+	if len(p.Constraints) > 0 {
+		if err := s.recordDecision(ctx, tx, canonical, p); err != nil {
+			return zero, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -515,14 +520,15 @@ func readHead(ctx context.Context, tx *sql.Tx, sid es.StreamID) (uint64, [es.Has
 // first (so a same-value rename does not self-collide), then claims. A
 // colliding claim returns es.ErrConstraintViolated, rolling back the append.
 // Values are stored exactly as given; callers must pre-hash personal data
-// (ADR 0025).
-func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.ConstraintOp) error {
+// (ADR 0025). table names the index to update; the append path passes
+// "unique_claims", and a rebuild (ADR 0043) replays into a temporary table.
+func applyClaims(ctx context.Context, tx *sql.Tx, table, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM unique_claims WHERE scope = ? AND value_key = ? AND stream_id = ?`,
+			`DELETE FROM `+table+` WHERE scope = ? AND value_key = ? AND stream_id = ?`,
 			op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			return fmt.Errorf("release claim %s=%q: %w", op.Scope, op.Value, err)
@@ -533,7 +539,7 @@ func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.Cons
 			continue
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO unique_claims (scope, value_key, stream_id) VALUES (?, ?, ?)`,
+			`INSERT INTO `+table+` (scope, value_key, stream_id) VALUES (?, ?, ?)`,
 			op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			if isConstraintViolation(err) {
@@ -541,6 +547,26 @@ func applyClaims(ctx context.Context, tx *sql.Tx, streamID string, ops []es.Cons
 			}
 			return fmt.Errorf("claim %s=%q: %w", op.Scope, op.Value, err)
 		}
+	}
+	return nil
+}
+
+// recordDecision records the append's constraint decisions in
+// append_decisions (ADR 0043), inside the append transaction and after
+// applyClaims has updated the live claim index. The row holds the original
+// op sequence (es.EncodeDecisionOps), not its effects, and the span
+// [ExpectedVersion, ExpectedVersion+len(events)) — an empty span for a
+// claim-only append. command_id is the CommandID string events stores,
+// including the zero UUID when the caller left it unset.
+func (s *Store) recordDecision(ctx context.Context, tx *sql.Tx, streamID string, p es.AppendParams) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO append_decisions (stream_id, from_version, to_version, command_id, ops)
+		 VALUES (?,?,?,?,?)`,
+		streamID, p.ExpectedVersion, p.ExpectedVersion+uint64(len(p.Events)),
+		p.CommandID.String(), es.EncodeDecisionOps(p.Constraints),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: append decision: %w", err)
 	}
 	return nil
 }
