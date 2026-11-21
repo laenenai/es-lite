@@ -168,7 +168,9 @@ matter.
 
 The hot path does not change. `applyClaims` keeps maintaining the live index,
 because the unique index is the serialization point; the decision row is a
-record, not a replacement.
+record, not a replacement. The rebuild refuses a pre-cutover state — live claims
+with an empty decision log means the one-time backfill (§3.5) has not run — and
+returns an error instead of deleting an index it cannot reconstruct.
 
 ### 3.3 The backup contract
 
@@ -229,11 +231,26 @@ ADR 0025.
 ### 3.5 Cutover
 
 Existing `unique_claims` rows have no decision history, and the migration cannot
-invent it. The cutover is: take one backup that includes `unique_claims`,
-restore it, then start streaming the three-table set. From that point the index
-is rebuildable. Record the cutover date; a restore from an older stream must be
-seeded from the pre-cutover copy. "Log-only" is true forward from the cutover,
-not retroactively.
+invent it — `ops` is binary, so the backfill cannot be a portable SQL
+`INSERT … SELECT`. The cutover is a one-time command, run with writers quiesced:
+
+1. migrate;
+2. grant the appender `SELECT, INSERT, DELETE` on `append_decisions` and
+   `USAGE` on its identity sequence, then deploy the binary — the grant needs
+   the table, and the binary needs the grant;
+3. run `es-verify claims --adopt-existing`, which writes one synthetic `Claim`
+   decision row per live `unique_claims` row (`from_version = to_version = 0`,
+   `command_id = NULL`, the claim's own `stream_id`);
+4. resume writers.
+
+The current index is exactly "these values are claimed", so replaying those
+Claims into an empty index reproduces it; released values are absent because
+their rows are absent. The command refuses to run when `append_decisions` holds
+any row, so it cannot run twice — a duplicate Claim row would make the rebuild
+fail. From that point the log is self-sufficient and no pre-cutover copy has to
+be kept. "Log-only" is true forward from the cutover, not retroactively: a
+restore from a stream older than it is a restore to a pre-0043 state and must
+use the old four-table rule.
 
 ### 3.6 Idempotency stays out
 
@@ -249,14 +266,65 @@ arm (`0010_command_dedup.sql`).
 Losing `command_dedup` on restore is the existing crash window between commit
 and `Save`: a retry re-handles, and with `WithDeterministicEventIDs` it collides
 on the event id (`es.ErrDuplicateEventID`); without them, the command's own
-optimistic concurrency is the defence. Include `command_dedup` in a backup if
-response replay across a restore matters. It is a cache of a completed command,
-not part of the state transition.
+optimistic concurrency is the defence. The default is therefore to **exclude**
+it from the backup set; include it only if replaying responses across a restore
+matters more than its retention and PII obligations. It is a cache of a
+completed command, not part of the state transition.
 
 Separately: ADR 0025 §5 lists the erasure surfaces and does not name
 `command_dedup`, and `DedupStore` has no purge. If responses can carry PII, that
 is a gap to fix on its own — retention or a purge — not something this ADR
 should paper over by copying them into the log.
+
+### 3.7 The record set is a replication feed
+
+The same three tables are not only a backup format; they are a logical
+replication feed. A consistent cut of `events`, `log_order` and
+`append_decisions` can seed a read-only clone that stays current by applying
+later cuts, or a writable staging environment that forks at a cut and diverges.
+That is a stronger product than "backup", and it is the reason the decision
+record has to be append-ordered and self-describing rather than a copy of the
+index: `unique_claims` is mutable (a release is a `DELETE` with no history),
+while `append_decisions` replays deterministically into an empty index and ties
+each claim back to its append.
+
+What a feed consumer must do:
+
+- **Apply per source transaction, not per table.** A replica that applies an
+  event batch without its decision row has a wrong index for a window. Cut all
+  three tables at one LSN/commit boundary; never mix export epochs.
+- **Apply idempotently.** CDC is at-least-once. Events dedupe on
+  `(workspace, stream, version)` or `event_id`, `log_order` on `from_position`,
+  decisions on `id`. A duplicate `Claim` is a **no-op on a replica**, not
+  `ErrConstraintViolated`: the source already validated it.
+- **Order by `id`, and allow gaps.** Identity sequences are non-transactional;
+  a rolled-back append consumes an `id` and leaves no row. Never assume `+1`.
+- **Refuse an unknown format.** The ops encoding carries a versioned domain
+  separator; a consumer on an older schema must reject a newer record, not
+  mis-decode it.
+- **Treat a per-workspace clone as an export, not replication.** Replication
+  sees the whole database; filter by `workspace_id` (or use the relay path) for
+  a tenant-scoped clone. Claims are per-workspace, so such a clone is
+  self-consistent.
+
+Two clone shapes, with different rules:
+
+- **Follow (read-only).** The feed keeps flowing; the clone never appends, so
+  the sequence is irrelevant and `es-verify all` / `order` / `claims` can run
+  continuously. This is the useful shape for DR verification: the copy proves
+  itself every day instead of at incident time.
+- **Fork (writable).** Seed at a cut, `setval` the sequence, then stop applying
+  and let it diverge. It is a fork: never merge it back, and never point it at
+  the backup prefix. Promotion is a cutover — quiesce, take a final cut,
+  repoint — not a merge.
+
+Data governance is part of the design, not an afterthought. A clone moves
+production payloads and claim identifiers into a lower-trust environment. Sealed
+payloads must not share the production key. Claim values are MACs: the same key
+lets the clone match them (and correlate environments); a different key keeps
+uniqueness working but makes them opaque. Choose deliberately. `command_dedup`
+does not travel, so a clone cannot replay production's Idempotency-Key
+responses; that is correct, since it should not answer production's clients.
 
 ## 4. Consequences
 
@@ -268,6 +336,9 @@ Positive:
   independent of backups.
 - The claims index gains a rebuild path and a verification oracle, the same
   shape projections already have (ADR 0005).
+- The same record set doubles as a replication feed: a consistent cut seeds a
+  read-only clone that verifies itself continuously, or a writable fork that
+  diverges deliberately (§3.7).
 - No change to `es.Store`, `Decide`, `AppendParams`, the chain, `log_order`,
   anchors, the feed, or snapshots.
 
@@ -281,6 +352,8 @@ Costs:
 - Claim values now appear twice. Under ADR 0025 they are opaque MACs; a
   deployment that stores plaintext claims widens its erasure surface (§3.4).
 - A new table, migration, grant, rebuild command, and least-privilege coverage.
+- A feed consumer is a new operational surface: lag, at-least-once apply, and a
+  schema/format version it must refuse rather than mis-read (§3.7).
 - The cutover caveat makes "log-only" a forward guarantee, not a retroactive
   one.
 
@@ -320,12 +393,16 @@ This ADR is accepted; the implementation is the next work item.
 - `Workspace.append` writes the row when `len(p.Constraints) > 0`, inside the
   existing transaction, after `applyClaims`.
 - `docs/deploy/README.md`: the appender grant line, the three-table backup rule,
-  the cutover, and `command_dedup` named as an erasure surface.
+  the restore and clone procedures, the cutover, and `command_dedup` named as an
+  erasure surface.
 - `postgres/leastpriv_test.go`: pin the grant and drive a claim through the
   appender role, including a claim-only append.
 - `es-verify claims`: rebuild into a temporary table, diff, report the first
-  divergence. Same release as the migration (§3.2).
-- README: the backup rule and the limits of replay.
+  divergence; `--adopt-existing` is the one-time cutover backfill. Same release
+  as the migration (§3.2, §3.5).
+- A migration note for adopters: grant before deploying the binary, and the
+  cutover order.
+- README: the backup rule, the clone mode, and the limits of replay.
 
 Not in scope: an asynchronous decision writer (the row must be transactional),
 per-workspace retention for `append_decisions`, and proto-typed ops (the binary
@@ -343,3 +420,7 @@ encoding keeps the store opaque and the table backend-neutral).
 4. **No-op releases:** every append with ops writes a row, even when a `Release`
    matched nothing. The row records the decision, and the replay is identical
    either way.
+5. **Restore shape:** the shared logical stream (three tables at one commit
+   boundary), used for restore, for a read-only clone, and for a writable fork.
+   WAL/PITR remains the only arbitrary-time-travel option; the stream restores
+   to a consistent cut.

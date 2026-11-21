@@ -424,6 +424,138 @@ in flight, or one starting immediately after, can re-insert a row. Quiesce
 the workspace before running it — or, for sealed state, destroy the key
 first, which makes any racing re-insert inert.
 
+## Backup, restore and clones (ADR 0043)
+
+The append path is the authority. From v0.21.0 the complete mutable truth is:
+
+- `events` (with every partition) — stream history, versions, the chain,
+  global positions, audit metadata;
+- `log_order` — one row per event-bearing append, the order root's input;
+- `append_decisions` — one row per constraint-bearing append: the part of
+  `Decide`'s output that is not an event.
+
+Everything else is derived or optional. `unique_claims` is a derived index —
+`append_decisions` replays into an empty one. `snapshots` is a cache. `anchors`
+recompute (the exported JSON is the durable evidence). `feed_checkpoints` and
+`feed_dead_letters` are optional; `feed_leases` is ephemeral. `command_dedup`
+is a post-commit response cache: exclude it, and read the dedup note below
+before deciding otherwise.
+
+**Before v0.21.0** there is no `append_decisions`; keep `unique_claims` in the
+backup set and treat the claims index as primary state. The one-time cutover
+below is what makes it derived.
+
+**PITR.** If arbitrary point-in-time recovery is the requirement, use physical
+backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
+The whole database returns — all three tables *and* the index — and nothing
+needs rebuilding. Restore the base backup, replay WAL to the target, restore
+cluster globals (roles, memberships) if they are not in the base backup, then
+run the three checks below and resume. PITR is cluster-wide and all-or-nothing;
+it cannot restore one workspace, and restoring to before a client's ack is data
+loss by definition. The WAL archive and the logical stream below are
+complementary: WAL for time travel, the stream for portability, clones and
+continuous verification.
+
+### Logical restore
+
+The stream restores to a **consistent cut**, not to an arbitrary timestamp. Cut
+all three tables at one commit boundary — one LSN from a CDC stream, or one
+export epoch. Never mix epochs: events from T with decisions from T−1 leaves
+claims missing.
+
+1. Provision an empty database at the same major version and run `es-migrate`
+   to head (schema, policies, triggers).
+2. Create the roles and grants (`pg_dumpall --globals` or IaC). Confirm
+   `es_relay` and the appender's grants, including:
+   ```sql
+   GRANT SELECT, INSERT, DELETE ON append_decisions TO <appender>;
+   GRANT USAGE ON SEQUENCE append_decisions_id_seq TO <appender>;
+   ```
+3. Load `events` (all partitions), `log_order` and `append_decisions` into that
+   cut. There are no foreign keys; one transaction is still preferred. For a
+   workspace-scoped restore, filter by `workspace_id` (or run through the relay
+   path) — a workspace session sees only its own rows under RLS.
+4. Advance the sequence: `SELECT setval('events_global_position_seq',
+   (SELECT max(global_position) FROM events));` and confirm `CACHE 1` (§ *The
+   `CACHE 1` invariant*). Skip it only when the restored log is empty.
+5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
+   The second command must report an empty diff. Rebuilding needs the
+   appender/owner connection; deleting and reinserting `unique_claims` is the
+   one place a restore writes that table.
+6. Run `es-verify all` (every stream chain) and `es-verify order` (every batch
+   hash recomputed from the events).
+7. Optionally restore `anchors` (or let roots recompute) and
+   `feed_checkpoints` (or replay from zero). Leaving `published_at` unset
+   causes projection re-delivery — at-least-once, which projections already
+   handle.
+8. Resume writers. Snapshots are absent and rebuild lazily; warm explicitly
+   with `Runtime.WarmSnapshot` if the first reads matter.
+
+An `es-verify claims` diff after an unreconciled cut is expected — it means the
+cut was mixed, not that data was lost. Re-cut and redo the load.
+
+### Clones
+
+The same three tables are a logical replication feed. Two shapes, different
+rules:
+
+- **Follow (read-only clone).** Apply later cuts as they arrive. Apply **per
+  source transaction**, not per table: an event batch without its decision row
+  has a wrong index for a window. The clone never appends, so the sequence is
+  irrelevant, and `es-verify all`, `order` and `claims` can run on a schedule.
+  That is the useful property: the DR copy proves itself continuously instead
+  of at incident time.
+- **Fork (writable staging).** Seed at a cut, `setval` the sequence, then stop
+  applying and let it diverge. It is a fork: never merge it back and never
+  point it at the backup prefix. Promotion is a cutover — quiesce, take a final
+  cut, repoint — not a merge.
+
+Apply idempotently, because CDC is at-least-once: events dedupe on
+`(workspace, stream, version)` or `event_id`, `log_order` on `from_position`,
+decisions on `id`. On a replica a duplicate `Claim` is a **no-op**, not
+`ErrConstraintViolated` — the source already validated it. Order by `id` and
+allow gaps: identity sequences are non-transactional, so a rolled-back append
+consumes an id without leaving a row. A per-workspace clone is an export, not
+replication — filter by `workspace_id`; claims are per-workspace, so such a
+clone is self-consistent.
+
+A clone moves production payloads and claim identifiers into a lower-trust
+environment. Do not share the production sealing key. Claim values are MACs:
+the same key lets the clone match and correlate them; a different key keeps
+uniqueness working but makes them opaque. Choose deliberately.
+
+### Dedup on restore
+
+`command_dedup` is not restored. A retry carrying a pre-restore
+Idempotency-Key can therefore miss the stored response and re-handle. With
+`Runtime.WithDeterministicEventIDs()` the event insert collides and the client
+gets `aborted`/409 — the documented "do not reuse this key" outcome; without
+deterministic ids, a retry with no expected-version check can duplicate. This
+is the same window that already exists between a commit and a failed dedup
+`Save`; a restore widens it, it does not create it. Clients must treat a 409
+after a restore as a duplicate, not a retryable error. If response replay
+across a restore matters, include `command_dedup` in the backup and accept its
+retention/PII obligations.
+
+### One-time cutover
+
+On the first v0.21.0 upgrade, existing `unique_claims` rows have no decision
+history. With writers quiesced:
+
+1. Apply the migration, then the new grants — in that order. The grant needs the
+   table; the deploy needs the grant, because the decision insert is in the
+   append transaction and a missing grant fails every constraint-bearing append.
+2. Deploy the binary.
+3. Run `es-verify claims --adopt-existing` once. It writes one synthetic
+   `Claim` row per live claim (`from_version = to_version = 0`,
+   `command_id = NULL`, the claim's own stream). It refuses when
+   `append_decisions` is non-empty, so it cannot run twice.
+4. Run `es-verify claims` (empty diff) and resume writers.
+
+From that point the three-table set is sufficient and no pre-cutover copy has
+to be retained. A restore from a stream older than the cutover is a pre-0043
+state: use the old four-table rule.
+
 ## Feed operations (ADR 0037)
 
 The feed's failure modes are *delay*, never *loss* — but only if the
