@@ -330,13 +330,18 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 	for _, ws := range workspaces {
 		rep, err := b.claims(ws).VerifyClaims(ctx)
 		if err != nil {
+			// Keep auditing the other workspaces and fold the verdict
+			// through mergeExit: a divergence already confirmed on an
+			// earlier workspace is a tamper, and a later read/connection
+			// error must not mask it as "nothing audited" (exit 2).
 			fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
-			return exitUsage
+			code = mergeExit(code, exitUsage)
+			continue
 		}
 		decisions += rep.Decisions
 		if !rep.OK {
 			fmt.Printf("DIVERGED: %s\n", rep.FirstDivergence)
-			code = exitBroken
+			code = mergeExit(code, exitBroken)
 		}
 	}
 	if code == exitIntact {

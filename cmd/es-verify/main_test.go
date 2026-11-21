@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -453,6 +454,76 @@ func TestClaimsCommandFlagsConflict(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "usage:") {
 		t.Errorf("claims --rebuild --adopt-existing: stderr %q, want the usage text", stderr)
+	}
+}
+
+// fakeClaims is a minimal es.ClaimsMaintainer for the precedence test: that
+// test drives VerifyClaims only, and the other methods exist to satisfy the
+// interface.
+type fakeClaims struct {
+	rep es.ClaimsVerifyReport
+	err error
+}
+
+func (f fakeClaims) RebuildClaims(context.Context) (es.ClaimsRebuildReport, error) {
+	return es.ClaimsRebuildReport{}, nil
+}
+
+func (f fakeClaims) VerifyClaims(context.Context) (es.ClaimsVerifyReport, error) {
+	return f.rep, f.err
+}
+
+func (f fakeClaims) AdoptClaims(context.Context) (int64, error) { return 0, nil }
+
+// fakeLister supplies ListStreams — the only Anchorer method claimWorkspaces
+// calls — for the Postgres-shaped precedence test. The embedded nil Anchorer
+// makes any accidental call to another method panic, so the fake cannot
+// quietly grow.
+type fakeLister struct {
+	es.Anchorer
+	refs []es.StreamRef
+}
+
+func (f fakeLister) ListStreams(context.Context) ([]es.StreamRef, error) { return f.refs, nil }
+
+// TestClaimsCommandDivergenceDominatesError pins the claims verify exit
+// precedence across workspaces: a divergence already confirmed on one
+// workspace is a tamper, and a later workspace's read/connection error must
+// not mask it as "nothing audited" (exit 2). Both orders must exit 1, per
+// mergeExit's broken-dominates rule.
+func TestClaimsCommandDivergenceDominatesError(t *testing.T) {
+	diverged := fakeClaims{rep: es.ClaimsVerifyReport{Decisions: 1, FirstDivergence: "scope=thing.slug value=61 stream=thing:a"}}
+	failed := fakeClaims{err: errors.New("read failed")}
+	for _, tc := range []struct {
+		name          string
+		first, second fakeClaims
+	}{
+		{"divergence then error", diverged, failed},
+		{"error then divergence", failed, diverged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &backend{
+				Anchorer: fakeLister{refs: []es.StreamRef{{Workspace: "a"}, {Workspace: "b"}}},
+				claims: func(ws string) es.ClaimsMaintainer {
+					if ws == "a" {
+						return tc.first
+					}
+					return tc.second
+				},
+				multiWS: true,
+			}
+			var code int
+			stdout, stderr := captureOutput(t, func() { code = cmdClaims(context.Background(), b, nil) })
+			if code != exitBroken {
+				t.Errorf("claims across a divergence and an error: exit %d, want %d — the divergence must dominate", code, exitBroken)
+			}
+			if !strings.Contains(stdout, "DIVERGED: "+diverged.rep.FirstDivergence) {
+				t.Errorf("claims across a divergence and an error: stdout %q, want the divergence report", stdout)
+			}
+			if !strings.Contains(stderr, "read failed") {
+				t.Errorf("claims across a divergence and an error: stderr %q, want the workspace error", stderr)
+			}
+		})
 	}
 }
 
