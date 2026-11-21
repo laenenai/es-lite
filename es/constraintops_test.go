@@ -3,6 +3,7 @@ package es
 import (
 	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -52,7 +53,9 @@ func TestConstraintOpsRejects(t *testing.T) {
 		"wrong domain":   append(append([]byte{0, 0, 0, 25}, bytes.Repeat([]byte{'x'}, 25)...), good[29:]...),
 		"trailing bytes": append(append([]byte{}, good...), 0),
 		"unknown kind":   func() []byte { b := append([]byte{}, good...); b[33] = 9; return b }(),
-		"count too high": func() []byte { b := append([]byte{}, good...); b[29] = 0; b[32] = 2; return b }(),
+		// One Claim encodes to 17 bytes after the count; a count of 18 must
+		// trip the count guard before any op is parsed.
+		"count too high": func() []byte { b := append([]byte{}, good...); b[29] = 0; b[32] = 18; return b }(),
 		"huge length": func() []byte {
 			b := append([]byte{}, good...)
 			b[34], b[35], b[36], b[37] = 0xff, 0xff, 0xff, 0xff
@@ -68,5 +71,37 @@ func TestConstraintOpsRejects(t *testing.T) {
 		if _, err := DecodeConstraintOps(good[:i]); err == nil {
 			t.Errorf("truncated at %d: accepted", i)
 		}
+	}
+
+	// The count guard is pinned by its own message, not merely by a later
+	// parse failing: count=18 exceeds the 17 remaining bytes.
+	countTooHigh := append([]byte{}, good...)
+	countTooHigh[29], countTooHigh[32] = 0, 18
+	if _, err := DecodeConstraintOps(countTooHigh); err == nil ||
+		!strings.Contains(err.Error(), "count 18 exceeds 17 remaining bytes") {
+		t.Errorf("count too high error = %v, want the count guard's message", err)
+	}
+}
+
+// TestConstraintOpsTruncatesRejectedDomain pins the error bound: a wrong
+// domain is attacker-controlled, so the error quotes at most 64 of its bytes
+// instead of echoing the whole blob.
+func TestConstraintOpsTruncatesRejectedDomain(t *testing.T) {
+	domain := strings.Repeat("x", 4096)
+	// u32 length prefix 4096 (0x00001000), then the wrong domain.
+	blob := append([]byte{0x00, 0x00, 0x10, 0x00}, []byte(domain)...)
+	_, err := DecodeConstraintOps(blob)
+	if err == nil {
+		t.Fatal("DecodeConstraintOps accepted a 4096-byte wrong domain")
+	}
+	msg := err.Error()
+	if len(msg) > 256 {
+		t.Fatalf("error is %d bytes, want it bounded: %q", len(msg), msg)
+	}
+	if !strings.Contains(msg, strings.Repeat("x", 64)) {
+		t.Errorf("error does not quote the 64-byte prefix: %q", msg)
+	}
+	if strings.Contains(msg, strings.Repeat("x", 65)) {
+		t.Errorf("error quotes more than 64 domain bytes: %q", msg)
 	}
 }

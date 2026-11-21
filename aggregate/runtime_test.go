@@ -99,6 +99,63 @@ func TestHandleRejectsConstraintsWithoutEvents(t *testing.T) {
 	}
 }
 
+type claimState struct{}
+type claimEvent struct{ value string }
+type claimCommand struct{}
+
+type claimCodec struct{}
+
+func (claimCodec) Encode(e claimEvent) (es.EncodedEvent, error) {
+	return es.EncodedEvent{TypeURL: "thing.v1.Claimed", SchemaVersion: 1, Payload: []byte(e.value)}, nil
+}
+func (claimCodec) Decode(es.EncodedEvent) (claimEvent, error) { return claimEvent{}, nil }
+
+// TestHandleCarriesConstraintOpsOnFirstEnvelope is the runtime positive path:
+// a Decide that returns events *and* constraints appends both, and the store
+// puts the ops on the first returned envelope only (ADR 0043 §2.1).
+func TestHandleCarriesConstraintOpsOnFirstEnvelope(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	sid, _ := es.NewStreamID("thing", "claim-positive")
+	ops := []es.ConstraintOp{es.Claim("email", "a@b.com")}
+
+	decider := es.Decider[claimState, claimCommand, claimEvent]{
+		Initial: func() claimState { return claimState{} },
+		Decide: func(claimState, claimCommand) ([]claimEvent, []es.ConstraintOp, error) {
+			return []claimEvent{{value: "first"}, {value: "second"}}, ops, nil
+		},
+		Evolve: func(s claimState, _ claimEvent) claimState { return s },
+	}
+	rt := aggregate.NewRuntime(store, decider, claimCodec{})
+
+	res, err := rt.Handle(ctx, sid, claimCommand{}, es.Meta{})
+	if err != nil {
+		t.Fatalf("handle events with constraints: %v", err)
+	}
+	if res.ToVersion != 2 || len(res.Envelopes) != 2 {
+		t.Fatalf("result = v%d with %d envelopes, want v2 with 2", res.ToVersion, len(res.Envelopes))
+	}
+	got := res.Envelopes[0].ConstraintOps
+	if len(got) != 1 || got[0] != ops[0] {
+		t.Errorf("first returned envelope ops = %+v, want %+v", got, ops)
+	}
+	if res.Envelopes[1].ConstraintOps != nil {
+		t.Errorf("second returned envelope ops = %+v, want nil", res.Envelopes[1].ConstraintOps)
+	}
+	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
+		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
+	}
+
+	// The ops survive a read back from the store on the same first envelope.
+	stream, err := store.ReadStream(ctx, sid, 0, 0)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if len(stream) != 2 || len(stream[0].ConstraintOps) != 1 || stream[1].ConstraintOps != nil {
+		t.Fatalf("read-back ops = %+v / %+v, want first only", stream[0].ConstraintOps, stream[1].ConstraintOps)
+	}
+}
+
 func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)

@@ -280,6 +280,23 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 		t.Fatalf("op-bearing events = %d, want 3 (claim, release, claim)", opRows)
 	}
 
+	// The ops are on the event row, so the appender's ordinary stream read
+	// returns them: ReadStream must carry the append's ConstraintOps on its
+	// first envelope, not via a second read of separate state.
+	stream, err := aws.ReadStream(ctx, sid, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadStream under the appender grants: %v", err)
+	}
+	if len(stream) != 3 {
+		t.Fatalf("ReadStream returned %d envelopes, want 3", len(stream))
+	}
+	if got := stream[0].ConstraintOps; len(got) != 1 || got[0] != es.Claim("email", "lp@example.test") {
+		t.Errorf("ReadStream first envelope ops = %+v, want the first Claim", got)
+	}
+	if got := stream[2].ConstraintOps; len(got) != 1 || got[0] != third {
+		t.Errorf("ReadStream third envelope ops = %+v, want the claim-bearing append's ops", got)
+	}
+
 	// The rebuild/verify oracle reads the whole event log with the
 	// appender's grants: SELECT is what a restore's rebuild and the
 	// es-verify claims check need. The rebuild replaces the live index
@@ -299,8 +316,8 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyClaims under the appender grants: %v", err)
 	}
-	if !verify.OK {
-		t.Fatalf("VerifyClaims under the appender grants = %+v, want OK", verify)
+	if !verify.OK || verify.Claims == 0 {
+		t.Fatalf("VerifyClaims under the appender grants = %+v, want OK with a non-zero Claims count", verify)
 	}
 
 	// Facet 2 — feed process: the fenced page read, then subscribe/ack.
@@ -339,6 +356,7 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- srv.Subscribe(subCtx, req, lpSink{delivered}) }()
 	var last es.Envelope
+	atPosition := make(map[uint64]es.Envelope, 3)
 	for i, want := range []uint64{pos1, pos2, pos3} {
 		select {
 		case env := <-delivered:
@@ -347,10 +365,21 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 				t.Fatalf("delivered position %d, want %d (event %d)", env.GlobalPosition, want, i)
 			}
 			last = env
+			atPosition[want] = env
 		case <-time.After(10 * time.Second):
 			cancel()
 			t.Fatalf("feed under the feed grants delivered %d of 3 events past the deadline", i)
 		}
+	}
+	// The feed delivers the envelope it read, so the ops travel with the
+	// event to a consumer — not just to ReadStream.
+	if got := atPosition[pos1].ConstraintOps; len(got) != 1 || got[0] != es.Claim("email", "lp@example.test") {
+		cancel()
+		t.Fatalf("delivered first envelope ops = %+v, want the first Claim", got)
+	}
+	if got := atPosition[pos3].ConstraintOps; len(got) != 1 || got[0] != third {
+		cancel()
+		t.Fatalf("delivered claim-bearing envelope ops = %+v, want %+v", got, third)
 	}
 	// The fenced ack — an ordinary consumer acknowledging its page.
 	if err := srv.Checkpoint(ctx, feed.Ack{

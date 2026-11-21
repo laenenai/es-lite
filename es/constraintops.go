@@ -11,6 +11,11 @@ import (
 // other domain, so a future layout is never mistaken for this one.
 const constraintOpsDomain = "es-lite.constraint-ops.v1"
 
+// maxDomainEcho bounds how many bytes of a rejected domain the decode error
+// quotes. The input is attacker-controlled, so echoing the whole blob would
+// turn a malformed row into an amplified error and a log-flood vector.
+const maxDomainEcho = 64
+
 // ClaimsRebuildReport summarizes a successful RebuildClaims: Ops is the number
 // of op-bearing event records replayed and Claims the number of live claims
 // they produced.
@@ -70,14 +75,16 @@ func EncodeConstraintOps(ops []ConstraintOp) []byte {
 // rejects a wrong domain, an unknown kind, a count larger than the remaining
 // bytes, any string length that exceeds the remaining buffer, and trailing
 // bytes. The decoded slice grows with the data actually present; the
-// attacker-controlled count never drives an allocation.
+// attacker-controlled count never drives an allocation. A rejected domain is
+// quoted only up to maxDomainEcho bytes, so a malformed blob cannot amplify
+// itself into an unbounded error.
 func DecodeConstraintOps(b []byte) ([]ConstraintOp, error) {
 	domain, b, err := readConstraintString(b, "domain")
 	if err != nil {
 		return nil, err
 	}
 	if domain != constraintOpsDomain {
-		return nil, fmt.Errorf("es-lite: constraint ops: unknown domain %q", domain)
+		return nil, fmt.Errorf("es-lite: constraint ops: unknown domain %q", truncateDomain(domain))
 	}
 	if len(b) < 4 {
 		return nil, fmt.Errorf("es-lite: constraint ops: truncated count")
@@ -112,6 +119,17 @@ func DecodeConstraintOps(b []byte) ([]ConstraintOp, error) {
 		return nil, fmt.Errorf("es-lite: constraint ops: %d trailing bytes", len(b))
 	}
 	return ops, nil
+}
+
+// truncateDomain caps the domain quoted in an error at maxDomainEcho bytes.
+// Truncation is byte-based so a multi-byte rune cannot push the echo past the
+// bound; callers format the result with %q, which escapes but never expands
+// the observed domain beyond that prefix.
+func truncateDomain(domain string) string {
+	if len(domain) <= maxDomainEcho {
+		return domain
+	}
+	return domain[:maxDomainEcho]
 }
 
 // readConstraintString consumes a u32 length prefix and that many bytes.

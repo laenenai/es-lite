@@ -141,8 +141,9 @@ func TestAppendRollbackWritesNoConstraintOps(t *testing.T) {
 	}
 }
 
-// TestAppendWithoutConstraintsWritesNoConstraintOps pins the negative: a plain
-// event append leaves the column NULL.
+// TestAppendWithoutConstraintsWritesNoConstraintOps pins the negative: a
+// nil-constraints append leaves constraint_ops NULL on EVERY row of the batch,
+// not just the first.
 func TestAppendWithoutConstraintsWritesNoConstraintOps(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
@@ -151,13 +152,22 @@ func TestAppendWithoutConstraintsWritesNoConstraintOps(t *testing.T) {
 	if _, err := s.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 0,
-		Events:          []es.EventData{{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain")}},
+		Events: []es.EventData{
+			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain-1")},
+			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain-2")},
+			{TypeURL: "counter.v1.Incremented", SchemaVersion: 1, Payload: []byte("plain-3")},
+		},
 	}); err != nil {
 		t.Fatalf("append without constraints: %v", err)
 	}
 	rows := eventOps(t, s, sid)
-	if len(rows) != 1 || rows[0].ops != nil {
-		t.Fatalf("constraint_ops after a zero-constraint append = %v, want NULL", rows)
+	if len(rows) != 3 {
+		t.Fatalf("event rows = %d, want 3", len(rows))
+	}
+	for _, row := range rows {
+		if row.ops != nil {
+			t.Fatalf("constraint_ops on v%d = %x, want NULL on every row", row.version, row.ops)
+		}
 	}
 }
 

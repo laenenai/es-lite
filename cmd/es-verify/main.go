@@ -64,8 +64,10 @@ type backend struct {
 	// claims is the per-workspace claims index maintainer (ADR 0043).
 	claims func(workspace string) es.ClaimsMaintainer
 	// claimWorkspaces enumerates the workspaces with claim state. Claims
-	// are a projection of the events (ADR 0043), so the event log is the
-	// complete discovery source; a claim-only workspace cannot exist.
+	// are a projection of the events (ADR 0043), so the events arm finds
+	// every healthy workspace; the implementation also unions
+	// unique_claims so a workspace with claims and no events is discovered
+	// and refused, not skipped.
 	claimWorkspaces func(context.Context) ([]string, error)
 	multiWS         bool
 	close           func()
