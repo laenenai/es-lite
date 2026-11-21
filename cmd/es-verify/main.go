@@ -342,8 +342,11 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 
 // claimWorkspaces resolves the workspaces a claims command runs over: an
 // explicit argument scopes the run to one; otherwise the backend enumerates
-// every workspace with claim state from the event log. Claims are a projection
-// of the events (ADR 0043), so no separate discovery source is needed.
+// every workspace with claim state. In a healthy store the event log's
+// workspace ids are complete, because a constraint-bearing append always
+// carries an event; the backend's query also unions unique_claims so a
+// workspace with claims and no op-bearing events is discovered and refused
+// rather than silently skipped (ADR 0043 §2.2).
 func claimWorkspaces(ctx context.Context, b *backend, args []string) ([]string, error) {
 	if len(args) == 1 {
 		return []string{args[0]}, nil

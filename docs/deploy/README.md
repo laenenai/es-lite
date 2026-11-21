@@ -487,20 +487,30 @@ event are one row, so an event cut is internally consistent; loading
    SQLite's `AUTOINCREMENT` tracks explicit-id inserts itself, so this step is
    Postgres-only.
 5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
-   The second command must report `claims OK`. Rebuilding needs the
-   appender/owner connection; deleting and reinserting `unique_claims` is the
-   one place a restore writes that table. The `constraint_ops` on the events
-   are the only input. A restored database whose live claims have no ops in
-   the event log is inconsistent — a partial restore or out-of-band SQL — and
-   both commands refuse it (`es.ErrClaimsWithoutDecisions`, exit 2) rather
-   than guess or delete. Do not load `unique_claims` from a different cut and
-   do not invent a backfill. Re-cut from the events, or start fresh.
-6. Run `es-verify all` (every stream chain) and `es-verify order` (every batch
-   hash recomputed from the events).
-7. Optionally restore `anchors` (or let roots recompute) and
-   `feed_checkpoints` (or replay from zero). Leaving `published_at` unset
-   causes projection re-delivery — at-least-once, which projections already
-   handle.
+   The second command must report `claims OK`. The whole-database form (no
+   workspace argument) needs the owner/superuser, or a role with `es_relay`
+   plus `SELECT` on `events` and `unique_claims` and `DELETE, INSERT` on
+   `unique_claims`: `ClaimWorkspaces` takes the role-gated bypass, which the
+   appender lacks, while the relay has `es_relay` but not the `unique_claims`
+   DML. The appender role is enough only for `es-verify claims <workspace>`.
+   Deleting and reinserting `unique_claims` is the one place a restore writes
+   that table. The `constraint_ops` on the events are the only input. A
+   restored database whose live claims have no ops in the event log is
+   inconsistent — a partial restore or out-of-band SQL — and both commands
+   refuse it (`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or
+   delete. Do not load `unique_claims` from a different cut and do not invent
+   a backfill. Re-cut from the events, or start fresh.
+6. Run `es-verify all` (every stream chain). Run `es-verify order` (every batch
+   hash recomputed from the events) only if you loaded `log_order`: an
+   events-only restore has no order witness, so the order check fails `EMPTY`
+   by design (exit 2). Skip it and keep the exported anchor JSON as the order
+   evidence (ADR 0043 §2.3).
+7. Optionally restore `anchors` and `feed_checkpoints` (or replay the feed
+   from zero). Do not expect a restored database without `log_order` to
+   recompute the order root: roots need the witness. Keep the source's
+   exported anchor JSON as the evidence, or record new anchors only after
+   `log_order` is present. Leaving `published_at` unset causes projection
+   re-delivery — at-least-once, which projections already handle.
 8. Resume writers. Snapshots are absent and rebuild lazily; warm explicitly
    with `Runtime.WarmSnapshot` if the first reads matter.
 

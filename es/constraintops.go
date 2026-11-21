@@ -121,10 +121,12 @@ func DecodeConstraintOps(b []byte) ([]ConstraintOp, error) {
 	return ops, nil
 }
 
-// truncateDomain caps the domain quoted in an error at maxDomainEcho bytes.
-// Truncation is byte-based so a multi-byte rune cannot push the echo past the
-// bound; callers format the result with %q, which escapes but never expands
-// the observed domain beyond that prefix.
+// truncateDomain caps the domain handed to an error at maxDomainEcho observed
+// bytes. The bound is on the bytes read from the blob, not on the rendered
+// output: callers format the result with %q, which expands non-printable or
+// invalid UTF-8 bytes to \xNN escapes, so the final error text can be longer
+// than the prefix. Truncation is byte-based, never rune-based, so the observed
+// domain cannot exceed the bound.
 func truncateDomain(domain string) string {
 	if len(domain) <= maxDomainEcho {
 		return domain

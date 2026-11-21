@@ -105,3 +105,28 @@ func TestConstraintOpsTruncatesRejectedDomain(t *testing.T) {
 		t.Errorf("error quotes more than 64 domain bytes: %q", msg)
 	}
 }
+
+// TestConstraintOpsTruncatesInvalidUTF8Domain pins the bound on observed bytes
+// rather than rendered length: %q expands each invalid byte to a \xNN escape,
+// so the error text may be longer than 64 bytes even though the domain prefix
+// is not. The 65th observed byte and the tail must never appear.
+func TestConstraintOpsTruncatesInvalidUTF8Domain(t *testing.T) {
+	const tail = "hidden-tail"
+	domain := strings.Repeat("\xff", maxDomainEcho) + tail
+	// u32 length prefix (75 fits in one byte) then the wrong domain.
+	blob := append([]byte{0x00, 0x00, 0x00, byte(len(domain))}, []byte(domain)...)
+	_, err := DecodeConstraintOps(blob)
+	if err == nil {
+		t.Fatal("DecodeConstraintOps accepted an invalid-UTF-8 wrong domain")
+	}
+	msg := err.Error()
+	if want := strings.Repeat(`\xff`, maxDomainEcho); !strings.Contains(msg, want) {
+		t.Errorf("error does not quote the %d-byte observed prefix: %q", maxDomainEcho, msg)
+	}
+	if strings.Contains(msg, strings.Repeat(`\xff`, maxDomainEcho+1)) {
+		t.Errorf("error quotes more than %d observed domain bytes: %q", maxDomainEcho, msg)
+	}
+	if strings.Contains(msg, tail) {
+		t.Errorf("error quotes past the observed bound: %q", msg)
+	}
+}

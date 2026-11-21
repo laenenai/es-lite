@@ -740,5 +740,14 @@ fresh.
 Roll back by redeploying the pre-0.21 binary: it ignores `constraint_ops`, so
 no schema rollback is required. If you also want the column gone, drop it only
 after the last new binary has stopped — a running new binary reads and writes
-it and fails without it. See `docs/deploy/README.md` for the backup, restore
+it and fails without it.
+
+A rollback window leaves a **mixed store**. The old binary still appends
+events, but its claims go to `unique_claims` with no ops on the log. After
+re-upgrading, the guard fires only when there are *zero* op-bearing events, so
+a mixed store is not refused with `es.ErrClaimsWithoutDecisions`: `es-verify
+claims` reports `DIVERGED` instead. Do not run `--rebuild` over that window —
+it replaces the index from the log and deletes the old binary's claims. Export
+or re-claim the values written during the rollback through the new append
+path first, then verify. See `docs/deploy/README.md` for the backup, restore
 and clone contract.
