@@ -692,51 +692,53 @@ become traceable. Already-recorded rows are not rewritten.
 correlations must match on the header's hash instead — or, better, send a
 UUID `Correlation-Id`, which still passes through byte-for-byte.
 
-## 2026-11-21 — Append decisions: new table, new appender grant, no legacy path
+## 2026-11-21 — Constraint ops on the event log: new column, no new table, claim-only appends rejected
 
-**What changes.** Migration 0014 (Postgres) and 0012 (SQLite) add
-`append_decisions`, written inside the append transaction for every append
-that carries at least one constraint op — including a claim-only append,
-which previously left no log record. The row records the ops `Decide`
-returned and `applyClaims` applied, so `unique_claims` becomes a derived
-index: `es-verify claims --rebuild` replays the table into it. The appender
-role needs `SELECT, INSERT, DELETE` on the new table (the
-`GENERATED ... AS IDENTITY` column draws its own value, so its sequence
-needs no grant):
+**What changes.** Migration 0014 (Postgres) adds a nullable `constraint_ops
+bytea` column to `events`; SQLite 0012 adds the same as `BLOB`. An append
+that carries constraint ops encodes them on the **first** event row of the
+batch; every other row gets `NULL`. The envelope exposes them as
+`es.Envelope.ConstraintOps`, and `unique_claims` is now a pure projection of
+the log: `es-verify claims --rebuild` replays the ops into it. There is no
+second table, no decision id and no new grant — the appender's existing
+`SELECT, INSERT` on `events` covers the new column.
 
-```sql
-GRANT SELECT, INSERT, DELETE ON append_decisions TO <appender>;
-```
-
-There is no Go API break: `es.Store`, `Decide`, `AppendParams`, the chain,
-`log_order`, anchors, the feed and snapshots are unchanged. Every
-constraint-bearing append now costs one more single-row INSERT.
+A constraint-bearing append must also carry at least one event. A `Claim` or
+`Release` with no domain event is refused with `es.ErrConstraintWithoutEvent`
+by `aggregate.Runtime` and by both stores. Previously such an append
+succeeded, changed the claims index and left no log record; the ops now ride
+with the event, so a claim cannot be invisible state. The
+`ErrConstraintWithoutEvent` check is the new Go API surface;
+`Envelope.ConstraintOps` is additive.
 
 **Who is affected.** Every deployment that calls `Claim`/`Release` or lets
-`aggregate.Runtime` apply constraints: the write path includes the new
-INSERT, and a missing grant fails the append. Postgres least-privilege
-deployments must add the grant above. Deployments that use no constraints
-are unaffected: the migration still lands, and no rows are written.
+`aggregate.Runtime` apply constraints: the append writes the new column, and
+a command that used to claim without an event now fails and must name one.
+Deployments that use no constraints are unaffected: the migration lands and
+every row's column is `NULL`.
 
-**What to do.** In this order: **migrate, grant, deploy.** The grant needs
-the table; the binary needs the grant, or every constraint-bearing append
-fails. Verify with `es-verify claims` (it must report `claims OK`, exit 0).
+**What to do.** In this order: **migrate, deploy.** There is no grant step
+and no second sequence to advance. Verify with `es-verify claims` (it must
+report `claims OK`, exit 0). Old binaries ignore the added column — their
+statements neither read nor write it — so a rollback needs no schema change.
 
 There is no legacy path. Every claim written by the new binary carries its
-decision row in the same transaction, but pre-0043 claims have none, and the
-migration does not invent one: a store with claims and no decisions is
+ops in the same transaction, but pre-0.21 claims have none, and the migration
+does not invent one: a store with claims and no ops in the event log is
 inconsistent, and `es-verify claims` / `--rebuild` refuse it
 (`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or delete. A
-pre-0043 database is therefore unsupported for rebuild and verify — start
+pre-0.21 database is therefore unsupported for rebuild and verify — start
 fresh, or export the values you still need and re-claim them through the
 append path.
 
-A restore is consistent only if `unique_claims` and `append_decisions` come
-from the same cut; a restored index with no decision history is refused like
-any other inconsistent store — re-cut from a matching set, or start fresh.
+A restore is consistent when the events are one cut: the ops are part of the
+event row, so an event and its claim are never split. Do not load
+`unique_claims` from another cut; rebuild it from the events. An index with
+no op history is refused like any other inconsistent store — re-cut, or start
+fresh.
 
-Roll back by redeploying the pre-0043 binary, then dropping
-`append_decisions`; dropping it while the new binary runs fails every
-constraint-bearing append (the decision INSERT is in the append transaction,
-and erasure's DELETE targets the same table). See `docs/deploy/README.md`
-for the backup, restore and clone contract.
+Roll back by redeploying the pre-0.21 binary: it ignores `constraint_ops`, so
+no schema rollback is required. If you also want the column gone, drop it only
+after the last new binary has stopped — a running new binary reads and writes
+it and fails without it. See `docs/deploy/README.md` for the backup, restore
+and clone contract.

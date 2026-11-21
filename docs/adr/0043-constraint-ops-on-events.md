@@ -1,6 +1,6 @@
 # ADR 0043: Constraint Ops on the Event Log (Log-Only Restore)
 
-- **Status:** Accepted (implementation in progress)
+- **Status:** Accepted (implemented)
 - **Date:** 2026-11-21
 - **Related:** ADR 0008 (uniqueness as a first-class constraint), ADR 0025
   (client-owned crypto and erasure), ADR 0029 (the chain attests the log),
@@ -19,10 +19,10 @@ discarded the operations. An append that carried a claim and **zero events**
 (`aggregate/runtime.go`'s no-op check) changed committed state with no record
 anywhere. An events-only restore therefore lost the claims index silently.
 
-A first design recorded the ops in an `append_decisions` sidecar table, in the
-append transaction. It restored the index and kept the claim-only append, but it
-left two tables where the event-sourcing promise says one, needed a one-time
-backfill for older stores, and needed an advisory lock to keep sidecar id order
+A first design recorded the ops in a separate decisions table, in the append
+transaction. It restored the index and kept the claim-only append, but it left
+two tables where the event-sourcing promise says one, needed a one-time
+backfill for older stores, and needed an advisory lock to keep row id order
 equal to apply order — because a claim-only append does not bump the stream
 version.
 
@@ -61,8 +61,8 @@ for stores written before this model, and no compatibility shims are carried.
   `validateAppend`. A `Release` with no domain event must name an event too. This
   is the semantic core, and it also removes the ordering race: every
   constraint-bearing append bumps the stream version, so same-stream appends
-  serialize on optimistic concurrency. No sidecar, no advisory lock, no id
-  ordering rule.
+  serialize on optimistic concurrency. No separate table, no advisory lock, no
+  id ordering rule.
 
 ### 2.2 Claims are a projection of the events
 
@@ -74,12 +74,18 @@ of the log:
   decodes `constraint_ops` on each row, applies release-then-claim, and replaces
   the index in one transaction.
 - `VerifyClaims` rebuilds into a temporary table and diffs both directions.
-- `ClaimWorkspaces` is `SELECT DISTINCT workspace_id FROM events`; a workspace
-  whose only appends were claim-only cannot exist.
+- `ClaimWorkspaces` is the union of the workspace ids in `events` and
+  `unique_claims`:
+  `SELECT DISTINCT workspace_id FROM events UNION SELECT DISTINCT
+  workspace_id FROM unique_claims ORDER BY 1`. In a healthy store the events
+  arm finds every workspace, because a constraint-bearing append always
+  carries an event. The union is **detection, not compatibility**: a workspace
+  with claims and no op-bearing events is exactly the inconsistent store the
+  tools must refuse, and reading only events would silently skip it.
 - An inconsistent store — live claims with no ops in the event log — is refused
   with `es.ErrClaimsWithoutDecisions` rather than guessed at or deleted. That is
   a partial restore or out-of-band SQL, not a migration state.
-- There is no `append_decisions` table, no decision id, and no adopt/backfill.
+- There is no separate decisions table, no decision id, and no adopt/backfill.
 
 ### 2.3 What a restore needs
 
@@ -123,8 +129,8 @@ A pre-0.21 store has claims with no ops on events. There is no backfill: the
 information does not exist. `RebuildClaims` and `VerifyClaims` refuse such a
 store (`ErrClaimsWithoutDecisions`); the upgrade path is a fresh database, or an
 explicit export of the claim values and a re-claim through the new append path.
-No dual-write, no sidecar, no source branching. This is the accepted cost of the
-events-only model.
+No dual-write, no separate table, no source branching. This is the accepted
+cost of the events-only model.
 
 ### 2.6 Idempotency stays out
 
@@ -154,7 +160,7 @@ The events table is a logical replication feed. The consumer contract:
 - **Follow vs fork.** A read-only clone keeps applying and can run
   `es-verify all|order|claims` continuously. A writable fork seeds at a cut,
   `setval`s the position sequence, and then stops applying; it never merges back,
-  and promotion is a cutover, not a merge.
+  and promotion is a handover, not a merge.
 - **`log_order` is optional for a functional clone** and required to re-verify
   order. `command_dedup` does not travel.
 
@@ -166,8 +172,9 @@ Positive:
   aggregates, chain, positions, and claims. One table to stream.
 - The ops travel on the feed, so a consumer that already reads envelopes gets
   them with no second stream.
-- The sidecar, the adopt/backfill path, the decision codec's id ordering, and
-  the advisory lock are gone. A claim-only append cannot hide state.
+- The separate table, the adopt/backfill path, the decision codec's id
+  ordering, and the advisory lock are gone. A claim-only append cannot hide
+  state.
 - Same-stream ordering is ordinary optimistic concurrency again: every
   constraint-bearing append bumps the version.
 
@@ -177,14 +184,14 @@ Costs:
   claims without an event must name one. That is a real API/domain restriction.
 - Claim values live in the immutable log: erasure is MAC + key destruction, and
   a plaintext claim value cannot be erased. This is a stronger obligation than
-  the sidecar's deletable rows.
+  the separate table's deletable rows.
 - The ops are not chain-attested. The DB is the trust boundary for them.
 - `log_order` is still a second table if you want order re-verification.
 - Pre-0.21 stores are unsupported for rebuild/verify.
 
 ## 4. Alternatives considered
 
-- **An `append_decisions` sidecar** (the first design). It kept claim-only
+- **A separate append-decisions table** (the first design). It kept claim-only
   appends and deletable decisions, at the cost of a second table, an adopt path,
   and an ordering lock. Rejected by the product owner: the property required is
   an events-only restore, and a claim without an event is invisible state.
@@ -209,10 +216,13 @@ Costs:
   and decode on every envelope scan; `Envelope.ConstraintOps` is excluded from
   the hash.
 - Runtime and both stores reject `ErrConstraintWithoutEvent`.
-- Rebuild/verify/`ClaimWorkspaces` read events; delete the sidecar code, its
-  migrations, and its tests.
+- Rebuild/verify read events; `ClaimWorkspaces` unions `events` with
+  `unique_claims` so a workspace with claims and no events is discovered and
+  refused, not skipped. Delete the separate table's code, migrations, and
+  tests.
 - Least privilege: the appender already has `SELECT, INSERT` on `events`; the
-  new column is covered. Remove the `append_decisions` grants.
+  new column is covered. There is no new table and no grant change, and the
+  superseded table's grants are removed.
 - Docs: runbook (backup/restore/clone/erasure), migration note (new column, no
   new table, claim-only rejection), README (the events-only rule and the MAC
   obligation).
