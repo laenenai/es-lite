@@ -283,9 +283,9 @@ applies uniqueness constraints and records their decisions in
 claims index after a restore, and deletes decision rows when a workspace
 is erased. It is also the process running `aggregate.Runtime`, so with a
 snapshot cache configured (ADR 0042) it both reads and writes `snapshots`
-— the same role as for `events`. `Release` is the only `DELETE` the
-append path ever issues, and it is on the claims index, never on the log
-(`Purge` on the snapshot cache, below, is the one other `DELETE`):
+— the same role as for `events`. `Release` is the only `DELETE` on the
+append path; erasure deletes `append_decisions` rows, and `Purge` on the
+snapshot cache is the other off-path `DELETE`:
 
 ```sql
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;

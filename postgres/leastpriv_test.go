@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/laenenai/es-lite/es"
 	"github.com/laenenai/es-lite/feed"
 	"github.com/laenenai/es-lite/postgres"
@@ -99,9 +101,9 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 		// verify the claims index after a restore, and delete decision
 		// rows when a workspace is erased. It is also the process
 		// running aggregate.Runtime, so with a snapshot cache it reads
-		// and writes snapshots. Release is the only DELETE the append
-		// path issues on the log, and it is on the claims index; Purge
-		// on the snapshot cache is the one other DELETE.
+		// and writes snapshots. Release is the only DELETE on the append
+		// path; erasure deletes append_decisions rows, and Purge on the
+		// snapshot cache is the other off-path DELETE.
 		{lpAppender, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAppender + `;
 			GRANT USAGE ON SEQUENCE events_global_position_seq TO ` + lpAppender + `;
@@ -145,15 +147,14 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 	}
 }
 
-// appendDecisionCount counts the workspace's append_decisions rows through a
-// probe's own pool. The table is FORCE ROW LEVEL SECURITY, so pinnedConn pins
-// app.workspace_id on the session before the read.
-func appendDecisionCount(t *testing.T, ctx context.Context, s *postgres.Store, ws string) int64 {
+// appendDecisionCount counts the workspace's append_decisions rows on the
+// facet's pinned probe connection. The caller pins app.workspace_id (the
+// table is FORCE ROW LEVEL SECURITY) and owns the connection.
+func appendDecisionCount(t *testing.T, ctx context.Context, conn *pgxpool.Conn) int64 {
 	t.Helper()
 	var n int64
-	if err := pinnedConn(t, s, ws).QueryRow(ctx,
-		`SELECT count(*) FROM append_decisions`).Scan(&n); err != nil {
-		t.Fatalf("count append_decisions under %s: %v", ws, err)
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM append_decisions`).Scan(&n); err != nil {
+		t.Fatalf("count append_decisions: %v", err)
 	}
 	return n
 }
@@ -256,7 +257,22 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	// claim-only append — no events — is the purest exercise: its
 	// decision row is the append's only durable effect, an empty span at
 	// the current head.
-	before := appendDecisionCount(t, ctx, appender, lpWS)
+	//
+	// One pinned connection serves every raw count/select/delete here:
+	// the probe pool's default max is max(4, NumCPU), and holding one
+	// leaves room for the append/rebuild/verify calls that borrow from
+	// the pool. app.workspace_id is pinned because append_decisions is
+	// FORCE ROW LEVEL SECURITY.
+	decisionConn, err := appender.Pool().Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire the appender's decision connection: %v", err)
+	}
+	defer decisionConn.Release()
+	if _, err := decisionConn.Exec(ctx,
+		`SELECT set_config('app.workspace_id', $1, false)`, lpWS); err != nil {
+		t.Fatalf("pin workspace on the appender's decision connection: %v", err)
+	}
+	before := appendDecisionCount(t, ctx, decisionConn)
 	res3, err := aws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 2,
@@ -268,7 +284,7 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	if res3.FromVersion != 2 || res3.ToVersion != 2 || len(res3.Envelopes) != 0 {
 		t.Fatalf("claim-only append result = %+v, want the empty span at v2 with no events", res3)
 	}
-	if got := appendDecisionCount(t, ctx, appender, lpWS); got != before+1 {
+	if got := appendDecisionCount(t, ctx, decisionConn); got != before+1 {
 		t.Fatalf("append_decisions count after the claim-only append = %d, want %d", got, before+1)
 	}
 	var (
@@ -276,7 +292,7 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 		from, to uint64
 		ops      []byte
 	)
-	if err := pinnedConn(t, appender, lpWS).QueryRow(ctx,
+	if err := decisionConn.QueryRow(ctx,
 		`SELECT id, from_version, to_version, ops FROM append_decisions
 		  WHERE workspace_id = $1 ORDER BY id DESC LIMIT 1`, lpWS).
 		Scan(&rowID, &from, &to, &ops); err != nil {
@@ -305,6 +321,9 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	if rebuild.Decisions != before+1 {
 		t.Fatalf("RebuildClaims replayed %d decisions, want %d", rebuild.Decisions, before+1)
 	}
+	if rebuild.Claims != 1 {
+		t.Fatalf("RebuildClaims produced %d live claims, want 1 — an empty replay must not pass", rebuild.Claims)
+	}
 	verify, err := appender.WorkspaceStore(lpWS).VerifyClaims(ctx)
 	if err != nil {
 		t.Fatalf("VerifyClaims under the appender grants: %v", err)
@@ -315,11 +334,11 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 
 	// Workspace erasure deletes decision rows with the appender's
 	// grants; the count returns to where this facet started.
-	if _, err := pinnedConn(t, appender, lpWS).Exec(ctx,
+	if _, err := decisionConn.Exec(ctx,
 		`DELETE FROM append_decisions WHERE workspace_id = $1 AND id = $2`, lpWS, rowID); err != nil {
 		t.Fatalf("delete the claim-only decision under the appender grants: %v", err)
 	}
-	if got := appendDecisionCount(t, ctx, appender, lpWS); got != before {
+	if got := appendDecisionCount(t, ctx, decisionConn); got != before {
 		t.Fatalf("append_decisions count after erasing the claim-only row = %d, want %d", got, before)
 	}
 
