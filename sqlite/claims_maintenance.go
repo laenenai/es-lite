@@ -34,6 +34,15 @@ const opPageSize = 1000
 // state — live claims with no ops in the event log — returning
 // ErrClaimsWithoutDecisions without deleting anything, because the log cannot
 // reconstruct that index.
+//
+// The rebuild replaces the index with what the log can prove. It refuses only
+// the fully unbacked store (live claims with zero op-bearing events); on a
+// partially inconsistent store — some claims with ops and some without — it
+// succeeds and deletes every live claim the log does not license. Run
+// VerifyClaims first, and on a mixed store export the divergent claims before
+// rebuilding (the rollback window in
+// docs/migration/2026-11-07-breaking-changes.md explains how that store
+// arises).
 func (s *Store) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, error) {
 	var zero es.ClaimsRebuildReport
 	tx, err := s.db.BeginTx(ctx, nil)

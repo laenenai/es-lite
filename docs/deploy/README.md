@@ -486,8 +486,15 @@ event are one row, so an event cut is internally consistent; loading
    Skip it only when the restored log is empty. There is no second sequence.
    SQLite's `AUTOINCREMENT` tracks explicit-id inserts itself, so this step is
    Postgres-only.
-5. Rebuild the index: `es-verify claims --rebuild`, then `es-verify claims`.
-   The second command must report `claims OK`. The whole-database form (no
+5. **Stop writers**, then rebuild the index: `es-verify claims --rebuild`, then
+   `es-verify claims`. The second command must report `claims OK`. `--rebuild`
+   replaces the index with what the log can prove, and an op committed after
+   its snapshot cannot be replayed; Postgres runs it in one Repeatable Read
+   transaction, so a writer racing the snapshot may surface as a
+   serialization error — loud and retryable, never a silent divergence. A
+   write that races the rebuild must retry after it commits. Keep writers
+   stopped until step 8.
+   The whole-database form (no
    workspace argument) needs the owner/superuser, or a role with `es_relay`
    plus `SELECT` on `events` and `unique_claims` and `DELETE, INSERT` on
    `unique_claims`: `ClaimWorkspaces` takes the role-gated bypass, which the
@@ -500,6 +507,15 @@ event are one row, so an event cut is internally consistent; loading
    refuse it (`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or
    delete. Do not load `unique_claims` from a different cut and do not invent
    a backfill. Re-cut from the events, or start fresh.
+
+   The guard is deliberately narrow: it fires only when there are **zero**
+   op-bearing events. A partially inconsistent store — some claims backed by
+   ops, some not — passes it, and `--rebuild` deletes every live claim the log
+   does not license. Run `es-verify claims` first; on a mixed store, export
+   the divergent claims through the new append path before rebuilding. The
+   rollback window in
+   [`docs/migration/2026-11-07-breaking-changes.md`](../migration/2026-11-07-breaking-changes.md)
+   is one way such a store arises.
 6. Run the chain audit. If you loaded `log_order`, run `es-verify all`: it
    verifies every stream chain and then the global log order (every batch hash
    recomputed from the events). An events-only restore has no order witness,
@@ -533,11 +549,31 @@ logical replication feed. Two shapes, different rules:
 
 - **Follow (read-only clone).** Apply later cuts as they arrive. Apply **per
   source transaction**, not per table: the ops ride on the event row, so an
-  event and its claim are never split. The clone never appends, so the
-  position sequence is irrelevant, and `es-verify all`, `es-verify order` (with
-  `log_order`) and `es-verify claims` can run on a schedule.
-  That is the useful property: the DR copy proves itself continuously instead
-  of at incident time.
+  event and its claim are never split.
+
+  The clone never draws new positions, but it must still advance the position
+  sequence after seeding and after each applied cut:
+  ```sql
+  SELECT setval('events_global_position_seq',
+                (SELECT max(global_position) FROM events));
+  ```
+  Logical replication copies explicit `global_position` values without
+  advancing the sequence, while the verifier's `settledBound(0)` reads
+  `pg_sequences.last_value`. An unadvanced sequence makes order verification
+  audit only the seeded prefix or report `EMPTY`, and `CheckAnchor` clamps its
+  bound. Grant the verifier role `USAGE` on the sequence — without it
+  `last_value` is masked to 0.
+
+  The clone also maintains `unique_claims`: apply each event's ops per source
+  transaction, or run `es-verify claims --rebuild` after a cut (pausing the
+  apply while it runs). A fresh events-only clone that loads events and leaves
+  the index empty diverges against the log; never load `unique_claims` from a
+  different cut.
+
+  Audit on a schedule: `es-verify all --chains-only` when `log_order` is not
+  loaded; `es-verify all` (or `es-verify order`) only when it is and the
+  sequence has been advanced. That is the useful property: the DR copy proves
+  itself continuously instead of at incident time.
 - **Fork (writable staging).** Seed at a cut, `setval` the one position
   sequence, then stop applying and let it diverge. It is a fork: never merge
   it back and never point it at the backup prefix. Promotion is a handover —

@@ -100,8 +100,8 @@ restored database. Stream it alongside the events if you want `es-verify order`
 and historical anchor checks on the clone; otherwise the exported anchor JSON
 is the evidence of the original order. For that events-only restore, run
 `es-verify all --chains-only`: it verifies every stream chain and skips the
-order stage, which has no witness to check. It is small and predates this ADR
-(ADR 0038).
+order stage, which has no witness to check. `log_order` is small and predates
+this ADR (ADR 0038).
 
 `command_dedup` is excluded (a post-commit response cache; ADR 0043 §Idempotency
 below). `snapshots` rebuild lazily, `feed_checkpoints` and `feed_dead_letters`
@@ -159,14 +159,27 @@ The events table is a logical replication feed. The consumer contract:
   `workspace_id`; claims are per-workspace, so such a clone is self-consistent.
 - **Refuse an unknown ops format.** The encoding carries a versioned domain; a
   consumer on an older schema must reject a newer record, not mis-decode it.
-- **Follow vs fork.** A read-only clone keeps applying and can run
-  `es-verify all|order|claims` continuously. A writable fork seeds at a cut,
-  `setval`s the position sequence, and then stops applying; it never merges back,
-  and promotion is a handover, not a merge.
+- **Follow vs fork.** A read-only clone keeps applying. It must still advance
+  the position sequence after seeding and after each applied cut:
+  `SELECT setval('events_global_position_seq', (SELECT max(global_position)
+  FROM events));`. Logical replication copies explicit `global_position`
+  values without advancing the sequence, while the verifier's
+  `settledBound(0)` reads `pg_sequences.last_value`; an unadvanced sequence
+  audits only the seeded prefix or reports `EMPTY`, and `CheckAnchor` clamps
+  the bound. The verifier role needs `USAGE` on the sequence — without it
+  `last_value` is masked to 0. Audit with `es-verify all --chains-only` when
+  `log_order` is absent; `all`/`order` only when it is present and the
+  sequence is advanced. Maintain `unique_claims` by applying each event's ops
+  per source transaction, or with `--rebuild` after a cut (pausing the apply):
+  a fresh events-only clone with an empty index diverges against its log. A
+  writable fork seeds at a cut, `setval`s the sequence, and then stops
+  applying; it never merges back, and promotion is a handover, not a merge.
 - **`log_order` is optional for a functional clone** and required to re-verify
   order. `command_dedup` does not travel.
 
 ## 3. Consequences
+
+### 3.1 Outcomes
 
 Positive:
 
@@ -190,6 +203,25 @@ Costs:
 - The ops are not chain-attested. The DB is the trust boundary for them.
 - `log_order` is still a second table if you want order re-verification.
 - Pre-0.21 stores are unsupported for rebuild/verify.
+
+### 3.2 Rebuild requires quiescence
+
+A rebuild is a restore operation, not a maintenance job to run against a live
+writer: `--rebuild` replaces the index with what the log can prove, and an op
+committed after its snapshot cannot be replayed. Postgres runs it in one
+Repeatable Read transaction, so the guard, delete, replay and count share one
+snapshot; SQLite gets the same property from its single connection. That fixes
+torn reads, not staleness — **stop writers before a rebuild**, and resume them
+after it commits. A writer racing the snapshot may surface as a serialization
+error: loud and retryable, never a silent divergence.
+
+`RebuildClaims` refuses only a store with live claims and zero op-bearing
+events. On a partially inconsistent store — some claims backed by ops, some
+not — the rebuild succeeds and deletes every live claim the log cannot prove.
+Run `VerifyClaims` first, and on a mixed store export the divergent claims
+before rebuilding. The rollback window in
+`docs/migration/2026-11-07-breaking-changes.md` is one way such a store
+arises.
 
 ## 4. Alternatives considered
 

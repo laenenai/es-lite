@@ -718,8 +718,9 @@ Deployments that use no constraints are unaffected: the migration lands and
 every row's column is `NULL`.
 
 **What to do.** In this order: **migrate, deploy.** There is no grant step
-and no second sequence to advance. Verify with `es-verify claims` (it must
-report `claims OK`, exit 0). Old binaries ignore the added column — their
+and no second sequence to advance. Verify with `es-verify claims` on a store
+with no legacy claims (it must report `claims OK`, exit 0); a pre-0.21 store
+with claims is refused — see below. Old binaries ignore the added column — their
 statements neither read nor write it — so a rollback needs no schema change.
 
 There is no legacy path. Every claim written by the new binary carries its
