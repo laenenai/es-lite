@@ -335,8 +335,7 @@ func TestAllExitCodePrecedence(t *testing.T) {
 }
 
 // seedClaim appends one event carrying one Claim constraint, so the store
-// also records an append decision — the row the claims cutover and the
-// claims commands operate on.
+// also records an append decision — the row the claims commands operate on.
 func seedClaim(t *testing.T, s *sqlite.Store, sid es.StreamID, scope, value string) {
 	t.Helper()
 	if _, err := s.Append(context.Background(), es.AppendParams{
@@ -346,22 +345,6 @@ func seedClaim(t *testing.T, s *sqlite.Store, sid es.StreamID, scope, value stri
 	}); err != nil {
 		t.Fatalf("append with claim: %v", err)
 	}
-}
-
-// countDecisions counts append_decisions rows through a fresh handle (the
-// store under test is closed before run opens its own).
-func countDecisions(t *testing.T) int {
-	t.Helper()
-	s, err := sqlite.Open(context.Background(), os.Getenv("SQLITE_DSN"))
-	if err != nil {
-		t.Fatalf("reopen sqlite: %v", err)
-	}
-	defer s.Close()
-	var n int
-	if err := s.DB().QueryRow(`SELECT count(*) FROM append_decisions`).Scan(&n); err != nil {
-		t.Fatalf("count decisions: %v", err)
-	}
-	return n
 }
 
 // TestClaimsCommandEmpty pins the claims oracle's empty case: a fresh
@@ -413,60 +396,11 @@ func TestClaimsCommandRebuildAndVerify(t *testing.T) {
 	}
 }
 
-// TestClaimsCommandAdoptAlreadyAdopted pins the CLI's side of the once-only
-// cutover: the adapter refuses a second backfill, and the command treats that
-// as "this workspace is done" — exit 0, nothing written — so a mixed database
-// can finish its cutover on a retry. The refusal itself is pinned at the
-// adapter level (TestAdoptRefusesWhenDecisionsExist).
-func TestClaimsCommandAdoptAlreadyAdopted(t *testing.T) {
-	s := newTestDB(t)
-	sid, err := es.NewStreamID("thing", "a")
-	if err != nil {
-		t.Fatalf("stream id: %v", err)
-	}
-	seedClaim(t, s, sid, "thing.slug", "a")
-	before := countDecisions(t)
-	closeDB(t, s)
-
-	var code int
-	_, stderr := captureOutput(t, func() { code = run([]string{"claims", "--adopt-existing"}) })
-	if code != exitIntact {
-		t.Errorf("claims --adopt-existing with decision history: exit %d, want %d — an adopted workspace is done, not a failure", code, exitIntact)
-	}
-	if !strings.Contains(stderr, "cutover") {
-		t.Errorf("claims --adopt-existing: stderr %q, want the cutover warning", stderr)
-	}
-	if !strings.Contains(stderr, "already adopted") {
-		t.Errorf("claims --adopt-existing: stderr %q, want the already-adopted note", stderr)
-	}
-	if after := countDecisions(t); after != before {
-		t.Errorf("claims --adopt-existing: %d decisions after, want %d (nothing added)", after, before)
-	}
-}
-
-// TestClaimsCommandFlagsConflict pins flag validation: --rebuild and
-// --adopt-existing are different cutovers and must not combine.
-func TestClaimsCommandFlagsConflict(t *testing.T) {
-	s := newTestDB(t)
-	closeDB(t, s)
-	var code int
-	_, stderr := captureOutput(t, func() { code = run([]string{"claims", "--rebuild", "--adopt-existing"}) })
-	if code != exitUsage {
-		t.Errorf("claims --rebuild --adopt-existing: exit %d, want %d", code, exitUsage)
-	}
-	if !strings.Contains(stderr, "usage:") {
-		t.Errorf("claims --rebuild --adopt-existing: stderr %q, want the usage text", stderr)
-	}
-}
-
 // fakeClaims is a minimal es.ClaimsMaintainer for the command tests: they
-// drive VerifyClaims or AdoptClaims, and the other methods exist to satisfy
-// the interface.
+// drive VerifyClaims, and RebuildClaims exists to satisfy the interface.
 type fakeClaims struct {
-	rep      es.ClaimsVerifyReport
-	err      error
-	adoptN   int64
-	adoptErr error
+	rep es.ClaimsVerifyReport
+	err error
 }
 
 func (f fakeClaims) RebuildClaims(context.Context) (es.ClaimsRebuildReport, error) {
@@ -476,8 +410,6 @@ func (f fakeClaims) RebuildClaims(context.Context) (es.ClaimsRebuildReport, erro
 func (f fakeClaims) VerifyClaims(context.Context) (es.ClaimsVerifyReport, error) {
 	return f.rep, f.err
 }
-
-func (f fakeClaims) AdoptClaims(context.Context) (int64, error) { return f.adoptN, f.adoptErr }
 
 // TestClaimsCommandDivergenceDominatesError pins the claims verify exit
 // precedence across workspaces: a divergence already confirmed on one
@@ -518,48 +450,6 @@ func TestClaimsCommandDivergenceDominatesError(t *testing.T) {
 			}
 			if !strings.Contains(stderr, "read failed") {
 				t.Errorf("claims across a divergence and an error: stderr %q, want the workspace error", stderr)
-			}
-		})
-	}
-}
-
-// TestClaimsCommandAdoptContinuesPastAdopted pins the mixed-database cutover:
-// one workspace may already be adopted, and the command must finish the rest
-// instead of aborting on it. Both orders exit 0 and report the already-adopted
-// workspace by name.
-func TestClaimsCommandAdoptContinuesPastAdopted(t *testing.T) {
-	adopted := fakeClaims{adoptErr: es.ErrClaimsAlreadyAdopted}
-	fresh := fakeClaims{adoptN: 2}
-	for _, tc := range []struct {
-		name          string
-		first, second fakeClaims
-	}{
-		{"adopted then fresh", adopted, fresh},
-		{"fresh then adopted", fresh, adopted},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			b := &backend{
-				claims: func(ws string) es.ClaimsMaintainer {
-					if ws == "a" {
-						return tc.first
-					}
-					return tc.second
-				},
-				claimWorkspaces: func(context.Context) ([]string, error) {
-					return []string{"a", "b"}, nil
-				},
-				multiWS: true,
-			}
-			var code int
-			stdout, stderr := captureOutput(t, func() { code = cmdClaims(context.Background(), b, []string{"--adopt-existing"}) })
-			if code != exitIntact {
-				t.Errorf("adopt across a mixed database: exit %d, want %d — an already-adopted workspace is not a failure", code, exitIntact)
-			}
-			if !strings.Contains(stdout, "claims adopted: 2 decisions") {
-				t.Errorf("adopt across a mixed database: stdout %q, want the fresh workspace's 2 decisions", stdout)
-			}
-			if !strings.Contains(stderr, "already adopted") {
-				t.Errorf("adopt across a mixed database: stderr %q, want the already-adopted note", stderr)
 			}
 		})
 	}

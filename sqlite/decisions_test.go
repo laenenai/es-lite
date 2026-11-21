@@ -14,8 +14,8 @@ import (
 )
 
 // decisionRow is one append_decisions row, as the raw query below reads it.
-// commandID is COALESCEd to "" so a NULL (the adopt backfill) scans without
-// a nullable pointer; a live append always writes the UUID string.
+// commandID is COALESCEd to "" so the scan needs no nullable pointer; a live
+// append always writes the UUID string (the zero UUID when unset).
 type decisionRow struct {
 	streamID    string
 	fromVersion uint64
@@ -335,49 +335,53 @@ func TestRebuildClaimsFromDecisions(t *testing.T) {
 	}
 }
 
-// TestRebuildRefusesPreCutoverState pins the mandatory guard: live claims
-// with no decision history mean the one-time adoption never ran, and a
-// rebuild must refuse rather than delete an index it cannot reconstruct.
-func TestRebuildRefusesPreCutoverState(t *testing.T) {
+// TestRebuildRefusesClaimsWithoutDecisions pins the mandatory guard: live
+// claims with no decision history are an inconsistent store — a partial
+// restore or rows written outside the append path — and a rebuild must refuse
+// rather than delete an index it cannot reconstruct.
+func TestRebuildRefusesClaimsWithoutDecisions(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	sid := decisionStream(t, "a")
 
-	appendWithOps(t, s, sid, 0, es.Claim("email", "precutover@b"))
+	appendWithOps(t, s, sid, 0, es.Claim("email", "no-decisions@b"))
 	if _, err := s.DB().ExecContext(ctx, `DELETE FROM append_decisions`); err != nil {
 		t.Fatalf("delete append_decisions: %v", err)
 	}
 
-	_, err := s.RebuildClaims(ctx)
-	if !errors.Is(err, es.ErrClaimsNotAdopted) {
-		t.Fatalf("rebuild with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	rep, err := s.RebuildClaims(ctx)
+	if !errors.Is(err, es.ErrClaimsWithoutDecisions) {
+		t.Fatalf("rebuild with no decision history: got %v, want ErrClaimsWithoutDecisions", err)
 	}
-	if _, found, err := s.LookupClaim(ctx, "email", "precutover@b"); err != nil || !found {
+	if rep != (es.ClaimsRebuildReport{}) {
+		t.Errorf("rebuild report on a claims-without-decisions state = %+v, want the zero report", rep)
+	}
+	if _, found, err := s.LookupClaim(ctx, "email", "no-decisions@b"); err != nil || !found {
 		t.Fatalf("claim after refused rebuild = found=%v err=%v, want still present", found, err)
 	}
 }
 
-// TestVerifyRefusesPreCutoverState pins the verify-side guard, the mirror of
-// RebuildClaims': live claims with no decision history are an un-adopted
-// database, not a tamper. Verify must return the zero report and
-// ErrClaimsNotAdopted rather than inventing a divergence, so the runbook's
-// "refusal is exit 2" contract holds.
-func TestVerifyRefusesPreCutoverState(t *testing.T) {
+// TestVerifyRefusesClaimsWithoutDecisions pins the verify-side guard, the
+// mirror of RebuildClaims': live claims with no decision history are an
+// inconsistent store, not a tamper. Verify must return the zero report and
+// ErrClaimsWithoutDecisions rather than inventing a divergence, so the
+// runbook's "refusal is exit 2" contract holds.
+func TestVerifyRefusesClaimsWithoutDecisions(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	sid := decisionStream(t, "a")
 
-	appendWithOps(t, s, sid, 0, es.Claim("email", "verify-precutover@b"))
+	appendWithOps(t, s, sid, 0, es.Claim("email", "verify-no-decisions@b"))
 	if _, err := s.DB().ExecContext(ctx, `DELETE FROM append_decisions`); err != nil {
 		t.Fatalf("delete append_decisions: %v", err)
 	}
 
 	rep, err := s.VerifyClaims(ctx)
-	if !errors.Is(err, es.ErrClaimsNotAdopted) {
-		t.Fatalf("verify with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	if !errors.Is(err, es.ErrClaimsWithoutDecisions) {
+		t.Fatalf("verify with no decision history: got %v, want ErrClaimsWithoutDecisions", err)
 	}
 	if rep != (es.ClaimsVerifyReport{}) {
-		t.Errorf("verify report on a pre-cutover state = %+v, want the zero report", rep)
+		t.Errorf("verify report on a claims-without-decisions state = %+v, want the zero report", rep)
 	}
 }
 
@@ -410,112 +414,5 @@ func TestVerifyClaimsReportsDivergence(t *testing.T) {
 		if !strings.Contains(rep.FirstDivergence, want) {
 			t.Errorf("FirstDivergence = %q, want it to name %q", rep.FirstDivergence, want)
 		}
-	}
-}
-
-// TestAdoptExistingClaims pins the one-time cutover: a synthetic Claim per
-// live index row is enough to reproduce that index from an empty one. One
-// index row holds a non-UTF-8 value key, which the synthetic decision must
-// carry byte for byte through adoption and replay.
-func TestAdoptExistingClaims(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	sidA := decisionStream(t, "a")
-	sidB := decisionStream(t, "b")
-	rawKey := []byte{0xff, 0x00, 0xfe}
-
-	appendWithOps(t, s, sidA, 0, es.Claim("email", "adopt-a@b"))
-	// A live index row the log does not know about, with a value that is not
-	// valid UTF-8: adoption reads the index, not the log, and must preserve
-	// the bytes exactly.
-	if _, err := s.DB().ExecContext(ctx,
-		`INSERT INTO unique_claims (scope, value_key, stream_id) VALUES (?,?,?)`,
-		"raw.scope", rawKey, sidB.Canonical()); err != nil {
-		t.Fatalf("insert raw claim: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `DELETE FROM append_decisions`); err != nil {
-		t.Fatalf("delete append_decisions: %v", err)
-	}
-
-	n, err := s.AdoptClaims(ctx)
-	if err != nil {
-		t.Fatalf("adopt: %v", err)
-	}
-	if n != 2 {
-		t.Errorf("adopted rows = %d, want 2", n)
-	}
-	rows := decisionRows(t, s)
-	if len(rows) != 2 {
-		t.Fatalf("append_decisions rows after adopt = %d, want 2", len(rows))
-	}
-	byScope := make(map[string]decisionRow, len(rows))
-	for _, r := range rows {
-		if r.fromVersion != 0 || r.toVersion != 0 {
-			t.Errorf("adopted span = [%d,%d), want [0,0)", r.fromVersion, r.toVersion)
-		}
-		if r.commandID != "" {
-			t.Errorf("adopted command_id = %q, want NULL", r.commandID)
-		}
-		ops, err := es.DecodeDecisionOps(r.ops)
-		if err != nil {
-			t.Fatalf("decode adopted ops: %v", err)
-		}
-		if len(ops) != 1 || ops[0].Op != es.ClaimOp {
-			t.Fatalf("adopted ops = %+v, want exactly one Claim", ops)
-		}
-		byScope[ops[0].Scope] = r
-	}
-	if r, ok := byScope["email"]; !ok || r.streamID != sidA.Canonical() {
-		t.Errorf("adopted email claim = %+v (present=%v), want stream %q", r, ok, sidA.Canonical())
-	}
-	raw, ok := byScope["raw.scope"]
-	if !ok || raw.streamID != sidB.Canonical() {
-		t.Fatalf("adopted raw claim = %+v (present=%v), want stream %q", raw, ok, sidB.Canonical())
-	}
-	rawOps, err := es.DecodeDecisionOps(raw.ops)
-	if err != nil {
-		t.Fatalf("decode raw ops: %v", err)
-	}
-	if got := []byte(rawOps[0].Value); !slices.Equal(got, rawKey) {
-		t.Errorf("adopted raw value = %x, want %x", got, rawKey)
-	}
-
-	// Lose the index: the adopted log alone must bring both values back.
-	if _, err := s.DB().ExecContext(ctx, `DELETE FROM unique_claims`); err != nil {
-		t.Fatalf("delete unique_claims: %v", err)
-	}
-	rep, err := s.RebuildClaims(ctx)
-	if err != nil {
-		t.Fatalf("rebuild after adopt: %v", err)
-	}
-	if rep.Decisions != 2 || rep.Claims != 2 {
-		t.Errorf("rebuild report after adopt = %+v, want {Decisions:2 Claims:2}", rep)
-	}
-	if _, found, err := s.LookupClaim(ctx, "email", "adopt-a@b"); err != nil || !found {
-		t.Errorf("lookup after adopt+rebuild of the email claim = found=%v err=%v, want present", found, err)
-	}
-	if sid, found, err := s.LookupClaim(ctx, "raw.scope", string(rawKey)); err != nil || !found || sid != sidB.Canonical() {
-		t.Errorf("lookup after adopt+rebuild of the raw claim = (%q, %v, %v), want (%q, true, nil)", sid, found, err, sidB.Canonical())
-	}
-
-	verify, err := s.VerifyClaims(ctx)
-	if err != nil {
-		t.Fatalf("verify after adopt+rebuild: %v", err)
-	}
-	if !verify.OK {
-		t.Errorf("verify after adopt+rebuild = %+v, want OK", verify)
-	}
-}
-
-// TestAdoptRefusesWhenDecisionsExist pins the one-time property: adoption
-// over recorded history would duplicate a Claim and break every rebuild.
-func TestAdoptRefusesWhenDecisionsExist(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-
-	appendWithOps(t, s, decisionStream(t, "a"), 0, es.Claim("email", "adopt-twice@b"))
-
-	if _, err := s.AdoptClaims(ctx); !errors.Is(err, es.ErrClaimsAlreadyAdopted) {
-		t.Fatalf("adopt with existing decisions: got %v, want ErrClaimsAlreadyAdopted", err)
 	}
 }

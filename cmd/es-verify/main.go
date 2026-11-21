@@ -1,7 +1,8 @@
 // Command es-verify audits the tamper-evident hash chain (ADR 0029) and
 // manages anchors. It needs no keys: it recomputes every hash from what the
 // database returns. Exit status is the audit result (0 intact, 1 broken,
-// 2 usage/connection error). An empty stream or an empty database is an
+// 2 error or refusal — a usage/connection problem, or a claims index the log
+// cannot license or reconstruct). An empty stream or an empty database is an
 // error, not an intact result: it certifies nothing (review F13).
 //
 // Usage:
@@ -22,10 +23,9 @@
 //	es-verify order [--upto N]
 //	  deep-verify the log order: recompute every log_order batch hash
 //	  from the events at or below the bound (0 = the log head)
-//	es-verify claims [--rebuild | --adopt-existing] [<workspace>]
+//	es-verify claims [--rebuild] [<workspace>]
 //	  verify the unique-claims index against its append decision log;
-//	  --rebuild replays the log over the live index, --adopt-existing
-//	  performs the one-time cutover backfill (writers must be stopped)
+//	  --rebuild replays the log over the live index
 //
 // Config (env), as es-migrate: BACKEND (postgres|sqlite), PG_DSN, SQLITE_DSN.
 package main
@@ -112,7 +112,7 @@ func usage() {
   es-verify all [--strict]
   es-verify anchor [--upto N] | --check <anchor.json> | list
   es-verify order [--upto N]
-  es-verify claims [--rebuild | --adopt-existing] [<workspace>]`)
+  es-verify claims [--rebuild] [<workspace>]`)
 }
 
 func cmdStream(ctx context.Context, b *backend, args []string) int {
@@ -275,20 +275,18 @@ func cmdOrder(ctx context.Context, b *backend, args []string) int {
 // cmdClaims maintains and audits the unique-claims index against the append
 // decision log recorded beside the events (ADR 0043). The default is the
 // oracle: rebuild into a temporary index and compare, without touching the
-// live index. --rebuild replays the log over the live index; --adopt-existing
-// is the one-time cutover backfill and refuses once any decision exists. The
-// two mutating modes are mutually exclusive. The refusal sentinels —
-// ErrClaimsNotAdopted for a rebuild before the cutover, ErrClaimsAlreadyAdopted
-// for a second adopt — and connection errors all exit 2: nothing was audited.
+// live index. --rebuild replays the log over the live index. An inconsistent
+// state — live claims with no decision history — is refused with
+// es.ErrClaimsWithoutDecisions, and that refusal, like connection errors,
+// exits 2: nothing was audited.
 func cmdClaims(ctx context.Context, b *backend, args []string) int {
 	fs := flag.NewFlagSet("claims", flag.ContinueOnError)
 	rebuild := fs.Bool("rebuild", false, "replace the live claims index by replaying the append decision log")
-	adopt := fs.Bool("adopt-existing", false, "backfill one decision per live claim (one-time cutover; writers must be stopped)")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	rest := fs.Args()
-	if len(rest) > 1 || (*rebuild && *adopt) {
+	if len(rest) > 1 {
 		usage()
 		return exitUsage
 	}
@@ -298,32 +296,7 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 		return exitUsage
 	}
 
-	switch {
-	case *adopt:
-		// The header is the operator's instruction, not decoration: the
-		// backfill reads the live index and must not race a writer.
-		fmt.Fprintln(os.Stderr, "es-verify: adopt the claims cutover with writers stopped")
-		var adopted int64
-		for _, ws := range workspaces {
-			n, err := b.claims(ws).AdoptClaims(ctx)
-			if err != nil {
-				// A workspace already carrying decisions is done, not a
-				// failure: a mixed database (A adopted, B not) must be
-				// able to finish its cutover on a retry. Only a real
-				// error stops the run.
-				if errors.Is(err, es.ErrClaimsAlreadyAdopted) {
-					fmt.Fprintf(os.Stderr, "es-verify: %salready adopted\n", wsPrefix(ws))
-					continue
-				}
-				fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
-				return exitUsage
-			}
-			adopted += n
-		}
-		fmt.Printf("claims adopted: %d decisions\n", adopted)
-		return exitIntact
-
-	case *rebuild:
+	if *rebuild {
 		var decisions, claims int64
 		for _, ws := range workspaces {
 			rep, err := b.claims(ws).RebuildClaims(ctx)

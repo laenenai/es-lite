@@ -12,18 +12,12 @@ import (
 // is never mistaken for this one.
 const decisionDomain = "es-lite.append-decisions.v1"
 
-var (
-	// ErrClaimsAlreadyAdopted reports that AdoptClaims found at least one
-	// recorded decision and refused to backfill over it. Adoption is a
-	// one-time cutover and must not run twice: a duplicate Claim row would
-	// make a rebuild fail (ADR 0043 §3.5).
-	ErrClaimsAlreadyAdopted = errors.New("es-lite: append decisions already exist")
-
-	// ErrClaimsNotAdopted reports a rebuild or verify against live claims
-	// with no decision history: the one-time cutover has not run, so the
-	// index cannot be reconstructed (ADR 0043 §3.2).
-	ErrClaimsNotAdopted = errors.New("es-lite: live claims have no decision history")
-)
+// ErrClaimsWithoutDecisions reports a rebuild or verify against a store whose
+// live claims index has no decision history. Every append writes its decision
+// row in the same transaction, so that state is inconsistent — a partial
+// restore, or rows written outside the append path — and the log cannot
+// license or reconstruct it (ADR 0043 §3.5).
+var ErrClaimsWithoutDecisions = errors.New("es-lite: live claims have no decision history")
 
 // ClaimsRebuildReport summarizes a successful RebuildClaims: Decisions is the
 // number of decision records replayed and Claims the number of live claims
@@ -45,12 +39,14 @@ type ClaimsVerifyReport struct {
 
 // ClaimsMaintainer is implemented by stores that can reconstruct the unique
 // claims index from the append decisions recorded alongside the events
-// (ADR 0043). The live index stays authoritative on the append path; these
+// (ADR 0043). Every claim is written with its decision row in the same
+// transaction, so in a store written by v0.21+ the two always agree; these
 // operations exist for restore, clone, and verification.
 type ClaimsMaintainer interface {
 	// RebuildClaims replaces the live claims index by replaying every
-	// recorded decision in append order. It refuses a pre-cutover state,
-	// returning ErrClaimsNotAdopted rather than deleting an index it cannot
+	// recorded decision in append order. Live claims with no decision
+	// history are inconsistent, so it returns ErrClaimsWithoutDecisions
+	// rather than guessing at a log or deleting an index it cannot
 	// reconstruct.
 	RebuildClaims(context.Context) (ClaimsRebuildReport, error)
 
@@ -58,11 +54,6 @@ type ClaimsMaintainer interface {
 	// live one, reporting the first divergence. It does not modify the live
 	// index.
 	VerifyClaims(context.Context) (ClaimsVerifyReport, error)
-
-	// AdoptClaims performs the one-time cutover backfill: one synthetic Claim
-	// per live claims row. It returns the number of rows written and
-	// ErrClaimsAlreadyAdopted when decision history already exists.
-	AdoptClaims(context.Context) (int64, error)
 }
 
 // EncodeDecisionOps serializes an append's non-event constraint decisions to

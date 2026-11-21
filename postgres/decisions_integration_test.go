@@ -18,8 +18,8 @@ import (
 )
 
 // decisionRow is one append_decisions row, as the raw queries below read it.
-// commandID is COALESCEd to "" so a NULL (the adopt backfill, Task 4) scans
-// without a nullable pointer; a live append always writes the UUID string.
+// commandID is COALESCEd to "" so the scan needs no nullable pointer; a live
+// append always writes the UUID string (the zero UUID when unset).
 type decisionRow struct {
 	streamID    string
 	fromVersion uint64
@@ -291,26 +291,30 @@ func TestRebuildClaimsFromDecisions(t *testing.T) {
 	}
 }
 
-// TestRebuildRefusesPreCutoverState pins the mandatory guard: live claims
-// with no decision history mean the one-time adoption never ran, and a
-// rebuild must refuse rather than delete an index it cannot reconstruct.
-func TestRebuildRefusesPreCutoverState(t *testing.T) {
+// TestRebuildRefusesClaimsWithoutDecisions pins the mandatory guard: live
+// claims with no decision history are an inconsistent store — a partial
+// restore or rows written outside the append path — and a rebuild must refuse
+// rather than delete an index it cannot reconstruct.
+func TestRebuildRefusesClaimsWithoutDecisions(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
-	const ws = "ws_dec_precutover"
+	const ws = "ws_dec_no_decisions"
 	sid := decisionStream(t, "a")
 
-	appendWithOps(t, s, ws, sid, 0, es.Claim("email", "precutover@b"))
+	appendWithOps(t, s, ws, sid, 0, es.Claim("email", "no-decisions@b"))
 	if _, err := pinnedConn(t, s, ws).Exec(ctx,
 		`DELETE FROM append_decisions WHERE workspace_id = $1`, ws); err != nil {
 		t.Fatalf("delete append_decisions: %v", err)
 	}
 
-	_, err := s.WorkspaceStore(ws).RebuildClaims(ctx)
-	if !errors.Is(err, es.ErrClaimsNotAdopted) {
-		t.Fatalf("rebuild with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	rep, err := s.WorkspaceStore(ws).RebuildClaims(ctx)
+	if !errors.Is(err, es.ErrClaimsWithoutDecisions) {
+		t.Fatalf("rebuild with no decision history: got %v, want ErrClaimsWithoutDecisions", err)
 	}
-	if _, found, err := s.WorkspaceStore(ws).LookupClaim(ctx, "email", "precutover@b"); err != nil || !found {
+	if rep != (es.ClaimsRebuildReport{}) {
+		t.Errorf("rebuild report on a claims-without-decisions state = %+v, want the zero report", rep)
+	}
+	if _, found, err := s.WorkspaceStore(ws).LookupClaim(ctx, "email", "no-decisions@b"); err != nil || !found {
 		t.Fatalf("claim after refused rebuild = found=%v err=%v, want still present", found, err)
 	}
 }
@@ -348,85 +352,6 @@ func TestVerifyClaimsReportsDivergence(t *testing.T) {
 	}
 }
 
-// TestAdoptExistingClaims pins the one-time cutover: a synthetic Claim per
-// live index row is enough to reproduce that index from an empty one.
-func TestAdoptExistingClaims(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	const ws = "ws_dec_adopt"
-	sid := decisionStream(t, "a")
-
-	appendWithOps(t, s, ws, sid, 0,
-		es.Claim("email", "adopt-a@b"), es.Claim("email", "adopt-b@b"))
-	if _, err := pinnedConn(t, s, ws).Exec(ctx,
-		`DELETE FROM append_decisions WHERE workspace_id = $1`, ws); err != nil {
-		t.Fatalf("delete append_decisions: %v", err)
-	}
-
-	wsStore := s.WorkspaceStore(ws)
-	n, err := wsStore.AdoptClaims(ctx)
-	if err != nil {
-		t.Fatalf("adopt: %v", err)
-	}
-	if n != 2 {
-		t.Errorf("adopted rows = %d, want 2", n)
-	}
-	rows := decisionRows(t, s, ws)
-	if len(rows) != 2 {
-		t.Fatalf("append_decisions rows after adopt = %d, want 2", len(rows))
-	}
-	for _, r := range rows {
-		if r.fromVersion != 0 || r.toVersion != 0 {
-			t.Errorf("adopted span = [%d,%d), want [0,0)", r.fromVersion, r.toVersion)
-		}
-		if r.commandID != "" {
-			t.Errorf("adopted command_id = %q, want NULL", r.commandID)
-		}
-		if r.streamID != sid.Canonical() {
-			t.Errorf("adopted stream_id = %q, want %q", r.streamID, sid.Canonical())
-		}
-	}
-
-	// Lose the index: the adopted log alone must bring both values back.
-	if _, err := pinnedConn(t, s, ws).Exec(ctx,
-		`DELETE FROM unique_claims WHERE workspace_id = $1`, ws); err != nil {
-		t.Fatalf("delete unique_claims: %v", err)
-	}
-	rep, err := wsStore.RebuildClaims(ctx)
-	if err != nil {
-		t.Fatalf("rebuild after adopt: %v", err)
-	}
-	if rep.Decisions != 2 || rep.Claims != 2 {
-		t.Errorf("rebuild report after adopt = %+v, want {Decisions:2 Claims:2}", rep)
-	}
-	for _, v := range []string{"adopt-a@b", "adopt-b@b"} {
-		if _, found, err := wsStore.LookupClaim(ctx, "email", v); err != nil || !found {
-			t.Errorf("lookup after adopt+rebuild of %q = found=%v err=%v, want present", v, found, err)
-		}
-	}
-	verify, err := wsStore.VerifyClaims(ctx)
-	if err != nil {
-		t.Fatalf("verify after adopt+rebuild: %v", err)
-	}
-	if !verify.OK {
-		t.Errorf("verify after adopt+rebuild = %+v, want OK", verify)
-	}
-}
-
-// TestAdoptRefusesWhenDecisionsExist pins the one-time property: adoption
-// over recorded history would duplicate a Claim and break every rebuild.
-func TestAdoptRefusesWhenDecisionsExist(t *testing.T) {
-	ctx := context.Background()
-	s := openStore(t)
-	const ws = "ws_dec_adopt_twice"
-
-	appendWithOps(t, s, ws, decisionStream(t, "a"), 0, es.Claim("email", "adopt-twice@b"))
-
-	if _, err := s.WorkspaceStore(ws).AdoptClaims(ctx); !errors.Is(err, es.ErrClaimsAlreadyAdopted) {
-		t.Fatalf("adopt with existing decisions: got %v, want ErrClaimsAlreadyAdopted", err)
-	}
-}
-
 // TestAppendWithoutConstraintsWritesNoDecision pins the negative: the record
 // is written only for an append that carries at least one constraint op, so a
 // plain event append leaves the decision log untouched.
@@ -452,14 +377,14 @@ func TestAppendWithoutConstraintsWritesNoDecision(t *testing.T) {
 // writes no event, so a workspace whose entire history is claim-only is
 // invisible to the stream list — and a rebuild/verify loop derived from it
 // would certify a database it never read. ClaimWorkspaces unions the decision
-// log with the pre-cutover index for exactly that case, and the claims
-// maintenance on the discovered workspace still works.
+// log with the live index for exactly that case, so an inconsistent
+// claims-only workspace is still discovered and its refusal is visible.
 func TestClaimWorkspacesIncludesClaimOnly(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 	const (
-		claimOnlyWS  = "ws_dec_ws_claim_only"
-		preCutoverWS = "ws_dec_ws_precutover"
+		claimOnlyWS    = "ws_dec_ws_claim_only"
+		inconsistentWS = "ws_dec_ws_inconsistent"
 	)
 	sid := decisionStream(t, "claim-only")
 
@@ -482,19 +407,19 @@ func TestClaimWorkspacesIncludesClaimOnly(t *testing.T) {
 		t.Fatalf("events in %s = %d, want 0 — the claim-only append writes none", claimOnlyWS, n)
 	}
 
-	// The union's other arm: a pre-cutover workspace holds an index row and
-	// no decision history, so only unique_claims can reveal it.
-	if _, err := pinnedConn(t, s, preCutoverWS).Exec(ctx,
+	// The union's other arm: an inconsistent workspace holds an index row
+	// and no decision history, so only unique_claims can reveal it.
+	if _, err := pinnedConn(t, s, inconsistentWS).Exec(ctx,
 		`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
-		preCutoverWS, "email", []byte("precutover@b"), sid.Canonical()); err != nil {
-		t.Fatalf("insert pre-cutover claim: %v", err)
+		inconsistentWS, "email", []byte("inconsistent@b"), sid.Canonical()); err != nil {
+		t.Fatalf("insert claim-only index row: %v", err)
 	}
 
 	got, err := s.ClaimWorkspaces(ctx)
 	if err != nil {
 		t.Fatalf("claim workspaces: %v", err)
 	}
-	for _, ws := range []string{claimOnlyWS, preCutoverWS} {
+	for _, ws := range []string{claimOnlyWS, inconsistentWS} {
 		if !slices.Contains(got, ws) {
 			t.Errorf("ClaimWorkspaces = %v, want it to include %s", got, ws)
 		}
@@ -515,30 +440,36 @@ func TestClaimWorkspacesIncludesClaimOnly(t *testing.T) {
 	if !verify.OK {
 		t.Errorf("claim-only verify = %+v, want OK", verify)
 	}
+
+	// Discovery must surface the inconsistent workspace so its refusal is
+	// visible, not skipped: the rebuild declines to guess or delete.
+	if _, err := s.WorkspaceStore(inconsistentWS).RebuildClaims(ctx); !errors.Is(err, es.ErrClaimsWithoutDecisions) {
+		t.Errorf("rebuild the inconsistent workspace: got %v, want ErrClaimsWithoutDecisions", err)
+	}
 }
 
-// TestVerifyRefusesPreCutoverState pins the verify-side guard, the mirror of
-// RebuildClaims': live claims with no decision history are an un-adopted
-// database, not a tamper. Verify must return the zero report and
-// ErrClaimsNotAdopted rather than inventing a divergence, so the runbook's
-// "refusal is exit 2" contract holds.
-func TestVerifyRefusesPreCutoverState(t *testing.T) {
+// TestVerifyRefusesClaimsWithoutDecisions pins the verify-side guard, the
+// mirror of RebuildClaims': live claims with no decision history are an
+// inconsistent store, not a tamper. Verify must return the zero report and
+// ErrClaimsWithoutDecisions rather than inventing a divergence, so the
+// runbook's "refusal is exit 2" contract holds.
+func TestVerifyRefusesClaimsWithoutDecisions(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
-	const ws = "ws_dec_verify_precutover"
+	const ws = "ws_dec_verify_no_decisions"
 
-	appendWithOps(t, s, ws, decisionStream(t, "a"), 0, es.Claim("email", "verify-precutover@b"))
+	appendWithOps(t, s, ws, decisionStream(t, "a"), 0, es.Claim("email", "verify-no-decisions@b"))
 	if _, err := pinnedConn(t, s, ws).Exec(ctx,
 		`DELETE FROM append_decisions WHERE workspace_id = $1`, ws); err != nil {
 		t.Fatalf("delete append_decisions: %v", err)
 	}
 
 	rep, err := s.WorkspaceStore(ws).VerifyClaims(ctx)
-	if !errors.Is(err, es.ErrClaimsNotAdopted) {
-		t.Fatalf("verify with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	if !errors.Is(err, es.ErrClaimsWithoutDecisions) {
+		t.Fatalf("verify with no decision history: got %v, want ErrClaimsWithoutDecisions", err)
 	}
 	if rep != (es.ClaimsVerifyReport{}) {
-		t.Errorf("verify report on a pre-cutover state = %+v, want the zero report", rep)
+		t.Errorf("verify report on a claims-without-decisions state = %+v, want the zero report", rep)
 	}
 }
 

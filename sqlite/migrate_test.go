@@ -250,7 +250,7 @@ func TestAppendDecisionsTableColumns(t *testing.T) {
 		{"stream_id", "TEXT", 1},
 		{"from_version", "INTEGER", 1},
 		{"to_version", "INTEGER", 1},
-		{"command_id", "TEXT", 0}, // NULL only for the adopt backfill
+		{"command_id", "TEXT", 0}, // nullable in the schema; live appends always write the UUID
 		{"ops", "BLOB", 1},
 		{"created_at", "TEXT", 1},
 	}

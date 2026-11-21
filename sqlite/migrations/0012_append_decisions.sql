@@ -18,9 +18,8 @@
 -- from_version/to_version are the appended span:
 -- [from_version, to_version), to_version = ExpectedVersion + len(events).
 -- command_id is the append's CommandID as events stores it, including the
--- zero UUID when the caller left it unset. The one-time cutover backfill
--- (AdoptClaims, ADR 0043 §3.5) has no command behind its synthetic Claims
--- and therefore writes NULL; live appends always write a string.
+-- zero UUID when the caller left it unset; live appends always write a
+-- string.
 --
 -- AUTOINCREMENT is deliberate: id is the replay order — the identity order
 -- in which the appends committed — so SQLite must never reuse an id after

@@ -381,8 +381,9 @@ func (s *Store) ListStreams(ctx context.Context) ([]es.StreamRef, error) {
 // distinct workspace ids in append_decisions unioned with those in
 // unique_claims. The union is deliberate — append_decisions covers a
 // workspace whose appends were all claim-only (no event, so ListStreams
-// cannot see it), while unique_claims covers a pre-cutover workspace whose
-// claims have no decision history yet. It runs under app.bypass_rls like
+// cannot see it), while unique_claims covers a workspace whose index has no
+// decision history: discovery must still surface it so the audit refuses it
+// visibly rather than skipping it. It runs under app.bypass_rls like
 // ListStreams: both tables are FORCE ROW LEVEL SECURITY, and the caller is
 // the operator's cross-workspace claims audit.
 func (s *Store) ClaimWorkspaces(ctx context.Context) ([]string, error) {
