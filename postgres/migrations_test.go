@@ -61,33 +61,33 @@ func TestFeedIndexesExist(t *testing.T) {
 	}
 }
 
-// TestAllBypassPoliciesRoleGated pins migrations 0007/0009's policy
-// shape (review F8/F12) through pg_policies — not file greps, which
-// would false-positive on comments (the Task 13 review ruling). All
-// four policies that carry a bypass arm — events, unique_claims,
-// anchors and log_order — must keep the arm (app.bypass_rls), gate it
-// on es_relay membership (pg_has_role), and guard that test with
-// EXISTS so it cannot hard-fail (pg_has_role errors) on a database
-// where the role has not been created yet.
+// TestAllBypassPoliciesRoleGated pins migrations 0007/0009's policy shape
+// (review F8/F12) through pg_policies — not file greps, which would
+// false-positive on comments (the Task 13 review ruling). All four policies
+// that carry a bypass arm — events, unique_claims, anchors and log_order —
+// must keep the arm (app.bypass_rls) in both USING and WITH CHECK, gate it on
+// es_relay membership (pg_has_role), and guard that test with EXISTS so it
+// cannot hard-fail (pg_has_role errors) on a database where the role has not
+// been created yet.
 func TestAllBypassPoliciesRoleGated(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
 	for _, table := range []string{"events", "unique_claims", "anchors", "log_order"} {
 		rows, err := s.Pool().Query(ctx, `
-			SELECT policyname, qual FROM pg_policies
+			SELECT policyname, qual, COALESCE(with_check, '') FROM pg_policies
 			WHERE schemaname = 'public' AND tablename = $1`, table)
 		if err != nil {
 			t.Fatalf("read policies for %s: %v", table, err)
 		}
-		var policies []struct{ name, qual string }
+		var policies []struct{ name, qual, withCheck string }
 		for rows.Next() {
-			var name, qual string
-			if err := rows.Scan(&name, &qual); err != nil {
+			var name, qual, withCheck string
+			if err := rows.Scan(&name, &qual, &withCheck); err != nil {
 				rows.Close()
 				t.Fatalf("scan policy for %s: %v", table, err)
 			}
-			policies = append(policies, struct{ name, qual string }{name, qual})
+			policies = append(policies, struct{ name, qual, withCheck string }{name, qual, withCheck})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -97,16 +97,46 @@ func TestAllBypassPoliciesRoleGated(t *testing.T) {
 			t.Fatalf("%s: %d policies, want exactly 1", table, len(policies))
 		}
 		p := policies[0]
-		for _, want := range []string{
-			"app.bypass_rls", // the bypass arm survives...
-			"pg_has_role",    // ...gated on es_relay membership (F8)...
-			"EXISTS",         // ...behind the missing-role guard (F12)
+		wanted := []string{"app.bypass_rls", "pg_has_role", "EXISTS"}
+		if table != "anchors" {
+			// anchors is store-wide by design (the root spans every
+			// workspace), so its policy carries the bypass arm only.
+			wanted = append(wanted, "app.workspace_id")
+		}
+		for _, def := range []struct{ clause, text string }{
+			{"USING", p.qual},
+			{"WITH CHECK", p.withCheck},
 		} {
-			if !strings.Contains(p.qual, want) {
-				t.Errorf("%s: policy %q qual %q lacks %q — the bypass arm must be role-gated behind an EXISTS guard",
-					table, p.name, p.qual, want)
+			for _, want := range wanted {
+				if !strings.Contains(def.text, want) {
+					t.Errorf("%s: policy %q %s %q lacks %q — the policy's arms must survive in both clauses",
+						table, p.name, def.clause, def.text, want)
+				}
 			}
 		}
+	}
+}
+
+// TestEventsConstraintOpsColumn pins migration 0014's shape (ADR 0043): the
+// events parent gains one nullable bytea column for the append's encoded
+// constraint ops (partitions inherit it). No new table: the event log is the
+// functional source.
+func TestEventsConstraintOpsColumn(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	var dataType, nullable string
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT data_type, is_nullable FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'events' AND column_name = 'constraint_ops'`,
+	).Scan(&dataType, &nullable); err != nil {
+		t.Fatalf("read events.constraint_ops definition: %v", err)
+	}
+	if dataType != "bytea" {
+		t.Fatalf("events.constraint_ops type = %q, want bytea", dataType)
+	}
+	if nullable != "YES" {
+		t.Fatalf("events.constraint_ops is_nullable = %q, want YES (only the first event of an op-bearing batch carries it)", nullable)
 	}
 }
 
@@ -360,8 +390,8 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("read shared ledger: %v", err)
 	}
-	if v != 13 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 13 (every embedded migration applied)", v)
+	if v != 14 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 14 (every embedded migration applied)", v)
 	}
 }
 
@@ -441,7 +471,7 @@ func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
 				PRIMARY KEY (workspace_id, stream_id)
 			)`,
 			wantErr: false,
-			wantV:   13,
+			wantV:   14,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -535,8 +565,8 @@ func TestMigrateWritesTheSharedLedger(t *testing.T) {
 	`).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if n != 13 {
-		t.Fatalf("eventstore ledger rows = %d, want 13", n)
+	if n != 14 {
+		t.Fatalf("eventstore ledger rows = %d, want 14", n)
 	}
 
 	var legacy bool
@@ -593,8 +623,8 @@ func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
 	`).Scan(&total); err != nil {
 		t.Fatalf("read ledger total: %v", err)
 	}
-	if total != 13 {
-		t.Fatalf("ledger rows = %d, want 13 after applying versions 4-13", total)
+	if total != 14 {
+		t.Fatalf("ledger rows = %d, want 14 after applying versions 4-14", total)
 	}
 }
 
@@ -617,8 +647,8 @@ func TestLedgerModuleNameUsesTheOption(t *testing.T) {
 	`).Scan(&eventstore); err != nil {
 		t.Fatalf("read eventstore rows: %v", err)
 	}
-	if custom != 13 {
-		t.Fatalf("custom ledger rows = %d, want 13", custom)
+	if custom != 14 {
+		t.Fatalf("custom ledger rows = %d, want 14", custom)
 	}
 	if eventstore != 0 {
 		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)

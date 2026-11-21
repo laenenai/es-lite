@@ -24,8 +24,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&v); err != nil {
 		t.Fatalf("schema_migrations: %v", err)
 	}
-	if v != 11 {
-		t.Fatalf("applied version = %d, want 11 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache; no 0005 — Postgres's is RLS-role-specific)", v)
+	if v != 12 {
+		t.Fatalf("applied version = %d, want 12 (0001 schema + 0002 hash chain + 0003 feed + 0004 definition fingerprint + 0006 log order + 0007 feed type index + 0008 command dedup + 0009 producer span context + 0010 delegated actor + 0011 snapshot cache + 0012 event constraint ops; no 0005 — Postgres's is RLS-role-specific)", v)
 	}
 	// Re-running is a no-op, not an error.
 	if err := s.Migrate(ctx); err != nil {
@@ -138,7 +138,7 @@ func TestConcurrentMigrateSameFile(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("iterate schema_migrations: %v", err)
 	}
-	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11}
+	want := []int{1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12}
 	if !slices.Equal(got, want) {
 		t.Fatalf("recorded versions = %v, want each of %v exactly once", got, want)
 	}
@@ -199,6 +199,55 @@ func TestSnapshotsTableColumns(t *testing.T) {
 	}
 	if got[0].pk != 1 {
 		t.Fatalf("stream_id pk = %d, want 1 (the primary key)", got[0].pk)
+	}
+}
+
+// TestEventsConstraintOpsColumn pins migration 0012's shape (ADR 0043): the
+// events table gains one nullable BLOB column for the append's encoded
+// constraint ops. No new table: the events table is the functional source.
+func TestEventsConstraintOpsColumn(t *testing.T) {
+	ctx := context.Background()
+	s, err := sqlite.Open(ctx, "file:"+t.Name()+"?mode=memory&cache=shared") // auto-migrates
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	rows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(events)`)
+	if err != nil {
+		t.Fatalf("table_info(events): %v", err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notNull int
+			dflt    any // NULL or a DEFAULT expression; must not scan into a typed value
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info(events): %v", err)
+		}
+		if name != "constraint_ops" {
+			continue
+		}
+		found = true
+		if typ != "BLOB" {
+			t.Fatalf("events.constraint_ops type = %q, want BLOB", typ)
+		}
+		if notNull != 0 {
+			t.Fatalf("events.constraint_ops notnull = %d, want 0 (nullable: only the first event of an op-bearing batch carries it)", notNull)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate table_info(events): %v", err)
+	}
+	if !found {
+		t.Fatal("events has no constraint_ops column")
 	}
 }
 

@@ -302,10 +302,9 @@ func TestNoOpCommandWritesNoSnapshot(t *testing.T) {
 }
 
 // constraintOnlyDecider copies counter.Decider and overrides only Decide: a
-// command that appends no events and applies one Release. Unlike the no-op
-// decider it reaches the append — the store accepts a zero-event append and
-// applies the claim op in its transaction — so Handle reaches the write
-// site with to == head.
+// command that emits one Release and no event. ADR 0043 rejects this shape —
+// constraint ops must accompany an event — so Handle returns
+// ErrConstraintWithoutEvent before the append.
 func constraintOnlyDecider() es.Decider[*counterv1.Counter, counterv1.Command, counterv1.Event] {
 	d := counter.Decider
 	d.Decide = func(*counterv1.Counter, counterv1.Command) ([]counterv1.Event, []es.ConstraintOp, error) {
@@ -314,81 +313,27 @@ func constraintOnlyDecider() es.Decider[*counterv1.Counter, counterv1.Command, c
 	return d
 }
 
-// TestConstraintOnlyAppendWritesNoStaleSnapshot pins the constraint-only
-// rule ADR 0042 §7 records: the append happens (unlike a no-op command),
-// so the write site is reached at the unchanged head and the same gap rule
-// measures it. Seeded at the head, the gap is zero and the cached snapshot
-// is left alone; full-folded at a head already past the gap, the rule is
-// due and writes a snapshot AT that head — a correct one, never a stale
-// version.
-func TestConstraintOnlyAppendWritesNoStaleSnapshot(t *testing.T) {
+// TestConstraintOnlyCommandIsRejected pins the events-only rule (ADR 0043
+// §2.1): a command that claims or releases without an event is refused, so no
+// store write, no claim and no snapshot happens. The runtime checks it after
+// Decide, before the no-op check.
+func TestConstraintOnlyCommandIsRejected(t *testing.T) {
 	ctx := context.Background()
+	store := openStore(t)
+	cache := newTestCache()
+	rt := aggregate.NewRuntime(store, constraintOnlyDecider(), counterv1.EventCodec{}).
+		WithSnapshots(cache, counterStateCodec{}, 1)
+	sid, _ := es.NewStreamID("counter", "constraint-only")
 
-	t.Run("seeded", func(t *testing.T) {
-		store := openStore(t)
-		cache, rt := newSnapshotRuntime(t, store)
-		rt.WithSnapshotEvery(3)
-		sid, _ := es.NewStreamID("counter", "constraint-seeded")
-
-		mustHandle(t, rt, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5}) // v1
-		for i := 0; i < 5; i++ {
-			mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 1}) // v2..v6
-		}
-		before, ok, err := cache.Load(ctx, sid.Canonical())
-		if err != nil || !ok || before.Version != 6 {
-			t.Fatalf("cache before the constraint-only handle: ok=%v version=%d err=%v, want the snapshot written at the v6 gap", ok, before.Version, err)
-		}
-
-		// A second runtime over the same store and cache, its decider
-		// swapped for the constraint-only one.
-		swap := aggregate.NewRuntime(store, constraintOnlyDecider(), counterv1.EventCodec{}).
-			WithSnapshots(cache, counterStateCodec{}, 1).
-			WithSnapshotEvery(3)
-		res := mustHandle(t, swap, ctx, sid, &counterv1.Increment{By: 1})
-
-		if res.FromVersion != 6 || res.ToVersion != 6 {
-			t.Fatalf("constraint-only handle: from=%d to=%d, want 6/6 — the claim applies but the version does not move", res.FromVersion, res.ToVersion)
-		}
-		after, ok, err := cache.Load(ctx, sid.Canonical())
-		if err != nil || !ok {
-			t.Fatalf("cache after the constraint-only handle: ok=%v err=%v, want the v6 snapshot kept", ok, err)
-		}
-		if after.Version != before.Version || !after.RecordedAt.Equal(before.RecordedAt) {
-			t.Fatalf("cached snapshot rewritten: version %d→%d, recordedAt %v→%v — want both unchanged (the gap from the v6 seed is zero)", before.Version, after.Version, before.RecordedAt, after.RecordedAt)
-		}
-	})
-
-	t.Run("full fold at a head past the gap", func(t *testing.T) {
-		store := openStore(t)
-		sid, _ := es.NewStreamID("counter", "constraint-full-fold")
-
-		// Build to v3 with no cache configured, so no snapshot exists and
-		// the next load must full-fold (seed 0).
-		plain := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
-		mustHandle(t, plain, ctx, sid, &counterv1.Init{Min: 0, Max: 1000, Initial: 5}) // v1
-		mustHandle(t, plain, ctx, sid, &counterv1.Increment{By: 1})                    // v2
-		mustHandle(t, plain, ctx, sid, &counterv1.Increment{By: 1})                    // v3
-
-		// Seed 0 and a head of 3 >= n: the gap rule is due, so the
-		// constraint-only append writes — at the unchanged head.
-		cache := newTestCache()
-		rt := aggregate.NewRuntime(store, constraintOnlyDecider(), counterv1.EventCodec{}).
-			WithSnapshots(cache, counterStateCodec{}, 1).
-			WithSnapshotEvery(3)
-		res := mustHandle(t, rt, ctx, sid, &counterv1.Increment{By: 1})
-
-		if res.FromVersion != 3 || res.ToVersion != 3 {
-			t.Fatalf("constraint-only handle: from=%d to=%d, want 3/3", res.FromVersion, res.ToVersion)
-		}
-		snap, ok, err := cache.Load(ctx, sid.Canonical())
-		if err != nil || !ok || snap.Version != 3 {
-			t.Fatalf("cache after the constraint-only handle: ok=%v version=%d err=%v, want the snapshot written at the unchanged head 3", ok, snap.Version, err)
-		}
-		st, err := counterStateCodec{}.Decode(snap.State)
-		if err != nil || st.GetCount() != 7 {
-			t.Fatalf("snapshot state: count=%d err=%v, want the head fold's 7 — a correct snapshot, not a stale one", st.GetCount(), err)
-		}
-	})
+	if _, err := rt.Handle(ctx, sid, &counterv1.Increment{By: 1}, es.Meta{}); !errors.Is(err, es.ErrConstraintWithoutEvent) {
+		t.Fatalf("constraint-only handle: got %v, want ErrConstraintWithoutEvent", err)
+	}
+	if _, ok, _ := cache.Load(ctx, sid.Canonical()); ok {
+		t.Fatal("cache holds a snapshot after a rejected constraint-only command")
+	}
+	if v, err := store.CurrentStreamVersion(ctx, sid); err != nil || v != 0 {
+		t.Fatalf("stream version = %d (err %v), want 0 — nothing was appended", v, err)
+	}
 }
 
 // TestWarmSnapshotWritesAtHead pins the explicit warm-up (ADR 0042 §3.1):

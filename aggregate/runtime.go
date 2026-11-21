@@ -444,6 +444,13 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 	if err != nil {
 		return zero, err // domain rejection — surfaced verbatim to the caller
 	}
+	if len(events) == 0 && len(constraints) > 0 {
+		// Constraint ops ride on the first event of the batch (ADR 0043):
+		// a claim or release with no domain event would be invisible state,
+		// so the runtime refuses it before the store sees it. No claim and
+		// no event is written.
+		return zero, fmt.Errorf("%w: %s", es.ErrConstraintWithoutEvent, sid)
+	}
 	if len(events) == 0 && len(constraints) == 0 {
 		// A no-op command: nothing to append. Return current state.
 		return Result[S, E]{State: state, FromVersion: version, ToVersion: version}, nil

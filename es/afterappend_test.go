@@ -107,8 +107,8 @@ func TestWithAfterAppendRecoversPanic(t *testing.T) {
 	}
 }
 
-func TestWithAfterAppendClaimOnlyAppend(t *testing.T) {
-	base := &appendStub{result: es.AppendResult{}} // zero envelopes: a claim-only append
+func TestWithAfterAppendZeroEnvelopeAppend(t *testing.T) {
+	base := &appendStub{result: es.AppendResult{}} // zero envelopes: a no-op append
 	fired := 0
 	var saw int
 	wrapped := es.WithAfterAppend(base, func(_ context.Context, res es.AppendResult) {
@@ -123,7 +123,7 @@ func TestWithAfterAppendClaimOnlyAppend(t *testing.T) {
 		t.Fatalf("hook fired %d times, want exactly once", fired)
 	}
 	if saw != 0 {
-		t.Fatalf("hook saw %d envelopes, want 0 for a claim-only append", saw)
+		t.Fatalf("hook saw %d envelopes, want 0 for a zero-envelope append", saw)
 	}
 }
 

@@ -94,11 +94,12 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 	t.Helper()
 	for _, g := range []struct{ role, grants string }{
 		// Appender: draw positions, chain events, attest batch order,
-		// apply uniqueness constraints (Release is the only DELETE the
-		// append path issues on the log, on the claims index; Purge on
-		// the snapshot cache is the one other DELETE). It is also the
-		// process running aggregate.Runtime, so with a snapshot cache
-		// it reads and writes snapshots.
+		// apply uniqueness constraints (their ops ride on the first event
+		// row, ADR 0043), read that log to rebuild or verify the claims
+		// index after a restore. It is also the process running
+		// aggregate.Runtime, so with a snapshot cache it reads and writes
+		// snapshots. Release is the only DELETE on the append path; Purge
+		// on the snapshot cache is the other off-path DELETE.
 		{lpAppender, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAppender + `;
 			GRANT USAGE ON SEQUENCE events_global_position_seq TO ` + lpAppender + `;
@@ -233,6 +234,92 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 		t.Fatalf("snapshot load after Purge under the appender grants: ok=%v err=%v, want absent", ok, err)
 	}
 
+	// Constraint ops are the rebuild/verify oracle's only input (ADR
+	// 0043): after a restore the appender role replays them from the event
+	// log to reconstruct the claims index. The appender's existing SELECT
+	// on events covers the new column; an event-bearing claim proves both
+	// the write and the read.
+	//
+	// One pinned connection serves the raw count: the probe pool's default
+	// max is max(4, NumCPU), and holding one leaves room for the
+	// append/rebuild/verify calls that borrow from the pool. app.workspace_id
+	// is pinned because events is FORCE ROW LEVEL SECURITY.
+	opsConn, err := appender.Pool().Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire the appender's ops connection: %v", err)
+	}
+	defer opsConn.Release()
+	if _, err := opsConn.Exec(ctx,
+		`SELECT set_config('app.workspace_id', $1, false)`, lpWS); err != nil {
+		t.Fatalf("pin workspace on the appender's ops connection: %v", err)
+	}
+	third := es.Claim("email", "lp-only@example.test")
+	res3, err := aws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 2,
+		Events:          []es.EventData{{TypeURL: lpType, SchemaVersion: 1, Payload: []byte("three")}},
+		Constraints:     []es.ConstraintOp{third},
+	})
+	if err != nil {
+		t.Fatalf("claim-bearing append under the appender grants: %v", err)
+	}
+	if res3.FromVersion != 2 || res3.ToVersion != 3 || len(res3.Envelopes) != 1 {
+		t.Fatalf("claim-bearing append result = %+v, want v2→v3 with one event", res3)
+	}
+	if got := res3.Envelopes[0].ConstraintOps; len(got) != 1 || got[0] != third {
+		t.Fatalf("returned envelope ops = %+v, want the one Claim", got)
+	}
+	pos3 := res3.Envelopes[0].GlobalPosition
+	var opRows int64
+	if err := opsConn.QueryRow(ctx,
+		`SELECT count(*) FROM events WHERE workspace_id = $1 AND constraint_ops IS NOT NULL`, lpWS).
+		Scan(&opRows); err != nil {
+		t.Fatalf("count op-bearing events under the appender grants: %v", err)
+	}
+	if opRows != 3 {
+		t.Fatalf("op-bearing events = %d, want 3 (claim, release, claim)", opRows)
+	}
+
+	// The ops are on the event row, so the appender's ordinary stream read
+	// returns them: ReadStream must carry the append's ConstraintOps on its
+	// first envelope, not via a second read of separate state.
+	stream, err := aws.ReadStream(ctx, sid, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadStream under the appender grants: %v", err)
+	}
+	if len(stream) != 3 {
+		t.Fatalf("ReadStream returned %d envelopes, want 3", len(stream))
+	}
+	if got := stream[0].ConstraintOps; len(got) != 1 || got[0] != es.Claim("email", "lp@example.test") {
+		t.Errorf("ReadStream first envelope ops = %+v, want the first Claim", got)
+	}
+	if got := stream[2].ConstraintOps; len(got) != 1 || got[0] != third {
+		t.Errorf("ReadStream third envelope ops = %+v, want the claim-bearing append's ops", got)
+	}
+
+	// The rebuild/verify oracle reads the whole event log with the
+	// appender's grants: SELECT is what a restore's rebuild and the
+	// es-verify claims check need. The rebuild replaces the live index
+	// (claim → release → claim leaves the one claim) and the verify
+	// compares the replay with it.
+	rebuild, err := appender.WorkspaceStore(lpWS).RebuildClaims(ctx)
+	if err != nil {
+		t.Fatalf("RebuildClaims under the appender grants: %v", err)
+	}
+	if rebuild.Ops != 3 {
+		t.Fatalf("RebuildClaims replayed %d op records, want 3", rebuild.Ops)
+	}
+	if rebuild.Claims != 1 {
+		t.Fatalf("RebuildClaims produced %d live claims, want 1 — an empty replay must not pass", rebuild.Claims)
+	}
+	verify, err := appender.WorkspaceStore(lpWS).VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("VerifyClaims under the appender grants: %v", err)
+	}
+	if !verify.OK || verify.Claims == 0 {
+		t.Fatalf("VerifyClaims under the appender grants = %+v, want OK with a non-zero Claims count", verify)
+	}
+
 	// Facet 2 — feed process: the fenced page read, then subscribe/ack.
 	feedStore := drainStoreAs(t, lpFeed)
 	fws := feedStore.WorkspaceStore(lpWS)
@@ -240,8 +327,8 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fenced page under the feed grants: %v", err)
 	}
-	if got := positions(page); len(got) != 2 || got[0] != pos1 || got[1] != pos2 {
-		t.Fatalf("page under the feed grants = %v, want [%d %d]", got, pos1, pos2)
+	if got := positions(page); len(got) != 3 || got[0] != pos1 || got[1] != pos2 || got[2] != pos3 {
+		t.Fatalf("page under the feed grants = %v, want [%d %d %d]", got, pos1, pos2, pos3)
 	}
 
 	srv, err := feed.NewServer(feed.Config{
@@ -269,7 +356,8 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- srv.Subscribe(subCtx, req, lpSink{delivered}) }()
 	var last es.Envelope
-	for i, want := range []uint64{pos1, pos2} {
+	atPosition := make(map[uint64]es.Envelope, 3)
+	for i, want := range []uint64{pos1, pos2, pos3} {
 		select {
 		case env := <-delivered:
 			if env.GlobalPosition != want {
@@ -277,10 +365,21 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 				t.Fatalf("delivered position %d, want %d (event %d)", env.GlobalPosition, want, i)
 			}
 			last = env
+			atPosition[want] = env
 		case <-time.After(10 * time.Second):
 			cancel()
-			t.Fatalf("feed under the feed grants delivered %d of 2 events past the deadline", i)
+			t.Fatalf("feed under the feed grants delivered %d of 3 events past the deadline", i)
 		}
+	}
+	// The feed delivers the envelope it read, so the ops travel with the
+	// event to a consumer — not just to ReadStream.
+	if got := atPosition[pos1].ConstraintOps; len(got) != 1 || got[0] != es.Claim("email", "lp@example.test") {
+		cancel()
+		t.Fatalf("delivered first envelope ops = %+v, want the first Claim", got)
+	}
+	if got := atPosition[pos3].ConstraintOps; len(got) != 1 || got[0] != third {
+		cancel()
+		t.Fatalf("delivered claim-bearing envelope ops = %+v, want %+v", got, third)
 	}
 	// The fenced ack — an ordinary consumer acknowledging its page.
 	if err := srv.Checkpoint(ctx, feed.Ack{
@@ -299,8 +398,8 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 		t.Fatalf("Subscribe returned %v, want context.Canceled after the test's cancel", err)
 	}
 	cp, found, err := postgres.NewCheckpointStore(feedStore).Checkpoint(ctx, lpWS, lpProjection, lpInstance)
-	if err != nil || !found || cp.Position != pos2 {
-		t.Fatalf("checkpoint under the feed grants = %+v found=%v err=%v, want position %d", cp, found, err, pos2)
+	if err != nil || !found || cp.Position != pos3 {
+		t.Fatalf("checkpoint under the feed grants = %+v found=%v err=%v, want position %d", cp, found, err, pos3)
 	}
 
 	// Facet 3 — relay: drain the backlog across workspaces.
@@ -313,8 +412,8 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drain under the relay grants: %v", err)
 	}
-	if n != 2 || len(relayed) != 2 {
-		t.Fatalf("drain under the relay grants claimed=%d delivered=%d, want 2/2", n, len(relayed))
+	if n != 3 || len(relayed) != 3 {
+		t.Fatalf("drain under the relay grants claimed=%d delivered=%d, want 3/3", n, len(relayed))
 	}
 	if got := unpublishedCount(t, ctx, s); got != 0 {
 		t.Fatalf("drain under the relay grants left %d unpublished rows, want 0", got)
@@ -330,11 +429,11 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("anchor under the anchor grants: %v", err)
 	}
-	if a.StreamCount != 1 || a.OrderCount != 2 {
-		t.Fatalf("anchor under the anchor grants = %+v, want 1 stream over 2 order rows", a)
+	if a.StreamCount != 1 || a.OrderCount != 3 {
+		t.Fatalf("anchor under the anchor grants = %+v, want 1 stream over 3 order rows", a)
 	}
-	if a.UptoGlobalPosition < pos2 {
-		t.Fatalf("anchor bound %d is below the appended head %d", a.UptoGlobalPosition, pos2)
+	if a.UptoGlobalPosition < pos3 {
+		t.Fatalf("anchor bound %d is below the appended head %d", a.UptoGlobalPosition, pos3)
 	}
 	if err := anchorJob.CheckAnchor(ctx, a); err != nil {
 		t.Fatalf("check under the anchor grants: %v", err)

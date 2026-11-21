@@ -143,12 +143,13 @@ func TestAppendNotifyRollbackDoesNotFire(t *testing.T) {
 	assertNoNotification(t, lc, 100*time.Millisecond)
 }
 
-// TestAppendNotifyClaimOnlyDoesNotFire pins the claim-only boundary: an
-// append with no events and one uniqueness claim succeeds but notifies
-// nobody — a claim is not a feed event, and a wake for it would only
-// cost every subscriber of the workspace a fenced read that delivers
-// nothing.
-func TestAppendNotifyClaimOnlyDoesNotFire(t *testing.T) {
+// TestAppendNotifyZeroEventDoesNotFire pins the zero-event boundary: an
+// append with no events succeeds (a no-op command) but notifies nobody — a
+// wake for it would only cost every subscriber of the workspace a fenced read
+// that delivers nothing. A constraint-bearing zero-event append is refused
+// before the notify path (ErrConstraintWithoutEvent, ADR 0043) and notifies
+// nobody either.
+func TestAppendNotifyZeroEventDoesNotFire(t *testing.T) {
 	const channel = "es_lite_notify_claim_only"
 	ctx := context.Background()
 	lc := listenConn(t, channel)
@@ -159,9 +160,21 @@ func TestAppendNotifyClaimOnlyDoesNotFire(t *testing.T) {
 	if _, err := ws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 0,
-		Constraints:     []es.ConstraintOp{es.Claim("email", "claim-only@example.test")},
 	}); err != nil {
-		t.Fatalf("claim-only append: %v", err)
+		t.Fatalf("zero-event append: %v", err)
+	}
+
+	// A claim with no event is refused before any insert or NOTIFY: the ops
+	// must ride on an event, so there is no committed change to announce.
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Constraints:     []es.ConstraintOp{es.Claim("email", "notify-only@b")},
+	}); !errors.Is(err, es.ErrConstraintWithoutEvent) {
+		t.Fatalf("claim-only append: got %v, want ErrConstraintWithoutEvent", err)
+	}
+	if _, found, err := ws.LookupClaim(ctx, "email", "notify-only@b"); err != nil || found {
+		t.Fatalf("claim after the refused append found=%v err=%v, want absent", found, err)
 	}
 
 	assertNoNotification(t, lc, 100*time.Millisecond)

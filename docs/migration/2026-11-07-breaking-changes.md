@@ -691,3 +691,64 @@ become traceable. Already-recorded rows are not rewritten.
 `correlation_id == command_id` (the old fallback shape) for non-UUID
 correlations must match on the header's hash instead — or, better, send a
 UUID `Correlation-Id`, which still passes through byte-for-byte.
+
+## 2026-11-21 — Constraint ops on the event log: new column, no new table, claim-only appends rejected
+
+**What changes.** Migration 0014 (Postgres) adds a nullable `constraint_ops
+bytea` column to `events`; SQLite 0012 adds the same as `BLOB`. An append
+that carries constraint ops encodes them on the **first** event row of the
+batch; every other row gets `NULL`. The envelope exposes them as
+`es.Envelope.ConstraintOps`, and `unique_claims` is now a pure projection of
+the log: `es-verify claims --rebuild` replays the ops into it. There is no
+second table, no decision id and no new grant — the appender's existing
+`SELECT, INSERT` on `events` covers the new column.
+
+A constraint-bearing append must also carry at least one event. A `Claim` or
+`Release` with no domain event is refused with `es.ErrConstraintWithoutEvent`
+by `aggregate.Runtime` and by both stores. Previously such an append
+succeeded, changed the claims index and left no log record; the ops now ride
+with the event, so a claim cannot be invisible state. The
+`ErrConstraintWithoutEvent` check is the new Go API surface;
+`Envelope.ConstraintOps` is additive.
+
+**Who is affected.** Every deployment that calls `Claim`/`Release` or lets
+`aggregate.Runtime` apply constraints: the append writes the new column, and
+a command that used to claim without an event now fails and must name one.
+Deployments that use no constraints are unaffected: the migration lands and
+every row's column is `NULL`.
+
+**What to do.** In this order: **migrate, deploy.** There is no grant step
+and no second sequence to advance. Verify with `es-verify claims` on a store
+with no legacy claims (it must report `claims OK`, exit 0); a pre-0.21 store
+with claims is refused — see below. Old binaries ignore the added column — their
+statements neither read nor write it — so a rollback needs no schema change.
+
+There is no legacy path. Every claim written by the new binary carries its
+ops in the same transaction, but pre-0.21 claims have none, and the migration
+does not invent one: a store with claims and no ops in the event log is
+inconsistent, and `es-verify claims` / `--rebuild` refuse it
+(`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or delete. A
+pre-0.21 database is therefore unsupported for rebuild and verify — start
+fresh, or export the values you still need and re-claim them through the
+append path.
+
+A restore is consistent when the events are one cut: the ops are part of the
+event row, so an event and its claim are never split. Do not load
+`unique_claims` from another cut; rebuild it from the events. An index with
+no op history is refused like any other inconsistent store — re-cut, or start
+fresh.
+
+Roll back by redeploying the pre-0.21 binary: it ignores `constraint_ops`, so
+no schema rollback is required. If you also want the column gone, drop it only
+after the last new binary has stopped — a running new binary reads and writes
+it and fails without it.
+
+A rollback window leaves a **mixed store**. The old binary still appends
+events, but its claims go to `unique_claims` with no ops on the log. After
+re-upgrading, the guard fires only when there are *zero* op-bearing events, so
+a mixed store is not refused with `es.ErrClaimsWithoutDecisions`: `es-verify
+claims` reports `DIVERGED` instead. Do not run `--rebuild` over that window —
+it replaces the index from the log and deletes the old binary's claims. Export
+or re-claim the values written during the rollback through the new append
+path first, then verify. See `docs/deploy/README.md` for the backup, restore
+and clone contract.

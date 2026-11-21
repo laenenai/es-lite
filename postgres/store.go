@@ -104,7 +104,7 @@ func WithMaxPayloadBytes(n int) Option { return func(c *openConfig) { c.maxPaylo
 // claims — with the channel and the workspace ID as parameters, so an
 // idle feed subscriber can be woken in single-digit milliseconds on a
 // clean fence instead of after a poll. NOTIFY is transactional: a
-// rolled-back append sends nothing, a claim-only append (no events)
+// rolled-back append sends nothing, a zero-event append (no events)
 // sends nothing, and an AppendTx notifies exactly when the caller's
 // transaction commits.
 //
@@ -718,7 +718,7 @@ const envelopeCols = `
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, workspace_id, prev_hash, hash,
 	trace_id, span_id, trace_flags,
-	via_type, via_id, via_principal`
+	via_type, via_id, via_principal, constraint_ops`
 
 // parseStoredUUID parses one stored audit-UUID column (event_id,
 // correlation_id, causation_id, command_id). A value that does not parse
@@ -748,6 +748,7 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		traceID, spanID                       []byte
 		flags                                 *int16
 		viaType, viaID, viaPrincipal          *string
+		constraintOps                         []byte
 	)
 	if err := row.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -755,7 +756,7 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &payload, &workspaceID, &e.PrevHash, &e.Hash,
 		&traceID, &spanID, &flags,
-		&viaType, &viaID, &viaPrincipal,
+		&viaType, &viaID, &viaPrincipal, &constraintOps,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -768,6 +769,17 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	}
 	e.StreamID = sid
 	e.Workspace = workspaceID
+	// Constraint ops (ADR 0043) are a restore record, not chain-attested:
+	// a corrupt blob fails the read loudly — naming the stream and version,
+	// never the bytes — rather than silently dropping the claims it would
+	// reconstruct. Decode whenever the column is non-NULL, so an out-of-band
+	// zero-length bytea fails as corrupt instead of reading as "no ops"; the
+	// store itself never writes one.
+	if constraintOps != nil {
+		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps); err != nil {
+			return es.Envelope{}, fmt.Errorf("constraint_ops for stream %s v%d: %w", sid, e.Version, err)
+		}
+	}
 	// The audit UUIDs are load-bearing (F34): a value that does not parse
 	// fails the read rather than being silently zeroed into a forged
 	// envelope.

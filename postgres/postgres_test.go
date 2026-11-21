@@ -399,10 +399,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("shared ledger: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0013 (snapshot cache)
-	// made it thirteen.
-	if v != 13 {
-		t.Fatalf("applied version = %d, want 13", v)
+	// Every embedded migration is applied on Open; 0014 (event constraint ops)
+	// made it fourteen.
+	if v != 14 {
+		t.Fatalf("applied version = %d, want 14", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.
@@ -460,12 +460,22 @@ func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 	if _, err := ws.Append(ctx, es.AppendParams{StreamID: sid, ExpectedVersion: 0}); !errors.Is(err, es.ErrConflict) {
 		t.Fatalf("stale empty append error = %v, want ErrConflict", err)
 	}
+	// A zero-event append carrying constraints is rejected (ADR 0043).
 	if _, err := ws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 1,
 		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
+	}); !errors.Is(err, es.ErrConstraintWithoutEvent) {
+		t.Fatalf("claim-only append error = %v, want ErrConstraintWithoutEvent", err)
+	}
+	// With an event the claim applies in the append transaction.
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 1,
+		Events:          []es.EventData{{TypeURL: "thing.v1.Claimed", SchemaVersion: 1, Payload: []byte("y")}},
+		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
 	}); err != nil {
-		t.Fatalf("claim-only append: %v", err)
+		t.Fatalf("claim-bearing append: %v", err)
 	}
 	if _, found, err := ws.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)

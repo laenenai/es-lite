@@ -170,9 +170,10 @@ migration — acceptable only for small databases.
 ## Relay role and RLS bypass (migration 0005)
 
 `Drain` — the delivery relay — and the anchor/verify path (`Anchor`,
-`CheckAnchor`, `ListStreams`, `ListAnchors`) are the only readers that
-work across workspaces, through the `app.bypass_rls` arm of the `events`
-and `unique_claims` policies. Migration 0005 role-gates that arm: it
+`CheckAnchor`, `ListStreams`, `ListAnchors`, `ClaimWorkspaces`) are the only
+readers that work across workspaces, through the `app.bypass_rls` arm of the
+`events` and `unique_claims` policies. Migration 0005
+role-gates that arm: it
 additionally requires `pg_has_role(current_user, 'es_relay', 'member')`,
 so the GUC alone — settable by any session — no longer lifts workspace
 isolation. Both paths verify the membership lazily, on the first bypassed
@@ -277,13 +278,14 @@ private `schema_migrations`.
 
 **Appender** — the process calling `Workspace.Append` (or `AppendTx`): it
 draws positions, reads the stream head for optimistic concurrency,
-inserts the events and their `log_order` attestation (design D1), and
-applies uniqueness constraints. It is also the process running
-`aggregate.Runtime`, so with a snapshot cache configured (ADR 0042) it
-both reads and writes `snapshots` — the same role as for `events`.
-`Release` is the only `DELETE` the append path ever issues, and it is on
-the claims index, never on the log (`Purge` on the snapshot cache, below,
-is the one other `DELETE`):
+inserts the events and their `log_order` attestation (design D1),
+applies uniqueness constraints — their ops ride on the first event row
+(ADR 0043) — reads the event log to rebuild or verify the claims index
+after a restore. It is also the process running `aggregate.Runtime`, so with a
+snapshot cache configured (ADR 0042) it both reads and writes `snapshots`
+— the same role as for `events`. `Release` is the only `DELETE` on the
+append path, and `Purge` on the snapshot cache is the other off-path
+`DELETE`:
 
 ```sql
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;
@@ -423,6 +425,215 @@ application-coordinated, like the projection purge (ADR 0004 §4): a command
 in flight, or one starting immediately after, can re-insert a row. Quiesce
 the workspace before running it — or, for sealed state, destroy the key
 first, which makes any racing re-insert inert.
+
+## Backup, restore and clones (ADR 0043)
+
+The append path is the authority. From v0.21.0 the functional source is the
+event log:
+
+- `events` (with every partition) — stream history, versions, the chain,
+  global positions, audit metadata, and the append's constraint ops, which
+  ride on the first event row of a constraint-bearing batch. Aggregates, the
+  chain, positions and the claims index all rebuild from it.
+- `log_order` — one row per event-bearing append, the order root's input. It
+  is the order witness, not state: stream it only if you need to re-verify the
+  global append order on the restored database.
+
+Everything else is derived or optional. `unique_claims` is a derived index —
+the ops on the events replay into an empty one. `snapshots` is a cache.
+`anchors` recompute (the exported JSON is the durable evidence).
+`feed_checkpoints` and `feed_dead_letters` are optional; `feed_leases` is
+ephemeral. `command_dedup` is a post-commit response cache: exclude it, and read
+the dedup note below before deciding otherwise. There is no second state table
+and no second sequence: one table carries the events and the ops.
+
+**PITR.** If arbitrary point-in-time recovery is the requirement, use physical
+backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
+The whole database returns — the events *and* the index — and nothing needs
+rebuilding. Restore the base backup, replay WAL to the target, restore cluster
+globals (roles, memberships) if they are not in the base backup, then run the
+checks below and resume. PITR is cluster-wide and all-or-nothing; it cannot
+restore one workspace, and restoring to before a client's ack is data loss by
+definition. The WAL archive and the logical stream below are complementary:
+WAL for time travel, the stream for portability, clones and continuous
+verification.
+
+### Logical restore
+
+The stream restores to a **consistent cut**, not to an arbitrary timestamp. Cut
+the events (and `log_order` if you carry it) at one commit boundary — one LSN
+from a CDC stream, or one export epoch. Never mix epochs: the ops and their
+event are one row, so an event cut is internally consistent; loading
+`unique_claims` from another cut is what breaks it.
+
+1. Provision an empty database at the same major version and run `es-migrate`
+   to head (schema, policies, triggers).
+2. Create the roles and grants (`pg_dumpall --globals` or IaC). Confirm
+   `es_relay` and the appender's grants. The appender's existing `SELECT,
+   INSERT` on `events` already covers `constraint_ops`: there is no new table
+   and no new grant.
+3. Load `events` (all partitions) into that cut, and `log_order` too if you
+   want order verification on the restored database. There are no foreign
+   keys; one transaction is still preferred. For a workspace-scoped restore,
+   filter by `workspace_id` (or run through the relay path) — a workspace
+   session sees only its own rows under RLS.
+4. Advance the position sequence, and confirm `CACHE 1` (§ *The `CACHE 1`
+   invariant*):
+   ```sql
+   SELECT setval('events_global_position_seq',
+                 (SELECT max(global_position) FROM events));
+   ```
+   Skip it only when the restored log is empty. There is no second sequence.
+   SQLite's `AUTOINCREMENT` tracks explicit-id inserts itself, so this step is
+   Postgres-only.
+5. **Stop writers.** Verify the index first: `es-verify claims` is
+   non-destructive and must report `claims OK` (exit 0; 1 names the first
+   divergence, 2 is a refusal or error). Rebuild only if you intend to replace
+   the index, after exporting any divergent claims: `es-verify claims
+   --rebuild`, then `es-verify claims` again (the second command must report
+   `claims OK`). `--rebuild`
+   replaces the index with what the log can prove, and an op committed after
+   its snapshot cannot be replayed; Postgres runs it in one Repeatable Read
+   transaction, so a writer racing the snapshot may surface as a
+   serialization error — loud and retryable, never a silent divergence. A
+   write that races the rebuild must retry after it commits. Keep writers
+   stopped until step 8.
+   The whole-database form (no
+   workspace argument) needs the owner/superuser, or a role with `es_relay`
+   plus `SELECT` on `events` and `unique_claims` and `DELETE, INSERT` on
+   `unique_claims`: `ClaimWorkspaces` takes the role-gated bypass, which the
+   appender lacks, while the relay has `es_relay` but not the `unique_claims`
+   DML. The appender role is enough only for `es-verify claims <workspace>`.
+   Deleting and reinserting `unique_claims` is the one place a restore writes
+   that table. The `constraint_ops` on the events are the only input. A
+   restored database whose live claims have no ops in the event log is
+   inconsistent — a partial restore or out-of-band SQL — and both commands
+   refuse it (`es.ErrClaimsWithoutDecisions`, exit 2) rather than guess or
+   delete. Do not load `unique_claims` from a different cut and do not invent
+   a backfill. Re-cut from the events, or start fresh.
+
+   The guard is deliberately narrow: it fires only when there are **zero**
+   op-bearing events. A partially inconsistent store — some claims backed by
+   ops, some not — passes it, and `--rebuild` deletes every live claim the log
+   does not license. Run `es-verify claims` first; on a mixed store, export
+   the divergent claims through the new append path before rebuilding. The
+   rollback window in
+   [`docs/migration/2026-11-07-breaking-changes.md`](../migration/2026-11-07-breaking-changes.md)
+   is one way such a store arises.
+6. Run the chain audit. If you loaded `log_order`, run `es-verify all`: it
+   verifies every stream chain and then the global log order (every batch hash
+   recomputed from the events). An events-only restore has no order witness,
+   so run `es-verify all --chains-only` instead: it verifies every stream and
+   skips the order stage, which would fail `EMPTY` by design (exit 2). Keep the
+   exported anchor JSON as the order evidence (ADR 0043 §2.3).
+7. Optionally restore `anchors` and `feed_checkpoints` (or replay the feed
+   from zero). Do not expect a restored database without `log_order` to
+   recompute the order root: roots need the witness. Keep the source's
+   exported anchor JSON as the evidence, or record new anchors only after
+   `log_order` is present. Leaving `published_at` unset causes projection
+   re-delivery — at-least-once, which projections already handle.
+8. Resume writers. Snapshots are absent and rebuild lazily; warm explicitly
+   with `Runtime.WarmSnapshot` if the first reads matter.
+
+An `es-verify claims` diff after an unreconciled cut is expected — it means the
+cut was mixed, not that data was lost. Re-cut and redo the load.
+
+`es-verify claims` exits 0 when the index matches the ops on the event log
+(`claims OK: N op records`), 1 on a divergence (`DIVERGED:`, naming the first
+divergent `(scope, value_key, stream_id)`), and 2 on a connection, usage or
+refusal error — the errored workspace was not audited, and a 2 is never a
+pass, even when earlier workspaces completed (a confirmed divergence
+dominates a later error). The mutating mode (`--rebuild`) exits 0 or 2 only: a
+rebuild that cannot replay the log refuses instead of leaving a partial index.
+
+### Clones
+
+The events table (plus `log_order` if you need order verification) is a
+logical replication feed. Two shapes, different rules:
+
+- **Follow (read-only clone).** Apply later cuts as they arrive. Apply **per
+  source transaction**, not per table: the ops ride on the event row, so an
+  event and its claim are never split.
+
+  The clone never draws new positions, but it must still advance the position
+  sequence after seeding and after each applied cut:
+  ```sql
+  SELECT setval('events_global_position_seq',
+                (SELECT max(global_position) FROM events));
+  ```
+  Logical replication copies explicit `global_position` values without
+  advancing the sequence, while the verifier's `settledBound(0)` reads
+  `pg_sequences.last_value`. An unadvanced sequence makes order verification
+  recompute every batch from an empty event page and report `BROKEN` (exit 1)
+  — a false failure; `EMPTY` is the no-`log_order` case. `CheckAnchor` clamps
+  its bound. Grant the principal that advances the sequence `UPDATE` on it for
+  `setval` (`GRANT UPDATE ON SEQUENCE events_global_position_seq TO <clone
+  applier>`), or run the `setval` as owner/superuser; grant the verifier
+  `USAGE` to read `last_value` — without it the value is masked to 0.
+
+  The clone also maintains `unique_claims`: apply each event's ops per source
+  transaction, or run `es-verify claims --rebuild` after a cut (pausing the
+  apply while it runs). A fresh events-only clone that loads events and leaves
+  the index empty diverges against the log; never load `unique_claims` from a
+  different cut.
+
+  Audit on a schedule: `es-verify all --chains-only` when `log_order` is not
+  loaded; `es-verify all` (or `es-verify order`) only when it is and the
+  sequence has been advanced. That is the useful property: the DR copy proves
+  itself continuously instead of at incident time.
+- **Fork (writable staging).** Seed at a cut, `setval` the one position
+  sequence, then stop applying and let it diverge. It is a fork: never merge
+  it back and never point it at the backup prefix. Promotion is a handover —
+  quiesce, take a final cut, repoint — not a merge.
+
+Apply idempotently, because CDC is at-least-once: dedupe events on
+`(workspace, stream, version)` or `event_id`; a duplicate event skips its ops
+with it. `log_order` dedupes on `from_position`. On a replica a duplicate
+`Claim` is a **no-op**, not `ErrConstraintViolated` — the source already
+validated it. Order by `global_position` and allow gaps: concurrent appends
+can commit out of draw order. A per-workspace clone is an export, not
+replication — filter by `workspace_id`; claims are per-workspace, so such a
+clone is self-consistent. `log_order` is optional for a functional clone and
+required to re-verify order; `command_dedup` does not travel.
+
+A clone moves production payloads and claim identifiers into a lower-trust
+environment. Do not share the production sealing key. Claim values are MACs:
+the same key lets the clone match and correlate them; a different key keeps
+uniqueness working but makes them opaque. Choose deliberately.
+
+### Dedup on restore
+
+`command_dedup` is not restored. A retry carrying a pre-restore
+Idempotency-Key can therefore miss the stored response and re-handle. With
+`Runtime.WithDeterministicEventIDs()` the event insert collides and the client
+gets `aborted`/409 — the documented "do not reuse this key" outcome; without
+deterministic ids, a retry with no expected-version check can duplicate. This
+is the same window that already exists between a commit and a failed dedup
+`Save`; a restore widens it, it does not create it. Clients must treat a 409
+after a restore as a duplicate, not a retryable error. If response replay
+across a restore matters, include `command_dedup` in the backup and accept its
+retention/PII obligations.
+
+### Erasing claims (ADR 0043)
+
+The ops are on the immutable event log, so a **plaintext claim value is
+permanent**. Deleting `unique_claims` is a cache wipe, not erasure: the next
+`es-verify claims --rebuild` resurrects every claim from its event. There is
+no row-level erasure path for a claim, and the appender's `DELETE` on
+`unique_claims` exists for `Release` and a rebuild's clear, not for erasure.
+
+Per-value erasure is therefore the same contract as event payloads (ADR 0025):
+for personal data, pass a keyed MAC or an opaque token you control and destroy
+the key. The stored value is inert without it. The same key lets a clone match
+and correlate the values; a different key keeps uniqueness working but makes
+them opaque. Do not pass a plaintext value you may later need to erase: the
+event log keeps exactly the bytes you supplied, and no rebuild, purge or
+`DELETE` can remove them.
+
+Deleting `unique_claims` by itself is a repair action, not a privacy one. A
+rebuild restores the index from the log; a store whose live claims have no ops
+in the log is the inconsistent case both commands refuse. Purge or repair the
+index only when you are rebuilding it from the events.
 
 ## Feed operations (ADR 0037)
 

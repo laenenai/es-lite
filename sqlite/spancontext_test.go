@@ -284,6 +284,16 @@ func TestSpanContextRebuild(t *testing.T) {
 		tx.Rollback()
 		t.Fatalf("re-apply 0010: %v", err)
 	}
+	// Likewise 0012 adds the constraint_ops column the store now inserts.
+	opsText, err := os.ReadFile("migrations/0012_event_constraint_ops.sql")
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("read 0012_event_constraint_ops.sql: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, string(opsText)); err != nil {
+		tx.Rollback()
+		t.Fatalf("re-apply 0012: %v", err)
+	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit rebuild: %v", err)
 	}
@@ -434,11 +444,11 @@ func TestSpanContextRebuild(t *testing.T) {
 		t.Fatalf("duplicate (stream_id, version) insert: error = %v, want the events.stream_id, events.version UNIQUE", err)
 	}
 
-	// Exactly the 24 expected columns, each with its declared type and
+	// Exactly the 25 expected columns, each with its declared type and
 	// nullability: 0001's sixteen, 0002's prev_hash/hash, the three
-	// span-context ones, and 0010's three via columns re-applied above
-	// — no more, no fewer. global_position is the rowid alias,
-	// which table_info reports as notnull=0, pk=1.
+	// span-context ones, 0010's three via columns, and 0012's
+	// constraint_ops — no more, no fewer. global_position is the rowid
+	// alias, which table_info reports as notnull=0, pk=1.
 	type colSpec struct {
 		typ         string
 		notnull, pk int
@@ -468,6 +478,7 @@ func TestSpanContextRebuild(t *testing.T) {
 		"via_type":        {"TEXT", 0, 0},
 		"via_id":          {"TEXT", 0, 0},
 		"via_principal":   {"TEXT", 0, 0},
+		"constraint_ops":  {"BLOB", 0, 0},
 	}
 	seen := make(map[string]bool, len(wantCols))
 	colRows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(events)`)

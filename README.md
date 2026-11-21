@@ -388,11 +388,24 @@ are client responsibilities (ADR 0025).
   if you actually encrypt client-side.
 - **Erasure is client-owned.** There is no server-side crypto-shredding and no
   `ForgetWorkspace`. If you need key-destruction erasure, keep keys outside
-  es-lite and account for snapshots, unique-claim values, read models and
-  database backups when you destroy them.
+  es-lite and account for snapshots, unique-claim values (which live in the
+  immutable event log), read models and database backups when you destroy them.
+  Deleting `unique_claims` is a cache wipe, not erasure: the next rebuild
+  resurrects the value from its event. For personal data, pass a keyed MAC and
+  destroy the key ([ADR 0043 §2.4](docs/adr/0043-constraint-ops-on-events.md#24-erasure)).
 - **Uniqueness values are opaque.** `Claim`/`Release` store the exact value you
-  provide. For personal data, pass a keyed hash/MAC you control, never the raw
-  value; `LookupClaim` must receive the same value. There is no PII flag.
+  provide, on the append's first event. For personal data, pass a keyed
+  hash/MAC you control, never the raw value; `LookupClaim` must receive the same
+  value. There is no PII flag, and a plaintext claim value cannot be erased.
+- **Backups and replay.** The functional source is `events` (all partitions):
+  aggregates, the chain, positions, and — because the append's constraint ops
+  ride on the first event of the batch — the claims index all rebuild from it.
+  `log_order` is the order witness: stream it too if you want to re-verify the
+  global append order on the restored database. `command_dedup` is not carried.
+  A store whose claims have no ops in the event log is inconsistent, and the
+  tools refuse it rather than guess or delete ([ADR
+  0043](docs/adr/0043-constraint-ops-on-events.md#25-no-legacy-path)). The
+  stream restores to a consistent cut, not arbitrary point-in-time recovery.
 - **Per-workspace isolation (Postgres).** RLS scopes rows to the workspace the
   caller supplies. That is isolation, not authentication: the application must
   authenticate callers and derive the workspace from trusted identity, never

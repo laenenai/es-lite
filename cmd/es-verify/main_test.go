@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -327,10 +328,146 @@ func TestAllExitCodePrecedence(t *testing.T) {
 			t.Fatalf("strip log_order rows: %v", err)
 		}
 		closeDB(t, s)
+		// The events-only shape: an intact chain but no order witness.
+		// `all` still includes the order stage, which is EMPTY (exit 2);
+		// --chains-only is the restore path that stops after the chains.
 		if code := run([]string{"all"}); code != exitUsage {
 			t.Errorf("all over intact streams and zero attested batches: exit %d, want %d — EMPTY certifies nothing (F13)", code, exitUsage)
 		}
+		var code int
+		stdout, _ := captureOutput(t, func() { code = run([]string{"all", "--chains-only"}) })
+		if code != exitIntact {
+			t.Errorf("all --chains-only over an intact chain with no log_order: exit %d, want %d", code, exitIntact)
+		}
+		if !strings.Contains(stdout, "ok      thing:a head=v2") ||
+			!strings.Contains(stdout, "es-verify: 1 streams checked") {
+			t.Errorf("all --chains-only: stdout %q, want the stream chain verified", stdout)
+		}
+		if strings.Contains(stdout, "log order") {
+			t.Errorf("all --chains-only: stdout %q, must not run the order stage", stdout)
+		}
 	})
+}
+
+// seedClaim appends one event carrying one Claim constraint, so the store
+// also records the ops on that event — the row the claims commands operate on.
+func seedClaim(t *testing.T, s *sqlite.Store, sid es.StreamID, scope, value string) {
+	t.Helper()
+	if _, err := s.Append(context.Background(), es.AppendParams{
+		StreamID:    sid,
+		Events:      []es.EventData{seedEvent(0)},
+		Constraints: []es.ConstraintOp{es.Claim(scope, value)},
+	}); err != nil {
+		t.Fatalf("append with claim: %v", err)
+	}
+}
+
+// TestClaimsCommandEmpty pins the claims oracle's empty case: a fresh
+// database has no ops and no claims, so the verify reports OK with zero op
+// records and exits 0 — the index and its log agree trivially.
+func TestClaimsCommandEmpty(t *testing.T) {
+	s := newTestDB(t)
+	closeDB(t, s)
+	var code int
+	stdout, _ := captureOutput(t, func() { code = run([]string{"claims"}) })
+	if code != exitIntact {
+		t.Errorf("claims on an empty db: exit %d, want %d", code, exitIntact)
+	}
+	if !strings.Contains(stdout, "claims OK: 0 op records") {
+		t.Errorf("claims on an empty db: stdout %q, want the zero-op OK", stdout)
+	}
+}
+
+// TestClaimsCommandRebuildAndVerify pins the rebuild/verify pair: a seeded
+// claim rebuilds to exactly one op record and one claim, verifies OK, and
+// rebuilding again is idempotent — the same event log replays to the same
+// index and still verifies.
+func TestClaimsCommandRebuildAndVerify(t *testing.T) {
+	s := newTestDB(t)
+	sid, err := es.NewStreamID("thing", "a")
+	if err != nil {
+		t.Fatalf("stream id: %v", err)
+	}
+	seedClaim(t, s, sid, "thing.slug", "a")
+	closeDB(t, s)
+
+	for i := 0; i < 2; i++ {
+		var code int
+		stdout, _ := captureOutput(t, func() { code = run([]string{"claims", "--rebuild"}) })
+		if code != exitIntact {
+			t.Fatalf("claims --rebuild (run %d): exit %d, want %d", i+1, code, exitIntact)
+		}
+		if !strings.Contains(stdout, "claims rebuilt: 1 op records, 1 claims") {
+			t.Errorf("claims --rebuild (run %d): stdout %q, want the seeded claim rebuilt", i+1, stdout)
+		}
+
+		stdout, _ = captureOutput(t, func() { code = run([]string{"claims"}) })
+		if code != exitIntact {
+			t.Fatalf("claims after rebuild (run %d): exit %d, want %d", i+1, code, exitIntact)
+		}
+		if !strings.Contains(stdout, "claims OK: 1 op records") {
+			t.Errorf("claims after rebuild (run %d): stdout %q, want the rebuilt index verified", i+1, stdout)
+		}
+	}
+}
+
+// fakeClaims is a minimal es.ClaimsMaintainer for the command tests: they
+// drive VerifyClaims, and RebuildClaims exists to satisfy the interface.
+type fakeClaims struct {
+	rep es.ClaimsVerifyReport
+	err error
+}
+
+func (f fakeClaims) RebuildClaims(context.Context) (es.ClaimsRebuildReport, error) {
+	return es.ClaimsRebuildReport{}, nil
+}
+
+func (f fakeClaims) VerifyClaims(context.Context) (es.ClaimsVerifyReport, error) {
+	return f.rep, f.err
+}
+
+// TestClaimsCommandDivergenceDominatesError pins the claims verify exit
+// precedence across workspaces: a divergence already confirmed on one
+// workspace is a tamper, and a later workspace's read/connection error must
+// not mask it as "nothing audited" (exit 2). Both orders must exit 1, per
+// mergeExit's broken-dominates rule, and the divergence names its workspace.
+func TestClaimsCommandDivergenceDominatesError(t *testing.T) {
+	diverged := fakeClaims{rep: es.ClaimsVerifyReport{Ops: 1, FirstDivergence: "scope=thing.slug value=61 stream=thing:a"}}
+	failed := fakeClaims{err: errors.New("read failed")}
+	for _, tc := range []struct {
+		name          string
+		first, second fakeClaims
+		divergedWS    string
+	}{
+		{"divergence then error", diverged, failed, "a"},
+		{"error then divergence", failed, diverged, "b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &backend{
+				claims: func(ws string) es.ClaimsMaintainer {
+					if ws == "a" {
+						return tc.first
+					}
+					return tc.second
+				},
+				claimWorkspaces: func(context.Context) ([]string, error) {
+					return []string{"a", "b"}, nil
+				},
+				multiWS: true,
+			}
+			var code int
+			stdout, stderr := captureOutput(t, func() { code = cmdClaims(context.Background(), b, nil) })
+			if code != exitBroken {
+				t.Errorf("claims across a divergence and an error: exit %d, want %d — the divergence must dominate", code, exitBroken)
+			}
+			if want := "DIVERGED: " + tc.divergedWS + " " + diverged.rep.FirstDivergence; !strings.Contains(stdout, want) {
+				t.Errorf("claims across a divergence and an error: stdout %q, want %q — the divergence must name its workspace", stdout, want)
+			}
+			if !strings.Contains(stderr, "read failed") {
+				t.Errorf("claims across a divergence and an error: stderr %q, want the workspace error", stderr)
+			}
+		})
+	}
 }
 
 // TestMergeExitCombinations pins the merge rule itself, over every

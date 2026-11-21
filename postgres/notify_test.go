@@ -14,7 +14,7 @@ import (
 // Unit tests for the opt-in append notify hint (ADR 0039 C2). No
 // database: a recording DBTX pins the statement discipline the
 // transactional contract rests on — the option off issues no statement
-// at all, a claim-only batch issues none, an oversized workspace ID is
+// at all, a zero-event batch issues none, an oversized workspace ID is
 // refused before any statement — and the channel validator is checked
 // rule by rule. The end-to-end behaviour against a real LISTEN
 // connection lives in notify_integration_test.go, gated by PG_DSN.
@@ -105,21 +105,19 @@ func TestNotifyAppendFiresOnceForNonEmptyBatch(t *testing.T) {
 	}
 }
 
-// TestNotifyAppendClaimOnlyBatchDoesNotNotify pins the claim-only
-// boundary: an append whose Events are empty and whose only work is a
-// uniqueness claim must not notify — a claim is not a feed event, and
-// waking a subscriber for it would deliver nothing but a wasted fenced
-// read.
-func TestNotifyAppendClaimOnlyBatchDoesNotNotify(t *testing.T) {
+// TestNotifyAppendZeroEventBatchDoesNotNotify pins the zero-event
+// boundary: an append whose Events are empty does no feed work, so it must
+// not notify — waking a subscriber would deliver nothing but a wasted fenced
+// read. A constraint-bearing zero-event append is rejected before this point
+// (ErrConstraintWithoutEvent, ADR 0043).
+func TestNotifyAppendZeroEventBatchDoesNotNotify(t *testing.T) {
 	db := &recordingDBTX{}
 	w := notifyWorkspace("es_lite_appended", "ws_notify")
-	if err := w.notifyAppend(context.Background(), db, es.AppendParams{
-		Constraints: []es.ConstraintOp{es.Claim("email", "claim-only@example.test")},
-	}); err != nil {
-		t.Fatalf("notifyAppend on a claim-only batch: %v", err)
+	if err := w.notifyAppend(context.Background(), db, es.AppendParams{}); err != nil {
+		t.Fatalf("notifyAppend on a zero-event batch: %v", err)
 	}
 	if len(db.execs) != 0 {
-		t.Fatalf("claim-only batch issued %d Exec calls, want 0", len(db.execs))
+		t.Fatalf("zero-event batch issued %d Exec calls, want 0", len(db.execs))
 	}
 }
 

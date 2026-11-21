@@ -195,6 +195,13 @@ func validateAppend(p es.AppendParams) error {
 			return err
 		}
 	}
+	// Constraint ops ride on the first event of the batch (ADR 0043): an
+	// append that carries ops but no event would be invisible state — a
+	// claim with no log row to reconstruct it. Refuse it before the xid is
+	// drawn, so nothing is written.
+	if len(p.Events) == 0 && len(p.Constraints) > 0 {
+		return fmt.Errorf("%w: %s", es.ErrConstraintWithoutEvent, p.StreamID)
+	}
 	return nil
 }
 
@@ -304,6 +311,14 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 	// append — the actor acting through the service — so one mapping
 	// covers the batch too.
 	viaType, viaID, viaPrincipal := viaArgs(p.Actor.Via)
+	// Constraint ops are a batch-level record (ADR 0043): encode once and
+	// write the blob on the FIRST event only; every later row is NULL. The
+	// ops are not part of the hash (CanonicalEnvelope excludes them), so
+	// this happens before the hash is computed and changes no byte of it.
+	var encodedOps []byte
+	if len(p.Constraints) > 0 {
+		encodedOps = es.EncodeConstraintOps(p.Constraints)
+	}
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
 		eventID := ev.EventID
@@ -327,6 +342,11 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			Payload:       ev.Payload,                      // opaque bytes, echoed back unchanged
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
+		var opsArg []byte
+		if i == 0 && len(encodedOps) > 0 {
+			opsArg = encodedOps
+			env.ConstraintOps = append([]es.ConstraintOp(nil), p.Constraints...)
+		}
 		hash := es.EnvelopeHash(env)
 		env.Hash = hash[:]
 		prev = hash // within one batch, event i chains to event i-1 in memory
@@ -340,8 +360,8 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 				actor_type, actor_id, actor_principal,
 				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
-				trace_id, span_id, trace_flags
-			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24)
+				trace_id, span_id, trace_flags, constraint_ops
+			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24,$25)
 			RETURNING global_position`,
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, occurred, recorded,
@@ -349,7 +369,7 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
 			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
-			traceID, spanID, flags,
+			traceID, spanID, flags, opsArg,
 		).Scan(&gp)
 		if err != nil {
 			var pgErr *pgconn.PgError
@@ -417,7 +437,7 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		}
 	}
 
-	if err := w.applyClaims(ctx, db, canonical, p.Constraints); err != nil {
+	if err := w.applyOps(ctx, db, "unique_claims", canonical, p.Constraints); err != nil {
 		return zero, err
 	}
 
@@ -465,18 +485,24 @@ func (w *Workspace) readHead(ctx context.Context, tx DBTX, sid es.StreamID) (uin
 	}
 }
 
-// applyClaims applies uniqueness ops in the append transaction (ADR 0008):
+// applyOps applies uniqueness ops in the append transaction (ADR 0008):
 // releases first (so a same-value rename does not self-collide), then claims.
-// The value_key is stored opaquely (ADR 0025): for personal data the caller
-// supplies a keyed MAC as the value; es-lite stores whatever bytes it is given.
-// A colliding claim returns es.ErrConstraintViolated, rolling back the append.
-func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, ops []es.ConstraintOp) error {
+// table is a closed set — "unique_claims" on the append path; the claims
+// rebuild's temporary index is the other (ADR 0043). The value_key is stored
+// opaquely (ADR 0025): for personal data the caller supplies a keyed MAC as
+// the value; es-lite stores whatever bytes it is given. A colliding claim
+// returns es.ErrConstraintViolated, rolling back the append.
+//
+// No advisory lock is needed: a constraint-bearing append carries at least
+// one event (validateAppend), so same-stream appends serialize on optimistic
+// concurrency and every op sequence has a stable global position to replay in.
+func (w *Workspace) applyOps(ctx context.Context, tx DBTX, table, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
 			continue
 		}
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM unique_claims WHERE workspace_id=$1 AND scope=$2 AND value_key=$3 AND stream_id=$4`,
+			`DELETE FROM `+table+` WHERE workspace_id=$1 AND scope=$2 AND value_key=$3 AND stream_id=$4`,
 			w.ws, op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			return fmt.Errorf("release claim %s: %w", op.Scope, err)
@@ -487,7 +513,7 @@ func (w *Workspace) applyClaims(ctx context.Context, tx DBTX, streamID string, o
 			continue
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
+			`INSERT INTO `+table+` (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
 			w.ws, op.Scope, []byte(op.Value), streamID,
 		); err != nil {
 			if isUniqueViolation(err) {
@@ -511,7 +537,7 @@ const maxNotifyWorkspaceBytes = 512
 // SELECT pg_notify($1, $2) with the channel and this workspace's ID, as
 // the append transaction's last statement — after the events, the
 // log_order row and the claims, so everything durable is written before
-// the hint. With the option off (an empty channel) or a claim-only
+// the hint. With the option off (an empty channel) or a zero-event
 // batch (no events) it issues no statement at all, which is what keeps
 // the default append path free of extra statements and extra locks.
 //
@@ -1189,7 +1215,7 @@ func (w *Workspace) MatchingRawHead(ctx context.Context, types []string) (uint64
 }
 
 // LookupClaim reads the uniqueness index (unique_claims) for the stream holding
-// (scope, value). The value is keyed exactly as applyClaims stores it — opaque
+// (scope, value). The value is keyed exactly as applyOps stores it — opaque
 // bytes as given (ADR 0025) — so writes and lookups agree. A personal-data
 // lookup must pass the same caller-computed MAC the write used.
 func (w *Workspace) LookupClaim(ctx context.Context, scope, value string) (string, bool, error) {
