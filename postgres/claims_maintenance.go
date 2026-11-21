@@ -112,8 +112,9 @@ func (w *Workspace) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, 
 //
 // The whole verify runs in one Repeatable Read transaction so the live index,
 // the replay and the diff read one snapshot: a live append during verify
-// cannot manufacture a false divergence. A writer racing the snapshot may
-// still surface as a serialization error, which is loud and retryable.
+// cannot manufacture a false divergence. Verify writes only a temporary table,
+// never the real ones, so Repeatable Read cannot raise a serialization failure
+// here; the rebuild is the writer.
 func (w *Workspace) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error) {
 	var zero es.ClaimsVerifyReport
 	tx, err := w.store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})

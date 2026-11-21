@@ -486,8 +486,12 @@ event are one row, so an event cut is internally consistent; loading
    Skip it only when the restored log is empty. There is no second sequence.
    SQLite's `AUTOINCREMENT` tracks explicit-id inserts itself, so this step is
    Postgres-only.
-5. **Stop writers**, then rebuild the index: `es-verify claims --rebuild`, then
-   `es-verify claims`. The second command must report `claims OK`. `--rebuild`
+5. **Stop writers.** Verify the index first: `es-verify claims` is
+   non-destructive and must report `claims OK` (exit 0; 1 names the first
+   divergence, 2 is a refusal or error). Rebuild only if you intend to replace
+   the index, after exporting any divergent claims: `es-verify claims
+   --rebuild`, then `es-verify claims` again (the second command must report
+   `claims OK`). `--rebuild`
    replaces the index with what the log can prove, and an op committed after
    its snapshot cannot be replayed; Postgres runs it in one Repeatable Read
    transaction, so a writer racing the snapshot may surface as a
@@ -560,9 +564,12 @@ logical replication feed. Two shapes, different rules:
   Logical replication copies explicit `global_position` values without
   advancing the sequence, while the verifier's `settledBound(0)` reads
   `pg_sequences.last_value`. An unadvanced sequence makes order verification
-  audit only the seeded prefix or report `EMPTY`, and `CheckAnchor` clamps its
-  bound. Grant the verifier role `USAGE` on the sequence — without it
-  `last_value` is masked to 0.
+  recompute every batch from an empty event page and report `BROKEN` (exit 1)
+  — a false failure; `EMPTY` is the no-`log_order` case. `CheckAnchor` clamps
+  its bound. Grant the principal that advances the sequence `UPDATE` on it for
+  `setval` (`GRANT UPDATE ON SEQUENCE events_global_position_seq TO <clone
+  applier>`), or run the `setval` as owner/superuser; grant the verifier
+  `USAGE` to read `last_value` — without it the value is masked to 0.
 
   The clone also maintains `unique_claims`: apply each event's ops per source
   transaction, or run `es-verify claims --rebuild` after a cut (pausing the

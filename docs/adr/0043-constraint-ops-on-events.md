@@ -165,9 +165,12 @@ The events table is a logical replication feed. The consumer contract:
   FROM events));`. Logical replication copies explicit `global_position`
   values without advancing the sequence, while the verifier's
   `settledBound(0)` reads `pg_sequences.last_value`; an unadvanced sequence
-  audits only the seeded prefix or reports `EMPTY`, and `CheckAnchor` clamps
-  the bound. The verifier role needs `USAGE` on the sequence — without it
-  `last_value` is masked to 0. Audit with `es-verify all --chains-only` when
+  makes order verification recompute every batch from an empty event page and
+  report `BROKEN` (exit 1) — a false failure, not `EMPTY` (that is the missing
+  `log_order` case), and `CheckAnchor` clamps the bound. The principal that
+  advances the sequence needs `UPDATE` on it for `setval` (or owner/superuser);
+  the verifier role needs `USAGE` to read `last_value` — without it the value
+  is masked to 0. Audit with `es-verify all --chains-only` when
   `log_order` is absent; `all`/`order` only when it is present and the
   sequence is advanced. Maintain `unique_claims` by applying each event's ops
   per source transaction, or with `--rebuild` after a cut (pausing the apply):
