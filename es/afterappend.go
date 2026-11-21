@@ -14,7 +14,7 @@ import "context"
 // falls back to the poll. Log inside fn and do not block.
 //
 // The workspace must be closed over by the caller (e.g. via the fn
-// closure); it is NOT reliably available from AppendResult. A claim-only
+// closure); it is NOT reliably available from AppendResult. A zero-event
 // append succeeds with zero envelopes, so indexing Envelopes[0] is wrong,
 // and Envelope.Workspace is empty on single-workspace backends (SQLite).
 //

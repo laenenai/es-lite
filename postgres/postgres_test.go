@@ -61,10 +61,7 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// truncated here. snapshots joins the list (0013, ADR 0042): it is
 	// derived, droppable cache state — not the audit log — so each test
 	// starts from no cached snapshots instead of the previous test's rows.
-	// append_decisions joins it too (0014, ADR 0043): its rows are written
-	// by the same appends as unique_claims, so a stale decision would
-	// survive the claim it records.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, append_decisions, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -402,7 +399,7 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("shared ledger: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0014 (append decisions)
+	// Every embedded migration is applied on Open; 0014 (event constraint ops)
 	// made it fourteen.
 	if v != 14 {
 		t.Fatalf("applied version = %d, want 14", v)
@@ -463,12 +460,22 @@ func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 	if _, err := ws.Append(ctx, es.AppendParams{StreamID: sid, ExpectedVersion: 0}); !errors.Is(err, es.ErrConflict) {
 		t.Fatalf("stale empty append error = %v, want ErrConflict", err)
 	}
+	// A zero-event append carrying constraints is rejected (ADR 0043).
 	if _, err := ws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 1,
 		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
+	}); !errors.Is(err, es.ErrConstraintWithoutEvent) {
+		t.Fatalf("claim-only append error = %v, want ErrConstraintWithoutEvent", err)
+	}
+	// With an event the claim applies in the append transaction.
+	if _, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 1,
+		Events:          []es.EventData{{TypeURL: "thing.v1.Claimed", SchemaVersion: 1, Payload: []byte("y")}},
+		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
 	}); err != nil {
-		t.Fatalf("claim-only append: %v", err)
+		t.Fatalf("claim-bearing append: %v", err)
 	}
 	if _, found, err := ws.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)

@@ -82,7 +82,10 @@ type AppendParams struct {
 
 	// Constraints are uniqueness Claim/Release operations applied in the
 	// same transaction as the events (ADR 0008). A colliding Claim rolls the
-	// whole append back with ErrConstraintViolated.
+	// whole append back with ErrConstraintViolated. The ops are also encoded
+	// onto the first event of the batch (events.constraint_ops, ADR 0043),
+	// so a constraint-bearing append must carry at least one event: zero
+	// events plus constraints is ErrConstraintWithoutEvent.
 	Constraints []ConstraintOp
 
 	// Command-scoped audit metadata, copied onto every produced Envelope.

@@ -61,21 +61,19 @@ func TestFeedIndexesExist(t *testing.T) {
 	}
 }
 
-// TestAllBypassPoliciesRoleGated pins migrations 0007/0009/0014's policy
-// shape (review F8/F12) through pg_policies — not file greps, which
-// would false-positive on comments (the Task 13 review ruling). All
-// five policies that carry a bypass arm — events, unique_claims, anchors,
-// log_order and append_decisions — must keep the arm (app.bypass_rls) in
-// both USING and WITH CHECK, gate it on es_relay membership (pg_has_role),
-// and guard that test with EXISTS so it cannot hard-fail (pg_has_role
-// errors) on a database where the role has not been created yet. The row
-// policy is only half the shape: append_decisions must also carry ENABLE
-// and FORCE ROW LEVEL SECURITY, like unique_claims.
+// TestAllBypassPoliciesRoleGated pins migrations 0007/0009's policy shape
+// (review F8/F12) through pg_policies — not file greps, which would
+// false-positive on comments (the Task 13 review ruling). All four policies
+// that carry a bypass arm — events, unique_claims, anchors and log_order —
+// must keep the arm (app.bypass_rls) in both USING and WITH CHECK, gate it on
+// es_relay membership (pg_has_role), and guard that test with EXISTS so it
+// cannot hard-fail (pg_has_role errors) on a database where the role has not
+// been created yet.
 func TestAllBypassPoliciesRoleGated(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
-	for _, table := range []string{"events", "unique_claims", "anchors", "log_order", "append_decisions"} {
+	for _, table := range []string{"events", "unique_claims", "anchors", "log_order"} {
 		rows, err := s.Pool().Query(ctx, `
 			SELECT policyname, qual, COALESCE(with_check, '') FROM pg_policies
 			WHERE schemaname = 'public' AND tablename = $1`, table)
@@ -117,16 +115,28 @@ func TestAllBypassPoliciesRoleGated(t *testing.T) {
 			}
 		}
 	}
+}
 
-	var enabled, forced bool
-	if err := s.Pool().QueryRow(ctx,
-		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = $1::regclass`,
-		"public.append_decisions",
-	).Scan(&enabled, &forced); err != nil {
-		t.Fatalf("read pg_class flags for append_decisions: %v", err)
+// TestEventsConstraintOpsColumn pins migration 0014's shape (ADR 0043): the
+// events parent gains one nullable bytea column for the append's encoded
+// constraint ops (partitions inherit it). No new table: the event log is the
+// functional source.
+func TestEventsConstraintOpsColumn(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+
+	var dataType, nullable string
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT data_type, is_nullable FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'events' AND column_name = 'constraint_ops'`,
+	).Scan(&dataType, &nullable); err != nil {
+		t.Fatalf("read events.constraint_ops definition: %v", err)
 	}
-	if !enabled || !forced {
-		t.Fatalf("append_decisions: RLS enabled=%v forced=%v, want both true (FORCE keeps the table owner subject)", enabled, forced)
+	if dataType != "bytea" {
+		t.Fatalf("events.constraint_ops type = %q, want bytea", dataType)
+	}
+	if nullable != "YES" {
+		t.Fatalf("events.constraint_ops is_nullable = %q, want YES (only the first event of an op-bearing batch carries it)", nullable)
 	}
 }
 

@@ -143,12 +143,12 @@ func TestAppendNotifyRollbackDoesNotFire(t *testing.T) {
 	assertNoNotification(t, lc, 100*time.Millisecond)
 }
 
-// TestAppendNotifyClaimOnlyDoesNotFire pins the claim-only boundary: an
-// append with no events and one uniqueness claim succeeds but notifies
-// nobody — a claim is not a feed event, and a wake for it would only
-// cost every subscriber of the workspace a fenced read that delivers
-// nothing.
-func TestAppendNotifyClaimOnlyDoesNotFire(t *testing.T) {
+// TestAppendNotifyZeroEventDoesNotFire pins the zero-event boundary: an
+// append with no events succeeds (a no-op command) but notifies nobody — a
+// wake for it would only cost every subscriber of the workspace a fenced read
+// that delivers nothing. A constraint-bearing zero-event append is refused
+// before the notify path (ErrConstraintWithoutEvent, ADR 0043).
+func TestAppendNotifyZeroEventDoesNotFire(t *testing.T) {
 	const channel = "es_lite_notify_claim_only"
 	ctx := context.Background()
 	lc := listenConn(t, channel)
@@ -159,9 +159,8 @@ func TestAppendNotifyClaimOnlyDoesNotFire(t *testing.T) {
 	if _, err := ws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 0,
-		Constraints:     []es.ConstraintOp{es.Claim("email", "claim-only@example.test")},
 	}); err != nil {
-		t.Fatalf("claim-only append: %v", err)
+		t.Fatalf("zero-event append: %v", err)
 	}
 
 	assertNoNotification(t, lc, 100*time.Millisecond)

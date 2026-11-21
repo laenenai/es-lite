@@ -247,33 +247,8 @@ func withPragmas(dsn string) string {
 // Append implements es.Store.
 func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult, error) {
 	var zero es.AppendResult
-	if err := p.StreamID.Validate(); err != nil {
+	if err := validateAppend(p); err != nil {
 		return zero, err
-	}
-	for _, op := range p.Constraints {
-		if err := op.Validate(); err != nil {
-			return zero, err
-		}
-	}
-	// A partial span context (ADR 0040) is refused before anything runs:
-	// the zero value means "absent" and is fine, but a caller that sets
-	// one id and not the other has produced a malformed context, and the
-	// events table's CHECK would abort the whole insert anyway. The
-	// error names the stream.
-	if p.SpanContext != (es.SpanContext{}) && !p.SpanContext.IsValid() {
-		return zero, fmt.Errorf("%w: %s", es.ErrMalformedSpanContext, p.StreamID)
-	}
-	// The delegated actor (ADR 0041 §3.4) is refused the same way, on
-	// the same terms: Actor.Validate enforces the delegation rules — a
-	// Via must be complete and must accompany an accountable actor —
-	// and a rejection means nothing was written. Postgres gets this
-	// from validateAppend, which both Append and AppendTx share;
-	// SQLite's single append path calls it inline, as it does for the
-	// checks above. There is no CHECK behind it here (ADR 0041 §3.3:
-	// enforcing one needs another events rebuild), so this call is the
-	// all-or-nothing enforcement. The error names the stream.
-	if err := p.Actor.Validate(); err != nil {
-		return zero, fmt.Errorf("%w: %s", err, p.StreamID)
 	}
 
 	// Payload cap (production review): reject the whole batch before the
@@ -333,6 +308,14 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	// append — the actor acting through the service — so one mapping
 	// covers the batch too.
 	viaType, viaID, viaPrincipal := viaArgs(p.Actor.Via)
+	// Constraint ops are a batch-level record (ADR 0043): encode once and
+	// write the blob on the FIRST event only; every later row is NULL. The
+	// ops are excluded from the hash (CanonicalEnvelope), so this changes
+	// no hash byte.
+	var encodedOps []byte
+	if len(p.Constraints) > 0 {
+		encodedOps = es.EncodeConstraintOps(p.Constraints)
+	}
 	envs := make([]es.Envelope, len(p.Events))
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
@@ -356,6 +339,11 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 			Payload:       ev.Payload,
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
+		var opsArg []byte
+		if i == 0 && len(encodedOps) > 0 {
+			opsArg = encodedOps
+			env.ConstraintOps = append([]es.ConstraintOp(nil), p.Constraints...)
+		}
 		hash := es.EnvelopeHash(env)
 		env.Hash = hash[:]
 		prev = hash // within one batch, event i chains to event i-1 in memory
@@ -368,15 +356,15 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 				actor_type, actor_id, actor_principal,
 				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
-				trace_id, span_id, trace_flags
-			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?)`,
+				trace_id, span_id, trace_flags, constraint_ops
+			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?,?)`,
 			eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, formatTS(occurred), formatTS(recorded),
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
 			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
-			traceID, spanID, flags,
+			traceID, spanID, flags, opsArg,
 		)
 		if err != nil {
 			if isConstraintViolation(err) {
@@ -437,11 +425,6 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	if err := applyClaims(ctx, tx, "unique_claims", canonical, p.Constraints); err != nil {
 		return zero, err
 	}
-	if len(p.Constraints) > 0 {
-		if err := s.recordDecision(ctx, tx, canonical, p); err != nil {
-			return zero, err
-		}
-	}
 
 	if err := tx.Commit(); err != nil {
 		return zero, fmt.Errorf("commit: %w", err)
@@ -451,6 +434,45 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// validateAppend applies the append-time invariants shared by every append
+// path before any statement runs. The error names the stream where the rule is
+// stream-scoped.
+func validateAppend(p es.AppendParams) error {
+	if err := p.StreamID.Validate(); err != nil {
+		return err
+	}
+	for _, op := range p.Constraints {
+		if err := op.Validate(); err != nil {
+			return err
+		}
+	}
+	// A partial span context (ADR 0040) is refused before anything runs:
+	// the zero value means "absent" and is fine, but a caller that sets
+	// one id and not the other has produced a malformed context, and the
+	// events table's CHECK would abort the whole insert anyway. The
+	// error names the stream.
+	if p.SpanContext != (es.SpanContext{}) && !p.SpanContext.IsValid() {
+		return fmt.Errorf("%w: %s", es.ErrMalformedSpanContext, p.StreamID)
+	}
+	// The delegated actor (ADR 0041 §3.4) is refused the same way, on
+	// the same terms: Actor.Validate enforces the delegation rules — a
+	// Via must be complete and must accompany an accountable actor —
+	// and a rejection means nothing was written. There is no CHECK
+	// behind it here (ADR 0041 §3.3: enforcing one needs another events
+	// rebuild), so this call is the all-or-nothing enforcement.
+	if err := p.Actor.Validate(); err != nil {
+		return fmt.Errorf("%w: %s", err, p.StreamID)
+	}
+	// Constraint ops ride on the first event of the batch (ADR 0043): an
+	// append that carries ops but no event would be invisible state — a
+	// claim with no log row to reconstruct it. Refuse it before the
+	// transaction opens, so nothing is written.
+	if len(p.Events) == 0 && len(p.Constraints) > 0 {
+		return fmt.Errorf("%w: %s", es.ErrConstraintWithoutEvent, p.StreamID)
+	}
+	return nil
 }
 
 // spanContextArgs maps a SpanContext onto the events table's three
@@ -523,10 +545,10 @@ func readHead(ctx context.Context, tx *sql.Tx, sid es.StreamID) (uint64, [es.Has
 // (ADR 0025). table names the index to update; the append path passes
 // "unique_claims", and a rebuild (ADR 0043) replays into a temporary table.
 //
-// Unlike Postgres, no advisory lock orders claim-only appends here: SQLite is
-// a single-writer database, so every append transaction serializes behind the
-// write lock and the decision row's AUTOINCREMENT id already follows the
-// order in which the ops were applied (ADR 0043 §3.1).
+// No ordering lock is needed: a constraint-bearing append carries at least
+// one event (validateAppend), so same-stream appends serialize behind the
+// single SQLite writer, and every op sequence has a stable global position to
+// replay in.
 func applyClaims(ctx context.Context, tx *sql.Tx, table, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
@@ -552,26 +574,6 @@ func applyClaims(ctx context.Context, tx *sql.Tx, table, streamID string, ops []
 			}
 			return fmt.Errorf("claim %s=%q: %w", op.Scope, op.Value, err)
 		}
-	}
-	return nil
-}
-
-// recordDecision records the append's constraint decisions in
-// append_decisions (ADR 0043), inside the append transaction and after
-// applyClaims has updated the live claim index. The row holds the original
-// op sequence (es.EncodeDecisionOps), not its effects, and the span
-// [ExpectedVersion, ExpectedVersion+len(events)) — an empty span for a
-// claim-only append. command_id is the CommandID string events stores,
-// including the zero UUID when the caller left it unset.
-func (s *Store) recordDecision(ctx context.Context, tx *sql.Tx, streamID string, p es.AppendParams) error {
-	_, err := tx.ExecContext(ctx,
-		`INSERT INTO append_decisions (stream_id, from_version, to_version, command_id, ops)
-		 VALUES (?,?,?,?,?)`,
-		streamID, p.ExpectedVersion, p.ExpectedVersion+uint64(len(p.Events)),
-		p.CommandID.String(), es.EncodeDecisionOps(p.Constraints),
-	)
-	if err != nil {
-		return fmt.Errorf("sqlite: append decision: %w", err)
 	}
 	return nil
 }
@@ -701,7 +703,7 @@ const envelopeCols = `
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, prev_hash, hash,
 	trace_id, span_id, trace_flags,
-	via_type, via_id, via_principal`
+	via_type, via_id, via_principal, constraint_ops`
 
 func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -743,6 +745,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		traceID, spanID                       []byte
 		flags                                 any
 		viaType, viaID, viaPrincipal          *string
+		constraintOps                         []byte
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -750,7 +753,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
 		&traceID, &spanID, &flags,
-		&viaType, &viaID, &viaPrincipal,
+		&viaType, &viaID, &viaPrincipal, &constraintOps,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -760,6 +763,15 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	}
 	if e.StreamID, err = es.ParseCanonical(streamID); err != nil {
 		return es.Envelope{}, fmt.Errorf("parse stream_id %q: %w", streamID, err)
+	}
+	// Constraint ops (ADR 0043) are a restore record, not chain-attested: a
+	// corrupt blob fails the read loudly — naming the stream and version,
+	// never the bytes — rather than silently dropping the claims it would
+	// reconstruct.
+	if len(constraintOps) > 0 {
+		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps); err != nil {
+			return es.Envelope{}, fmt.Errorf("constraint_ops for stream %s v%d: %w", e.StreamID, e.Version, err)
+		}
 	}
 	if e.OccurredAt, err = parseTS(occurredAt); err != nil {
 		return es.Envelope{}, fmt.Errorf("parse occurred_at %q: %w", occurredAt, err)

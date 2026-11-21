@@ -335,7 +335,7 @@ func TestAllExitCodePrecedence(t *testing.T) {
 }
 
 // seedClaim appends one event carrying one Claim constraint, so the store
-// also records an append decision — the row the claims commands operate on.
+// also records the ops on that event — the row the claims commands operate on.
 func seedClaim(t *testing.T, s *sqlite.Store, sid es.StreamID, scope, value string) {
 	t.Helper()
 	if _, err := s.Append(context.Background(), es.AppendParams{
@@ -348,8 +348,8 @@ func seedClaim(t *testing.T, s *sqlite.Store, sid es.StreamID, scope, value stri
 }
 
 // TestClaimsCommandEmpty pins the claims oracle's empty case: a fresh
-// database has no decisions and no claims, so the verify reports OK with
-// zero decisions and exits 0 — the index and its log agree trivially.
+// database has no ops and no claims, so the verify reports OK with zero op
+// records and exits 0 — the index and its log agree trivially.
 func TestClaimsCommandEmpty(t *testing.T) {
 	s := newTestDB(t)
 	closeDB(t, s)
@@ -358,15 +358,15 @@ func TestClaimsCommandEmpty(t *testing.T) {
 	if code != exitIntact {
 		t.Errorf("claims on an empty db: exit %d, want %d", code, exitIntact)
 	}
-	if !strings.Contains(stdout, "claims OK: 0 decisions") {
-		t.Errorf("claims on an empty db: stdout %q, want the zero-decision OK", stdout)
+	if !strings.Contains(stdout, "claims OK: 0 op records") {
+		t.Errorf("claims on an empty db: stdout %q, want the zero-op OK", stdout)
 	}
 }
 
 // TestClaimsCommandRebuildAndVerify pins the rebuild/verify pair: a seeded
-// claim rebuilds to exactly one decision and one claim, verifies OK, and
-// rebuilding again is idempotent — the same decision log replays to the
-// same index and still verifies.
+// claim rebuilds to exactly one op record and one claim, verifies OK, and
+// rebuilding again is idempotent — the same event log replays to the same
+// index and still verifies.
 func TestClaimsCommandRebuildAndVerify(t *testing.T) {
 	s := newTestDB(t)
 	sid, err := es.NewStreamID("thing", "a")
@@ -382,7 +382,7 @@ func TestClaimsCommandRebuildAndVerify(t *testing.T) {
 		if code != exitIntact {
 			t.Fatalf("claims --rebuild (run %d): exit %d, want %d", i+1, code, exitIntact)
 		}
-		if !strings.Contains(stdout, "claims rebuilt: 1 decisions, 1 claims") {
+		if !strings.Contains(stdout, "claims rebuilt: 1 op records, 1 claims") {
 			t.Errorf("claims --rebuild (run %d): stdout %q, want the seeded claim rebuilt", i+1, stdout)
 		}
 
@@ -390,7 +390,7 @@ func TestClaimsCommandRebuildAndVerify(t *testing.T) {
 		if code != exitIntact {
 			t.Fatalf("claims after rebuild (run %d): exit %d, want %d", i+1, code, exitIntact)
 		}
-		if !strings.Contains(stdout, "claims OK: 1 decisions") {
+		if !strings.Contains(stdout, "claims OK: 1 op records") {
 			t.Errorf("claims after rebuild (run %d): stdout %q, want the rebuilt index verified", i+1, stdout)
 		}
 	}
@@ -417,7 +417,7 @@ func (f fakeClaims) VerifyClaims(context.Context) (es.ClaimsVerifyReport, error)
 // not mask it as "nothing audited" (exit 2). Both orders must exit 1, per
 // mergeExit's broken-dominates rule, and the divergence names its workspace.
 func TestClaimsCommandDivergenceDominatesError(t *testing.T) {
-	diverged := fakeClaims{rep: es.ClaimsVerifyReport{Decisions: 1, FirstDivergence: "scope=thing.slug value=61 stream=thing:a"}}
+	diverged := fakeClaims{rep: es.ClaimsVerifyReport{Ops: 1, FirstDivergence: "scope=thing.slug value=61 stream=thing:a"}}
 	failed := fakeClaims{err: errors.New("read failed")}
 	for _, tc := range []struct {
 		name          string

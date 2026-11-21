@@ -265,6 +265,23 @@ func TestSpanContextExcludedFromCanonicalAndHash(t *testing.T) {
 	}
 }
 
+// Constraint ops (ADR 0043) are a restore record on the event row, not an
+// attested fact: like the span context they must be invisible to the canonical
+// encoding and the hash, so adding or changing them never moves the chain.
+func TestConstraintOpsExcludedFromCanonicalAndHash(t *testing.T) {
+	withOps := goldenV1
+	withOps.ConstraintOps = []es.ConstraintOp{
+		es.Claim("email", "a@b"),
+		es.Release("email", "c@d"),
+	}
+	if got, want := es.CanonicalEnvelope(withOps), es.CanonicalEnvelope(goldenV1); !bytes.Equal(got, want) {
+		t.Fatal("constraint ops leaked into the canonical encoding")
+	}
+	if es.EnvelopeHash(withOps) != es.EnvelopeHash(goldenV1) {
+		t.Fatal("constraint ops changed the envelope hash")
+	}
+}
+
 func TestAnchorRootOrderIndependent(t *testing.T) {
 	a := es.StreamHead{Workspace: "w", StreamID: es.StreamID{Type: "a", ID: "1"}, Version: 3, Hash: make([]byte, es.HashSize)}
 	b := es.StreamHead{Workspace: "w", StreamID: es.StreamID{Type: "b", ID: "1"}, Version: 1}

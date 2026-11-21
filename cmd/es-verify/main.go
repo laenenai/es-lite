@@ -24,8 +24,8 @@
 //	  deep-verify the log order: recompute every log_order batch hash
 //	  from the events at or below the bound (0 = the log head)
 //	es-verify claims [--rebuild] [<workspace>]
-//	  verify the unique-claims index against its append decision log;
-//	  --rebuild replays the log over the live index
+//	  verify the unique-claims index against the constraint ops on the
+//	  event log; --rebuild replays the log over the live index
 //
 // Config (env), as es-migrate: BACKEND (postgres|sqlite), PG_DSN, SQLITE_DSN.
 package main
@@ -63,10 +63,9 @@ type backend struct {
 	verifyOrder func(context.Context, uint64) (*es.OrderVerifyReport, error)
 	// claims is the per-workspace claims index maintainer (ADR 0043).
 	claims func(workspace string) es.ClaimsMaintainer
-	// claimWorkspaces enumerates the workspaces with claim state. It is
-	// not derived from streams: a workspace whose appends were all
-	// claim-only has no event, so a stream-derived list would skip the
-	// only workspace the audit needed to read.
+	// claimWorkspaces enumerates the workspaces with claim state. Claims
+	// are a projection of the events (ADR 0043), so the event log is the
+	// complete discovery source; a claim-only workspace cannot exist.
 	claimWorkspaces func(context.Context) ([]string, error)
 	multiWS         bool
 	close           func()
@@ -272,16 +271,16 @@ func cmdOrder(ctx context.Context, b *backend, args []string) int {
 	}
 }
 
-// cmdClaims maintains and audits the unique-claims index against the append
-// decision log recorded beside the events (ADR 0043). The default is the
+// cmdClaims maintains and audits the unique-claims index against the
+// constraint ops recorded on the event log (ADR 0043). The default is the
 // oracle: rebuild into a temporary index and compare, without touching the
 // live index. --rebuild replays the log over the live index. An inconsistent
-// state — live claims with no decision history — is refused with
+// state — live claims with no ops in the event log — is refused with
 // es.ErrClaimsWithoutDecisions, and that refusal, like connection errors,
 // exits 2: nothing was audited.
 func cmdClaims(ctx context.Context, b *backend, args []string) int {
 	fs := flag.NewFlagSet("claims", flag.ContinueOnError)
-	rebuild := fs.Bool("rebuild", false, "replace the live claims index by replaying the append decision log")
+	rebuild := fs.Bool("rebuild", false, "replace the live claims index by replaying the constraint ops on the event log")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -297,22 +296,22 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 	}
 
 	if *rebuild {
-		var decisions, claims int64
+		var ops, claims int64
 		for _, ws := range workspaces {
 			rep, err := b.claims(ws).RebuildClaims(ctx)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
 				return exitUsage
 			}
-			decisions += rep.Decisions
+			ops += rep.Ops
 			claims += rep.Claims
 		}
-		fmt.Printf("claims rebuilt: %d decisions, %d claims\n", decisions, claims)
+		fmt.Printf("claims rebuilt: %d op records, %d claims\n", ops, claims)
 		return exitIntact
 	}
 
 	code := exitIntact
-	var decisions int64
+	var ops int64
 	for _, ws := range workspaces {
 		rep, err := b.claims(ws).VerifyClaims(ctx)
 		if err != nil {
@@ -324,7 +323,7 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 			code = mergeExit(code, exitUsage)
 			continue
 		}
-		decisions += rep.Decisions
+		ops += rep.Ops
 		if !rep.OK {
 			// Name the workspace like verifyOne does: in a multi-workspace
 			// audit the divergence is worthless to an operator who cannot
@@ -334,16 +333,15 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 		}
 	}
 	if code == exitIntact {
-		fmt.Printf("claims OK: %d decisions\n", decisions)
+		fmt.Printf("claims OK: %d op records\n", ops)
 	}
 	return code
 }
 
 // claimWorkspaces resolves the workspaces a claims command runs over: an
 // explicit argument scopes the run to one; otherwise the backend enumerates
-// every workspace with claim state. Listing streams would miss a workspace
-// whose appends were all claim-only (ADR 0043): it writes no event, so its
-// claims index would go unaudited while the command exited 0.
+// every workspace with claim state from the event log. Claims are a projection
+// of the events (ADR 0043), so no separate discovery source is needed.
 func claimWorkspaces(ctx context.Context, b *backend, args []string) ([]string, error) {
 	if len(args) == 1 {
 		return []string{args[0]}, nil

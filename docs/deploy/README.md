@@ -279,21 +279,19 @@ private `schema_migrations`.
 **Appender** — the process calling `Workspace.Append` (or `AppendTx`): it
 draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1),
-applies uniqueness constraints and records their decisions in
-`append_decisions` (ADR 0043), reads that log to rebuild or verify the
-claims index after a restore, and deletes decision rows when a workspace
-is erased. It is also the process running `aggregate.Runtime`, so with a
+applies uniqueness constraints — their ops ride on the first event row
+(ADR 0043) — reads the event log to rebuild or verify the claims index
+after a restore. It is also the process running `aggregate.Runtime`, so with a
 snapshot cache configured (ADR 0042) it both reads and writes `snapshots`
 — the same role as for `events`. `Release` is the only `DELETE` on the
-append path; erasure deletes `append_decisions` rows, and `Purge` on the
-snapshot cache is the other off-path `DELETE`:
+append path, and `Purge` on the snapshot cache is the other off-path
+`DELETE`:
 
 ```sql
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;
 GRANT SELECT, INSERT ON events, unique_claims TO <appender>;
 GRANT DELETE ON unique_claims TO <appender>;
 GRANT INSERT ON log_order TO <appender>;
-GRANT SELECT, INSERT, DELETE ON append_decisions TO <appender>;
 GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO <appender>;
 ```
 

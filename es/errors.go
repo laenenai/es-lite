@@ -49,6 +49,21 @@ var (
 	// empty scope).
 	ErrInvalidConstraint = errors.New("es-lite: invalid constraint")
 
+	// ErrConstraintWithoutEvent reports an append that carries constraint
+	// ops but no events. Constraint ops ride on the first event of the
+	// batch (ADR 0043), so a claim or release must accompany a domain
+	// event; nothing is written when this is returned. The runtime checks
+	// it after Decide, and both stores check it in validateAppend.
+	ErrConstraintWithoutEvent = errors.New("es-lite: constraints require at least one event")
+
+	// ErrClaimsWithoutDecisions reports a rebuild or verify against a store
+	// whose live claims index has no op-bearing event history. Every
+	// op-bearing append writes its ops on an event in the same transaction,
+	// so that state is inconsistent — a partial restore, or rows written
+	// outside the append path — and the log cannot license or reconstruct
+	// it (ADR 0043 §2.5).
+	ErrClaimsWithoutDecisions = errors.New("es-lite: live claims have no decision history")
+
 	// ErrTerminal reports that a command was issued against a stream
 	// whose Decider.IsTerminal returned true. The stream is closed —
 	// no further events may be appended.

@@ -10,23 +10,30 @@ import (
 )
 
 // The claims index is derived state (ADR 0043): the append path keeps
-// unique_claims authoritative and records each append's constraint ops in
-// append_decisions, so these two operations can reconstruct the index after a
+// unique_claims authoritative and records each append's constraint ops on its
+// first event row, so these two operations can reconstruct the index after a
 // restore and prove a live index matches its log. Each runs in one transaction
 // and commits once, so the guard, the delete, the replay and the final count
 // all see the same snapshot; a decode or apply failure rolls the whole
 // operation back.
 //
 // One SQLite database is one workspace, so unlike the Postgres adapter these
-// carry no workspace predicate and no row security: every row in the
-// database belongs to the single tenant.
+// carry no workspace predicate and no row security: every row in the database
+// belongs to the single tenant.
 
 var _ es.ClaimsMaintainer = (*Store)(nil)
 
-// RebuildClaims replaces the live claims index by replaying every decision
-// record in append order (ADR 0043 §3.2). It refuses an inconsistent state —
-// live claims with no decision history — returning ErrClaimsWithoutDecisions
-// without deleting anything, because the log cannot reconstruct that index.
+// opPageSize bounds the op-bearing event rows one replay query buffers. SQLite
+// keeps one connection, so a page is read and closed before its ops are
+// applied; keyset paging on global_position replays in the one order the log
+// defines without holding a large log in memory all at once.
+const opPageSize = 1000
+
+// RebuildClaims replaces the live claims index by replaying every op-bearing
+// event in global position order (ADR 0043 §2.2). It refuses an inconsistent
+// state — live claims with no ops in the event log — returning
+// ErrClaimsWithoutDecisions without deleting anything, because the log cannot
+// reconstruct that index.
 func (s *Store) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, error) {
 	var zero es.ClaimsRebuildReport
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -39,22 +46,22 @@ func (s *Store) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, erro
 	if err != nil {
 		return zero, fmt.Errorf("sqlite: rebuild claims: count live claims: %w", err)
 	}
-	decisions, err := countRows(ctx, tx, `SELECT count(*) FROM append_decisions`)
+	ops, err := countRows(ctx, tx, `SELECT count(*) FROM events WHERE constraint_ops IS NOT NULL`)
 	if err != nil {
-		return zero, fmt.Errorf("sqlite: rebuild claims: count decisions: %w", err)
+		return zero, fmt.Errorf("sqlite: rebuild claims: count ops: %w", err)
 	}
-	if decisions == 0 && claims > 0 {
-		// A live index with no decision history is inconsistent: a partial
+	if ops == 0 && claims > 0 {
+		// A live index with no op-bearing events is inconsistent: a partial
 		// restore, or rows written outside the append path. The log cannot
 		// reconstruct it, so refuse rather than guess or delete (ADR 0043
-		// §3.5).
+		// §2.5).
 		return zero, es.ErrClaimsWithoutDecisions
 	}
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM unique_claims`); err != nil {
 		return zero, fmt.Errorf("sqlite: rebuild claims: clear index: %w", err)
 	}
-	replayed, err := replayDecisions(ctx, tx, "unique_claims")
+	replayed, err := replayOps(ctx, tx, "unique_claims")
 	if err != nil {
 		return zero, err
 	}
@@ -65,15 +72,15 @@ func (s *Store) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, erro
 	if err := tx.Commit(); err != nil {
 		return zero, fmt.Errorf("sqlite: rebuild claims: commit: %w", err)
 	}
-	return es.ClaimsRebuildReport{Decisions: replayed, Claims: after}, nil
+	return es.ClaimsRebuildReport{Ops: replayed, Claims: after}, nil
 }
 
-// VerifyClaims rebuilds the decision log into a temporary copy of the index
+// VerifyClaims rebuilds the event log's ops into a temporary copy of the index
 // and reports the first (scope, value, stream) where the copy and the live
-// index disagree (ADR 0043 §3.2). It never modifies the live index; the temp
-// table is dropped by the next verify and otherwise lives only on the
-// store's single connection. Like RebuildClaims it refuses an inconsistent
-// state — live claims with no decision history — returning
+// index disagree (ADR 0043 §2.2). It never modifies the live index; the temp
+// table is dropped by the next verify and otherwise lives only on the store's
+// single connection. Like RebuildClaims it refuses an inconsistent state —
+// live claims with no ops in the event log — returning
 // ErrClaimsWithoutDecisions instead of reporting the missing log as a
 // divergence.
 //
@@ -87,20 +94,20 @@ func (s *Store) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error)
 	}
 	defer tx.Rollback()
 
-	// The guard mirrors RebuildClaims: live claims with no decision history
+	// The guard mirrors RebuildClaims: live claims with no op-bearing events
 	// are inconsistent — a partial restore or out-of-band SQL — so the log
 	// cannot license (or reconstruct) the index. Refuse with
 	// ErrClaimsWithoutDecisions rather than invent a divergence out of the
-	// missing history (ADR 0043 §3.5).
+	// missing history (ADR 0043 §2.5).
 	liveClaims, err := countRows(ctx, tx, `SELECT count(*) FROM unique_claims`)
 	if err != nil {
 		return zero, fmt.Errorf("sqlite: verify claims: count live claims: %w", err)
 	}
-	liveDecisions, err := countRows(ctx, tx, `SELECT count(*) FROM append_decisions`)
+	liveOps, err := countRows(ctx, tx, `SELECT count(*) FROM events WHERE constraint_ops IS NOT NULL`)
 	if err != nil {
-		return zero, fmt.Errorf("sqlite: verify claims: count decisions: %w", err)
+		return zero, fmt.Errorf("sqlite: verify claims: count ops: %w", err)
 	}
-	if liveDecisions == 0 && liveClaims > 0 {
+	if liveOps == 0 && liveClaims > 0 {
 		return zero, es.ErrClaimsWithoutDecisions
 	}
 
@@ -121,7 +128,7 @@ func (s *Store) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error)
 		)`); err != nil {
 		return zero, fmt.Errorf("sqlite: verify claims: create temp index: %w", err)
 	}
-	decisions, err := replayDecisions(ctx, tx, "claims_rebuild")
+	ops, err := replayOps(ctx, tx, "claims_rebuild")
 	if err != nil {
 		return zero, err
 	}
@@ -130,7 +137,7 @@ func (s *Store) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error)
 		return zero, fmt.Errorf("sqlite: verify claims: count rebuilt claims: %w", err)
 	}
 
-	rep := es.ClaimsVerifyReport{OK: true, Decisions: decisions, Claims: claims}
+	rep := es.ClaimsVerifyReport{OK: true, Ops: ops, Claims: claims}
 	var (
 		scope  string
 		value  []byte
@@ -168,49 +175,58 @@ func (s *Store) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error)
 	return rep, nil
 }
 
-// replayDecisions applies every decision record to table in append (id)
-// order, returning how many rows it replayed. It reads the whole log before
-// applying, because the single connection cannot execute an insert while the
-// query's rows are still open. The ops go through the same DecodeDecisionOps
-// and applyClaims the append path uses, so release-then-claim ordering is
-// identical to a live append.
-func replayDecisions(ctx context.Context, tx *sql.Tx, table string) (int64, error) {
-	type decision struct {
-		id       int64
+// replayOps applies every op-bearing event to table in global position order,
+// returning how many op records it replayed. Paging is keyset on
+// global_position: a page is read and closed before its ops are applied, and
+// the next page starts strictly above the last position read. The ops go
+// through the same DecodeConstraintOps and applyClaims the append path uses,
+// so release-then-claim ordering is identical to a live append.
+func replayOps(ctx context.Context, tx *sql.Tx, table string) (int64, error) {
+	type opRecord struct {
+		position uint64
 		streamID string
 		ops      []byte
 	}
-	var decisions []decision
-	rows, err := tx.QueryContext(ctx,
-		`SELECT id, stream_id, ops FROM append_decisions ORDER BY id`)
-	if err != nil {
-		return 0, fmt.Errorf("sqlite: replay decisions: read: %w", err)
-	}
-	for rows.Next() {
-		var d decision
-		if err := rows.Scan(&d.id, &d.streamID, &d.ops); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("sqlite: replay decisions: scan: %w", err)
-		}
-		decisions = append(decisions, d)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("sqlite: replay decisions: read: %w", err)
-	}
-
-	var applied int64
-	for _, d := range decisions {
-		ops, err := es.DecodeDecisionOps(d.ops)
+	var (
+		applied int64
+		after   uint64
+	)
+	for {
+		rows, err := tx.QueryContext(ctx,
+			`SELECT global_position, stream_id, constraint_ops FROM events
+			  WHERE constraint_ops IS NOT NULL AND global_position > ?
+			  ORDER BY global_position LIMIT ?`, after, opPageSize)
 		if err != nil {
-			return applied, fmt.Errorf("sqlite: replay decision %d: %w", d.id, err)
+			return applied, fmt.Errorf("sqlite: replay ops: read: %w", err)
 		}
-		if err := applyClaims(ctx, tx, table, d.streamID, ops); err != nil {
-			return applied, err
+		var page []opRecord
+		for rows.Next() {
+			var r opRecord
+			if err := rows.Scan(&r.position, &r.streamID, &r.ops); err != nil {
+				rows.Close()
+				return applied, fmt.Errorf("sqlite: replay ops: scan: %w", err)
+			}
+			page = append(page, r)
 		}
-		applied++
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return applied, fmt.Errorf("sqlite: replay ops: read: %w", err)
+		}
+		if len(page) == 0 {
+			return applied, nil
+		}
+		for _, r := range page {
+			ops, err := es.DecodeConstraintOps(r.ops)
+			if err != nil {
+				return applied, fmt.Errorf("sqlite: replay ops at position %d: %w", r.position, err)
+			}
+			if err := applyClaims(ctx, tx, table, r.streamID, ops); err != nil {
+				return applied, err
+			}
+			applied++
+			after = r.position
+		}
 	}
-	return applied, nil
 }
 
 // countRows runs one count query in the caller's transaction and returns it.

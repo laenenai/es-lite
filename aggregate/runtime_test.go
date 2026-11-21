@@ -71,7 +71,7 @@ func (noEventCodec) Decode(es.EncodedEvent) (noEvent, error) {
 	panic("Decode must not be called when there are no events")
 }
 
-func TestHandleAppliesConstraintsWithoutEvents(t *testing.T) {
+func TestHandleRejectsConstraintsWithoutEvents(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
 	sid, _ := es.NewStreamID("thing", "main")
@@ -85,15 +85,17 @@ func TestHandleAppliesConstraintsWithoutEvents(t *testing.T) {
 	}
 	rt := aggregate.NewRuntime(store, decider, noEventCodec{})
 
-	res, err := rt.Handle(ctx, sid, noEventCommand{}, es.Meta{})
-	if err != nil {
-		t.Fatalf("claim-only handle: %v", err)
+	// Constraint ops ride on the first event of the batch (ADR 0043): a
+	// claim with no domain event is refused before the store sees it, so
+	// neither a claim nor an event is written.
+	if _, err := rt.Handle(ctx, sid, noEventCommand{}, es.Meta{}); !errors.Is(err, es.ErrConstraintWithoutEvent) {
+		t.Fatalf("constraint-only handle: got %v, want ErrConstraintWithoutEvent", err)
 	}
-	if res.FromVersion != 0 || res.ToVersion != 0 {
-		t.Fatalf("claim-only versions = %d/%d, want 0/0", res.FromVersion, res.ToVersion)
+	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com"); err != nil || found {
+		t.Fatalf("claim lookup found=%v err=%v, want absent", found, err)
 	}
-	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
-		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)
+	if v, err := store.CurrentStreamVersion(ctx, sid); err != nil || v != 0 {
+		t.Fatalf("stream version = %d (err %v), want 0 — the rejected append wrote nothing", v, err)
 	}
 }
 
@@ -114,12 +116,24 @@ func TestEmptyAppendChecksVersionAndAppliesConstraints(t *testing.T) {
 		t.Fatalf("stale empty append error = %v, want ErrConflict", err)
 	}
 
+	// A zero-event append carrying constraints is now rejected: the ops
+	// must ride on an event (ADR 0043).
 	if _, err := store.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 1,
 		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
+	}); !errors.Is(err, es.ErrConstraintWithoutEvent) {
+		t.Fatalf("claim-only append error = %v, want ErrConstraintWithoutEvent", err)
+	}
+
+	// With an event the same claim applies in the append transaction.
+	if _, err := store.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 1,
+		Events:          []es.EventData{{TypeURL: "thing.v1.Claimed", SchemaVersion: 1, Payload: []byte("y")}},
+		Constraints:     []es.ConstraintOp{es.Claim("email", "a@b.com")},
 	}); err != nil {
-		t.Fatalf("claim-only append: %v", err)
+		t.Fatalf("claim-bearing append: %v", err)
 	}
 	if _, found, err := store.LookupClaim(ctx, "email", "a@b.com"); err != nil || !found {
 		t.Fatalf("claim lookup found=%v err=%v, want found", found, err)

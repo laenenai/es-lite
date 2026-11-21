@@ -2,11 +2,8 @@ package postgres
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -198,6 +195,13 @@ func validateAppend(p es.AppendParams) error {
 			return err
 		}
 	}
+	// Constraint ops ride on the first event of the batch (ADR 0043): an
+	// append that carries ops but no event would be invisible state — a
+	// claim with no log row to reconstruct it. Refuse it before the xid is
+	// drawn, so nothing is written.
+	if len(p.Events) == 0 && len(p.Constraints) > 0 {
+		return fmt.Errorf("%w: %s", es.ErrConstraintWithoutEvent, p.StreamID)
+	}
 	return nil
 }
 
@@ -307,6 +311,14 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 	// append — the actor acting through the service — so one mapping
 	// covers the batch too.
 	viaType, viaID, viaPrincipal := viaArgs(p.Actor.Via)
+	// Constraint ops are a batch-level record (ADR 0043): encode once and
+	// write the blob on the FIRST event only; every later row is NULL. The
+	// ops are not part of the hash (CanonicalEnvelope excludes them), so
+	// this happens before the hash is computed and changes no byte of it.
+	var encodedOps []byte
+	if len(p.Constraints) > 0 {
+		encodedOps = es.EncodeConstraintOps(p.Constraints)
+	}
 	for i, ev := range p.Events {
 		version := p.ExpectedVersion + uint64(i) + 1
 		eventID := ev.EventID
@@ -330,6 +342,11 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			Payload:       ev.Payload,                      // opaque bytes, echoed back unchanged
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
+		var opsArg []byte
+		if i == 0 && len(encodedOps) > 0 {
+			opsArg = encodedOps
+			env.ConstraintOps = append([]es.ConstraintOp(nil), p.Constraints...)
+		}
 		hash := es.EnvelopeHash(env)
 		env.Hash = hash[:]
 		prev = hash // within one batch, event i chains to event i-1 in memory
@@ -343,8 +360,8 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 				actor_type, actor_id, actor_principal,
 				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
-				trace_id, span_id, trace_flags
-			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24)
+				trace_id, span_id, trace_flags, constraint_ops
+			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24,$25)
 			RETURNING global_position`,
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, occurred, recorded,
@@ -352,7 +369,7 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
 			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
-			traceID, spanID, flags,
+			traceID, spanID, flags, opsArg,
 		).Scan(&gp)
 		if err != nil {
 			var pgErr *pgconn.PgError
@@ -424,18 +441,6 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		return zero, err
 	}
 
-	// The append-decision record (ADR 0043) is written after the claim
-	// index has been updated, in the same transaction: a collision above
-	// has already aborted the append, and a commit below can only succeed
-	// with both the claim effects and their record. A claim-only append
-	// (no events) still records one row — the empty span [v,v) — because
-	// the decision is then the append's only durable effect.
-	if len(p.Constraints) > 0 {
-		if err := w.recordDecision(ctx, db, canonical, p); err != nil {
-			return zero, err
-		}
-	}
-
 	// The opt-in append hint (ADR 0039 C2), deliberately the transaction's
 	// last statement: after the events, the log_order row and the claims.
 	// notifyAppend's first check is the option, so with WithAppendNotify
@@ -488,21 +493,10 @@ func (w *Workspace) readHead(ctx context.Context, tx DBTX, sid es.StreamID) (uin
 // the value; es-lite stores whatever bytes it is given. A colliding claim
 // returns es.ErrConstraintViolated, rolling back the append.
 //
-// Before applying, the transaction takes an advisory lock per distinct
-// (workspace, scope, value). A Claim already serializes on the unique index,
-// but a Release that matches nothing takes no row lock, so two claim-only
-// appends at the same version could otherwise commit their effects and their
-// decision rows in opposite orders. The lock is transaction-scoped — held to
-// commit, covering both the effect and the decision-record id — and acquired
-// in sorted key order so concurrent batches cannot deadlock (ADR 0043 §3.1).
+// No advisory lock is needed: a constraint-bearing append carries at least
+// one event (validateAppend), so same-stream appends serialize on optimistic
+// concurrency and every op sequence has a stable global position to replay in.
 func (w *Workspace) applyOps(ctx context.Context, tx DBTX, table, streamID string, ops []es.ConstraintOp) error {
-	for _, key := range claimLockKeys(w.ws, ops) {
-		if _, err := tx.Exec(ctx,
-			`SELECT pg_advisory_xact_lock($1)`, key,
-		); err != nil {
-			return fmt.Errorf("lock claim key: %w", err)
-		}
-	}
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
 			continue
@@ -531,54 +525,6 @@ func (w *Workspace) applyOps(ctx context.Context, tx DBTX, table, streamID strin
 	return nil
 }
 
-// claimLockKeys returns the advisory-lock keys for one append's ops: one per
-// distinct (workspace, scope, value), sorted by the raw key so every batch
-// acquires them in the same order. The key is hashed to a bigint because
-// claim values are opaque bytes (ADR 0025) — a MAC need not be valid UTF-8,
-// and a text parameter cannot carry a NUL byte or invalid UTF-8. A hash
-// collision only serializes two unrelated appends; it cannot break
-// correctness. Empty for an append with no constraints, which writes no
-// decision row and needs no ordering against anyone.
-func claimLockKeys(ws string, ops []es.ConstraintOp) []int64 {
-	seen := make(map[string]struct{}, len(ops))
-	raw := make([]string, 0, len(ops))
-	for _, op := range ops {
-		key := ws + "\x00" + op.Scope + "\x00" + op.Value
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		raw = append(raw, key)
-	}
-	sort.Strings(raw)
-	keys := make([]int64, len(raw))
-	for i, key := range raw {
-		sum := sha256.Sum256([]byte(key))
-		keys[i] = int64(binary.BigEndian.Uint64(sum[:8]))
-	}
-	return keys
-}
-
-// recordDecision records the append's constraint decisions in
-// append_decisions (ADR 0043), inside the append transaction and after
-// applyOps has updated the live claim index. The row holds the original op
-// sequence (es.EncodeDecisionOps), not its effects, and the span
-// [ExpectedVersion, ExpectedVersion+len(events)) — an empty span for a
-// claim-only append. command_id is the CommandID string events stores,
-// including the zero UUID when the caller left it unset.
-func (w *Workspace) recordDecision(ctx context.Context, tx DBTX, streamID string, p es.AppendParams) error {
-	_, err := tx.Exec(ctx,
-		`INSERT INTO append_decisions (workspace_id, stream_id, from_version, to_version, command_id, ops)
-		 VALUES ($1,$2,$3,$4,$5,$6)`,
-		w.ws, streamID, p.ExpectedVersion, p.ExpectedVersion+uint64(len(p.Events)),
-		p.CommandID.String(), es.EncodeDecisionOps(p.Constraints),
-	)
-	if err != nil {
-		return fmt.Errorf("postgres: append decision: %w", err)
-	}
-	return nil
-}
-
 // maxNotifyWorkspaceBytes bounds the workspace ID the notify path will
 // carry as a NOTIFY payload: 512 bytes, far under the 8000-byte NOTIFY
 // limit, so the limit cannot be hit — an oversized ID is rejected here
@@ -591,7 +537,7 @@ const maxNotifyWorkspaceBytes = 512
 // SELECT pg_notify($1, $2) with the channel and this workspace's ID, as
 // the append transaction's last statement — after the events, the
 // log_order row and the claims, so everything durable is written before
-// the hint. With the option off (an empty channel) or a claim-only
+// the hint. With the option off (an empty channel) or a zero-event
 // batch (no events) it issues no statement at all, which is what keeps
 // the default append path free of extra statements and extra locks.
 //

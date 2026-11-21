@@ -50,6 +50,14 @@ type Envelope struct {
 	// when the caller has no trace context.
 	SpanContext SpanContext
 
+	// ConstraintOps is the append's constraint-op sequence (ADR 0043),
+	// decoded from events.constraint_ops. The store writes them on the
+	// FIRST event of the batch and NULL on the rest, so only that
+	// envelope carries a non-nil slice. Like SpanContext — and for the
+	// same reason, the chain attests the event, not this restore record —
+	// they are excluded from CanonicalEnvelope and never enter the hash.
+	ConstraintOps []ConstraintOp
+
 	// Payload — canonical serialized event bytes (proto by convention).
 	Payload []byte
 

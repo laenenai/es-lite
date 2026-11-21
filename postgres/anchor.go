@@ -377,15 +377,12 @@ func (s *Store) ListStreams(ctx context.Context) ([]es.StreamRef, error) {
 	return out, rows.Err()
 }
 
-// ClaimWorkspaces returns every workspace that holds claim state: the
-// distinct workspace ids in append_decisions unioned with those in
-// unique_claims. The union is deliberate — append_decisions covers a
-// workspace whose appends were all claim-only (no event, so ListStreams
-// cannot see it), while unique_claims covers a workspace whose index has no
-// decision history: discovery must still surface it so the audit refuses it
-// visibly rather than skipping it. It runs under app.bypass_rls like
-// ListStreams: both tables are FORCE ROW LEVEL SECURITY, and the caller is
-// the operator's cross-workspace claims audit.
+// ClaimWorkspaces returns every workspace with claim state: the distinct
+// workspace ids in the event log. Claims are a projection of the events
+// (ADR 0043 §2.2), and a constraint-bearing append always carries an event,
+// so a workspace whose appends were all claim-only cannot exist. It runs
+// under app.bypass_rls like ListStreams: events is FORCE ROW LEVEL SECURITY,
+// and the caller is the operator's cross-workspace claims audit.
 func (s *Store) ClaimWorkspaces(ctx context.Context) ([]string, error) {
 	tx, err := s.bypassTx(ctx)
 	if err != nil {
@@ -393,10 +390,7 @@ func (s *Store) ClaimWorkspaces(ctx context.Context) ([]string, error) {
 	}
 	defer tx.Rollback(ctx)
 	rows, err := tx.Query(ctx,
-		`SELECT DISTINCT workspace_id FROM append_decisions
-		 UNION
-		 SELECT DISTINCT workspace_id FROM unique_claims
-		 ORDER BY 1`)
+		`SELECT DISTINCT workspace_id FROM events ORDER BY 1`)
 	if err != nil {
 		return nil, err
 	}
