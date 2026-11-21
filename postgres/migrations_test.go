@@ -65,29 +65,31 @@ func TestFeedIndexesExist(t *testing.T) {
 // shape (review F8/F12) through pg_policies — not file greps, which
 // would false-positive on comments (the Task 13 review ruling). All
 // five policies that carry a bypass arm — events, unique_claims, anchors,
-// log_order and append_decisions — must keep the arm (app.bypass_rls),
-// gate it on es_relay membership (pg_has_role), and guard that test with
-// EXISTS so it cannot hard-fail (pg_has_role errors) on a database
-// where the role has not been created yet.
+// log_order and append_decisions — must keep the arm (app.bypass_rls) in
+// both USING and WITH CHECK, gate it on es_relay membership (pg_has_role),
+// and guard that test with EXISTS so it cannot hard-fail (pg_has_role
+// errors) on a database where the role has not been created yet. The row
+// policy is only half the shape: append_decisions must also carry ENABLE
+// and FORCE ROW LEVEL SECURITY, like unique_claims.
 func TestAllBypassPoliciesRoleGated(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)
 
 	for _, table := range []string{"events", "unique_claims", "anchors", "log_order", "append_decisions"} {
 		rows, err := s.Pool().Query(ctx, `
-			SELECT policyname, qual FROM pg_policies
+			SELECT policyname, qual, COALESCE(with_check, '') FROM pg_policies
 			WHERE schemaname = 'public' AND tablename = $1`, table)
 		if err != nil {
 			t.Fatalf("read policies for %s: %v", table, err)
 		}
-		var policies []struct{ name, qual string }
+		var policies []struct{ name, qual, withCheck string }
 		for rows.Next() {
-			var name, qual string
-			if err := rows.Scan(&name, &qual); err != nil {
+			var name, qual, withCheck string
+			if err := rows.Scan(&name, &qual, &withCheck); err != nil {
 				rows.Close()
 				t.Fatalf("scan policy for %s: %v", table, err)
 			}
-			policies = append(policies, struct{ name, qual string }{name, qual})
+			policies = append(policies, struct{ name, qual, withCheck string }{name, qual, withCheck})
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
@@ -97,16 +99,34 @@ func TestAllBypassPoliciesRoleGated(t *testing.T) {
 			t.Fatalf("%s: %d policies, want exactly 1", table, len(policies))
 		}
 		p := policies[0]
-		for _, want := range []string{
-			"app.bypass_rls", // the bypass arm survives...
-			"pg_has_role",    // ...gated on es_relay membership (F8)...
-			"EXISTS",         // ...behind the missing-role guard (F12)
+		wanted := []string{"app.bypass_rls", "pg_has_role", "EXISTS"}
+		if table != "anchors" {
+			// anchors is store-wide by design (the root spans every
+			// workspace), so its policy carries the bypass arm only.
+			wanted = append(wanted, "app.workspace_id")
+		}
+		for _, def := range []struct{ clause, text string }{
+			{"USING", p.qual},
+			{"WITH CHECK", p.withCheck},
 		} {
-			if !strings.Contains(p.qual, want) {
-				t.Errorf("%s: policy %q qual %q lacks %q — the bypass arm must be role-gated behind an EXISTS guard",
-					table, p.name, p.qual, want)
+			for _, want := range wanted {
+				if !strings.Contains(def.text, want) {
+					t.Errorf("%s: policy %q %s %q lacks %q — the policy's arms must survive in both clauses",
+						table, p.name, def.clause, def.text, want)
+				}
 			}
 		}
+	}
+
+	var enabled, forced bool
+	if err := s.Pool().QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = $1::regclass`,
+		"public.append_decisions",
+	).Scan(&enabled, &forced); err != nil {
+		t.Fatalf("read pg_class flags for append_decisions: %v", err)
+	}
+	if !enabled || !forced {
+		t.Fatalf("append_decisions: RLS enabled=%v forced=%v, want both true (FORCE keeps the table owner subject)", enabled, forced)
 	}
 }
 

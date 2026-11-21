@@ -3,8 +3,10 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -422,6 +424,176 @@ func TestAdoptRefusesWhenDecisionsExist(t *testing.T) {
 
 	if _, err := s.WorkspaceStore(ws).AdoptClaims(ctx); !errors.Is(err, es.ErrClaimsAlreadyAdopted) {
 		t.Fatalf("adopt with existing decisions: got %v, want ErrClaimsAlreadyAdopted", err)
+	}
+}
+
+// TestAppendWithoutConstraintsWritesNoDecision pins the negative: the record
+// is written only for an append that carries at least one constraint op, so a
+// plain event append leaves the decision log untouched.
+func TestAppendWithoutConstraintsWritesNoDecision(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_no_constraints"
+
+	if _, err := s.Workspace(ws).Append(ctx, es.AppendParams{
+		StreamID:        decisionStream(t, "plain"),
+		ExpectedVersion: 0,
+		Events:          eventData("plain"),
+	}); err != nil {
+		t.Fatalf("append without constraints: %v", err)
+	}
+	if got := len(decisionRows(t, s, ws)); got != 0 {
+		t.Fatalf("append_decisions rows after a zero-constraint append = %d, want 0", got)
+	}
+}
+
+// TestClaimWorkspacesIncludesClaimOnly pins the workspace discovery for
+// `es-verify claims`: it must not come from ListStreams. A claim-only append
+// writes no event, so a workspace whose entire history is claim-only is
+// invisible to the stream list — and a rebuild/verify loop derived from it
+// would certify a database it never read. ClaimWorkspaces unions the decision
+// log with the pre-cutover index for exactly that case, and the claims
+// maintenance on the discovered workspace still works.
+func TestClaimWorkspacesIncludesClaimOnly(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const (
+		claimOnlyWS  = "ws_dec_ws_claim_only"
+		preCutoverWS = "ws_dec_ws_precutover"
+	)
+	sid := decisionStream(t, "claim-only")
+
+	// A genuinely empty database enumerates no workspaces: the zero-row
+	// audit still exits 0 because there is nothing to read.
+	if empty, err := s.ClaimWorkspaces(ctx); err != nil {
+		t.Fatalf("claim workspaces on an empty database: %v", err)
+	} else if len(empty) != 0 {
+		t.Fatalf("ClaimWorkspaces on an empty database = %v, want none", empty)
+	}
+
+	if _, err := s.Workspace(claimOnlyWS).Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Constraints:     []es.ConstraintOp{es.Claim("email", "ws-claim-only@b")},
+	}); err != nil {
+		t.Fatalf("claim-only append: %v", err)
+	}
+	if n := countPinned(t, s, claimOnlyWS, `SELECT count(*) FROM events`); n != 0 {
+		t.Fatalf("events in %s = %d, want 0 — the claim-only append writes none", claimOnlyWS, n)
+	}
+
+	// The union's other arm: a pre-cutover workspace holds an index row and
+	// no decision history, so only unique_claims can reveal it.
+	if _, err := pinnedConn(t, s, preCutoverWS).Exec(ctx,
+		`INSERT INTO unique_claims (workspace_id, scope, value_key, stream_id) VALUES ($1,$2,$3,$4)`,
+		preCutoverWS, "email", []byte("precutover@b"), sid.Canonical()); err != nil {
+		t.Fatalf("insert pre-cutover claim: %v", err)
+	}
+
+	got, err := s.ClaimWorkspaces(ctx)
+	if err != nil {
+		t.Fatalf("claim workspaces: %v", err)
+	}
+	for _, ws := range []string{claimOnlyWS, preCutoverWS} {
+		if !slices.Contains(got, ws) {
+			t.Errorf("ClaimWorkspaces = %v, want it to include %s", got, ws)
+		}
+	}
+
+	wsStore := s.WorkspaceStore(claimOnlyWS)
+	rebuild, err := wsStore.RebuildClaims(ctx)
+	if err != nil {
+		t.Fatalf("rebuild the claim-only workspace: %v", err)
+	}
+	if rebuild.Decisions != 1 || rebuild.Claims != 1 {
+		t.Errorf("claim-only rebuild report = %+v, want {Decisions:1 Claims:1}", rebuild)
+	}
+	verify, err := wsStore.VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("verify the claim-only workspace: %v", err)
+	}
+	if !verify.OK {
+		t.Errorf("claim-only verify = %+v, want OK", verify)
+	}
+}
+
+// TestVerifyRefusesPreCutoverState pins the verify-side guard, the mirror of
+// RebuildClaims': live claims with no decision history are an un-adopted
+// database, not a tamper. Verify must return the zero report and
+// ErrClaimsNotAdopted rather than inventing a divergence, so the runbook's
+// "refusal is exit 2" contract holds.
+func TestVerifyRefusesPreCutoverState(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const ws = "ws_dec_verify_precutover"
+
+	appendWithOps(t, s, ws, decisionStream(t, "a"), 0, es.Claim("email", "verify-precutover@b"))
+	if _, err := pinnedConn(t, s, ws).Exec(ctx,
+		`DELETE FROM append_decisions WHERE workspace_id = $1`, ws); err != nil {
+		t.Fatalf("delete append_decisions: %v", err)
+	}
+
+	rep, err := s.WorkspaceStore(ws).VerifyClaims(ctx)
+	if !errors.Is(err, es.ErrClaimsNotAdopted) {
+		t.Fatalf("verify with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	}
+	if rep != (es.ClaimsVerifyReport{}) {
+		t.Errorf("verify report on a pre-cutover state = %+v, want the zero report", rep)
+	}
+}
+
+// TestClaimReplayOrderSurvivesConcurrentRelease pins the advisory lock in
+// applyOps (ADR 0043 §3.1). A no-op Release takes no row lock, so without the
+// lock two claim-only appends at the same version can commit their effects
+// and their decision rows in opposite orders: the live index holds the claim,
+// the replay releases it, and a healthy database reports DIVERGED. The lock
+// serializes each (workspace, scope, value) pair, so every round either
+// release-then-claim or claim-then-release replays exactly.
+func TestClaimReplayOrderSurvivesConcurrentRelease(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	const (
+		ws     = "ws_dec_replay_order"
+		rounds = 50
+	)
+	for i := 0; i < rounds; i++ {
+		sid := decisionStream(t, fmt.Sprintf("round-%d", i))
+		value := fmt.Sprintf("race-%d@b", i)
+		var (
+			wg   sync.WaitGroup
+			errs [2]error
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, errs[0] = s.Workspace(ws).Append(ctx, es.AppendParams{
+				StreamID:        sid,
+				ExpectedVersion: 0,
+				Constraints:     []es.ConstraintOp{es.Release("email", value)},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			_, errs[1] = s.Workspace(ws).Append(ctx, es.AppendParams{
+				StreamID:        sid,
+				ExpectedVersion: 0,
+				Constraints:     []es.ConstraintOp{es.Claim("email", value)},
+			})
+		}()
+		wg.Wait()
+		for j, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d append %d: %v", i, j, err)
+			}
+		}
+	}
+
+	rep, err := s.WorkspaceStore(ws).VerifyClaims(ctx)
+	if err != nil {
+		t.Fatalf("verify after %d concurrent claim/release rounds: %v", rounds, err)
+	}
+	if !rep.OK {
+		t.Fatalf("verify after %d concurrent claim/release rounds = %+v, want OK — the decision id order must match the apply order", rounds, rep)
 	}
 }
 

@@ -522,6 +522,11 @@ func readHead(ctx context.Context, tx *sql.Tx, sid es.StreamID) (uint64, [es.Has
 // Values are stored exactly as given; callers must pre-hash personal data
 // (ADR 0025). table names the index to update; the append path passes
 // "unique_claims", and a rebuild (ADR 0043) replays into a temporary table.
+//
+// Unlike Postgres, no advisory lock orders claim-only appends here: SQLite is
+// a single-writer database, so every append transaction serializes behind the
+// write lock and the decision row's AUTOINCREMENT id already follows the
+// order in which the ops were applied (ADR 0043 §3.1).
 func applyClaims(ctx context.Context, tx *sql.Tx, table, streamID string, ops []es.ConstraintOp) error {
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {

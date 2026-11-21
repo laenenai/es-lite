@@ -70,7 +70,9 @@ func (s *Store) RebuildClaims(ctx context.Context) (es.ClaimsRebuildReport, erro
 // and reports the first (scope, value, stream) where the copy and the live
 // index disagree (ADR 0043 §3.2). It never modifies the live index; the temp
 // table is dropped by the next verify and otherwise lives only on the
-// store's single connection.
+// store's single connection. Like RebuildClaims it refuses a pre-cutover
+// state — live claims with no decision history — returning
+// ErrClaimsNotAdopted instead of reporting the missing log as a divergence.
 //
 // A failed read or decode is an error, never an OK report: silence from a
 // broken read would be indistinguishable from a matching index.
@@ -81,6 +83,23 @@ func (s *Store) VerifyClaims(ctx context.Context) (es.ClaimsVerifyReport, error)
 		return zero, fmt.Errorf("sqlite: verify claims: begin: %w", err)
 	}
 	defer tx.Rollback()
+
+	// The pre-cutover guard mirrors RebuildClaims: live claims with no
+	// decision history mean the one-time cutover never ran, so the log cannot
+	// license (or reconstruct) the index. That is "not adopted", not a
+	// tamper; reporting a divergence would fail the runbook's exit-2
+	// contract and invent a divergence out of the missing history.
+	liveClaims, err := countRows(ctx, tx, `SELECT count(*) FROM unique_claims`)
+	if err != nil {
+		return zero, fmt.Errorf("sqlite: verify claims: count live claims: %w", err)
+	}
+	liveDecisions, err := countRows(ctx, tx, `SELECT count(*) FROM append_decisions`)
+	if err != nil {
+		return zero, fmt.Errorf("sqlite: verify claims: count decisions: %w", err)
+	}
+	if liveDecisions == 0 && liveClaims > 0 {
+		return zero, es.ErrClaimsNotAdopted
+	}
 
 	// SQLite has no ON COMMIT DROP, and the Store keeps one connection for
 	// its lifetime, so a successful verify leaves the temp table behind on

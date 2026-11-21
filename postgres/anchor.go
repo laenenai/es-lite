@@ -377,6 +377,40 @@ func (s *Store) ListStreams(ctx context.Context) ([]es.StreamRef, error) {
 	return out, rows.Err()
 }
 
+// ClaimWorkspaces returns every workspace that holds claim state: the
+// distinct workspace ids in append_decisions unioned with those in
+// unique_claims. The union is deliberate — append_decisions covers a
+// workspace whose appends were all claim-only (no event, so ListStreams
+// cannot see it), while unique_claims covers a pre-cutover workspace whose
+// claims have no decision history yet. It runs under app.bypass_rls like
+// ListStreams: both tables are FORCE ROW LEVEL SECURITY, and the caller is
+// the operator's cross-workspace claims audit.
+func (s *Store) ClaimWorkspaces(ctx context.Context) ([]string, error) {
+	tx, err := s.bypassTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT workspace_id FROM append_decisions
+		 UNION
+		 SELECT DISTINCT workspace_id FROM unique_claims
+		 ORDER BY 1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ws string
+		if err := rows.Scan(&ws); err != nil {
+			return nil, err
+		}
+		out = append(out, ws)
+	}
+	return out, rows.Err()
+}
+
 // OrderRows implements es.Anchorer: the log_order rows with
 // to_position <= upto, under app.bypass_rls (the role-gated admin path,
 // as for every cross-workspace read). upto == 0 reads the whole log —

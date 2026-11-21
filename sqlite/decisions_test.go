@@ -160,6 +160,33 @@ func TestAppendRollbackWritesNoDecision(t *testing.T) {
 	}
 }
 
+// TestAppendWithoutConstraintsWritesNoDecision pins the negative: the record
+// is written only for an append that carries at least one constraint op, so a
+// plain event append leaves the decision log untouched.
+func TestAppendWithoutConstraintsWritesNoDecision(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, err := es.NewStreamID("counter", "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events: []es.EventData{{
+			TypeURL:       "counter.v1.Incremented",
+			SchemaVersion: 1,
+			Payload:       []byte("plain"),
+		}},
+	}); err != nil {
+		t.Fatalf("append without constraints: %v", err)
+	}
+	if got := len(decisionRows(t, s)); got != 0 {
+		t.Fatalf("append_decisions rows after a zero-constraint append = %d, want 0", got)
+	}
+}
+
 // TestClaimOnlyAppendWritesDecision pins the zero-event case: a claim-only
 // append has a decision worth recording even though it has no events, and
 // its span is empty (from == to == ExpectedVersion).
@@ -327,6 +354,30 @@ func TestRebuildRefusesPreCutoverState(t *testing.T) {
 	}
 	if _, found, err := s.LookupClaim(ctx, "email", "precutover@b"); err != nil || !found {
 		t.Fatalf("claim after refused rebuild = found=%v err=%v, want still present", found, err)
+	}
+}
+
+// TestVerifyRefusesPreCutoverState pins the verify-side guard, the mirror of
+// RebuildClaims': live claims with no decision history are an un-adopted
+// database, not a tamper. Verify must return the zero report and
+// ErrClaimsNotAdopted rather than inventing a divergence, so the runbook's
+// "refusal is exit 2" contract holds.
+func TestVerifyRefusesPreCutoverState(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid := decisionStream(t, "a")
+
+	appendWithOps(t, s, sid, 0, es.Claim("email", "verify-precutover@b"))
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM append_decisions`); err != nil {
+		t.Fatalf("delete append_decisions: %v", err)
+	}
+
+	rep, err := s.VerifyClaims(ctx)
+	if !errors.Is(err, es.ErrClaimsNotAdopted) {
+		t.Fatalf("verify with no decision history: got %v, want ErrClaimsNotAdopted", err)
+	}
+	if rep != (es.ClaimsVerifyReport{}) {
+		t.Errorf("verify report on a pre-cutover state = %+v, want the zero report", rep)
 	}
 }
 

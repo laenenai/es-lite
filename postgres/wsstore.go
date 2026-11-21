@@ -2,8 +2,11 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -484,7 +487,22 @@ func (w *Workspace) readHead(ctx context.Context, tx DBTX, sid es.StreamID) (uin
 // opaquely (ADR 0025): for personal data the caller supplies a keyed MAC as
 // the value; es-lite stores whatever bytes it is given. A colliding claim
 // returns es.ErrConstraintViolated, rolling back the append.
+//
+// Before applying, the transaction takes an advisory lock per distinct
+// (workspace, scope, value). A Claim already serializes on the unique index,
+// but a Release that matches nothing takes no row lock, so two claim-only
+// appends at the same version could otherwise commit their effects and their
+// decision rows in opposite orders. The lock is transaction-scoped — held to
+// commit, covering both the effect and the decision-record id — and acquired
+// in sorted key order so concurrent batches cannot deadlock (ADR 0043 §3.1).
 func (w *Workspace) applyOps(ctx context.Context, tx DBTX, table, streamID string, ops []es.ConstraintOp) error {
+	for _, key := range claimLockKeys(w.ws, ops) {
+		if _, err := tx.Exec(ctx,
+			`SELECT pg_advisory_xact_lock($1)`, key,
+		); err != nil {
+			return fmt.Errorf("lock claim key: %w", err)
+		}
+	}
 	for _, op := range ops {
 		if op.Op != es.ReleaseOp {
 			continue
@@ -511,6 +529,34 @@ func (w *Workspace) applyOps(ctx context.Context, tx DBTX, table, streamID strin
 		}
 	}
 	return nil
+}
+
+// claimLockKeys returns the advisory-lock keys for one append's ops: one per
+// distinct (workspace, scope, value), sorted by the raw key so every batch
+// acquires them in the same order. The key is hashed to a bigint because
+// claim values are opaque bytes (ADR 0025) — a MAC need not be valid UTF-8,
+// and a text parameter cannot carry a NUL byte or invalid UTF-8. A hash
+// collision only serializes two unrelated appends; it cannot break
+// correctness. Empty for an append with no constraints, which writes no
+// decision row and needs no ordering against anyone.
+func claimLockKeys(ws string, ops []es.ConstraintOp) []int64 {
+	seen := make(map[string]struct{}, len(ops))
+	raw := make([]string, 0, len(ops))
+	for _, op := range ops {
+		key := ws + "\x00" + op.Scope + "\x00" + op.Value
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		raw = append(raw, key)
+	}
+	sort.Strings(raw)
+	keys := make([]int64, len(raw))
+	for i, key := range raw {
+		sum := sha256.Sum256([]byte(key))
+		keys[i] = int64(binary.BigEndian.Uint64(sum[:8]))
+	}
+	return keys
 }
 
 // recordDecision records the append's constraint decisions in
