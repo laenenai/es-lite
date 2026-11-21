@@ -745,7 +745,9 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		traceID, spanID                       []byte
 		flags                                 any
 		viaType, viaID, viaPrincipal          *string
-		constraintOps                         []byte
+		// sql.Null distinguishes a NULL column from a zero-length blob: the
+		// driver scans both as a nil []byte, so the slice alone cannot.
+		constraintOps sql.Null[[]byte]
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -767,9 +769,11 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	// Constraint ops (ADR 0043) are a restore record, not chain-attested: a
 	// corrupt blob fails the read loudly — naming the stream and version,
 	// never the bytes — rather than silently dropping the claims it would
-	// reconstruct.
-	if len(constraintOps) > 0 {
-		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps); err != nil {
+	// reconstruct. Decode whenever the column is non-NULL, so an out-of-band
+	// zero-length blob fails as corrupt instead of reading as "no ops"; the
+	// store itself never writes one.
+	if constraintOps.Valid {
+		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps.V); err != nil {
 			return es.Envelope{}, fmt.Errorf("constraint_ops for stream %s v%d: %w", e.StreamID, e.Version, err)
 		}
 	}

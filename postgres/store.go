@@ -772,8 +772,10 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	// Constraint ops (ADR 0043) are a restore record, not chain-attested:
 	// a corrupt blob fails the read loudly — naming the stream and version,
 	// never the bytes — rather than silently dropping the claims it would
-	// reconstruct.
-	if len(constraintOps) > 0 {
+	// reconstruct. Decode whenever the column is non-NULL, so an out-of-band
+	// zero-length bytea fails as corrupt instead of reading as "no ops"; the
+	// store itself never writes one.
+	if constraintOps != nil {
 		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps); err != nil {
 			return es.Envelope{}, fmt.Errorf("constraint_ops for stream %s v%d: %w", sid, e.Version, err)
 		}
