@@ -1,6 +1,6 @@
 # ADR 0043: Append Decisions and Log-Only Restore
 
-- **Status:** Proposed
+- **Status:** Accepted (implementation pending)
 - **Date:** 2026-11-21
 - **Related:** ADR 0008 (uniqueness as a first-class constraint), ADR 0025
   (client-owned crypto and erasure), ADR 0029 (the chain attests the log, not
@@ -116,6 +116,14 @@ append_decisions (
   caller order. The encoding is `u32 count` followed, per op, by `u8 kind`,
   `u32 len(scope) ‖ scope`, `u32 len(value) ‖ value`, under a versioned domain
   separator. The replay applies the same two-pass release-then-claim rule.
+- Every append with at least one op writes a row, including a `Release` that
+  matched nothing. The row answers "what did this append decide", not "what
+  changed"; the replay is identical either way, and skipping no-ops would need
+  a rows-affected check that makes the table's row set depend on prior state.
+- `command_id` is kept. A claim-only append has no envelope to carry it, so for
+  that case the column is the only link from the decision back to its cause; on
+  an event-bearing append it duplicates the events' value and saves a join
+  during an audit.
 - SQLite mirrors the table without `workspace_id`, like `unique_claims`
   (single-workspace backend).
 - `id` is the replay order. It is deliberately not a global position and does
@@ -150,10 +158,13 @@ rule, in one transaction, against a database with no writers. `LookupClaim` and
 the release/claim arms of `append` then see exactly the pre-restore index
 (`postgres/wsstore.go:479,490,1206`).
 
-Ship an oracle alongside it: `es-verify claims` rebuilds into a temporary table
-and diffs it against the live one, reporting the first divergent
+Ship the oracle with it: `es-verify claims` rebuilds into a temporary table and
+diffs it against the live one, reporting the first divergent
 `(scope, value_key, stream_id)`. That is the same shape as the chain and order
-checks: a cheap, keyless verification of state that is otherwise trusted.
+checks: a cheap, keyless verification of state that is otherwise trusted. It is
+part of the same release as the migration, because a rebuild path without an
+oracle is untested by construction and a restore is exactly when that would
+matter.
 
 The hot path does not change. `applyClaims` keeps maintaining the live index,
 because the unique index is the serialization point; the decision row is a
@@ -300,7 +311,7 @@ Costs:
 
 ## 6. Rollout
 
-This ADR is not implemented. When accepted:
+This ADR is accepted; the implementation is the next work item.
 
 - Migration `postgres/migrations/0014_append_decisions.sql` and
   `sqlite/migrations/0012_append_decisions.sql` (numbers may shift if another
@@ -313,19 +324,22 @@ This ADR is not implemented. When accepted:
 - `postgres/leastpriv_test.go`: pin the grant and drive a claim through the
   appender role, including a claim-only append.
 - `es-verify claims`: rebuild into a temporary table, diff, report the first
-  divergence.
+  divergence. Same release as the migration (§3.2).
 - README: the backup rule and the limits of replay.
 
 Not in scope: an asynchronous decision writer (the row must be transactional),
 per-workspace retention for `append_decisions`, and proto-typed ops (the binary
 encoding keeps the store opaque and the table backend-neutral).
 
-## 7. Open questions, to settle before Accepted
+## 7. Resolved before acceptance
 
-1. Table name: `append_decisions` versus `constraint_log`.
-2. Whether `es-verify claims` ships with the migration or immediately after it.
-3. Whether `command_id` earns its column (audit value versus another erasure
-   axis).
-4. Whether a release-only append that matched nothing still writes a row.
-   Recording every append with ops is simpler and preserves "what did this
-   append decide"; skipping no-op releases keeps the table smaller.
+1. **Name:** `append_decisions`. It says what the row is, and it does not need a
+   new name if append decisions later carry more than constraints.
+2. **`es-verify claims`:** ships with the migration. The oracle is the proof
+   that the restore set is complete; a rebuild path without one is untested by
+   construction.
+3. **`command_id`:** kept. It is the only link from a claim-only append's
+   decision back to its cause, and the identifier is not claim data.
+4. **No-op releases:** every append with ops writes a row, even when a `Release`
+   matched nothing. The row records the decision, and the replay is identical
+   either way.
