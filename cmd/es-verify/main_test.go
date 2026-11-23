@@ -494,3 +494,114 @@ func TestMergeExitCombinations(t *testing.T) {
 		}
 	}
 }
+
+func seedTaggedStream(t *testing.T, s *sqlite.Store, sid es.StreamID, n int) {
+	t.Helper()
+	events := make([]es.EventData, n)
+	for i := range events {
+		events[i] = es.EventData{
+			TypeURL: "thing.v1.Happened",
+			Payload: []byte{byte(i + 1)},
+			Tags:    map[string]string{"flowdoc.block": fmt.Sprintf("b%d", i+1)},
+		}
+	}
+	if _, err := s.Append(context.Background(), es.AppendParams{
+		StreamID: sid,
+		Events:   events,
+		Tags:     map[string]string{"flowdoc.space": "s1"},
+	}); err != nil {
+		t.Fatalf("append tagged events: %v", err)
+	}
+}
+
+func TestTagsCommandEmpty(t *testing.T) {
+	s := newTestDB(t)
+	sid, _ := es.NewStreamID("thing", "untagged")
+	seedStream(t, s, sid, 2)
+	closeDB(t, s)
+
+	if code := run([]string{"tags"}); code != exitUsage {
+		t.Errorf("tags on an untagged log: exit %d, want %d (EMPTY)", code, exitUsage)
+	}
+	// all must not fail on an untagged log: tags are optional metadata.
+	if code := run([]string{"all"}); code != exitIntact {
+		t.Errorf("all on an untagged log: exit %d, want %d", code, exitIntact)
+	}
+}
+
+func TestTagsCommandRebuildAndVerify(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	sid, _ := es.NewStreamID("thing", "tagged")
+	seedTaggedStream(t, s, sid, 2)
+	if _, err := s.DB().ExecContext(ctx,
+		`DELETE FROM event_tags WHERE rowid IN (SELECT rowid FROM event_tags WHERE tag_key = 'flowdoc.block' LIMIT 1)`); err != nil {
+		t.Fatalf("delete a tag row: %v", err)
+	}
+	closeDB(t, s)
+
+	if code := run([]string{"tags", "--rebuild", "default"}); code != exitIntact {
+		t.Fatalf("tags --rebuild: exit %d, want %d", code, exitIntact)
+	}
+	if code := run([]string{"tags", "default"}); code != exitIntact {
+		t.Fatalf("tags <workspace> after rebuild: exit %d, want %d", code, exitIntact)
+	}
+
+	handle, err := sqlite.Open(ctx, os.Getenv("SQLITE_DSN"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := handle.DB().ExecContext(ctx,
+		`DELETE FROM event_tags WHERE rowid IN (SELECT rowid FROM event_tags WHERE tag_key = 'flowdoc.block' LIMIT 1)`); err != nil {
+		handle.Close()
+		t.Fatalf("tamper tag row: %v", err)
+	}
+	handle.Close()
+
+	if code := run([]string{"tags", "default"}); code != exitBroken {
+		t.Errorf("tags <workspace> after divergence: exit %d, want %d", code, exitBroken)
+	}
+}
+
+func TestTagsCommandAttestation(t *testing.T) {
+	ctx := context.Background()
+	s := newTestDB(t)
+	sid, _ := es.NewStreamID("thing", "tagged-attest")
+	seedTaggedStream(t, s, sid, 2)
+	closeDB(t, s)
+
+	if code := run([]string{"tags"}); code != exitIntact {
+		t.Fatalf("tags attestation: exit %d, want %d", code, exitIntact)
+	}
+
+	handle, err := sqlite.Open(ctx, os.Getenv("SQLITE_DSN"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := handle.DB().ExecContext(ctx, `UPDATE log_order SET tags_hash = zeroblob(32)`); err != nil {
+		handle.Close()
+		t.Fatalf("tamper tags_hash: %v", err)
+	}
+	handle.Close()
+
+	if code := run([]string{"tags"}); code != exitBroken {
+		t.Errorf("tags attestation after tamper: exit %d, want %d", code, exitBroken)
+	}
+	if code := run([]string{"all"}); code != exitBroken {
+		t.Errorf("all after tags_hash tamper: exit %d, want %d", code, exitBroken)
+	}
+	if code := run([]string{"all", "--chains-only"}); code != exitIntact {
+		t.Errorf("all --chains-only after tags_hash tamper: exit %d, want %d", code, exitIntact)
+	}
+}
+
+func TestTagsCommandUsage(t *testing.T) {
+	s := newTestDB(t)
+	closeDB(t, s)
+	if code := run([]string{"tags", "--rebuild", "a", "b"}); code != exitUsage {
+		t.Errorf("tags with two workspaces: exit %d, want %d", code, exitUsage)
+	}
+	if code := run([]string{"tags", "--nope"}); code != exitUsage {
+		t.Errorf("tags with an unknown flag: exit %d, want %d", code, exitUsage)
+	}
+}

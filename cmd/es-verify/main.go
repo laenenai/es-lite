@@ -62,6 +62,10 @@ type backend struct {
 	// here) is surfaced loudly by the order stage — its own OrderRows
 	// error, exit 2 — never a silent skip, never a vacuous pass.
 	verifyOrder func(context.Context, uint64) (*es.OrderVerifyReport, error)
+	// verifyTagHashes is the store-wide tag attestation (design 2026-11-23).
+	verifyTagHashes func(context.Context, uint64) (*es.TagsHashVerifyReport, error)
+	// tags is the per-workspace tags projection maintainer.
+	tags func(workspace string) es.TagMaintainer
 	// claims is the per-workspace claims index maintainer (ADR 0043).
 	claims func(workspace string) es.ClaimsMaintainer
 	// claimWorkspaces enumerates the workspaces with claim state. Claims
@@ -102,6 +106,8 @@ func run(args []string) int {
 		return cmdOrder(ctx, b, args[1:])
 	case "claims":
 		return cmdClaims(ctx, b, args[1:])
+	case "tags":
+		return cmdTags(ctx, b, args[1:])
 	default:
 		usage()
 		return exitUsage
@@ -114,6 +120,7 @@ func usage() {
   es-verify all [--strict] [--chains-only]
   es-verify anchor [--upto N] | --check <anchor.json> | list
   es-verify order [--upto N]
+  es-verify tags [--rebuild] [--upto N] [<workspace>]
   es-verify claims [--rebuild] [<workspace>]`)
 }
 
@@ -189,7 +196,12 @@ func cmdAll(ctx context.Context, b *backend, args []string) int {
 	// The merge keeps a broken stream verdict dominant: a tamper must
 	// not be masked by the order stage's EMPTY (a pre-0006 store with
 	// zero attested batches) or usage verdict.
-	return mergeExit(code, cmdOrder(ctx, b, nil))
+	code = mergeExit(code, cmdOrder(ctx, b, nil))
+	// Tags attestation is the third stage. Unlike order, zero tagged
+	// batches is a valid untagged log, not "nothing audited", so `all`
+	// treats it as intact; the explicit `tags` command still reports
+	// EMPTY (exit 2) when invoked on its own.
+	return mergeExit(code, cmdTagsAll(ctx, b))
 }
 
 // mergeExit folds one stage's verdict into the running exit code of
@@ -348,6 +360,107 @@ func cmdClaims(ctx context.Context, b *backend, args []string) int {
 	return code
 }
 
+// cmdTags audits the event_tags projection and the per-batch tags hashes
+// (design 2026-11-23). The default with no workspace is the attestation
+// oracle: recompute each tagged batch's TagsHash from events.tags and compare
+// it with log_order.tags_hash. With a workspace it verifies the projection
+// against a rebuild; --rebuild replaces the live projection (the restore
+// path). A divergence exits 1; a read error or an empty attestation exits 2.
+func cmdTags(ctx context.Context, b *backend, args []string) int {
+	fs := flag.NewFlagSet("tags", flag.ContinueOnError)
+	rebuild := fs.Bool("rebuild", false, "replace the live event_tags projection from events.tags")
+	upto := fs.Uint64("upto", 0, "verify tag hashes at or below this global_position (0 = log head)")
+	if err := fs.Parse(args); err != nil {
+		return exitUsage
+	}
+	rest := fs.Args()
+	if len(rest) > 1 {
+		usage()
+		return exitUsage
+	}
+
+	if *rebuild {
+		if b.multiWS && len(rest) == 0 {
+			usage()
+			return exitUsage
+		}
+		ws := ""
+		if len(rest) == 1 {
+			ws = rest[0]
+		}
+		rep, err := b.tags(ws).RebuildTags(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(ws), err)
+			return exitUsage
+		}
+		fmt.Printf("tags rebuilt: %d events, %d tags\n", rep.Events, rep.Tags)
+		return exitIntact
+	}
+
+	if len(rest) == 1 {
+		rep, err := b.tags(rest[0]).VerifyTags(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(rest[0]), err)
+			return exitUsage
+		}
+		if !rep.OK {
+			fmt.Printf("DIVERGED: %s%s\n", wsLabel(rest[0]), rep.FirstDivergence)
+			return exitBroken
+		}
+		fmt.Printf("tags OK: %d events, %d tags\n", rep.Events, rep.Tags)
+		return exitIntact
+	}
+
+	if b.verifyTagHashes == nil {
+		fmt.Fprintln(os.Stderr, "es-verify: this backend cannot verify tag hashes")
+		return exitUsage
+	}
+	rep, err := b.verifyTagHashes(ctx, *upto)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "es-verify: %v\n", err)
+		return exitUsage
+	}
+	switch {
+	case !rep.OK:
+		m := rep.Mismatch
+		fmt.Printf("BROKEN  tags at batch from_position %d: tags_hash %s, recomputed %s\n",
+			m.From, hex.EncodeToString(m.ExpectedTagsHash), hex.EncodeToString(m.ActualTagsHash))
+		return exitBroken
+	case rep.RowsChecked == 0:
+		fmt.Println("EMPTY   tags: no tagged batches")
+		return exitUsage
+	default:
+		fmt.Printf("ok      tags: %d batches verified\n", rep.RowsChecked)
+		return exitIntact
+	}
+}
+
+// cmdTagsAll is the `all` stage: it reports a broken tags hash but treats an
+// untagged log as intact, unlike the explicit `tags` command's EMPTY.
+func cmdTagsAll(ctx context.Context, b *backend) int {
+	if b.verifyTagHashes == nil {
+		fmt.Fprintln(os.Stderr, "es-verify: this backend cannot verify tag hashes")
+		return exitUsage
+	}
+	rep, err := b.verifyTagHashes(ctx, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "es-verify: %v\n", err)
+		return exitUsage
+	}
+	if !rep.OK {
+		m := rep.Mismatch
+		fmt.Printf("BROKEN  tags at batch from_position %d: tags_hash %s, recomputed %s\n",
+			m.From, hex.EncodeToString(m.ExpectedTagsHash), hex.EncodeToString(m.ActualTagsHash))
+		return exitBroken
+	}
+	if rep.RowsChecked == 0 {
+		fmt.Println("tags: no tagged batches")
+		return exitIntact
+	}
+	fmt.Printf("ok      tags: %d batches verified\n", rep.RowsChecked)
+	return exitIntact
+}
+
 // claimWorkspaces resolves the workspaces a claims command runs over: an
 // explicit argument scopes the run to one; otherwise the backend enumerates
 // every workspace with claim state. In a healthy store the event log's
@@ -458,6 +571,8 @@ func openBackend(ctx context.Context) (*backend, error) {
 			scope:           store.Workspace,
 			chainedSince:    store.ChainedSince,
 			verifyOrder:     store.VerifyOrder,
+			verifyTagHashes: store.VerifyTagHashes,
+			tags:            func(ws string) es.TagMaintainer { return store.WorkspaceStore(ws) },
 			claims:          func(ws string) es.ClaimsMaintainer { return store.WorkspaceStore(ws) },
 			claimWorkspaces: store.ClaimWorkspaces,
 			multiWS:         true,
@@ -476,11 +591,13 @@ func openBackend(ctx context.Context) (*backend, error) {
 			return nil, fmt.Errorf("open sqlite: %w", err)
 		}
 		return &backend{
-			Anchorer:     store,
-			scope:        func(string) es.Store { return store },
-			chainedSince: store.ChainedSince,
-			verifyOrder:  store.VerifyOrder,
-			claims:       func(string) es.ClaimsMaintainer { return store },
+			Anchorer:        store,
+			scope:           func(string) es.Store { return store },
+			chainedSince:    store.ChainedSince,
+			verifyOrder:     store.VerifyOrder,
+			verifyTagHashes: store.VerifyTagHashes,
+			tags:            func(string) es.TagMaintainer { return store },
+			claims:          func(string) es.ClaimsMaintainer { return store },
 			claimWorkspaces: func(context.Context) ([]string, error) {
 				return []string{""}, nil
 			},
