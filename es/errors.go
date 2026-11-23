@@ -146,6 +146,20 @@ var (
 	// ErrInvalidTagQuery reports a malformed TagQuery: no tags, an invalid
 	// tag, a limit outside [0,1000], or a ToPosition before FromPosition.
 	ErrInvalidTagQuery = errors.New("es-lite: invalid tag query")
+
+	// ErrEmptyMultiAppend reports a MultiAppend with no appends, or an
+	// append with no events. A multi-append writes events to several
+	// streams; an empty element has nothing to write.
+	ErrEmptyMultiAppend = errors.New("es-lite: multi-append requires at least one append with events")
+
+	// ErrDuplicateMultiStream reports two appends for the same stream in one
+	// MultiAppend. The second append's ExpectedVersion would be stale.
+	ErrDuplicateMultiStream = errors.New("es-lite: duplicate stream in multi-append")
+
+	// ErrConflictingMultiAppend reports that the appends in one MultiAppend
+	// disagree on the shared command metadata: CommandID, CorrelationID,
+	// CausationID, Actor, SpanContext, or a non-zero OccurredAt.
+	ErrConflictingMultiAppend = errors.New("es-lite: multi-append command metadata mismatch")
 )
 
 // DecidedAtSkewError is the structured form of ErrDecidedAtSkew: it carries
