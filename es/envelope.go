@@ -58,6 +58,14 @@ type Envelope struct {
 	// they are excluded from CanonicalEnvelope and never enter the hash.
 	ConstraintOps []ConstraintOp
 
+	// Tags is the event's merged tag set — the append's batch tags
+	// overlaid with the event's own — decoded from events.tags. Tags are
+	// indexed metadata for ReadByTags, not a business fact: like
+	// SpanContext and ConstraintOps they are excluded from
+	// CanonicalEnvelope and never enter the hash chain. Their attestation
+	// is the per-batch log_order.tags_hash plus the anchor's tags root.
+	Tags map[string]string
+
 	// Payload — canonical serialized event bytes (proto by convention).
 	Payload []byte
 

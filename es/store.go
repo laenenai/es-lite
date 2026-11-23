@@ -80,6 +80,13 @@ type AppendParams struct {
 	// ExpectedVersion+1, +2, ...
 	Events []EventData
 
+	// Tags apply to every event in the batch. EventData.Tags are per
+	// event; the adapter overlays them on this set — the same key with a
+	// different value is ErrConflictingTag — and caps the merged set at
+	// MaxTagsPerEvent. A FlowDoc append puts flowdoc.space here once for
+	// the whole document.
+	Tags map[string]string
+
 	// Constraints are uniqueness Claim/Release operations applied in the
 	// same transaction as the events (ADR 0008). A colliding Claim rolls the
 	// whole append back with ErrConstraintViolated. The ops are also encoded
@@ -109,6 +116,10 @@ type EventData struct {
 	TypeURL       string
 	SchemaVersion uint32
 	Payload       []byte
+
+	// Tags are this event's own tags, overlaid on AppendParams.Tags. A
+	// FlowDoc event puts flowdoc.block here; the batch carries the space.
+	Tags map[string]string
 }
 
 // AppendResult reports what was committed.

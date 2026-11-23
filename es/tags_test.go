@@ -1,6 +1,7 @@
 package es_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"reflect"
@@ -9,6 +10,21 @@ import (
 
 	"github.com/laenenai/es-lite/es"
 )
+
+func TestEnvelopeCarriesTags(t *testing.T) {
+	withTags := goldenV1
+	withTags.Tags = map[string]string{"k": "v"}
+
+	if got, want := es.CanonicalEnvelope(withTags), es.CanonicalEnvelope(goldenV1); !bytes.Equal(got, want) {
+		t.Fatalf("tags changed the canonical envelope:\n got %x\nwant %x", got, want)
+	}
+	if got, want := es.EnvelopeHash(withTags), es.EnvelopeHash(goldenV1); got != want {
+		t.Fatalf("tags changed the event hash: got %x, want %x", got, want)
+	}
+	if got := es.CanonicalEnvelope(goldenV1); len(got) != 218 {
+		t.Fatalf("golden canonical length = %d, want 218", len(got))
+	}
+}
 
 func TestValidateTag(t *testing.T) {
 	valid := []struct{ key, value string }{

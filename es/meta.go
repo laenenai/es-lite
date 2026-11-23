@@ -15,4 +15,9 @@ type Meta struct {
 	CorrelationID uuid.UUID // originating flow; defaults to CommandID if zero
 	CausationID   uuid.UUID // the cause of this command (e.g. a prior event id)
 	Actor         Actor     // who issued the command
+
+	// Tags are batch-scoped tags copied onto every event the command
+	// produces (for FlowDoc, flowdoc.space). The store validates them and
+	// overlays each event's own Decider.Tags on top.
+	Tags map[string]string
 }

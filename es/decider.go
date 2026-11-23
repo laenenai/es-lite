@@ -28,4 +28,11 @@ type Decider[S, C, E any] struct {
 	Decide     func(state S, cmd C) (events []E, constraints []ConstraintOp, err error)
 	Evolve     func(state S, event E) S
 	IsTerminal func(state S) bool
+
+	// Tags (optional) returns an event's own tag set — for FlowDoc,
+	// flowdoc.block. The runtime copies it onto EventData.Tags and the
+	// store overlays it on the command's batch tags. Like Decide and
+	// Evolve it MUST be pure: no clock, no I/O, no generated IDs. nil
+	// means the aggregate produces no per-event tags.
+	Tags func(event E) map[string]string
 }
