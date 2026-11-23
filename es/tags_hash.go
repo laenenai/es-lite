@@ -112,3 +112,18 @@ func TagsRoot(rows []TagsRow) [HashSize]byte {
 	}
 	return sha256.Sum256(b)
 }
+
+// TagsRows selects the covered log_order rows that carry a tags hash, in the
+// shape TagsRoot aggregates. Rows without tags (a NULL tags_hash) are excluded:
+// they are the untagged batches, not empty tag sets. The caller computes the
+// root over the result and sets the anchor's TagsRootHash, TagsCount and
+// TagsFromPosition from it.
+func TagsRows(rows []OrderRow) []TagsRow {
+	out := make([]TagsRow, 0, len(rows))
+	for _, r := range rows {
+		if r.TagsHash != nil {
+			out = append(out, TagsRow{From: r.From, To: r.To, TagsHash: r.TagsHash})
+		}
+	}
+	return out
+}

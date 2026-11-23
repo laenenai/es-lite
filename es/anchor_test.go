@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -155,5 +156,39 @@ func TestAnchorRootSortIsBytewiseOnCanonical(t *testing.T) {
 	}
 	if got := es.AnchorRoot([]es.StreamHead{a9, a5}); got != sha256.Sum256(anchorPreimage([]es.StreamHead{a9, a5})) {
 		t.Fatal("permuting equal-key heads changed the hashed order (the sort must be stable)")
+	}
+}
+
+func TestOrderRowTagsHashDoesNotChangeOrderRoot(t *testing.T) {
+	rows := []es.OrderRow{
+		{From: 1, To: 2, Count: 1, BatchHash: bytes.Repeat([]byte{0x11}, es.HashSize)},
+		{From: 3, To: 4, Count: 2, BatchHash: bytes.Repeat([]byte{0x22}, es.HashSize)},
+	}
+	withTags := append([]es.OrderRow(nil), rows...)
+	withTags[0].TagsHash = bytes.Repeat([]byte{0x99}, es.HashSize)
+
+	if got, want := es.OrderRoot(withTags), es.OrderRoot(rows); got != want {
+		t.Fatalf("OrderRoot changed when TagsHash was set: %x != %x", got, want)
+	}
+}
+
+func TestAnchorJSONLegacyTagsRoot(t *testing.T) {
+	const legacy = `{
+		"anchor_id": "a1",
+		"created_at": "2026-11-23T00:00:00Z",
+		"upto_global_position": 10,
+		"stream_count": 1,
+		"root_hash": "AA==",
+		"order_root_hash": "AQ==",
+		"order_from_position": 1,
+		"order_count": 1
+	}`
+	var a es.Anchor
+	if err := json.Unmarshal([]byte(legacy), &a); err != nil {
+		t.Fatalf("unmarshal legacy anchor: %v", err)
+	}
+	if a.TagsRootHash != nil || a.TagsCount != 0 || a.TagsFromPosition != 0 {
+		t.Fatalf("legacy anchor tags fields = (%x, %d, %d), want (nil, 0, 0)",
+			a.TagsRootHash, a.TagsCount, a.TagsFromPosition)
 	}
 }

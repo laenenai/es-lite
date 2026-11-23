@@ -52,6 +52,19 @@ type Anchor struct {
 	// OrderCount is how many log_order rows the order root aggregates —
 	// the order analog of StreamCount.
 	OrderCount uint64 `json:"order_count"`
+
+	// TagsRootHash is the anchor's tags root: TagsRoot over the log_order
+	// rows at or below the bound that carry a non-NULL tags_hash. Nil for a
+	// legacy anchor recorded before tags attestation (including a v0.22-style
+	// anchor that has an order root but no tags root): such an anchor skips
+	// the tags comparison. A new anchor always carries a real root, even over
+	// zero tagged rows.
+	TagsRootHash []byte `json:"tags_root_hash,omitempty"`
+	// TagsFromPosition is the first position the tags root attests: the
+	// lowest from_position among covered tagged batches — 0 when none.
+	TagsFromPosition uint64 `json:"tags_from_position"`
+	// TagsCount is how many tagged batches the tags root aggregates.
+	TagsCount uint64 `json:"tags_count"`
 }
 
 // StreamRef names a stream across workspaces, for store-wide operations.
