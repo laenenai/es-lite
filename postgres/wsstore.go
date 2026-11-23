@@ -168,8 +168,28 @@ func (w *Workspace) AppendTx(ctx context.Context, db DBTX, p es.AppendParams) (e
 	return w.append(ctx, db, p)
 }
 
+// mergedTags returns one merged, validated tag set per event: the append's
+// batch tags overlaid with each event's own. validateAppend calls it before
+// anything is written; append calls it again to project event_tags and hash
+// the batch.
+func mergedTags(p es.AppendParams) ([]map[string]string, error) {
+	per := make([]map[string]string, len(p.Events))
+	for i := range p.Events {
+		per[i] = p.Events[i].Tags
+	}
+	return es.MergedTags(p.Tags, per)
+}
+
 func validateAppend(p es.AppendParams) error {
 	if err := p.StreamID.Validate(); err != nil {
+		return err
+	}
+	// Tags ride on events, like constraint ops: a tag with no event would be
+	// silently dropped, so refuse it before the xid is drawn.
+	if len(p.Events) == 0 && len(p.Tags) > 0 {
+		return fmt.Errorf("%w: tags require at least one event: %s", es.ErrInvalidTag, p.StreamID)
+	}
+	if _, err := mergedTags(p); err != nil {
 		return err
 	}
 	// A partial span context (ADR 0040) is refused before anything runs —
@@ -276,6 +296,14 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 	occurred = es.TruncateMicros(occurred)
 	canonical := p.StreamID.Canonical()
 
+	// Validate and merge the tag set once, before any position is drawn.
+	// validateAppend already checked it; this second call is the value the
+	// loop writes and the projection hashes.
+	merged, err := mergedTags(p)
+	if err != nil {
+		return zero, err
+	}
+
 	// Optimistic-concurrency guard and chain head in one read (ADR 0029 §1).
 	current, prev, err := w.readHead(ctx, db, p.StreamID)
 	if err != nil {
@@ -339,6 +367,7 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			CommandID:     p.CommandID,
 			Actor:         p.Actor,
 			SpanContext:   p.SpanContext,
+			Tags:          merged[i],
 			Payload:       ev.Payload,                      // opaque bytes, echoed back unchanged
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
@@ -346,6 +375,14 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		if i == 0 && len(encodedOps) > 0 {
 			opsArg = encodedOps
 			env.ConstraintOps = append([]es.ConstraintOp(nil), p.Constraints...)
+		}
+		var tagsArg any
+		if len(merged[i]) > 0 {
+			raw, err := es.EncodeTags(merged[i])
+			if err != nil {
+				return zero, err
+			}
+			tagsArg = string(raw)
 		}
 		hash := es.EnvelopeHash(env)
 		env.Hash = hash[:]
@@ -360,8 +397,8 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 				actor_type, actor_id, actor_principal,
 				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
-				trace_id, span_id, trace_flags, constraint_ops
-			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24,$25)
+				trace_id, span_id, trace_flags, constraint_ops, tags
+			) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9, $10,$11,$12, $13,$14,$15, $16,$17,$18,$19, $20,$21, $22,$23,$24,$25, $26)
 			RETURNING global_position`,
 			w.ws, eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, occurred, recorded,
@@ -369,7 +406,7 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
 			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
-			traceID, spanID, flags, opsArg,
+			traceID, spanID, flags, opsArg, tagsArg,
 		).Scan(&gp)
 		if err != nil {
 			var pgErr *pgconn.PgError
@@ -410,6 +447,36 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 		envs[i] = env
 	}
 
+	// Event-tag projection (design Decision 5): one multi-row insert per
+	// append, in the same transaction, from the same merged sets the events
+	// wrote. A tag-insert failure rolls the events back, so an event is
+	// never committed without its tags.
+	var tagKeys, tagValues []string
+	var tagPositions []int64
+	var tagEntries []es.TagEntry
+	for i := range envs {
+		for k, v := range merged[i] {
+			tagKeys = append(tagKeys, k)
+			tagValues = append(tagValues, v)
+			tagPositions = append(tagPositions, int64(envs[i].GlobalPosition))
+			tagEntries = append(tagEntries, es.TagEntry{
+				Position: envs[i].GlobalPosition,
+				Key:      k,
+				Value:    v,
+			})
+		}
+	}
+	if len(tagKeys) > 0 {
+		if _, err := db.Exec(ctx,
+			`INSERT INTO event_tags (workspace_id, tag_key, tag_value, global_position)
+			 SELECT $1, k, v, p
+			 FROM unnest($2::text[], $3::text[], $4::bigint[]) AS t(k, v, p)`,
+			w.ws, tagKeys, tagValues, tagPositions,
+		); err != nil {
+			return zero, fmt.Errorf("insert event_tags: %w", err)
+		}
+	}
+
 	// Log-order attestation (design D1, F11): one log_order row per
 	// non-empty batch, hashed and inserted in THIS transaction from
 	// exactly the (position, hash) pairs the loop above already
@@ -427,11 +494,16 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 			entries[i] = es.OrderEntry{Position: envs[i].GlobalPosition, Hash: envs[i].Hash}
 		}
 		batchHash := es.BatchOrderHash(entries)
+		var tagsHashArg []byte
+		if len(tagEntries) > 0 {
+			h := es.TagsHash(tagEntries)
+			tagsHashArg = h[:]
+		}
 		if _, err := db.Exec(ctx,
-			`INSERT INTO log_order (from_position, to_position, workspace_id, stream_id, event_count, batch_hash)
-			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			`INSERT INTO log_order (from_position, to_position, workspace_id, stream_id, event_count, batch_hash, tags_hash)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 			int64(envs[0].GlobalPosition), int64(envs[len(envs)-1].GlobalPosition),
-			w.ws, canonical, len(envs), batchHash[:],
+			w.ws, canonical, len(envs), batchHash[:], tagsHashArg,
 		); err != nil {
 			return zero, fmt.Errorf("insert log_order: %w", err)
 		}

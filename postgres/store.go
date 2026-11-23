@@ -718,7 +718,7 @@ const envelopeCols = `
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, workspace_id, prev_hash, hash,
 	trace_id, span_id, trace_flags,
-	via_type, via_id, via_principal, constraint_ops`
+	via_type, via_id, via_principal, constraint_ops, tags`
 
 // parseStoredUUID parses one stored audit-UUID column (event_id,
 // correlation_id, causation_id, command_id). A value that does not parse
@@ -749,6 +749,7 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		flags                                 *int16
 		viaType, viaID, viaPrincipal          *string
 		constraintOps                         []byte
+		tagsRaw                               []byte
 	)
 	if err := row.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -756,7 +757,7 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &payload, &workspaceID, &e.PrevHash, &e.Hash,
 		&traceID, &spanID, &flags,
-		&viaType, &viaID, &viaPrincipal, &constraintOps,
+		&viaType, &viaID, &viaPrincipal, &constraintOps, &tagsRaw,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -779,6 +780,13 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps); err != nil {
 			return es.Envelope{}, fmt.Errorf("constraint_ops for stream %s v%d: %w", sid, e.Version, err)
 		}
+	}
+	// Tags are indexed metadata, not chain-attested: a stored value that is
+	// not the flat string map the append wrote is corruption and fails the
+	// read loudly — naming the stream and version, never the bytes — rather
+	// than silently dropping the tags a change feed depends on.
+	if e.Tags, err = es.DecodeTags(tagsRaw); err != nil {
+		return es.Envelope{}, fmt.Errorf("tags for stream %s v%d: %w", sid, e.Version, err)
 	}
 	// The audit UUIDs are load-bearing (F34): a value that does not parse
 	// fails the read rather than being silently zeroed into a forged

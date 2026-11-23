@@ -86,6 +86,12 @@ type OrderRow struct {
 	From, To  uint64
 	Count     uint32
 	BatchHash []byte
+
+	// TagsHash is the batch's es.TagsHash, or nil when no event in the
+	// batch carried a tag. OrderRoot deliberately ignores it (the order
+	// root's meaning is unchanged); the anchor's sibling tags root
+	// aggregates it via es.TagsRoot.
+	TagsHash []byte
 }
 
 // OrderRoot is the anchor's order root: SHA-256 over the log_order rows

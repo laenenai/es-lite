@@ -448,7 +448,7 @@ type logOrderRow struct {
 // (upto == 0: no clamp, the whole log) under tx, in ascending
 // from_position order.
 func readLogOrderRows(ctx context.Context, tx pgx.Tx, upto uint64) ([]logOrderRow, error) {
-	q := `SELECT from_position, to_position, event_count, batch_hash, workspace_id, stream_id FROM log_order`
+	q := `SELECT from_position, to_position, event_count, batch_hash, tags_hash, workspace_id, stream_id FROM log_order`
 	args := []any{}
 	if upto > 0 {
 		q += ` WHERE to_position <= $1`
@@ -463,7 +463,7 @@ func readLogOrderRows(ctx context.Context, tx pgx.Tx, upto uint64) ([]logOrderRo
 	var out []logOrderRow
 	for rows.Next() {
 		var r logOrderRow
-		if err := rows.Scan(&r.From, &r.To, &r.Count, &r.BatchHash, &r.Workspace, &r.Stream); err != nil {
+		if err := rows.Scan(&r.From, &r.To, &r.Count, &r.BatchHash, &r.TagsHash, &r.Workspace, &r.Stream); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
