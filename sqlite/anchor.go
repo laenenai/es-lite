@@ -65,6 +65,9 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 		return es.Anchor{}, err
 	}
 	orderRoot := es.OrderRoot(rows)
+	// The tags root is a sibling aggregate over only the tagged batches.
+	tagsRows := es.TagsRows(rows)
+	tagsRoot := es.TagsRoot(tagsRows)
 	a := es.Anchor{
 		ID:                 newV7().String(),
 		CreatedAt:          es.TruncateMicros(time.Now()),
@@ -77,11 +80,16 @@ func (s *Store) Anchor(ctx context.Context, upto uint64) (es.Anchor, error) {
 		// for anchors recorded before log-order attestation).
 		OrderRootHash: orderRoot[:],
 		OrderCount:    uint64(len(rows)),
+		TagsRootHash:  tagsRoot[:],
+		TagsCount:     uint64(len(tagsRows)),
 	}
 	// rows is from_position-ascending: the first row's From is the first
 	// position the root attests; 0 (the zero value) when none are.
 	if len(rows) > 0 {
 		a.OrderFromPosition = rows[0].From
+	}
+	if len(tagsRows) > 0 {
+		a.TagsFromPosition = tagsRows[0].From
 	}
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO anchors (anchor_id, created_at, upto_global_position, stream_count, root_hash) VALUES (?,?,?,?,?)`,
@@ -168,6 +176,22 @@ func (s *Store) CheckAnchor(ctx context.Context, a es.Anchor) error {
 		return fmt.Errorf("%w: anchor %s at global_position %d (order rows %d, recomputed %d; order from %d, recomputed %d; order root %x, recomputed %x)",
 			es.ErrAnchorMismatch, a.ID, a.UptoGlobalPosition, a.OrderCount, len(rows), a.OrderFromPosition, from, a.OrderRootHash, orderRoot[:])
 	}
+	// The tags root is a sibling of the order root: nil on a legacy anchor
+	// (including a v0.22-style order-only anchor), in which case it is
+	// skipped. A new anchor's root is a real hash even over zero tagged rows.
+	if a.TagsRootHash == nil {
+		return nil
+	}
+	tagsRows := es.TagsRows(rows)
+	tagsRoot := es.TagsRoot(tagsRows)
+	var tagsFrom uint64
+	if len(tagsRows) > 0 {
+		tagsFrom = tagsRows[0].From
+	}
+	if !bytes.Equal(tagsRoot[:], a.TagsRootHash) || tagsFrom != a.TagsFromPosition || uint64(len(tagsRows)) != a.TagsCount {
+		return fmt.Errorf("%w: anchor %s at global_position %d (tags rows %d, recomputed %d; tags from %d, recomputed %d; tags root %x, recomputed %x)",
+			es.ErrAnchorMismatch, a.ID, a.UptoGlobalPosition, a.TagsCount, len(tagsRows), a.TagsFromPosition, tagsFrom, a.TagsRootHash, tagsRoot[:])
+	}
 	return nil
 }
 
@@ -223,7 +247,7 @@ type logOrderRow struct {
 // (upto == 0: no clamp, the whole log) in ascending from_position
 // order.
 func (s *Store) readLogOrderRows(ctx context.Context, upto uint64) ([]logOrderRow, error) {
-	q := `SELECT from_position, to_position, event_count, batch_hash, stream_id FROM log_order`
+	q := `SELECT from_position, to_position, event_count, batch_hash, tags_hash, stream_id FROM log_order`
 	args := []any{}
 	if upto > 0 {
 		q += ` WHERE to_position <= ?`
@@ -238,7 +262,7 @@ func (s *Store) readLogOrderRows(ctx context.Context, upto uint64) ([]logOrderRo
 	var out []logOrderRow
 	for rows.Next() {
 		var r logOrderRow
-		if err := rows.Scan(&r.From, &r.To, &r.Count, &r.BatchHash, &r.Stream); err != nil {
+		if err := rows.Scan(&r.From, &r.To, &r.Count, &r.BatchHash, &r.TagsHash, &r.Stream); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

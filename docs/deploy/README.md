@@ -241,6 +241,27 @@ SQLite needs no manual step: migration 0013's plain build runs inside the
 migration transaction, and the single-connection store is quiescent while it
 runs.
 
+## Event tags (migration 0016)
+
+Migration 0016 adds `events.tags` (jsonb), the `event_tags` projection with
+eight hash partitions, and `log_order.tags_hash` (ADR 0044). There is **no
+build-order step and no backfill**: `event_tags` starts empty and every
+existing event has `NULL` tags, so the migration is catalog-only apart from the
+one-time `VALIDATE CONSTRAINT` scan of the all-`NULL` column. Unlike the
+0003/0012/0015 index sections, do not build anything in advance: the
+partitioned table, its eight partitions and the parent policy are created in
+the migration (as with `events`, the policy lives on the parent and no grants
+are issued on the partitions). `event_tags` grows only as new tagged appends
+arrive, at roughly two rows per FlowDoc event.
+
+RLS mirrors `events` (workspace arm plus the role-gated `es_relay` bypass), and
+no grants are issued in the migration. Issue them per § *Grants*, then grant
+`SELECT` to whatever principal serves `ReadByTags`. `log_order.tags_hash` is
+written by the appender in the append transaction, so no grant changes for it.
+
+On SQLite, migration 0014 is the equivalent; `event_tags` has no
+`workspace_id` because one database is one workspace.
+
 ## Relay role and RLS bypass (migration 0005)
 
 `Drain` — the delivery relay — and the anchor/verify path (`Anchor`,
@@ -353,8 +374,9 @@ private `schema_migrations`.
 **Appender** — the process calling `Workspace.Append` (or `AppendTx`): it
 draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1),
-applies uniqueness constraints — their ops ride on the first event row
-(ADR 0043) — reads the event log to rebuild or verify the claims index
+projects the merged tags into `event_tags` (ADR 0044), applies uniqueness
+constraints — their ops ride on the first event row (ADR 0043) — and reads
+the event log to rebuild or verify the claims index and verify the tags index
 after a restore. It is also the process running `aggregate.Runtime`, so with a
 snapshot cache configured (ADR 0042) it both reads and writes `snapshots`
 — the same role as for `events`. `Release` is the only `DELETE` on the
@@ -366,7 +388,33 @@ GRANT USAGE ON SEQUENCE events_global_position_seq TO <appender>;
 GRANT SELECT, INSERT ON events, unique_claims TO <appender>;
 GRANT DELETE ON unique_claims TO <appender>;
 GRANT INSERT ON log_order TO <appender>;
+GRANT SELECT, INSERT ON event_tags TO <appender>;
 GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO <appender>;
+```
+
+**Tags rebuild** — the role running `es-verify tags --rebuild` (a workspace
+restore): it reads the workspace's events and replaces its `event_tags` rows.
+It needs the appender's `SELECT` on `events` plus `DELETE` on `event_tags`;
+the appender role works if you add that one grant, and the owner always can.
+The store-wide attestation (`es-verify tags` with no workspace, and the
+`es-verify all` tag stage) additionally needs `es_relay`, `SELECT` on
+`events`/`log_order`, and `USAGE` on the position sequence — the anchor job's
+grants below already cover exactly that. Stop writers for a rebuild (ADR 0044
+§2.5).
+
+```sql
+GRANT SELECT ON events TO <tags rebuild role>;
+GRANT SELECT, INSERT, DELETE ON event_tags TO <tags rebuild role>;
+```
+
+**Tag readers** — any service calling `TagReader.ReadByTags` (a query API or a
+projection) needs `SELECT` on `event_tags` alongside its existing `SELECT` on
+`events`; the workspace predicate and RLS scope every read, so it needs no
+bypass. The feed process itself reads events, not tags, unless you run a
+tag-driven consumer under the same role.
+
+```sql
+GRANT SELECT ON event_tags TO <tag reader>;
 ```
 
 **Feed process** — `feed.Server` over the Postgres adapters: the
@@ -415,6 +463,12 @@ GRANT SELECT, INSERT ON anchors TO <anchor job>;
 GRANT USAGE ON SEQUENCE events_global_position_seq TO <anchor job>;
 GRANT es_relay TO <anchor job>;
 ```
+
+The same role can run the store-wide tag audit: `es-verify tags` and the tag
+stage of `es-verify all` read `events.tags` and `log_order.tags_hash` under the
+bypass and fence on the position sequence — all grants the anchor job already
+holds, with no `event_tags` access. The workspace-scoped projection check and
+`--rebuild` do touch `event_tags` and run under the tags-rebuild grants above.
 
 ### The `CACHE 1` invariant
 
@@ -506,15 +560,18 @@ The append path is the authority. From v0.21.0 the functional source is the
 event log:
 
 - `events` (with every partition) — stream history, versions, the chain,
-  global positions, audit metadata, and the append's constraint ops, which
-  ride on the first event row of a constraint-bearing batch. Aggregates, the
-  chain, positions and the claims index all rebuild from it.
-- `log_order` — one row per event-bearing append, the order root's input. It
-  is the order witness, not state: stream it only if you need to re-verify the
-  global append order on the restored database.
+  global positions, audit metadata, the append's constraint ops (on the first
+  event row of a constraint-bearing batch), and the append's tags (on every
+  event). Aggregates, the chain, positions, the claims index and the tag index
+  all rebuild from it.
+- `log_order` — one row per event-bearing append, the order root's and the
+  tags root's input. It is the order witness, not state: stream it only if you
+  need to re-verify the global append order on the restored database.
 
 Everything else is derived or optional. `unique_claims` is a derived index —
-the ops on the events replay into an empty one. `snapshots` is a cache.
+the ops on the events replay into an empty one. `event_tags` is a derived index
+— `RebuildTags` projects the tags on the events into an empty one. `snapshots`
+is a cache.
 `anchors` recompute (the exported JSON is the durable evidence).
 `feed_checkpoints` and `feed_dead_letters` are optional; `feed_leases` is
 ephemeral. `command_dedup` is a post-commit response cache: exclude it, and read
@@ -530,6 +587,15 @@ measurement rather than run: seeding it is a multi-hour write through the
 index set. See [the results](../benchmarks/2026-11-21-results.md) for the
 matrix, hardware and caveats. These are local, single-writer, warm-OS-cache
 numbers; re-run on your storage before quoting an SLA.
+
+**Tags envelope (2026-11-23).** A 100k-event tagged smoke measured ~145
+bytes/row for `event_tags` (200k rows / 29 MB), tagged append p50 2.7 ms /
+p99 6.1 ms, and `ReadByTags` pages at p50 3.1 ms / p99 4.0 ms. At 500M events
+and two tags each, ~1B rows implies roughly 150 GB, inside the design's
+150–250 GB estimate. `RebuildTags` is linear in tag rows and requires
+quiescence. The 10M and 50M tagged runs were **not** measured; treat the
+extrapolation as an anchor. See
+[the smoke results](../benchmarks/2026-11-23-event-tags-smoke.md).
 
 **PITR.** If arbitrary point-in-time recovery is the requirement, use physical
 backups plus WAL archiving (`pgBackRest`, `WAL-G`, or the managed equivalent).
@@ -553,14 +619,17 @@ event are one row, so an event cut is internally consistent; loading
 1. Provision an empty database at the same major version and run `es-migrate`
    to head (schema, policies, triggers).
 2. Create the roles and grants (`pg_dumpall --globals` or IaC). Confirm
-   `es_relay` and the appender's grants. The appender's existing `SELECT,
-   INSERT` on `events` already covers `constraint_ops`: there is no new table
-   and no new grant.
-3. Load `events` (all partitions) into that cut, and `log_order` too if you
-   want order verification on the restored database. There are no foreign
-   keys; one transaction is still preferred. For a workspace-scoped restore,
-   filter by `workspace_id` (or run through the relay path) — a workspace
-   session sees only its own rows under RLS.
+   `es_relay` and the appender's grants. The appender's `SELECT, INSERT` on
+   `events` already covers `constraint_ops` and `tags`; `event_tags` is a new
+   table, so grant the appender `SELECT, INSERT` and the tags-rebuild role
+   `SELECT, INSERT, DELETE` on it (§ *Grants*).
+3. Load `events` (all partitions, including `tags`) into that cut, and
+   `log_order` too if you want order and tag-root verification on the restored
+   database. There are no foreign keys; one transaction is still preferred.
+   For a workspace-scoped restore, filter by `workspace_id` (or run through the
+   relay path) — a workspace session sees only its own rows under RLS. Do not
+   load `event_tags` from another cut: it is derived, and `RebuildTags`
+   recreates it from the events.
 4. Advance the position sequence, and confirm `CACHE 1` (§ *The `CACHE 1`
    invariant*):
    ```sql
@@ -570,7 +639,24 @@ event are one row, so an event cut is internally consistent; loading
    Skip it only when the restored log is empty. There is no second sequence.
    SQLite's `AUTOINCREMENT` tracks explicit-id inserts itself, so this step is
    Postgres-only.
-5. **Stop writers.** Run `es-verify claims` first; it is non-destructive.
+5. **Stop writers.** Rebuild the two derived indexes from the log, tags first,
+   then claims. Both checks are non-destructive; both rebuilds replace the
+   index with what the log can prove.
+
+   *Tags.* Run `es-verify tags <workspace>`; on a pure events-only restore the
+   live `event_tags` is empty while the events carry tags, so it reports
+   `DIVERGED` (exit 1) — the rebuild's prompt, not a lost restore. Exit 0 means
+   the projection already matches (a physical restore, or a clone that applied
+   it): skip the rebuild. Run `es-verify tags --rebuild <workspace>`, then the
+   check again, which must report `tags OK`. A stored non-string tag value is
+   refused rather than stringified; that is corruption, not an empty tag set.
+   The rebuild is one Repeatable Read transaction (SQLite: its single
+   connection), so a failure leaves the live index unchanged. Keep writers
+   stopped anyway: an append committed after the snapshot keeps its own tag
+   rows, but it is absent from the rebuild's snapshot-bound report, and a
+   racing rebuild can serialize-fail.
+
+   *Claims.* Run `es-verify claims`; it is non-destructive.
    On a pure events-only restore the live index is empty while the log has
    ops, so it reports `DIVERGED` (exit 1) — that is the rebuild's prompt, not
    a lost restore. Exit 0 means the index already matches (a physical restore,
@@ -607,11 +693,15 @@ event are one row, so an event cut is internally consistent; loading
    [`docs/migration/2026-11-07-breaking-changes.md`](../migration/2026-11-07-breaking-changes.md)
    is one way such a store arises.
 6. Run the chain audit. If you loaded `log_order`, run `es-verify all`: it
-   verifies every stream chain and then the global log order (every batch hash
-   recomputed from the events). An events-only restore has no order witness,
-   so run `es-verify all --chains-only` instead: it verifies every stream and
-   skips the order stage, which would fail `EMPTY` by design (exit 2). Keep the
-   exported anchor JSON as the order evidence (ADR 0043 §2.3).
+   verifies every stream chain, the global log order (every batch hash
+   recomputed from the events), and the per-batch tags hashes (recomputed from
+   `events.tags`). An untagged log passes the tag stage. To audit tags on
+   their own, run `es-verify tags` (store-wide; exits 2 with `EMPTY` when
+   there are no tagged batches). An events-only restore has no order or tag
+   witness, so run `es-verify all --chains-only` instead: it verifies every
+   stream and skips the order and tag stages, which would fail `EMPTY` by
+   design (exit 2). Keep the exported anchor JSON as the order and tag
+   evidence (ADR 0043 §2.3, ADR 0044 §2.6).
 7. Optionally restore `anchors` and `feed_checkpoints` (or replay the feed
    from zero). Do not expect a restored database without `log_order` to
    recompute the order root: roots need the witness. Keep the source's
@@ -657,16 +747,18 @@ logical replication feed. Two shapes, different rules:
   applier>`), or run the `setval` as owner/superuser; grant the verifier
   `USAGE` to read `last_value` — without it the value is masked to 0.
 
-  The clone also maintains `unique_claims`: apply each event's ops per source
-  transaction, or run `es-verify claims --rebuild` after a cut (pausing the
-  apply while it runs). A fresh events-only clone that loads events and leaves
-  the index empty diverges against the log; never load `unique_claims` from a
-  different cut.
+  The clone also maintains the derived indexes. For `unique_claims`, apply
+  each event's ops per source transaction, or run `es-verify claims --rebuild`
+  after a cut (pausing the apply while it runs). For `event_tags`, apply each
+  event's tag rows per source transaction (or rebuild after a cut), or run
+  `es-verify tags --rebuild <workspace>`; a fresh events-only clone that loads
+  events and leaves either index empty diverges against the log. Never load
+  `unique_claims` or `event_tags` from a different cut.
 
   Audit on a schedule: `es-verify all --chains-only` when `log_order` is not
-  loaded; `es-verify all` (or `es-verify order`) only when it is and the
-  sequence has been advanced. That is the useful property: the DR copy proves
-  itself continuously instead of at incident time.
+  loaded; `es-verify all` (or `es-verify order` plus `es-verify tags`) only
+  when it is and the sequence has been advanced. That is the useful property:
+  the DR copy proves itself continuously instead of at incident time.
 - **Fork (writable staging).** Seed at a cut, `setval` the one position
   sequence, then stop applying and let it diverge. It is a fork: never merge
   it back and never point it at the backup prefix. Promotion is a handover —
@@ -674,7 +766,7 @@ logical replication feed. Two shapes, different rules:
 
 Apply idempotently, because CDC is at-least-once: dedupe events on
 `(workspace, stream, version)` or `event_id`; a duplicate event skips its ops
-with it. `log_order` dedupes on `from_position`. On a replica a duplicate
+and its tags with it. `log_order` dedupes on `from_position`. On a replica a duplicate
 `Claim` is a **no-op**, not `ErrConstraintViolated` — the source already
 validated it. Order by `global_position` and allow gaps: concurrent appends
 can commit out of draw order. A per-workspace clone is an export, not
@@ -727,6 +819,13 @@ Deleting `unique_claims` by itself is a repair action, not a privacy one. A
 rebuild restores the index from the log; a store whose live claims have no ops
 in the log is the inconsistent case both commands refuse. Purge or repair the
 index only when you are rebuilding it from the events.
+
+**Tags follow the same rule** (ADR 0044 §2.8). They are immutable and indexed:
+deleting `event_tags` rows is a cache wipe, and `es-verify tags --rebuild`
+resurrects them from `events.tags`. A tag value must therefore be a
+non-personal identifier. For personal data, pass a keyed MAC or an opaque id
+and destroy the key; es-lite stores the bytes verbatim, and the off-box anchor's
+`tags_root_hash` attests that they did not change after the append.
 
 ## Feed operations (ADR 0037)
 

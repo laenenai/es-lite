@@ -67,6 +67,22 @@ the append path and does not build a hash chain. measure runs real appends,
 then RebuildClaims and VerifyClaims, and prints the footprint.`)
 }
 
+// tagFlags is the opt-in tag scenario shared by seed and measure. The default
+// is the untagged baseline, so existing measurements stay comparable.
+type tagFlags struct {
+	enabled     bool
+	space       string
+	blockPrefix string
+}
+
+func addTagFlags(fs *flag.FlagSet) *tagFlags {
+	t := &tagFlags{}
+	fs.BoolVar(&t.enabled, "tags", false, "write flowdoc.space/flowdoc.block tags (default: untagged baseline)")
+	fs.StringVar(&t.space, "tag-space", "bench-space", "flowdoc.space value when -tags is set")
+	fs.StringVar(&t.blockPrefix, "tag-block-prefix", "b", "flowdoc.block prefix when -tags is set")
+	return t
+}
+
 // seedSQL inserts one position range. $11 is the range's first global
 // position, used only to keep stream/version numbering local to the
 // workspace. Every opEvery-th row carries the encoded ops blob, with a unique
@@ -76,7 +92,7 @@ INSERT INTO events (
   workspace_id, global_position, event_id, stream_type, stream_id, version,
   type_url, schema_version, occurred_at, recorded_at,
   correlation_id, causation_id, command_id,
-  actor_type, actor_id, actor_principal, payload, constraint_ops
+  actor_type, actor_id, actor_principal, payload, constraint_ops, tags
 )
 SELECT
   $1, g, gen_random_uuid()::text, 'bench',
@@ -86,6 +102,9 @@ SELECT
   $4, $4, $4, 'bench', 'bench', 'bench', $5::bytea,
   CASE WHEN g % $6::bigint = 0
        THEN overlay($7::bytea PLACING decode(md5(g::text) || md5((g + 1)::text), 'hex') FROM $8::int FOR 32)
+       ELSE NULL END,
+  CASE WHEN $12::boolean
+       THEN jsonb_build_object('flowdoc.space', $13::text, 'flowdoc.block', $14::text || (g % 1000)::text)
        ELSE NULL END
 FROM generate_series($9::bigint, $10::bigint) AS g`
 
@@ -101,8 +120,9 @@ func runSeed(ctx context.Context, args []string) error {
 	opEvery := fs.Int64("op-every", 100, "one constraint-bearing row every N events (>= 1)")
 	eventsPerStream := fs.Int64("events-per-stream", 100, "events per synthetic stream")
 	chunk := fs.Int64("chunk", 1_000_000, "rows per INSERT transaction")
-	reset := fs.Bool("reset", true, "truncate events, log_order and unique_claims first")
+	reset := fs.Bool("reset", true, "truncate events, event_tags, log_order and unique_claims first")
 	vacuum := fs.Bool("vacuum", true, "VACUUM (ANALYZE) events after seeding")
+	tags := addTagFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -118,7 +138,7 @@ func runSeed(ctx context.Context, args []string) error {
 	pool := store.Pool()
 
 	if *reset {
-		if _, err := pool.Exec(ctx, `TRUNCATE events, log_order, unique_claims RESTART IDENTITY`); err != nil {
+		if _, err := pool.Exec(ctx, `TRUNCATE events, event_tags, log_order, unique_claims RESTART IDENTITY`); err != nil {
 			return fmt.Errorf("truncate: %w", err)
 		}
 	}
@@ -150,9 +170,20 @@ func runSeed(ctx context.Context, args []string) error {
 			chunkStart := time.Now()
 			if _, err := pool.Exec(ctx, seedSQL,
 				ws, *eventsPerStream, now, nilID, payload, *opEvery,
-				base, valueStart, lo, hi, first,
+				base, valueStart, lo, hi, first, tags.enabled, tags.space, tags.blockPrefix,
 			); err != nil {
 				return fmt.Errorf("seed %s %d-%d: %w", ws, lo, hi, err)
+			}
+			if tags.enabled {
+				if _, err := pool.Exec(ctx, `
+					INSERT INTO event_tags (workspace_id, tag_key, tag_value, global_position)
+					SELECT e.workspace_id, kv.key, kv.value, e.global_position
+					FROM events e, jsonb_each_text(e.tags) AS kv
+					WHERE e.workspace_id = $1
+					  AND e.global_position BETWEEN $2 AND $3
+					  AND e.tags IS NOT NULL`, ws, lo, hi); err != nil {
+					return fmt.Errorf("project tags %s %d-%d: %w", ws, lo, hi, err)
+				}
 			}
 			fmt.Printf("seeded %s %d-%d in %.1fs\n", ws, lo, hi, time.Since(chunkStart).Seconds())
 		}
@@ -190,6 +221,9 @@ func runMeasure(ctx context.Context, args []string) error {
 	skipRebuild := fs.Bool("skip-rebuild", false, "skip RebuildClaims")
 	skipVerify := fs.Bool("skip-verify", false, "skip VerifyClaims")
 	asJSON := fs.Bool("json", false, "print the result as JSON")
+	tags := addTagFlags(fs)
+	tagReadLimit := fs.Int("tag-read-limit", 1000, "ReadByTags page size when -tags is set")
+	tagReadPages := fs.Int("tag-read-pages", 50, "ReadByTags pages to time when -tags is set (0 = until exhausted)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -228,6 +262,9 @@ func runMeasure(ctx context.Context, args []string) error {
 					SchemaVersion: 1,
 					Payload:       payload,
 				}
+				if tags.enabled {
+					events[j].Tags = map[string]string{"flowdoc.block": fmt.Sprintf("%s%d", tags.blockPrefix, j)}
+				}
 			}
 			p := es.AppendParams{
 				StreamID:      sid,
@@ -236,6 +273,9 @@ func runMeasure(ctx context.Context, args []string) error {
 				CorrelationID: uuid.New(),
 				Actor:         es.Actor{Type: "bench", ID: "bench"},
 				OccurredAt:    time.Now().UTC(),
+			}
+			if tags.enabled {
+				p.Tags = map[string]string{"flowdoc.space": tags.space}
 			}
 			if *claimEvery > 0 && i%*claimEvery == 0 {
 				p.Constraints = []es.ConstraintOp{
@@ -249,6 +289,13 @@ func runMeasure(ctx context.Context, args []string) error {
 			durations = append(durations, time.Since(start))
 		}
 		res.Appends = summarizeAppends(durations, *batch, *claimEvery)
+	}
+
+	if tags.enabled {
+		res.Tags, err = measureTagReads(ctx, w, tags.space, *tagReadLimit, *tagReadPages)
+		if err != nil {
+			return err
+		}
 	}
 
 	if !*skipRebuild {
@@ -302,7 +349,7 @@ func runReset(ctx context.Context, args []string) error {
 	}
 	defer store.Close()
 	if _, err := store.Pool().Exec(ctx,
-		`TRUNCATE events, log_order, unique_claims RESTART IDENTITY`); err != nil {
+		`TRUNCATE events, event_tags, log_order, unique_claims RESTART IDENTITY`); err != nil {
 		return err
 	}
 	if _, err := store.Pool().Exec(ctx, `SELECT setval('events_global_position_seq', 1, false)`); err != nil {
@@ -316,9 +363,20 @@ type measureResult struct {
 	Workspace      string            `json:"workspace"`
 	Footprint      map[string]string `json:"footprint_before"`
 	Appends        appendResult      `json:"appends"`
+	Tags           *tagReadResult    `json:"tag_reads,omitempty"`
 	Rebuild        rebuildResult     `json:"rebuild"`
 	Verify         verifyResult      `json:"verify"`
 	FootprintAfter map[string]string `json:"footprint_after"`
+}
+
+type tagReadResult struct {
+	Pages     int     `json:"pages"`
+	Events    int     `json:"events"`
+	PageLimit int     `json:"page_limit"`
+	P50Ms     float64 `json:"p50_ms"`
+	P99Ms     float64 `json:"p99_ms"`
+	MeanMs    float64 `json:"mean_ms"`
+	MaxMs     float64 `json:"max_ms"`
 }
 
 type appendResult struct {
@@ -345,6 +403,54 @@ type verifyResult struct {
 	FirstDivergence string  `json:"first_divergence,omitempty"`
 }
 
+// measureTagReads pages ReadByTags by global position and reports the page
+// latencies. maxPages 0 pages until the query returns an empty/short page.
+func measureTagReads(ctx context.Context, w *postgres.Workspace, space string, limit, maxPages int) (*tagReadResult, error) {
+	r := &tagReadResult{PageLimit: limit}
+	var (
+		durations []time.Duration
+		cursor    uint64
+	)
+	for page := 0; maxPages == 0 || page < maxPages; page++ {
+		start := time.Now()
+		envs, err := w.ReadByTags(ctx, es.TagQuery{
+			Tags:         map[string]string{"flowdoc.space": space},
+			FromPosition: cursor,
+			Limit:        limit,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("read by tags: %w", err)
+		}
+		durations = append(durations, time.Since(start))
+		if len(envs) == 0 {
+			break
+		}
+		r.Events += len(envs)
+		cursor = envs[len(envs)-1].GlobalPosition
+		if len(envs) < limit {
+			break
+		}
+	}
+	r.Pages = len(durations)
+	if r.Pages == 0 {
+		return r, nil
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	var total time.Duration
+	for _, d := range durations {
+		total += d
+	}
+	r.MeanMs = ms(total / time.Duration(len(durations)))
+	r.MaxMs = ms(durations[len(durations)-1])
+	r.P50Ms = ms(durations[len(durations)*50/100])
+	p99 := len(durations) * 99 / 100
+	if p99 >= len(durations) {
+		p99 = len(durations) - 1
+	}
+	r.P99Ms = ms(durations[p99])
+	return r, nil
+}
+
 func summarizeAppends(durations []time.Duration, batch, claimEvery int) appendResult {
 	r := appendResult{Count: len(durations), Batch: batch, ClaimEvery: claimEvery}
 	if len(durations) == 0 {
@@ -369,14 +475,15 @@ func summarizeAppends(durations []time.Duration, batch, claimEvery int) appendRe
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 func footprint(ctx context.Context, pool *pgxpool.Pool, ws string) (map[string]string, error) {
-	var events, opRows, claims, logOrder int64
+	var events, opRows, claims, logOrder, tags int64
 	if err := pool.QueryRow(ctx, `
 		SELECT
 		  (SELECT count(*) FROM events WHERE workspace_id = $1),
 		  (SELECT count(*) FROM events WHERE workspace_id = $1 AND constraint_ops IS NOT NULL),
 		  (SELECT count(*) FROM unique_claims WHERE workspace_id = $1),
-		  (SELECT count(*) FROM log_order WHERE workspace_id = $1)
-	`, ws).Scan(&events, &opRows, &claims, &logOrder); err != nil {
+		  (SELECT count(*) FROM log_order WHERE workspace_id = $1),
+		  (SELECT count(*) FROM event_tags WHERE workspace_id = $1)
+	`, ws).Scan(&events, &opRows, &claims, &logOrder, &tags); err != nil {
 		return nil, fmt.Errorf("footprint counts: %w", err)
 	}
 
@@ -406,15 +513,27 @@ func footprint(ctx context.Context, pool *pgxpool.Pool, ws string) (map[string]s
 		return nil, fmt.Errorf("footprint ops index: %w", err)
 	}
 
+	var tagTotal string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_size_pretty(COALESCE(sum(pg_total_relation_size(c.oid)), 0))
+		FROM pg_class c
+		JOIN pg_inherits i ON i.inhrelid = c.oid
+		WHERE i.inhparent = 'event_tags'::regclass
+	`).Scan(&tagTotal); err != nil {
+		return nil, fmt.Errorf("footprint event_tags size: %w", err)
+	}
+
 	return map[string]string{
-		"events":    strconv.FormatInt(events, 10),
-		"op_rows":   strconv.FormatInt(opRows, 10),
-		"claims":    strconv.FormatInt(claims, 10),
-		"log_order": strconv.FormatInt(logOrder, 10),
-		"total":     total,
-		"heap":      heap,
-		"indexes":   indexes,
-		"ops_index": opsIndex,
+		"events":           strconv.FormatInt(events, 10),
+		"op_rows":          strconv.FormatInt(opRows, 10),
+		"claims":           strconv.FormatInt(claims, 10),
+		"log_order":        strconv.FormatInt(logOrder, 10),
+		"tags":             strconv.FormatInt(tags, 10),
+		"total":            total,
+		"heap":             heap,
+		"indexes":          indexes,
+		"ops_index":        opsIndex,
+		"event_tags_total": tagTotal,
 	}, nil
 }
 
@@ -440,6 +559,11 @@ func printMeasure(r measureResult) {
 		fmt.Printf("  appends: n=%d batch=%d claim-every=%d p50=%.1fms p99=%.1fms mean=%.1fms max=%.1fms\n",
 			r.Appends.Count, r.Appends.Batch, r.Appends.ClaimEvery,
 			r.Appends.P50Ms, r.Appends.P99Ms, r.Appends.MeanMs, r.Appends.MaxMs)
+	}
+	if r.Tags != nil {
+		fmt.Printf("  tag reads: pages=%d events=%d limit=%d p50=%.1fms p99=%.1fms mean=%.1fms max=%.1fms\n",
+			r.Tags.Pages, r.Tags.Events, r.Tags.PageLimit,
+			r.Tags.P50Ms, r.Tags.P99Ms, r.Tags.MeanMs, r.Tags.MaxMs)
 	}
 	if r.Rebuild.Seconds > 0 {
 		fmt.Printf("  rebuild: %.2fs ops=%d claims=%d\n", r.Rebuild.Seconds, r.Rebuild.Ops, r.Rebuild.Claims)

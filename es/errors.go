@@ -127,6 +127,39 @@ var (
 	// the append fails and nothing is written. Both stores return it
 	// from Actor.Validate at the append seam; match it with errors.Is.
 	ErrInvalidDelegation = errors.New("es-lite: invalid delegation")
+
+	// ErrInvalidTag reports a tag key or value outside the tag vocabulary:
+	// a key not matching [a-z0-9._:-]+, a key longer than 128 bytes, a
+	// value longer than 512 bytes, invalid UTF-8, or a NUL byte. It is
+	// also returned when a stored tags column cannot be decoded.
+	ErrInvalidTag = errors.New("es-lite: invalid tag")
+
+	// ErrTooManyTags reports more than 32 tags on one merged event (the
+	// batch tags overlaid with the event's own tags).
+	ErrTooManyTags = errors.New("es-lite: too many tags")
+
+	// ErrConflictingTag reports that a batch tag and an event tag set the
+	// same key to different values. The whole append is rejected; nothing
+	// is written.
+	ErrConflictingTag = errors.New("es-lite: conflicting tag value")
+
+	// ErrInvalidTagQuery reports a malformed TagQuery: no tags, an invalid
+	// tag, a limit outside [0,1000], or a ToPosition before FromPosition.
+	ErrInvalidTagQuery = errors.New("es-lite: invalid tag query")
+
+	// ErrEmptyMultiAppend reports a MultiAppend with no appends, or an
+	// append with no events. A multi-append writes events to several
+	// streams; an empty element has nothing to write.
+	ErrEmptyMultiAppend = errors.New("es-lite: multi-append requires at least one append with events")
+
+	// ErrDuplicateMultiStream reports two appends for the same stream in one
+	// MultiAppend. The second append's ExpectedVersion would be stale.
+	ErrDuplicateMultiStream = errors.New("es-lite: duplicate stream in multi-append")
+
+	// ErrConflictingMultiAppend reports that the appends in one MultiAppend
+	// disagree on the shared command metadata: CommandID, CorrelationID,
+	// CausationID, Actor, SpanContext, or a non-zero OccurredAt.
+	ErrConflictingMultiAppend = errors.New("es-lite: multi-append command metadata mismatch")
 )
 
 // DecidedAtSkewError is the structured form of ErrDecidedAtSkew: it carries

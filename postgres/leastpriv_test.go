@@ -94,18 +94,22 @@ func grantLeastPrivilege(t *testing.T, ctx context.Context, s *postgres.Store) {
 	t.Helper()
 	for _, g := range []struct{ role, grants string }{
 		// Appender: draw positions, chain events, attest batch order,
-		// apply uniqueness constraints (their ops ride on the first event
-		// row, ADR 0043), read that log to rebuild or verify the claims
-		// index after a restore. It is also the process running
+		// project tags into event_tags (ADR 0044), apply uniqueness
+		// constraints (their ops ride on the first event row, ADR 0043),
+		// read that log to rebuild or verify the claims index and verify
+		// the tag index after a restore. It is also the process running
 		// aggregate.Runtime, so with a snapshot cache it reads and writes
 		// snapshots. Release is the only DELETE on the append path; Purge
-		// on the snapshot cache is the other off-path DELETE.
+		// on the snapshot cache is the other off-path DELETE. A tags
+		// rebuild needs DELETE on event_tags, which the appender does not
+		// hold: that is the separate tags-rebuild role.
 		{lpAppender, `
 			GRANT USAGE ON SCHEMA public TO ` + lpAppender + `;
 			GRANT USAGE ON SEQUENCE events_global_position_seq TO ` + lpAppender + `;
 			GRANT SELECT, INSERT ON events, unique_claims TO ` + lpAppender + `;
 			GRANT DELETE ON unique_claims TO ` + lpAppender + `;
 			GRANT INSERT ON log_order TO ` + lpAppender + `;
+			GRANT SELECT, INSERT ON event_tags TO ` + lpAppender + `;
 			GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO ` + lpAppender},
 		// Feed process: the horizon fence (pg_sequences needs USAGE on
 		// the sequence, never SELECT) + the feed's own state tables.
@@ -175,14 +179,21 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	res1, err := aws.Append(ctx, es.AppendParams{
 		StreamID:        sid,
 		ExpectedVersion: 0,
-		Events:          []es.EventData{{TypeURL: lpType, SchemaVersion: 1, Payload: []byte("one")}},
-		Constraints:     []es.ConstraintOp{es.Claim("email", "lp@example.test")},
+		Events: []es.EventData{{
+			TypeURL: lpType, SchemaVersion: 1, Payload: []byte("one"),
+			Tags: map[string]string{"flowdoc.block": "b1"},
+		}},
+		Tags:        map[string]string{"flowdoc.space": "s1"},
+		Constraints: []es.ConstraintOp{es.Claim("email", "lp@example.test")},
 	})
 	if err != nil {
 		t.Fatalf("append under the appender grants: %v", err)
 	}
 	if res1.ToVersion != 1 || res1.Envelopes[0].GlobalPosition == 0 {
 		t.Fatalf("first append result = %+v, want v1 at a real position", res1)
+	}
+	if got := res1.Envelopes[0].Tags; got["flowdoc.space"] != "s1" || got["flowdoc.block"] != "b1" {
+		t.Fatalf("tagged append tags = %#v, want the merged space and block", got)
 	}
 	if _, found, err := aws.LookupClaim(ctx, "email", "lp@example.test"); err != nil || !found {
 		t.Fatalf("claim lookup under the appender grants: found=%v err=%v, want found", found, err)
@@ -278,6 +289,26 @@ func TestLeastPrivilegeEndToEnd(t *testing.T) {
 	}
 	if opRows != 3 {
 		t.Fatalf("op-bearing events = %d, want 3 (claim, release, claim)", opRows)
+	}
+
+	// The tagged first append projected its merged space and block under the
+	// appender's SELECT, INSERT grant. The appender verifies the projection
+	// (a rebuild needs DELETE, the separate tags-rebuild role) and its SELECT
+	// covers the row count.
+	var tagRows int64
+	if err := opsConn.QueryRow(ctx,
+		`SELECT count(*) FROM event_tags WHERE workspace_id = $1`, lpWS).Scan(&tagRows); err != nil {
+		t.Fatalf("count event_tags under the appender grants: %v", err)
+	}
+	if tagRows != 2 {
+		t.Fatalf("event_tags rows = %d, want 2 (space + block)", tagRows)
+	}
+	tagVerify, err := appender.WorkspaceStore(lpWS).VerifyTags(ctx)
+	if err != nil {
+		t.Fatalf("VerifyTags under the appender grants: %v", err)
+	}
+	if !tagVerify.OK || tagVerify.Events != 1 || tagVerify.Tags != 2 {
+		t.Fatalf("VerifyTags under the appender grants = %+v, want OK with 1 event / 2 tags", tagVerify)
 	}
 
 	// The ops are on the event row, so the appender's ordinary stream read

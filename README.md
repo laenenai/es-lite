@@ -47,9 +47,10 @@ transport, authentication, encryption and business rules.
 | Optimistic concurrency | `UNIQUE (workspace, stream, version)` → `ErrConflict` |
 | Per-workspace data isolation (Postgres) | RLS + hash partitioning; the caller supplies the workspace |
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
+| Indexed event tags | `events.tags` as the source plus a synchronous `event_tags` projection; `ReadByTags` with AND semantics in global-position order (ADR 0044) |
 | At-least-once delivery, fenced | `feed` core + Postgres adapters; consumer adapter in `eventfeed`; legacy in-process `delivery.Poller`/`Relay`; Postgres feed reads are commit-safe via the horizon fence (ADR 0037) |
 | Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
-| Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes plus per-batch log-order attestation, both computed in the append transaction; keyless verification (`es-verify stream\|order\|all`) and exportable anchors (ADRs 0029 and 0038) |
+| Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes plus per-batch log-order and tag attestation, all computed in the append transaction; keyless verification (`es-verify stream\|order\|tags\|all`) and exportable anchors (ADRs 0029, 0038 and 0044) |
 | Schema lifecycle | versioned migrations (`es-migrate`) |
 | Aggregate runtime | proto-defined events, the Decider model, generated codecs and sum-types |
 
@@ -397,11 +398,16 @@ are client responsibilities (ADR 0025).
   provide, on the append's first event. For personal data, pass a keyed
   hash/MAC you control, never the raw value; `LookupClaim` must receive the same
   value. There is no PII flag, and a plaintext claim value cannot be erased.
+- **Tags are immutable metadata.** `events.tags` is indexed and survives every
+  rebuild; deleting `event_tags` rows is a cache wipe. Use non-personal
+  identifiers, or a keyed MAC you can destroy, never a plaintext personal value
+  ([ADR 0044 §2.8](docs/adr/0044-event-tags.md#28-erasure-and-the-trust-boundary)).
 - **Backups and replay.** The functional source is `events` (all partitions):
   aggregates, the chain, positions, and — because the append's constraint ops
-  ride on the first event of the batch — the claims index all rebuild from it.
-  `log_order` is the order witness: stream it too if you want to re-verify the
-  global append order on the restored database. `command_dedup` is not carried.
+  and tags ride on the event rows — the claims and tag indexes all rebuild from
+  it. `log_order` is the order and tag-root witness: stream it too if you want
+  to re-verify the global append order on the restored database.
+  `command_dedup` is not carried.
   A store whose claims have no ops in the event log is inconsistent, and the
   tools refuse it rather than guess or delete ([ADR
   0043](docs/adr/0043-constraint-ops-on-events.md#25-no-legacy-path)). The

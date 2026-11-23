@@ -467,6 +467,9 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 			SchemaVersion: enc.SchemaVersion,
 			Payload:       enc.Payload,
 		}
+		if r.decider.Tags != nil {
+			encoded[i].Tags = r.decider.Tags(events[i])
+		}
 		// Deterministic event ids (WithDeterministicEventIDs): derive the
 		// id from the command id and the event's index in the batch, so a
 		// retried command derives the ids its first run stored and the
@@ -487,6 +490,7 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 		StreamID:        sid,
 		ExpectedVersion: version,
 		Events:          encoded,
+		Tags:            meta.Tags,
 		Constraints:     constraints,
 		CommandID:       meta.CommandID,
 		CorrelationID:   meta.CorrelationID,

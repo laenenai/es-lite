@@ -431,8 +431,8 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("read shared ledger: %v", err)
 	}
-	if v != 15 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 15 (every embedded migration applied)", v)
+	if v != 16 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 16 (every embedded migration applied)", v)
 	}
 }
 
@@ -512,7 +512,7 @@ func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
 				PRIMARY KEY (workspace_id, stream_id)
 			)`,
 			wantErr: false,
-			wantV:   15,
+			wantV:   16,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -606,8 +606,8 @@ func TestMigrateWritesTheSharedLedger(t *testing.T) {
 	`).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if n != 15 {
-		t.Fatalf("eventstore ledger rows = %d, want 15", n)
+	if n != 16 {
+		t.Fatalf("eventstore ledger rows = %d, want 16", n)
 	}
 
 	var legacy bool
@@ -664,8 +664,8 @@ func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
 	`).Scan(&total); err != nil {
 		t.Fatalf("read ledger total: %v", err)
 	}
-	if total != 15 {
-		t.Fatalf("ledger rows = %d, want 15 after applying versions 4-15", total)
+	if total != 16 {
+		t.Fatalf("ledger rows = %d, want 16 after applying versions 4-16", total)
 	}
 }
 
@@ -688,10 +688,115 @@ func TestLedgerModuleNameUsesTheOption(t *testing.T) {
 	`).Scan(&eventstore); err != nil {
 		t.Fatalf("read eventstore rows: %v", err)
 	}
-	if custom != 15 {
-		t.Fatalf("custom ledger rows = %d, want 15", custom)
+	if custom != 16 {
+		t.Fatalf("custom ledger rows = %d, want 16", custom)
 	}
 	if eventstore != 0 {
 		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)
+	}
+}
+
+// TestEventTagsSchema pins migration 0016's projection shape: a HASH-
+// partitioned parent, eight partitions matching events, and exactly the
+// tag-first primary key on each partition (no secondary position index —
+// events.tags serves per-event reads).
+func TestEventTagsSchema(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	var kind string
+	if err := s.Pool().QueryRow(ctx, `SELECT relkind FROM pg_class WHERE relname = 'event_tags'`).Scan(&kind); err != nil {
+		t.Fatalf("event_tags parent: %v", err)
+	}
+	if kind != "p" {
+		t.Fatalf("event_tags relkind = %q, want p (partitioned)", kind)
+	}
+
+	for _, p := range []string{
+		"event_tags_p0", "event_tags_p1", "event_tags_p2", "event_tags_p3",
+		"event_tags_p4", "event_tags_p5", "event_tags_p6", "event_tags_p7",
+	} {
+		if err := s.Pool().QueryRow(ctx, `SELECT relkind FROM pg_class WHERE relname = $1`, p).Scan(&kind); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if kind != "r" {
+			t.Fatalf("%s relkind = %q, want r", p, kind)
+		}
+		var n int
+		if err := s.Pool().QueryRow(ctx, `
+			SELECT count(*) FROM pg_indexes
+			WHERE tablename = $1
+			  AND indexdef ILIKE '%(workspace_id, tag_key, tag_value, global_position)%'`, p).Scan(&n); err != nil {
+			t.Fatalf("%s primary key: %v", p, err)
+		}
+		if n != 1 {
+			t.Fatalf("%s: %d indexes match the tag-first primary key, want 1", p, n)
+		}
+		if err := s.Pool().QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = $1`, p).Scan(&n); err != nil {
+			t.Fatalf("%s index count: %v", p, err)
+		}
+		if n != 1 {
+			t.Fatalf("%s has %d indexes, want only the primary key", p, n)
+		}
+	}
+}
+
+// TestEventTagsRLS pins the projection's tenant isolation: ENABLE + FORCE and
+// the current events policy (0007), including the es_relay role gate.
+func TestEventTagsRLS(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	var rls, force bool
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'event_tags'
+	`).Scan(&rls, &force); err != nil {
+		t.Fatalf("event_tags rls flags: %v", err)
+	}
+	if !rls || !force {
+		t.Fatalf("event_tags rls=%v force=%v, want both true", rls, force)
+	}
+
+	var qual string
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT qual FROM pg_policies
+		WHERE tablename = 'event_tags' AND policyname = 'event_tags_workspace_isolation'
+	`).Scan(&qual); err != nil {
+		t.Fatalf("event_tags policy: %v", err)
+	}
+	if !strings.Contains(qual, "es_relay") {
+		t.Fatalf("event_tags policy is not role-gated by es_relay: %s", qual)
+	}
+}
+
+func TestEventsTagsColumn(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	var dataType, nullable string
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT data_type, is_nullable FROM information_schema.columns
+		WHERE table_name = 'events' AND column_name = 'tags'
+	`).Scan(&dataType, &nullable); err != nil {
+		t.Fatalf("events.tags: %v", err)
+	}
+	if dataType != "jsonb" || nullable != "YES" {
+		t.Fatalf("events.tags = %s nullable=%s, want jsonb nullable=YES", dataType, nullable)
+	}
+}
+
+func TestLogOrderTagsHashColumn(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	var dataType, nullable string
+	if err := s.Pool().QueryRow(ctx, `
+		SELECT data_type, is_nullable FROM information_schema.columns
+		WHERE table_name = 'log_order' AND column_name = 'tags_hash'
+	`).Scan(&dataType, &nullable); err != nil {
+		t.Fatalf("log_order.tags_hash: %v", err)
+	}
+	if dataType != "bytea" || nullable != "YES" {
+		t.Fatalf("log_order.tags_hash = %s nullable=%s, want bytea nullable=YES", dataType, nullable)
 	}
 }
