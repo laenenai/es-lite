@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/laenenai/es-lite/es"
+	"github.com/laenenai/es-lite/sqlite"
 )
 
 func tableColumns(t *testing.T, ctx context.Context, s interface {
@@ -280,4 +281,184 @@ func TestSQLiteTagsDoNotChangeEventHash(t *testing.T) {
 			t.Fatalf("envelope %d hash changed when tags were removed", i)
 		}
 	}
+}
+
+func seedThreeTaggedSQLite(t *testing.T, ctx context.Context, s *sqlite.Store, sid es.StreamID) []es.Envelope {
+	t.Helper()
+	batches := []map[string]string{
+		{"k": "range", "flowdoc.space": "s1"},
+		{"k": "range", "flowdoc.space": "s1"},
+		{"k": "range", "flowdoc.space": "s2"},
+	}
+	blocks := []string{"b1", "b2", "b1"}
+	var out []es.Envelope
+	for i := range batches {
+		res, err := s.Append(ctx, es.AppendParams{
+			StreamID:        sid,
+			ExpectedVersion: uint64(i),
+			Events: []es.EventData{{
+				TypeURL: "thing.v1.Happened",
+				Payload: []byte{byte('a' + i)},
+				Tags:    map[string]string{"flowdoc.block": blocks[i]},
+			}},
+			Tags: batches[i],
+		})
+		if err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		out = append(out, res.Envelopes...)
+	}
+	return out
+}
+
+func sqliteTagPositions(envs []es.Envelope) []uint64 {
+	out := make([]uint64, len(envs))
+	for i := range envs {
+		out[i] = envs[i].GlobalPosition
+	}
+	return out
+}
+
+func TestSQLiteReadByTagsAND(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "tags-and")
+	envs := seedThreeTaggedSQLite(t, ctx, s, sid)
+
+	got, err := s.ReadByTags(ctx, es.TagQuery{Tags: map[string]string{
+		"flowdoc.space": "s1",
+		"flowdoc.block": "b1",
+	}})
+	if err != nil {
+		t.Fatalf("ReadByTags: %v", err)
+	}
+	if len(got) != 1 || got[0].GlobalPosition != envs[0].GlobalPosition {
+		t.Fatalf("ReadByTags = %v, want only position %d", sqliteTagPositions(got), envs[0].GlobalPosition)
+	}
+}
+
+func TestSQLiteReadByTagsRangeAndOrder(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "tags-range")
+	envs := seedThreeTaggedSQLite(t, ctx, s, sid)
+
+	got, err := s.ReadByTags(ctx, es.TagQuery{
+		Tags:         map[string]string{"k": "range"},
+		FromPosition: envs[0].GlobalPosition,
+		ToPosition:   envs[2].GlobalPosition,
+	})
+	if err != nil {
+		t.Fatalf("ReadByTags: %v", err)
+	}
+	if want := []uint64{envs[1].GlobalPosition, envs[2].GlobalPosition}; !equalSQLitePositions(got, want) {
+		t.Fatalf("ReadByTags = %v, want %v", sqliteTagPositions(got), want)
+	}
+	got, err = s.ReadByTags(ctx, es.TagQuery{
+		Tags:       map[string]string{"k": "range"},
+		ToPosition: envs[1].GlobalPosition,
+	})
+	if err != nil {
+		t.Fatalf("ReadByTags: %v", err)
+	}
+	if want := []uint64{envs[0].GlobalPosition, envs[1].GlobalPosition}; !equalSQLitePositions(got, want) {
+		t.Fatalf("ReadByTags = %v, want %v", sqliteTagPositions(got), want)
+	}
+}
+
+func TestSQLiteReadByTagsPagination(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "tags-page")
+	envs := seedThreeTaggedSQLite(t, ctx, s, sid)
+
+	first, err := s.ReadByTags(ctx, es.TagQuery{Tags: map[string]string{"k": "range"}, Limit: 1})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if len(first) != 1 || first[0].GlobalPosition != envs[0].GlobalPosition {
+		t.Fatalf("page 1 = %v, want position %d", sqliteTagPositions(first), envs[0].GlobalPosition)
+	}
+	second, err := s.ReadByTags(ctx, es.TagQuery{
+		Tags:         map[string]string{"k": "range"},
+		FromPosition: first[0].GlobalPosition,
+		Limit:        1,
+	})
+	if err != nil {
+		t.Fatalf("page 2: %v", err)
+	}
+	if len(second) != 1 || second[0].GlobalPosition != envs[1].GlobalPosition {
+		t.Fatalf("page 2 = %v, want position %d", sqliteTagPositions(second), envs[1].GlobalPosition)
+	}
+}
+
+func TestSQLiteReadByTagsLimit(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "tags-limit")
+	seedThreeTaggedSQLite(t, ctx, s, sid)
+
+	got, err := s.ReadByTags(ctx, es.TagQuery{Tags: map[string]string{"k": "range"}})
+	if err != nil {
+		t.Fatalf("ReadByTags: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("default limit returned %d events, want 3", len(got))
+	}
+	for _, limit := range []int{-1, es.MaxTagReadLimit + 1} {
+		if _, err := s.ReadByTags(ctx, es.TagQuery{Tags: map[string]string{"k": "range"}, Limit: limit}); !errors.Is(err, es.ErrInvalidTagQuery) {
+			t.Fatalf("Limit=%d error = %v, want ErrInvalidTagQuery", limit, err)
+		}
+	}
+}
+
+func TestSQLiteReadByTagsRejectsEmptyQuery(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.ReadByTags(ctx, es.TagQuery{}); !errors.Is(err, es.ErrInvalidTagQuery) {
+		t.Fatalf("empty query error = %v, want ErrInvalidTagQuery", err)
+	}
+}
+
+func TestSQLiteReadByTagsRejectsInvertedRange(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	if _, err := s.ReadByTags(ctx, es.TagQuery{
+		Tags:         map[string]string{"k": "v"},
+		FromPosition: 5,
+		ToPosition:   4,
+	}); !errors.Is(err, es.ErrInvalidTagQuery) {
+		t.Fatalf("inverted range error = %v, want ErrInvalidTagQuery", err)
+	}
+}
+
+func TestSQLiteReadByTagsAsOf(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "tags-asof")
+	envs := seedThreeTaggedSQLite(t, ctx, s, sid)
+
+	got, err := s.ReadByTags(ctx, es.TagQuery{
+		Tags:       map[string]string{"k": "range"},
+		ToPosition: envs[1].GlobalPosition,
+	})
+	if err != nil {
+		t.Fatalf("ReadByTags: %v", err)
+	}
+	if want := []uint64{envs[0].GlobalPosition, envs[1].GlobalPosition}; !equalSQLitePositions(got, want) {
+		t.Fatalf("as-of read = %v, want %v", sqliteTagPositions(got), want)
+	}
+}
+
+func equalSQLitePositions(envs []es.Envelope, want []uint64) bool {
+	got := sqliteTagPositions(envs)
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
