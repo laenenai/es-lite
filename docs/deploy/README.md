@@ -246,10 +246,13 @@ runs.
 Migration 0016 adds `events.tags` (jsonb), the `event_tags` projection with
 eight hash partitions, and `log_order.tags_hash` (ADR 0044). There is **no
 build-order step and no backfill**: `event_tags` starts empty and every
-existing event has `NULL` tags, so the migration is catalog-only. Unlike the
-0003/0012/0015 index sections, do not build anything in advance; the eight
-partitions and their policies are created in the migration. `event_tags` grows
-only as new tagged appends arrive, at roughly two rows per FlowDoc event.
+existing event has `NULL` tags, so the migration is catalog-only apart from the
+one-time `VALIDATE CONSTRAINT` scan of the all-`NULL` column. Unlike the
+0003/0012/0015 index sections, do not build anything in advance: the
+partitioned table, its eight partitions and the parent policy are created in
+the migration (as with `events`, the policy lives on the parent and no grants
+are issued on the partitions). `event_tags` grows only as new tagged appends
+arrive, at roughly two rows per FlowDoc event.
 
 RLS mirrors `events` (workspace arm plus the role-gated `es_relay` bypass), and
 no grants are issued in the migration. Issue them per § *Grants*, then grant
@@ -373,8 +376,8 @@ draws positions, reads the stream head for optimistic concurrency,
 inserts the events and their `log_order` attestation (design D1),
 projects the merged tags into `event_tags` (ADR 0044), applies uniqueness
 constraints — their ops ride on the first event row (ADR 0043) — and reads
-the event log to rebuild or verify the claims and tags indexes after a
-restore. It is also the process running `aggregate.Runtime`, so with a
+the event log to rebuild or verify the claims index and verify the tags index
+after a restore. It is also the process running `aggregate.Runtime`, so with a
 snapshot cache configured (ADR 0042) it both reads and writes `snapshots`
 — the same role as for `events`. `Release` is the only `DELETE` on the
 append path, and `Purge` on the snapshot cache is the other off-path
@@ -648,8 +651,10 @@ event are one row, so an event cut is internally consistent; loading
    check again, which must report `tags OK`. A stored non-string tag value is
    refused rather than stringified; that is corruption, not an empty tag set.
    The rebuild is one Repeatable Read transaction (SQLite: its single
-   connection), so a failure leaves the live index unchanged. Writers must stay
-   stopped: an append committed after the snapshot cannot be replayed.
+   connection), so a failure leaves the live index unchanged. Keep writers
+   stopped anyway: an append committed after the snapshot keeps its own tag
+   rows, but it is absent from the rebuild's snapshot-bound report, and a
+   racing rebuild can serialize-fail.
 
    *Claims.* Run `es-verify claims`; it is non-destructive.
    On a pure events-only restore the live index is empty while the log has

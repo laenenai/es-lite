@@ -24,6 +24,10 @@
 //	es-verify order [--upto N]
 //	  deep-verify the log order: recompute every log_order batch hash
 //	  from the events at or below the bound (0 = the log head)
+//	es-verify tags [--rebuild] [<workspace>] | [--upto N]
+//	  verify the event_tags projection against events.tags (workspace) or
+//	  the per-batch tags hashes against log_order (store-wide, --upto);
+//	  --rebuild re-projects the workspace
 //	es-verify claims [--rebuild] [<workspace>]
 //	  verify the unique-claims index against the constraint ops on the
 //	  event log; --rebuild replays the log over the live index
@@ -120,7 +124,7 @@ func usage() {
   es-verify all [--strict] [--chains-only]
   es-verify anchor [--upto N] | --check <anchor.json> | list
   es-verify order [--upto N]
-  es-verify tags [--rebuild] [--upto N] [<workspace>]
+  es-verify tags [--rebuild] [<workspace>] | [--upto N]
   es-verify claims [--rebuild] [<workspace>]`)
 }
 
@@ -398,6 +402,10 @@ func cmdTags(ctx context.Context, b *backend, args []string) int {
 	}
 
 	if len(rest) == 1 {
+		if *upto != 0 {
+			fmt.Fprintln(os.Stderr, "es-verify: --upto applies to the store-wide tag attestation, not a workspace projection check")
+			return exitUsage
+		}
 		rep, err := b.tags(rest[0]).VerifyTags(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "es-verify: %s%v\n", wsPrefix(rest[0]), err)

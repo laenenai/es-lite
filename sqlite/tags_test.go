@@ -247,11 +247,13 @@ func TestSQLiteReadCorruptTagsFailsLoudly(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if _, err := s.DB().ExecContext(ctx, `UPDATE events SET tags = '{"k":1}'`); err != nil {
-		t.Fatalf("corrupt tags: %v", err)
-	}
-	if _, err := s.ReadStream(ctx, sid, 0, 0); err == nil {
-		t.Fatal("ReadStream with a non-string tag value returned no error")
+	for _, corrupt := range []string{`{"k":1}`, `["a","b"]`, ``, `null`, `{"Bad":"v"}`} {
+		if _, err := s.DB().ExecContext(ctx, `UPDATE events SET tags = ?`, corrupt); err != nil {
+			t.Fatalf("corrupt tags with %q: %v", corrupt, err)
+		}
+		if _, err := s.ReadStream(ctx, sid, 0, 0); err == nil {
+			t.Fatalf("ReadStream with tags=%q returned no error", corrupt)
+		}
 	}
 }
 

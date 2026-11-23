@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/laenenai/es-lite/es"
 )
@@ -16,15 +17,69 @@ var (
 	_ es.TagAttester   = (*Store)(nil)
 )
 
+// storedTagsPage bounds the validation scan's working set. The rebuild and
+// verify already read every tagged event; this only keeps that pre-pass from
+// materializing the whole workspace at once.
+const storedTagsPage = 1000
+
+// validateStoredTags pages the workspace's tagged events and decodes each
+// with the strict stored-tag decoder: the value must be a JSON object whose
+// keys and values pass the append vocabulary and whose count is within the
+// cap. It runs before RebuildTags deletes anything and before VerifyTags
+// builds its temp table, so corruption is refused rather than stringified or
+// certified. The scan is keyset-paged by global_position.
+func validateStoredTags(ctx context.Context, tx pgx.Tx, workspace string) error {
+	var after uint64
+	for {
+		rows, err := tx.Query(ctx, `
+			SELECT global_position, stream_id, tags FROM events
+			WHERE workspace_id = $1 AND tags IS NOT NULL
+			  AND global_position > $2
+			ORDER BY global_position
+			LIMIT $3`, workspace, int64(after), storedTagsPage)
+		if err != nil {
+			return fmt.Errorf("read stored tags: %w", err)
+		}
+		n := 0
+		for rows.Next() {
+			var (
+				pos    uint64
+				stream string
+				raw    []byte
+			)
+			if err := rows.Scan(&pos, &stream, &raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan stored tags: %w", err)
+			}
+			if _, err := es.DecodeStoredTags(raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("workspace %s stream %s position %d: %w", workspace, stream, pos, err)
+			}
+			after = pos
+			n++
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return fmt.Errorf("stored tags rows: %w", err)
+		}
+		if n < storedTagsPage {
+			return nil
+		}
+	}
+}
+
 // RebuildTags replaces the live event_tags projection by re-projecting every
 // tagged event in the workspace. It is the restore path: load events, run
 // this, and the tag index is back. One Repeatable Read transaction: the guard,
 // the delete, the insert and the final count see one snapshot, so a decode
 // failure rolls the whole rebuild back and leaves the live index as it was.
 //
-// A stored tags value that is an object with a non-string member is refused
-// before the delete. jsonb_each_text would silently stringify it; this path
-// must not turn corruption into a plausible tag row.
+// Every stored tags value is decoded and validated against the append
+// vocabulary before the delete: a non-object, an invalid key or value, or an
+// over-cap set is refused. jsonb_each_text would silently stringify a
+// non-string member; this path must not turn corruption into a plausible tag
+// row.
 func (w *Workspace) RebuildTags(ctx context.Context) (es.TagsRebuildReport, error) {
 	var zero es.TagsRebuildReport
 	tx, err := w.store.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
@@ -36,15 +91,8 @@ func (w *Workspace) RebuildTags(ctx context.Context) (es.TagsRebuildReport, erro
 		return zero, fmt.Errorf("postgres: rebuild tags: set workspace: %w", err)
 	}
 
-	bad, err := countRows(ctx, tx, `
-		SELECT count(*) FROM events e, jsonb_each(e.tags) kv
-		WHERE e.workspace_id = $1 AND e.tags IS NOT NULL
-		  AND jsonb_typeof(kv.value) <> 'string'`, w.ws)
-	if err != nil {
-		return zero, fmt.Errorf("postgres: rebuild tags: check values: %w", err)
-	}
-	if bad > 0 {
-		return zero, fmt.Errorf("postgres: rebuild tags: %d stored tag values are not strings", bad)
+	if err := validateStoredTags(ctx, tx, w.ws); err != nil {
+		return zero, fmt.Errorf("postgres: rebuild tags: %w", err)
 	}
 
 	events, err := countRows(ctx, tx,
@@ -92,17 +140,12 @@ func (w *Workspace) VerifyTags(ctx context.Context) (es.TagsVerifyReport, error)
 		return zero, fmt.Errorf("postgres: verify tags: set workspace: %w", err)
 	}
 
-	// Mirror RebuildTags' fail-loud guard: jsonb_each_text would stringify
-	// a non-string value, turning corruption into a plausible divergence.
-	bad, err := countRows(ctx, tx, `
-		SELECT count(*) FROM events e, jsonb_each(e.tags) kv
-		WHERE e.workspace_id = $1 AND e.tags IS NOT NULL
-		  AND jsonb_typeof(kv.value) <> 'string'`, w.ws)
-	if err != nil {
-		return zero, fmt.Errorf("postgres: verify tags: check values: %w", err)
-	}
-	if bad > 0 {
-		return zero, fmt.Errorf("postgres: verify tags: %d stored tag values are not strings", bad)
+	// Mirror RebuildTags' fail-loud guard: jsonb_each_text would stringify a
+	// non-string value, turning corruption into a plausible divergence, and
+	// an invalid key or over-cap set would be certified as a valid
+	// projection.
+	if err := validateStoredTags(ctx, tx, w.ws); err != nil {
+		return zero, fmt.Errorf("postgres: verify tags: %w", err)
 	}
 
 	events, err := countRows(ctx, tx,
@@ -168,6 +211,11 @@ func (w *Workspace) VerifyTags(ctx context.Context) (es.TagsVerifyReport, error)
 // cannot launder a changed tag through the index. RowsChecked counts tagged
 // batches; an untagged batch (NULL tags_hash) is checked for "no entries" but
 // is not counted.
+//
+// One LEFT JOIN returns every covered batch and its tagged events, ordered by
+// from_position, so the audit is one round trip rather than one query per
+// batch. An untagged batch still yields one row with NULL event columns —
+// exactly the "expected no entries" case a NULL tags_hash asserts.
 func (s *Store) VerifyTagHashes(ctx context.Context, upto uint64) (*es.TagsHashVerifyReport, error) {
 	if err := s.checkRelayRole(ctx); err != nil {
 		return nil, err
@@ -182,88 +230,111 @@ func (s *Store) VerifyTagHashes(ctx context.Context, upto uint64) (*es.TagsHashV
 	}
 	defer tx.Rollback(ctx)
 
-	rows, err := readLogOrderRows(ctx, tx, bound)
+	rows, err := tx.Query(ctx, `
+		SELECT lo.from_position, lo.to_position, lo.workspace_id, lo.stream_id, lo.tags_hash,
+		       e.global_position, e.tags
+		FROM log_order lo
+		LEFT JOIN events e
+		  ON e.workspace_id = lo.workspace_id
+		 AND e.stream_id = lo.stream_id
+		 AND e.global_position BETWEEN lo.from_position AND lo.to_position
+		 AND e.tags IS NOT NULL
+		WHERE ($1::bigint = 0 OR lo.to_position <= $1)
+		ORDER BY lo.from_position, e.global_position`, int64(bound))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("postgres: verify tag hashes: read batches: %w", err)
+	}
+	defer rows.Close()
+
+	type tagBatch struct {
+		from, to          uint64
+		workspace, stream string
+		stored            []byte
+		entries           []es.TagEntry
 	}
 
-	var checked uint64
-	for i := range rows {
-		r := &rows[i]
-		entries, err := readTagEntries(ctx, tx, r.Workspace, r.Stream, r.From, r.To)
-		if err != nil {
-			return nil, err
-		}
-		got := es.TagsHash(entries)
-
-		if r.TagsHash == nil {
-			if len(entries) == 0 {
-				continue
+	var (
+		checked uint64
+		cur     *tagBatch
+	)
+	// finish compares one completed batch and reports whether it was the
+	// first mismatch. A NULL stored hash must have no entries; a stored hash
+	// must match the recomputed one.
+	finish := func(b *tagBatch) (*es.TagsHashVerifyReport, bool) {
+		got := es.TagsHash(b.entries)
+		if b.stored == nil {
+			if len(b.entries) == 0 {
+				return nil, false
 			}
-			return &es.TagsHashVerifyReport{
-				OK:          false,
-				RowsChecked: checked + 1,
-				Mismatch: &es.TagRowMismatch{
-					From:             r.From,
-					ExpectedTagsHash: nil,
-					ActualTagsHash:   got[:],
-				},
-			}, nil
-		}
-
-		checked++
-		if !bytes.Equal(got[:], r.TagsHash) {
 			return &es.TagsHashVerifyReport{
 				OK:          false,
 				RowsChecked: checked,
 				Mismatch: &es.TagRowMismatch{
-					From:             r.From,
-					ExpectedTagsHash: r.TagsHash,
+					From:             b.from,
+					ExpectedTagsHash: nil,
 					ActualTagsHash:   got[:],
 				},
-			}, nil
+			}, true
 		}
+		checked++
+		if !bytes.Equal(got[:], b.stored) {
+			return &es.TagsHashVerifyReport{
+				OK:          false,
+				RowsChecked: checked,
+				Mismatch: &es.TagRowMismatch{
+					From:             b.from,
+					ExpectedTagsHash: b.stored,
+					ActualTagsHash:   got[:],
+				},
+			}, true
+		}
+		return nil, false
 	}
-	return &es.TagsHashVerifyReport{OK: true, RowsChecked: checked}, nil
-}
 
-// readTagEntries pages one batch's events and expands their tags into the
-// (position, key, value) entries TagsHash attests. The query is scoped by
-// workspace and stream, so concurrently interleaved positions from other
-// streams cannot leak into the batch.
-func readTagEntries(ctx context.Context, tx pgx.Tx, workspace, stream string, from, to uint64) ([]es.TagEntry, error) {
-	rows, err := tx.Query(ctx, `
-		SELECT global_position, tags FROM events
-		WHERE workspace_id = $1 AND stream_id = $2
-		  AND global_position BETWEEN $3 AND $4
-		  AND tags IS NOT NULL
-		ORDER BY global_position`,
-		workspace, stream, int64(from), int64(to))
-	if err != nil {
-		return nil, fmt.Errorf("postgres: verify tag hashes: read events: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []es.TagEntry
 	for rows.Next() {
 		var (
-			pos uint64
-			raw []byte
+			from, to          uint64
+			workspace, stream string
+			stored            []byte
+			pos               pgtype.Int8
+			raw               []byte
 		)
-		if err := rows.Scan(&pos, &raw); err != nil {
-			return nil, fmt.Errorf("postgres: verify tag hashes: scan event: %w", err)
+		if err := rows.Scan(&from, &to, &workspace, &stream, &stored, &pos, &raw); err != nil {
+			return nil, fmt.Errorf("postgres: verify tag hashes: scan batch: %w", err)
 		}
-		tags, err := es.DecodeTags(raw)
+		if cur == nil || cur.from != from {
+			if cur != nil {
+				if rep, mismatch := finish(cur); mismatch {
+					return rep, nil
+				}
+			}
+			cur = &tagBatch{
+				from: from, to: to, workspace: workspace, stream: stream,
+				stored: append([]byte(nil), stored...),
+			}
+		}
+		if !pos.Valid {
+			continue
+		}
+		tags, err := es.DecodeStoredTags(raw)
 		if err != nil {
-			return nil, fmt.Errorf("postgres: verify tag hashes: workspace %s stream %s position %d: %w",
-				workspace, stream, pos, err)
+			return nil, fmt.Errorf(
+				"postgres: verify tag hashes: workspace %s stream %s position %d: %w",
+				workspace, stream, pos.Int64, err)
 		}
 		for k, v := range tags {
-			entries = append(entries, es.TagEntry{Position: pos, Key: k, Value: v})
+			cur.entries = append(cur.entries, es.TagEntry{
+				Position: uint64(pos.Int64), Key: k, Value: v,
+			})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres: verify tag hashes: rows: %w", err)
 	}
-	return entries, nil
+	if cur != nil {
+		if rep, mismatch := finish(cur); mismatch {
+			return rep, nil
+		}
+	}
+	return &es.TagsHashVerifyReport{OK: true, RowsChecked: checked}, nil
 }

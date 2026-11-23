@@ -1,6 +1,7 @@
 package es
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -101,8 +102,7 @@ func ValidateTag(key, value string) error {
 // one merged set per event, in input order. A nil entry means the event has
 // no tags. A key present in both sets with different values is
 // ErrConflictingTag; the same value simply dedupes. The merged set is capped
-// at MaxTagsPerEvent. It does not depend on EventData, so the core tag
-// vocabulary compiles before the append fields land.
+// at MaxTagsPerEvent.
 func MergedTags(batch map[string]string, perEvent []map[string]string) ([]map[string]string, error) {
 	if len(batch) > MaxTagsPerEvent {
 		return nil, fmt.Errorf("%w: %d batch tags, max %d",
@@ -190,6 +190,21 @@ func DecodeTags(raw []byte) (map[string]string, error) {
 		}
 	}
 	return tags, nil
+}
+
+// DecodeStoredTags parses a non-NULL tags column strictly. Unlike DecodeTags,
+// which treats zero bytes and "null" as no tags for a NULL column, this
+// requires the stored value itself to be a JSON object: a non-NULL empty
+// string, "null", an array or a scalar is corruption, not an empty tag set.
+// Stores call it only when the column is non-NULL, so a NULL row stays the
+// one representation of "no tags". It validates the object's keys, values and
+// count through DecodeTags.
+func DecodeStoredTags(raw []byte) (map[string]string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("%w: stored tags is not a JSON object", ErrInvalidTag)
+	}
+	return DecodeTags(raw)
 }
 
 // TagReader is implemented by stores that can query events by tag. It is a

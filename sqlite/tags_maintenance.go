@@ -15,9 +15,60 @@ var (
 	_ es.TagAttester   = (*Store)(nil)
 )
 
+// storedTagsPage bounds the validation scan's working set. The rebuild and
+// verify already read every tagged event; this only keeps that pre-pass from
+// materializing the whole store at once.
+const storedTagsPage = 1000
+
+// validateStoredTags pages the tagged events and decodes each with the strict
+// stored-tag decoder: the value must be a JSON object whose keys and values
+// pass the append vocabulary and whose count is within the cap. SQLite's
+// json_each would happily expand a string array into key "0", "1"; the
+// decoder refuses it. It runs before RebuildTags deletes anything and before
+// VerifyTags builds its temp table.
+func validateStoredTags(ctx context.Context, tx *sql.Tx) error {
+	var after int64
+	for {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT global_position, stream_id, tags FROM events
+			WHERE tags IS NOT NULL AND global_position > ?
+			ORDER BY global_position
+			LIMIT ?`, after, storedTagsPage)
+		if err != nil {
+			return fmt.Errorf("read stored tags: %w", err)
+		}
+		n := 0
+		for rows.Next() {
+			var (
+				pos    int64
+				stream string
+				raw    string
+			)
+			if err := rows.Scan(&pos, &stream, &raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan stored tags: %w", err)
+			}
+			if _, err := es.DecodeStoredTags([]byte(raw)); err != nil {
+				rows.Close()
+				return fmt.Errorf("stream %s position %d: %w", stream, pos, err)
+			}
+			after = pos
+			n++
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return fmt.Errorf("stored tags rows: %w", err)
+		}
+		if n < storedTagsPage {
+			return nil
+		}
+	}
+}
+
 // RebuildTags replaces the live event_tags projection by re-projecting every
 // tagged event. It is the restore path for SQLite. One transaction: the
-// non-string guard, the delete, the insert and the final count see one
+// stored-tag guard, the delete, the insert and the final count see one
 // snapshot, so a failure rolls the whole rebuild back.
 func (s *Store) RebuildTags(ctx context.Context) (es.TagsRebuildReport, error) {
 	var zero es.TagsRebuildReport
@@ -27,14 +78,8 @@ func (s *Store) RebuildTags(ctx context.Context) (es.TagsRebuildReport, error) {
 	}
 	defer tx.Rollback()
 
-	bad, err := countRows(ctx, tx, `
-		SELECT count(*) FROM events e, json_each(e.tags) AS kv
-		WHERE e.tags IS NOT NULL AND kv.type <> 'text'`)
-	if err != nil {
-		return zero, fmt.Errorf("sqlite: rebuild tags: check values: %w", err)
-	}
-	if bad > 0 {
-		return zero, fmt.Errorf("sqlite: rebuild tags: %d stored tag values are not strings", bad)
+	if err := validateStoredTags(ctx, tx); err != nil {
+		return zero, fmt.Errorf("sqlite: rebuild tags: %w", err)
 	}
 
 	events, err := countRows(ctx, tx, `SELECT count(*) FROM events WHERE tags IS NOT NULL`)
@@ -74,14 +119,8 @@ func (s *Store) VerifyTags(ctx context.Context) (es.TagsVerifyReport, error) {
 	}
 	defer tx.Rollback()
 
-	bad, err := countRows(ctx, tx, `
-		SELECT count(*) FROM events e, json_each(e.tags) AS kv
-		WHERE e.tags IS NOT NULL AND kv.type <> 'text'`)
-	if err != nil {
-		return zero, fmt.Errorf("sqlite: verify tags: check values: %w", err)
-	}
-	if bad > 0 {
-		return zero, fmt.Errorf("sqlite: verify tags: %d stored tag values are not strings", bad)
+	if err := validateStoredTags(ctx, tx); err != nil {
+		return zero, fmt.Errorf("sqlite: verify tags: %w", err)
 	}
 
 	events, err := countRows(ctx, tx, `SELECT count(*) FROM events WHERE tags IS NOT NULL`)
@@ -155,87 +194,113 @@ func (s *Store) VerifyTags(ctx context.Context) (es.TagsVerifyReport, error) {
 // event_tags, so a changed tag cannot be laundered through the index.
 // RowsChecked counts tagged batches; an untagged batch is checked for "no
 // entries" but is not counted.
+//
+// One LEFT JOIN returns every covered batch and its tagged events, ordered by
+// from_position, so the audit is one round trip rather than one query per
+// batch. An untagged batch still yields one row with NULL event columns —
+// exactly the "expected no entries" case a NULL tags_hash asserts.
 func (s *Store) VerifyTagHashes(ctx context.Context, upto uint64) (*es.TagsHashVerifyReport, error) {
-	rows, err := s.readLogOrderRows(ctx, upto)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT lo.from_position, lo.to_position, lo.stream_id, lo.tags_hash,
+		       e.global_position, e.tags
+		FROM log_order lo
+		LEFT JOIN events e
+		  ON e.stream_id = lo.stream_id
+		 AND e.global_position BETWEEN lo.from_position AND lo.to_position
+		 AND e.tags IS NOT NULL
+		WHERE (? = 0 OR lo.to_position <= ?)
+		ORDER BY lo.from_position, e.global_position`, int64(upto), int64(upto))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sqlite: verify tag hashes: read batches: %w", err)
+	}
+	defer rows.Close()
+
+	type tagBatch struct {
+		from, to uint64
+		stream   string
+		stored   []byte
+		entries  []es.TagEntry
 	}
 
-	var checked uint64
-	for i := range rows {
-		r := &rows[i]
-		entries, err := readSQLiteTagEntries(ctx, s.db, r.Stream, r.From, r.To)
-		if err != nil {
-			return nil, err
-		}
-		got := es.TagsHash(entries)
-
-		if r.TagsHash == nil {
-			if len(entries) == 0 {
-				continue
+	var (
+		checked uint64
+		cur     *tagBatch
+	)
+	finish := func(b *tagBatch) (*es.TagsHashVerifyReport, bool) {
+		got := es.TagsHash(b.entries)
+		if b.stored == nil {
+			if len(b.entries) == 0 {
+				return nil, false
 			}
-			return &es.TagsHashVerifyReport{
-				OK:          false,
-				RowsChecked: checked + 1,
-				Mismatch: &es.TagRowMismatch{
-					From:             r.From,
-					ExpectedTagsHash: nil,
-					ActualTagsHash:   got[:],
-				},
-			}, nil
-		}
-
-		checked++
-		if !bytes.Equal(got[:], r.TagsHash) {
 			return &es.TagsHashVerifyReport{
 				OK:          false,
 				RowsChecked: checked,
 				Mismatch: &es.TagRowMismatch{
-					From:             r.From,
-					ExpectedTagsHash: r.TagsHash,
+					From:             b.from,
+					ExpectedTagsHash: nil,
 					ActualTagsHash:   got[:],
 				},
-			}, nil
+			}, true
 		}
+		checked++
+		if !bytes.Equal(got[:], b.stored) {
+			return &es.TagsHashVerifyReport{
+				OK:          false,
+				RowsChecked: checked,
+				Mismatch: &es.TagRowMismatch{
+					From:             b.from,
+					ExpectedTagsHash: b.stored,
+					ActualTagsHash:   got[:],
+				},
+			}, true
+		}
+		return nil, false
 	}
-	return &es.TagsHashVerifyReport{OK: true, RowsChecked: checked}, nil
-}
 
-// readSQLiteTagEntries expands one batch's events into the (position, key,
-// value) entries TagsHash attests. The query is scoped by stream, so
-// interleaved positions from other streams cannot leak into the batch.
-func readSQLiteTagEntries(ctx context.Context, db *sql.DB, stream string, from, to uint64) ([]es.TagEntry, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT global_position, tags FROM events
-		WHERE stream_id = ?
-		  AND global_position BETWEEN ? AND ?
-		  AND tags IS NOT NULL
-		ORDER BY global_position`,
-		stream, int64(from), int64(to))
-	if err != nil {
-		return nil, fmt.Errorf("sqlite: verify tag hashes: read events: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []es.TagEntry
 	for rows.Next() {
 		var (
-			pos uint64
-			raw string
+			from, to uint64
+			stream   string
+			stored   []byte
+			pos      sql.NullInt64
+			raw      sql.NullString
 		)
-		if err := rows.Scan(&pos, &raw); err != nil {
-			return nil, fmt.Errorf("sqlite: verify tag hashes: scan event: %w", err)
+		if err := rows.Scan(&from, &to, &stream, &stored, &pos, &raw); err != nil {
+			return nil, fmt.Errorf("sqlite: verify tag hashes: scan batch: %w", err)
 		}
-		tags, err := es.DecodeTags([]byte(raw))
+		if cur == nil || cur.from != from {
+			if cur != nil {
+				if rep, mismatch := finish(cur); mismatch {
+					return rep, nil
+				}
+			}
+			cur = &tagBatch{
+				from: from, to: to, stream: stream,
+				stored: append([]byte(nil), stored...),
+			}
+		}
+		if !pos.Valid {
+			continue
+		}
+		tags, err := es.DecodeStoredTags([]byte(raw.String))
 		if err != nil {
-			return nil, fmt.Errorf("sqlite: verify tag hashes: stream %s position %d: %w", stream, pos, err)
+			return nil, fmt.Errorf(
+				"sqlite: verify tag hashes: stream %s position %d: %w",
+				stream, pos.Int64, err)
 		}
 		for k, v := range tags {
-			entries = append(entries, es.TagEntry{Position: pos, Key: k, Value: v})
+			cur.entries = append(cur.entries, es.TagEntry{
+				Position: uint64(pos.Int64), Key: k, Value: v,
+			})
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("sqlite: verify tag hashes: rows: %w", err)
 	}
-	return entries, nil
+	if cur != nil {
+		if rep, mismatch := finish(cur); mismatch {
+			return rep, nil
+		}
+	}
+	return &es.TagsHashVerifyReport{OK: true, RowsChecked: checked}, nil
 }

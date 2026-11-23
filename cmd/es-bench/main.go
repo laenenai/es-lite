@@ -70,14 +70,16 @@ then RebuildClaims and VerifyClaims, and prints the footprint.`)
 // tagFlags is the opt-in tag scenario shared by seed and measure. The default
 // is the untagged baseline, so existing measurements stay comparable.
 type tagFlags struct {
-	enabled bool
-	space   string
+	enabled     bool
+	space       string
+	blockPrefix string
 }
 
 func addTagFlags(fs *flag.FlagSet) *tagFlags {
 	t := &tagFlags{}
 	fs.BoolVar(&t.enabled, "tags", false, "write flowdoc.space/flowdoc.block tags (default: untagged baseline)")
 	fs.StringVar(&t.space, "tag-space", "bench-space", "flowdoc.space value when -tags is set")
+	fs.StringVar(&t.blockPrefix, "tag-block-prefix", "b", "flowdoc.block prefix when -tags is set")
 	return t
 }
 
@@ -102,7 +104,7 @@ SELECT
        THEN overlay($7::bytea PLACING decode(md5(g::text) || md5((g + 1)::text), 'hex') FROM $8::int FOR 32)
        ELSE NULL END,
   CASE WHEN $12::boolean
-       THEN jsonb_build_object('flowdoc.space', $13::text, 'flowdoc.block', 'b' || (g % 1000)::text)
+       THEN jsonb_build_object('flowdoc.space', $13::text, 'flowdoc.block', $14::text || (g % 1000)::text)
        ELSE NULL END
 FROM generate_series($9::bigint, $10::bigint) AS g`
 
@@ -168,7 +170,7 @@ func runSeed(ctx context.Context, args []string) error {
 			chunkStart := time.Now()
 			if _, err := pool.Exec(ctx, seedSQL,
 				ws, *eventsPerStream, now, nilID, payload, *opEvery,
-				base, valueStart, lo, hi, first, tags.enabled, tags.space,
+				base, valueStart, lo, hi, first, tags.enabled, tags.space, tags.blockPrefix,
 			); err != nil {
 				return fmt.Errorf("seed %s %d-%d: %w", ws, lo, hi, err)
 			}
@@ -261,7 +263,7 @@ func runMeasure(ctx context.Context, args []string) error {
 					Payload:       payload,
 				}
 				if tags.enabled {
-					events[j].Tags = map[string]string{"flowdoc.block": fmt.Sprintf("b%d", j)}
+					events[j].Tags = map[string]string{"flowdoc.block": fmt.Sprintf("%s%d", tags.blockPrefix, j)}
 				}
 			}
 			p := es.AppendParams{

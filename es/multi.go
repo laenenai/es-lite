@@ -41,6 +41,7 @@ func ValidateMultiAppend(m MultiAppend) error {
 	}
 
 	first := m.Appends[0]
+	var occurredAt time.Time
 	seen := make(map[string]struct{}, len(m.Appends))
 	for i, p := range m.Appends {
 		if len(p.Events) == 0 {
@@ -51,6 +52,20 @@ func ValidateMultiAppend(m MultiAppend) error {
 			return fmt.Errorf("%w: stream %s", ErrDuplicateMultiStream, canonical)
 		}
 		seen[canonical] = struct{}{}
+
+		// OccurredAt is compared across every non-zero append, not only
+		// against the first: a zero first append must not hide two later
+		// appends disagreeing with each other. MultiOccurredAt then has
+		// exactly one non-zero value to choose.
+		if !p.OccurredAt.IsZero() {
+			t := TruncateMicros(p.OccurredAt)
+			switch {
+			case occurredAt.IsZero():
+				occurredAt = t
+			case !t.Equal(occurredAt):
+				return fmt.Errorf("%w: append %d occurred_at differs", ErrConflictingMultiAppend, i)
+			}
+		}
 
 		if i == 0 {
 			continue
@@ -66,9 +81,6 @@ func ValidateMultiAppend(m MultiAppend) error {
 			return fmt.Errorf("%w: append %d actor differs", ErrConflictingMultiAppend, i)
 		case p.SpanContext != first.SpanContext:
 			return fmt.Errorf("%w: append %d span context differs", ErrConflictingMultiAppend, i)
-		case !p.OccurredAt.IsZero() && !first.OccurredAt.IsZero() &&
-			!TruncateMicros(p.OccurredAt).Equal(TruncateMicros(first.OccurredAt)):
-			return fmt.Errorf("%w: append %d occurred_at differs", ErrConflictingMultiAppend, i)
 		}
 	}
 	return nil

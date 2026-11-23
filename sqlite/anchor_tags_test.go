@@ -118,3 +118,32 @@ func TestSQLiteLegacyAnchorWithoutTagsRoot(t *testing.T) {
 		t.Fatalf("CheckAnchor on a fully legacy anchor: %v", err)
 	}
 }
+
+// TestSQLiteAnchorOverZeroTaggedRows pins the empty-set contract: a new anchor
+// over an untagged log still records a real tags root, not the nil legacy
+// marker, with zero covered batches.
+func TestSQLiteAnchorOverZeroTaggedRows(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "anchor-untagged")
+
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID: sid,
+		Events:   []es.EventData{{TypeURL: "thing.v1.Happened", Payload: []byte("1")}},
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("Anchor: %v", err)
+	}
+	if len(a.TagsRootHash) != es.HashSize {
+		t.Fatalf("TagsRootHash length = %d, want a real %d-byte root", len(a.TagsRootHash), es.HashSize)
+	}
+	if a.TagsCount != 0 || a.TagsFromPosition != 0 {
+		t.Fatalf("tags coverage = (%d, %d), want (0, 0)", a.TagsCount, a.TagsFromPosition)
+	}
+	if err := s.CheckAnchor(ctx, a); err != nil {
+		t.Fatalf("CheckAnchor: %v", err)
+	}
+}

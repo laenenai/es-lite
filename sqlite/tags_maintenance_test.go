@@ -2,6 +2,8 @@ package sqlite_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -275,5 +277,143 @@ func TestSQLiteVerifyTagHashesDetectsTamperedHash(t *testing.T) {
 	}
 	if rep.OK || rep.Mismatch == nil {
 		t.Fatalf("VerifyTagHashes = %+v, want a mismatch", rep)
+	}
+}
+
+// TestSQLiteTagMaintenanceRefusesInvalidVocabulary pins the strict stored-tag
+// guard on SQLite: a JSON string array (which json_each would expand into
+// synthetic keys), a bad key, an over-cap object, an empty string and the
+// literal "null" are all corruption. Rebuild and verify refuse before
+// touching the live index.
+func TestSQLiteTagMaintenanceRefusesInvalidVocabulary(t *testing.T) {
+	tooMany := make(map[string]string, es.MaxTagsPerEvent+1)
+	for i := 0; i <= es.MaxTagsPerEvent; i++ {
+		tooMany[fmt.Sprintf("k%d", i)] = "v"
+	}
+	tooManyJSON, err := json.Marshal(tooMany)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		tags string
+	}{
+		{"string array", `["a","b"]`},
+		{"uppercase key", `{"Bad":"v"}`},
+		{"over cap", string(tooManyJSON)},
+		{"empty string", ``},
+		{"literal null", `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := openStore(t)
+			sid, _ := es.NewStreamID("counter", "invalid-vocab-"+strings.ReplaceAll(tc.name, " ", "-"))
+
+			if _, err := s.Append(ctx, es.AppendParams{
+				StreamID: sid,
+				Events: []es.EventData{{
+					TypeURL: "thing.v1.Happened",
+					Payload: []byte("1"),
+					Tags:    map[string]string{"flowdoc.block": "b1"},
+				}},
+				Tags: map[string]string{"flowdoc.space": "s1"},
+			}); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+			before := len(sqliteLiveTagRows(t, ctx, s))
+			if _, err := s.DB().ExecContext(ctx, `UPDATE events SET tags = ?`, tc.tags); err != nil {
+				t.Fatalf("corrupt tags: %v", err)
+			}
+
+			if _, err := s.RebuildTags(ctx); err == nil {
+				t.Fatal("RebuildTags accepted a stored tag that violates the vocabulary")
+			}
+			if _, err := s.VerifyTags(ctx); err == nil {
+				t.Fatal("VerifyTags accepted a stored tag that violates the vocabulary")
+			}
+			if after := len(sqliteLiveTagRows(t, ctx, s)); after != before {
+				t.Fatalf("live tag rows changed from %d to %d after refused maintenance", before, after)
+			}
+		})
+	}
+}
+
+// TestSQLiteVerifyTagHashesMultipleBatches pins the single-pass join's
+// grouping across tagged and untagged batches.
+func TestSQLiteVerifyTagHashesMultipleBatches(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	sid, _ := es.NewStreamID("counter", "verify-tag-hashes-multi")
+
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID: sid,
+		Events: []es.EventData{
+			{TypeURL: "thing.v1.Happened", Payload: []byte("1"), Tags: map[string]string{"flowdoc.block": "b1"}},
+			{TypeURL: "thing.v1.Happened", Payload: []byte("2"), Tags: map[string]string{"flowdoc.block": "b2"}},
+		},
+		Tags: map[string]string{"flowdoc.space": "s1"},
+	}); err != nil {
+		t.Fatalf("append tagged 1: %v", err)
+	}
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 2,
+		Events:          []es.EventData{{TypeURL: "thing.v1.Happened", Payload: []byte("3")}},
+	}); err != nil {
+		t.Fatalf("append untagged: %v", err)
+	}
+	if _, err := s.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 3,
+		Events: []es.EventData{{
+			TypeURL: "thing.v1.Happened", Payload: []byte("4"),
+			Tags: map[string]string{"flowdoc.block": "b3"},
+		}},
+		Tags: map[string]string{"flowdoc.space": "s1"},
+	}); err != nil {
+		t.Fatalf("append tagged 2: %v", err)
+	}
+
+	rows, err := s.DB().QueryContext(ctx,
+		`SELECT from_position FROM log_order WHERE tags_hash IS NOT NULL ORDER BY from_position`)
+	if err != nil {
+		t.Fatalf("read tagged batches: %v", err)
+	}
+	defer rows.Close()
+	var froms []uint64
+	for rows.Next() {
+		var from uint64
+		if err := rows.Scan(&from); err != nil {
+			t.Fatalf("scan batch: %v", err)
+		}
+		froms = append(froms, from)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("batch rows: %v", err)
+	}
+	if len(froms) != 2 {
+		t.Fatalf("tagged batches = %v, want 2", froms)
+	}
+
+	rep, err := s.VerifyTagHashes(ctx, 0)
+	if err != nil {
+		t.Fatalf("VerifyTagHashes: %v", err)
+	}
+	if !rep.OK || rep.RowsChecked != 2 {
+		t.Fatalf("VerifyTagHashes = %+v, want OK with 2 tagged batches", rep)
+	}
+
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE events SET tags = NULL WHERE global_position >= ? AND tags IS NOT NULL`,
+		int64(froms[1])); err != nil {
+		t.Fatalf("remove tags: %v", err)
+	}
+	rep, err = s.VerifyTagHashes(ctx, 0)
+	if err != nil {
+		t.Fatalf("VerifyTagHashes after removal: %v", err)
+	}
+	if rep.OK || rep.Mismatch == nil || rep.Mismatch.From != froms[1] {
+		t.Fatalf("VerifyTagHashes after removal = %+v, want mismatch at %d", rep, froms[1])
 	}
 }

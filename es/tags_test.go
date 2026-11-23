@@ -144,6 +144,26 @@ func TestTagsJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecodeStoredTags(t *testing.T) {
+	got, err := es.DecodeStoredTags([]byte(`{"a":"1"}`))
+	if err != nil || !reflect.DeepEqual(got, map[string]string{"a": "1"}) {
+		t.Fatalf("DecodeStoredTags = (%#v, %v), want the object", got, err)
+	}
+	if got, err := es.DecodeStoredTags([]byte(` {} `)); err != nil || got != nil {
+		t.Fatalf("DecodeStoredTags(empty object) = (%#v, %v), want (nil, nil)", got, err)
+	}
+
+	// A non-NULL tags column must be a JSON object. NULL itself is handled
+	// by the caller and never reaches this function.
+	for _, raw := range []string{
+		``, `null`, `[]`, `["a","b"]`, `"a"`, `1`, `true`, `{"Bad":"v"}`, `{"k":1}`,
+	} {
+		if _, err := es.DecodeStoredTags([]byte(raw)); !errors.Is(err, es.ErrInvalidTag) {
+			t.Errorf("DecodeStoredTags(%q) error = %v, want ErrInvalidTag", raw, err)
+		}
+	}
+}
+
 func TestTagQueryValidate(t *testing.T) {
 	valid := es.TagQuery{Tags: map[string]string{"k": "v"}}
 	if err := valid.Validate(); err != nil {

@@ -604,4 +604,7 @@ func TestTagsCommandUsage(t *testing.T) {
 	if code := run([]string{"tags", "--nope"}); code != exitUsage {
 		t.Errorf("tags with an unknown flag: exit %d, want %d", code, exitUsage)
 	}
+	if code := run([]string{"tags", "--upto", "5", "default"}); code != exitUsage {
+		t.Errorf("tags with --upto and a workspace: exit %d, want %d", code, exitUsage)
+	}
 }

@@ -784,9 +784,13 @@ func scanEnvelope(row pgx.Row) (es.Envelope, error) {
 	// Tags are indexed metadata, not chain-attested: a stored value that is
 	// not the flat string map the append wrote is corruption and fails the
 	// read loudly — naming the stream and version, never the bytes — rather
-	// than silently dropping the tags a change feed depends on.
-	if e.Tags, err = es.DecodeTags(tagsRaw); err != nil {
-		return es.Envelope{}, fmt.Errorf("tags for stream %s v%d: %w", sid, e.Version, err)
+	// than silently dropping the tags a change feed depends on. A NULL
+	// column is the one representation of "no tags"; any non-NULL value must
+	// be an object (a literal "null" or empty string is corruption too).
+	if tagsRaw != nil {
+		if e.Tags, err = es.DecodeStoredTags(tagsRaw); err != nil {
+			return es.Envelope{}, fmt.Errorf("tags for stream %s v%d: %w", sid, e.Version, err)
+		}
 	}
 	// The audit UUIDs are load-bearing (F34): a value that does not parse
 	// fails the read rather than being silently zeroed into a forged

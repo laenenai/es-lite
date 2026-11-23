@@ -199,13 +199,18 @@ the append pays two rows per FlowDoc event plus one statement.
 
 `RebuildTags` deletes the workspace's rows and re-projects `events.tags` in one
 Repeatable Read transaction (Postgres; SQLite gets the same from its single
-connection), so a failure leaves the live index unchanged. It pre-checks for
-non-string values because `jsonb_each_text` would stringify them. `VerifyTags`
-rebuilds into a temporary table and diffs both directions without touching the
-live index; it applies the same guard. **Both require quiescence**: a rebuild
-is a restore operation, and an append committed after its snapshot cannot be
-replayed. A racing writer surfaces as a serialization error, loud and
-retryable, never a silent divergence.
+connection), so a failure leaves the live index unchanged. It pre-checks every
+stored tag with the strict decoder — a non-object, an invalid key or value, or
+an over-cap set is refused, because `jsonb_each_text` would stringify a
+non-string member and `json_each` would expand a string array into synthetic
+keys. `VerifyTags` rebuilds into a temporary table and diffs both directions
+without touching the live index; it applies the same guard. **Both require
+quiescence**: a rebuild is a restore operation, and its report is
+snapshot-bound. An append committed during the rebuild keeps its own tag rows
+(the delete and re-insert see only the snapshot), so the projection is not
+lost; a racing *rebuild* may surface as a serialization error, loud and
+retryable. Stop writers for a predictable report and to keep rebuilds from
+overlapping.
 
 ### 2.6 Attestation: a per-batch hash and a sibling anchor root
 
@@ -321,8 +326,10 @@ change after the fact; `es-verify tags` recomputes from the event rows.
 `RebuildTags` is linear in tag rows: a full events scan plus one insert per
 tag row, in one transaction. On a large store, budget it as a quiesced restore
 step, not an online job. `VerifyTags` doubles the scan (live vs temporary) but
-never mutates the live index. `VerifyTagHashes` pages `log_order` and reads the
-covered events per batch; its cost tracks tagged batches, not the whole log.
+never mutates the live index. `VerifyTagHashes` streams each covered batch and
+its tagged events through one join, ordered by `from_position`: the audit is one
+round trip, not one query per batch, and the database's work is proportional to
+the covered rows and the tagged events it finds.
 
 `es-verify all` gained a tag-attestation stage. It treats **zero tagged
 batches as intact**, because an untagged log is valid; the explicit

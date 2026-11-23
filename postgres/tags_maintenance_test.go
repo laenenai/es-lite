@@ -2,6 +2,8 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -274,5 +276,124 @@ func TestVerifyTagsRefusesNonStringValue(t *testing.T) {
 	}
 	if _, err := ws.VerifyTags(ctx); err == nil {
 		t.Fatal("VerifyTags with a non-string tag value returned nil, want an error")
+	}
+}
+
+// TestTagMaintenanceRefusesInvalidVocabulary pins the full stored-tag guard:
+// an object with a bad key or too many members is corruption, not a
+// projection. Rebuild and verify both refuse before touching the live index.
+func TestTagMaintenanceRefusesInvalidVocabulary(t *testing.T) {
+	tooMany := make(map[string]string, es.MaxTagsPerEvent+1)
+	for i := 0; i <= es.MaxTagsPerEvent; i++ {
+		tooMany[fmt.Sprintf("k%d", i)] = "v"
+	}
+	tooManyJSON, err := json.Marshal(tooMany)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		tags string
+	}{
+		{"uppercase key", `{"Bad":"v"}`},
+		{"over cap", string(tooManyJSON)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := openStore(t)
+			ws := s.WorkspaceStore("ws_a")
+			sid, _ := es.NewStreamID("counter", "invalid-vocab-"+strings.ReplaceAll(tc.name, " ", "-"))
+
+			appendTagged(t, ctx, ws, sid, 0,
+				map[string]string{"flowdoc.space": "s1"},
+				map[string]string{"flowdoc.block": "b1"},
+			)
+			before := len(readLiveTagRows(t, ctx, s))
+			if _, err := s.Pool().Exec(ctx, `
+				UPDATE events SET tags = $1
+				WHERE workspace_id = 'ws_a' AND stream_id = $2`,
+				tc.tags, sid.Canonical()); err != nil {
+				t.Fatalf("corrupt tags: %v", err)
+			}
+
+			if _, err := ws.RebuildTags(ctx); err == nil {
+				t.Fatal("RebuildTags accepted a stored tag that violates the vocabulary")
+			}
+			if _, err := ws.VerifyTags(ctx); err == nil {
+				t.Fatal("VerifyTags accepted a stored tag that violates the vocabulary")
+			}
+			if after := len(readLiveTagRows(t, ctx, s)); after != before {
+				t.Fatalf("live tag rows changed from %d to %d after refused maintenance", before, after)
+			}
+		})
+	}
+}
+
+// TestVerifyTagHashesMultipleBatches pins the single-pass join's grouping:
+// two tagged batches separated by an untagged one, on one stream, are each
+// checked and only the tagged ones are counted.
+func TestVerifyTagHashesMultipleBatches(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_a")
+	sid, _ := es.NewStreamID("counter", "verify-tag-hashes-multi")
+
+	appendTagged(t, ctx, ws, sid, 0,
+		map[string]string{"flowdoc.space": "s1"},
+		map[string]string{"flowdoc.block": "b1"},
+		map[string]string{"flowdoc.block": "b2"},
+	)
+	appendTagged(t, ctx, ws, sid, 2, nil, nil)
+	appendTagged(t, ctx, ws, sid, 3,
+		map[string]string{"flowdoc.space": "s1"},
+		map[string]string{"flowdoc.block": "b3"},
+	)
+
+	rows, err := s.Pool().Query(ctx, `
+		SELECT from_position FROM log_order
+		WHERE workspace_id = 'ws_a' AND tags_hash IS NOT NULL
+		ORDER BY from_position`)
+	if err != nil {
+		t.Fatalf("read tagged batches: %v", err)
+	}
+	defer rows.Close()
+	var froms []uint64
+	for rows.Next() {
+		var from uint64
+		if err := rows.Scan(&from); err != nil {
+			t.Fatalf("scan batch: %v", err)
+		}
+		froms = append(froms, from)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("batch rows: %v", err)
+	}
+	if len(froms) != 2 {
+		t.Fatalf("tagged batches = %v, want 2", froms)
+	}
+
+	rep, err := s.VerifyTagHashes(ctx, 0)
+	if err != nil {
+		t.Fatalf("VerifyTagHashes: %v", err)
+	}
+	if !rep.OK || rep.RowsChecked != 2 {
+		t.Fatalf("VerifyTagHashes = %+v, want OK with 2 tagged batches", rep)
+	}
+
+	// Remove every tag from the second tagged batch. Its stored hash stays
+	// non-NULL, so the empty recomputation must disagree.
+	if _, err := s.Pool().Exec(ctx, `
+		UPDATE events SET tags = NULL
+		WHERE workspace_id = 'ws_a' AND global_position >= $1 AND tags IS NOT NULL`,
+		int64(froms[1])); err != nil {
+		t.Fatalf("remove tags: %v", err)
+	}
+	rep, err = s.VerifyTagHashes(ctx, 0)
+	if err != nil {
+		t.Fatalf("VerifyTagHashes after removal: %v", err)
+	}
+	if rep.OK || rep.Mismatch == nil || rep.Mismatch.From != froms[1] {
+		t.Fatalf("VerifyTagHashes after removal = %+v, want mismatch at %d", rep, froms[1])
 	}
 }

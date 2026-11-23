@@ -108,3 +108,28 @@ func TestLegacyAnchorWithoutTagsRootVerifies(t *testing.T) {
 		t.Fatalf("CheckAnchor on a fully legacy anchor: %v", err)
 	}
 }
+
+// TestAnchorOverZeroTaggedRows pins the empty-set contract: a new anchor over
+// an untagged log still records a real tags root (not nil, which is reserved
+// for legacy anchors), with zero covered batches.
+func TestAnchorOverZeroTaggedRows(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_a")
+	sid, _ := es.NewStreamID("counter", "anchor-untagged")
+
+	appendTagged(t, ctx, ws, sid, 0, nil, nil)
+	a, err := s.Anchor(ctx, 0)
+	if err != nil {
+		t.Fatalf("Anchor: %v", err)
+	}
+	if len(a.TagsRootHash) != es.HashSize {
+		t.Fatalf("TagsRootHash length = %d, want a real %d-byte root", len(a.TagsRootHash), es.HashSize)
+	}
+	if a.TagsCount != 0 || a.TagsFromPosition != 0 {
+		t.Fatalf("tags coverage = (%d, %d), want (0, 0)", a.TagsCount, a.TagsFromPosition)
+	}
+	if err := s.CheckAnchor(ctx, a); err != nil {
+		t.Fatalf("CheckAnchor: %v", err)
+	}
+}

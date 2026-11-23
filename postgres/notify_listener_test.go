@@ -57,7 +57,7 @@ func openNotifyStore(t *testing.T, channel string) *Store {
 	// sequentially, so a truncate is safe; this is the same isolation
 	// the external suite's openStoreWithOptions applies.
 	if _, err := s.Pool().Exec(context.Background(),
-		`TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
+		`TRUNCATE events, event_tags, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	return s

@@ -180,10 +180,14 @@ func (w *Workspace) AppendMultiTx(ctx context.Context, db DBTX, m es.MultiAppend
 	if err := es.ValidateMultiAppend(m); err != nil {
 		return nil, err
 	}
-	// Validate every append before the first statement, so an invalid tag or
-	// stream id on the last stream cannot leave the earlier ones written.
+	// Validate every append before the first statement, so an invalid tag,
+	// stream id or oversized payload on the last stream cannot leave the
+	// earlier ones written.
 	for i := range m.Appends {
 		if err := validateAppend(m.Appends[i]); err != nil {
+			return nil, err
+		}
+		if err := w.checkPayload(m.Appends[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -208,6 +212,21 @@ func (w *Workspace) AppendMultiTx(ctx context.Context, db DBTX, m es.MultiAppend
 		return nil, err
 	}
 	return out, nil
+}
+
+// checkPayload enforces the store's payload cap on every event in the batch
+// before any statement runs. AppendMultiTx calls it in its pre-pass so a
+// later append's oversized payload cannot leave the earlier appends written in
+// the caller's transaction.
+func (w *Workspace) checkPayload(p es.AppendParams) error {
+	for i, ev := range p.Events {
+		if w.store.maxPayloadBytes > 0 && len(ev.Payload) > w.store.maxPayloadBytes {
+			version := p.ExpectedVersion + uint64(i) + 1
+			return fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
+				es.ErrPayloadTooLarge, p.StreamID, version, ev.TypeURL, len(ev.Payload), w.store.maxPayloadBytes)
+		}
+	}
+	return nil
 }
 
 // mergedTags returns one merged, validated tag set per event: the append's
@@ -313,12 +332,8 @@ func (w *Workspace) appendInternal(ctx context.Context, db DBTX, p es.AppendPara
 	// reaches the log. A single oversized event otherwise wedges every
 	// feed subscription consuming its type. The error carries stream,
 	// version, type URL and size only — never the payload bytes.
-	for i, ev := range p.Events {
-		if w.store.maxPayloadBytes > 0 && len(ev.Payload) > w.store.maxPayloadBytes {
-			version := p.ExpectedVersion + uint64(i) + 1
-			return zero, fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
-				es.ErrPayloadTooLarge, p.StreamID, version, ev.TypeURL, len(ev.Payload), w.store.maxPayloadBytes)
-		}
+	if err := w.checkPayload(p); err != nil {
+		return zero, err
 	}
 
 	// P1 (spec §5.1.3): assign this transaction's xid before any position

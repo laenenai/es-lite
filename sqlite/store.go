@@ -537,9 +537,6 @@ func (s *Store) AppendMulti(ctx context.Context, m es.MultiAppend) ([]es.AppendR
 	return out, nil
 }
 
-// validateAppend applies the append-time invariants shared by every append
-// path before any statement runs. The error names the stream where the rule is
-// stream-scoped.
 // mergedTags returns one merged, validated tag set per event: the append's
 // batch tags overlaid with each event's own. validateAppend calls it before
 // anything is written; Append calls it again to project event_tags and hash
@@ -552,6 +549,9 @@ func mergedTags(p es.AppendParams) ([]map[string]string, error) {
 	return es.MergedTags(p.Tags, per)
 }
 
+// validateAppend applies the append-time invariants shared by every append
+// path before any statement runs. The error names the stream where the rule is
+// stream-scoped.
 func validateAppend(p es.AppendParams) error {
 	if err := p.StreamID.Validate(); err != nil {
 		return err
@@ -902,8 +902,10 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	// Tags are indexed metadata, not chain-attested: a stored value that is
 	// not the flat string map the append wrote is corruption and fails the
 	// read loudly, rather than silently dropping the tags a feed depends on.
+	// A NULL column is the one representation of "no tags"; any non-NULL
+	// value must be an object (a literal "null" or empty string is corrupt).
 	if tagsRaw.Valid {
-		if e.Tags, err = es.DecodeTags([]byte(tagsRaw.V)); err != nil {
+		if e.Tags, err = es.DecodeStoredTags([]byte(tagsRaw.V)); err != nil {
 			return es.Envelope{}, fmt.Errorf("tags for stream %s v%d: %w", e.StreamID, e.Version, err)
 		}
 	}

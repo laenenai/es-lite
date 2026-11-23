@@ -67,17 +67,29 @@ func TestValidateMultiAppend(t *testing.T) {
 	}
 
 	at := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
-	first := a
-	first.OccurredAt = at
-	second := b
-	second.OccurredAt = at.Add(time.Second)
-	if err := es.ValidateMultiAppend(es.MultiAppend{Appends: []es.AppendParams{first, second}}); !errors.Is(err, es.ErrConflictingMultiAppend) {
+	c := validMultiAppend(t, "c", command)
+	atB := b
+	atB.OccurredAt = at
+	atC := c
+	atC.OccurredAt = at.Add(time.Second)
+	if err := es.ValidateMultiAppend(es.MultiAppend{Appends: []es.AppendParams{atB, atC}}); !errors.Is(err, es.ErrConflictingMultiAppend) {
 		t.Errorf("different occurred_at: err = %v, want ErrConflictingMultiAppend", err)
 	}
 
-	sameTime := b
-	sameTime.OccurredAt = at
-	if err := es.ValidateMultiAppend(es.MultiAppend{Appends: []es.AppendParams{first, sameTime}}); err != nil {
+	// A zero first append does not excuse later appends from agreeing with
+	// each other: two non-zero times after a zero one are still a conflict.
+	if err := es.ValidateMultiAppend(es.MultiAppend{Appends: []es.AppendParams{a, atB, atC}}); !errors.Is(err, es.ErrConflictingMultiAppend) {
+		t.Errorf("zero first, disagreeing occurred_at: err = %v, want ErrConflictingMultiAppend", err)
+	}
+	zeroC := c
+	zeroC.OccurredAt = time.Time{}
+	if err := es.ValidateMultiAppend(es.MultiAppend{Appends: []es.AppendParams{a, atB, zeroC}}); err != nil {
+		t.Errorf("zero first, one non-zero occurred_at: err = %v, want nil", err)
+	}
+
+	atC2 := c
+	atC2.OccurredAt = at
+	if err := es.ValidateMultiAppend(es.MultiAppend{Appends: []es.AppendParams{atB, atC2}}); err != nil {
 		t.Errorf("same occurred_at: err = %v, want nil", err)
 	}
 
