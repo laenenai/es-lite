@@ -61,7 +61,7 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// truncated here. snapshots joins the list (0013, ADR 0042): it is
 	// derived, droppable cache state — not the audit log — so each test
 	// starts from no cached snapshots instead of the previous test's rows.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, event_tags, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -399,10 +399,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 	if err := s.Pool().QueryRow(ctx, `SELECT COALESCE(MAX(version),0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("shared ledger: %v", err)
 	}
-	// Every embedded migration is applied on Open; 0014 (event constraint ops)
-	// and 0015 (the op-bearing partial index) made it fifteen.
-	if v != 15 {
-		t.Fatalf("applied version = %d, want 15", v)
+	// Every embedded migration is applied on Open; 0014 (event constraint ops),
+	// 0015 (the op-bearing partial index) and 0016 (event tags) made it sixteen.
+	if v != 16 {
+		t.Fatalf("applied version = %d, want 16", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.
