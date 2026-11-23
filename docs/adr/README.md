@@ -41,6 +41,7 @@ than editing history.
 | 0041 | [Delegated Actor (One Level)](./0041-delegated-actor.md) | Accepted (implemented) |
 | 0042 | [Snapshot Write Policy and In-Tree Snapshot Caches](./0042-snapshot-write-policy.md) | Accepted (implemented) |
 | 0043 | [Constraint Ops on the Event Log (Log-Only Restore)](./0043-constraint-ops-on-events.md) | Accepted (implemented) |
+| 0044 | [Event Tags and Multi-Stream Append](./0044-event-tags.md) | Accepted (implemented) |
 
 ADRs 0029–0033 are the es-lite side of the `contracts` integration, all
 implemented on this branch; the ordered implementation plan is in
