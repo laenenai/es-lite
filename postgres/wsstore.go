@@ -168,6 +168,48 @@ func (w *Workspace) AppendTx(ctx context.Context, db DBTX, p es.AppendParams) (e
 	return w.append(ctx, db, p)
 }
 
+// AppendMultiTx appends several streams inside the transaction db the caller
+// owns. It never commits or rolls back that transaction. The appends execute
+// in input order under one resolved OccurredAt; each checks its own
+// ExpectedVersion, and any failure leaves the whole set for the caller to
+// roll back. See es.MultiAppend for the identity and locking contract.
+func (w *Workspace) AppendMultiTx(ctx context.Context, db DBTX, m es.MultiAppend) ([]es.AppendResult, error) {
+	if err := requireTx(db, "AppendMultiTx"); err != nil {
+		return nil, err
+	}
+	if err := es.ValidateMultiAppend(m); err != nil {
+		return nil, err
+	}
+	// Validate every append before the first statement, so an invalid tag or
+	// stream id on the last stream cannot leave the earlier ones written.
+	for i := range m.Appends {
+		if err := validateAppend(m.Appends[i]); err != nil {
+			return nil, err
+		}
+	}
+	if err := setWorkspace(ctx, db, w.ws); err != nil {
+		return nil, fmt.Errorf("set workspace: %w", err)
+	}
+
+	occurred := es.MultiOccurredAt(m.Appends, time.Now())
+	out := make([]es.AppendResult, len(m.Appends))
+	for i := range m.Appends {
+		p := m.Appends[i]
+		p.OccurredAt = occurred
+		res, err := w.appendInternal(ctx, db, p, false)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = res
+	}
+	// One hint after the last append, so it is the transaction's last
+	// statement. All appends have at least one event (ValidateMultiAppend).
+	if err := w.notifyAppendOnce(ctx, db); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // mergedTags returns one merged, validated tag set per event: the append's
 // batch tags overlaid with each event's own. validateAppend calls it before
 // anything is written; append calls it again to project event_tags and hash
@@ -256,6 +298,13 @@ func viaArgs(ref es.ActorRef) (viaType, viaID, viaPrincipal *string) {
 // append is the shared append body. The caller has validated p, set the
 // workspace RLS context and owns the transaction boundary.
 func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.AppendResult, error) {
+	return w.appendInternal(ctx, db, p, true)
+}
+
+// appendInternal is append with the append hint optionally suppressed.
+// AppendMultiTx suppresses the per-append hint and emits one at the end of
+// the transaction, so ADR 0039's last-statement placement still holds.
+func (w *Workspace) appendInternal(ctx context.Context, db DBTX, p es.AppendParams, notify bool) (es.AppendResult, error) {
 	var zero es.AppendResult
 
 	// Payload cap (production review): reject the whole batch before any
@@ -518,9 +567,12 @@ func (w *Workspace) append(ctx context.Context, db DBTX, p es.AppendParams) (es.
 	// notifyAppend's first check is the option, so with WithAppendNotify
 	// unset — the default — this adds no statement and no lock to the
 	// append path; a notify error aborts the transaction rather than
-	// committing a broken hint.
-	if err := w.notifyAppend(ctx, db, p); err != nil {
-		return zero, err
+	// committing a broken hint. A multi-append suppresses it here and emits
+	// one hint after its last append.
+	if notify {
+		if err := w.notifyAppend(ctx, db, p); err != nil {
+			return zero, err
+		}
 	}
 
 	return es.AppendResult{
@@ -623,7 +675,16 @@ const maxNotifyWorkspaceBytes = 512
 // broken hint. The workspace ID is the payload and the payload is
 // nothing else; the channel is a capability and is never logged.
 func (w *Workspace) notifyAppend(ctx context.Context, db DBTX, p es.AppendParams) error {
-	if w.store.notifyChannel == "" || len(p.Events) == 0 {
+	if len(p.Events) == 0 {
+		return nil
+	}
+	return w.notifyAppendOnce(ctx, db)
+}
+
+// notifyAppendOnce emits the append hint without inspecting a batch, for the
+// multi-append path that emits one hint after its last append.
+func (w *Workspace) notifyAppendOnce(ctx context.Context, db DBTX) error {
+	if w.store.notifyChannel == "" {
 		return nil
 	}
 	if len(w.ws) > maxNotifyWorkspaceBytes {
