@@ -301,6 +301,11 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	recorded := es.TruncateMicros(time.Now())
 
 	canonical := p.StreamID.Canonical()
+	// Validate and merge the tag set once, before any insert.
+	merged, err := mergedTags(p)
+	if err != nil {
+		return zero, err
+	}
 	// The span context is a property of the append (the producing trace),
 	// not of an individual event, so one mapping covers the whole batch.
 	traceID, spanID, flags := spanContextArgs(p.SpanContext)
@@ -336,6 +341,7 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 			CommandID:     p.CommandID,
 			Actor:         p.Actor,
 			SpanContext:   p.SpanContext,
+			Tags:          merged[i],
 			Payload:       ev.Payload,
 			PrevHash:      append([]byte(nil), prev[:]...), // copy: prev is rewritten below
 		}
@@ -343,6 +349,14 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		if i == 0 && len(encodedOps) > 0 {
 			opsArg = encodedOps
 			env.ConstraintOps = append([]es.ConstraintOp(nil), p.Constraints...)
+		}
+		var tagsArg any
+		if len(merged[i]) > 0 {
+			raw, err := es.EncodeTags(merged[i])
+			if err != nil {
+				return zero, err
+			}
+			tagsArg = string(raw)
 		}
 		hash := es.EnvelopeHash(env)
 		env.Hash = hash[:]
@@ -356,15 +370,15 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 				actor_type, actor_id, actor_principal,
 				via_type, via_id, via_principal, payload,
 				prev_hash, hash,
-				trace_id, span_id, trace_flags, constraint_ops
-			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?,?)`,
+				trace_id, span_id, trace_flags, constraint_ops, tags
+			) VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?, ?,?,?,?,?)`,
 			eventID.String(), p.StreamID.Type, canonical, version,
 			ev.TypeURL, ev.SchemaVersion, formatTS(occurred), formatTS(recorded),
 			p.CorrelationID.String(), p.CausationID.String(), p.CommandID.String(),
 			p.Actor.Type, p.Actor.ID, p.Actor.Principal(),
 			viaType, viaID, viaPrincipal, ev.Payload,
 			env.PrevHash, env.Hash,
-			traceID, spanID, flags, opsArg,
+			traceID, spanID, flags, opsArg, tagsArg,
 		)
 		if err != nil {
 			if isConstraintViolation(err) {
@@ -396,6 +410,31 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		envs[i] = env
 	}
 
+	// Event-tag projection: one multi-row insert per append, in the same
+	// transaction, from the same merged sets the events wrote.
+	var tagPlaceholders []string
+	var tagArgs []any
+	var tagEntries []es.TagEntry
+	for i := range envs {
+		for k, v := range merged[i] {
+			tagPlaceholders = append(tagPlaceholders, "(?,?,?)")
+			tagArgs = append(tagArgs, k, v, int64(envs[i].GlobalPosition))
+			tagEntries = append(tagEntries, es.TagEntry{
+				Position: envs[i].GlobalPosition,
+				Key:      k,
+				Value:    v,
+			})
+		}
+	}
+	if len(tagPlaceholders) > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO event_tags (tag_key, tag_value, global_position) VALUES `+strings.Join(tagPlaceholders, ","),
+			tagArgs...,
+		); err != nil {
+			return zero, fmt.Errorf("insert event_tags: %w", err)
+		}
+	}
+
 	// Log-order attestation (design D1, F11): one log_order row per
 	// non-empty batch, hashed and inserted in THIS transaction from
 	// exactly the (position, hash) pairs the loop above already
@@ -412,11 +451,16 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 			entries[i] = es.OrderEntry{Position: envs[i].GlobalPosition, Hash: envs[i].Hash}
 		}
 		batchHash := es.BatchOrderHash(entries)
+		var tagsHashArg []byte
+		if len(tagEntries) > 0 {
+			h := es.TagsHash(tagEntries)
+			tagsHashArg = h[:]
+		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO log_order (from_position, to_position, stream_id, event_count, batch_hash)
-			 VALUES (?,?,?,?,?)`,
+			`INSERT INTO log_order (from_position, to_position, stream_id, event_count, batch_hash, tags_hash)
+			 VALUES (?,?,?,?,?,?)`,
 			envs[0].GlobalPosition, envs[len(envs)-1].GlobalPosition,
-			canonical, len(envs), batchHash[:],
+			canonical, len(envs), batchHash[:], tagsHashArg,
 		); err != nil {
 			return zero, fmt.Errorf("insert log_order: %w", err)
 		}
@@ -439,8 +483,28 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 // validateAppend applies the append-time invariants shared by every append
 // path before any statement runs. The error names the stream where the rule is
 // stream-scoped.
+// mergedTags returns one merged, validated tag set per event: the append's
+// batch tags overlaid with each event's own. validateAppend calls it before
+// anything is written; Append calls it again to project event_tags and hash
+// the batch.
+func mergedTags(p es.AppendParams) ([]map[string]string, error) {
+	per := make([]map[string]string, len(p.Events))
+	for i := range p.Events {
+		per[i] = p.Events[i].Tags
+	}
+	return es.MergedTags(p.Tags, per)
+}
+
 func validateAppend(p es.AppendParams) error {
 	if err := p.StreamID.Validate(); err != nil {
+		return err
+	}
+	// Tags ride on events, like constraint ops: a tag with no event would be
+	// silently dropped, so refuse it before the transaction opens.
+	if len(p.Events) == 0 && len(p.Tags) > 0 {
+		return fmt.Errorf("%w: tags require at least one event: %s", es.ErrInvalidTag, p.StreamID)
+	}
+	if _, err := mergedTags(p); err != nil {
 		return err
 	}
 	for _, op := range p.Constraints {
@@ -703,7 +767,7 @@ const envelopeCols = `
 	correlation_id, causation_id, command_id,
 	actor_type, actor_id, payload, prev_hash, hash,
 	trace_id, span_id, trace_flags,
-	via_type, via_id, via_principal, constraint_ops`
+	via_type, via_id, via_principal, constraint_ops, tags`
 
 func (s *Store) queryEnvelopes(ctx context.Context, q string, args ...any) ([]es.Envelope, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
@@ -748,6 +812,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		// sql.Null distinguishes a NULL column from a zero-length blob: the
 		// driver scans both as a nil []byte, so the slice alone cannot.
 		constraintOps sql.Null[[]byte]
+		tagsRaw       sql.Null[string]
 	)
 	if err := rows.Scan(
 		&e.GlobalPosition, &eventID, &streamType, &streamID, &e.Version,
@@ -755,7 +820,7 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 		&correlationID, &causationID, &commandID,
 		&actorType, &actorID, &e.Payload, &e.PrevHash, &e.Hash,
 		&traceID, &spanID, &flags,
-		&viaType, &viaID, &viaPrincipal, &constraintOps,
+		&viaType, &viaID, &viaPrincipal, &constraintOps, &tagsRaw,
 	); err != nil {
 		return es.Envelope{}, err
 	}
@@ -775,6 +840,14 @@ func scanEnvelope(rows *sql.Rows) (es.Envelope, error) {
 	if constraintOps.Valid {
 		if e.ConstraintOps, err = es.DecodeConstraintOps(constraintOps.V); err != nil {
 			return es.Envelope{}, fmt.Errorf("constraint_ops for stream %s v%d: %w", e.StreamID, e.Version, err)
+		}
+	}
+	// Tags are indexed metadata, not chain-attested: a stored value that is
+	// not the flat string map the append wrote is corruption and fails the
+	// read loudly, rather than silently dropping the tags a feed depends on.
+	if tagsRaw.Valid {
+		if e.Tags, err = es.DecodeTags([]byte(tagsRaw.V)); err != nil {
+			return es.Envelope{}, fmt.Errorf("tags for stream %s v%d: %w", e.StreamID, e.Version, err)
 		}
 	}
 	if e.OccurredAt, err = parseTS(occurredAt); err != nil {

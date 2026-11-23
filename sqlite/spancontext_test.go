@@ -294,6 +294,14 @@ func TestSpanContextRebuild(t *testing.T) {
 		tx.Rollback()
 		t.Fatalf("re-apply 0012: %v", err)
 	}
+	// 0014's events.tags column also lived on the table 0009 dropped.
+	// Only that column is lost: event_tags and log_order.tags_hash are
+	// separate objects and survive the events rebuild, so re-running the
+	// whole 0014 here would duplicate the log_order column.
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE events ADD COLUMN tags TEXT`); err != nil {
+		tx.Rollback()
+		t.Fatalf("restore 0014 events.tags: %v", err)
+	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit rebuild: %v", err)
 	}
@@ -444,10 +452,10 @@ func TestSpanContextRebuild(t *testing.T) {
 		t.Fatalf("duplicate (stream_id, version) insert: error = %v, want the events.stream_id, events.version UNIQUE", err)
 	}
 
-	// Exactly the 25 expected columns, each with its declared type and
+	// Exactly the 26 expected columns, each with its declared type and
 	// nullability: 0001's sixteen, 0002's prev_hash/hash, the three
-	// span-context ones, 0010's three via columns, and 0012's
-	// constraint_ops — no more, no fewer. global_position is the rowid
+	// span-context ones, 0010's three via columns, 0012's constraint_ops,
+	// and 0014's tags — no more, no fewer. global_position is the rowid
 	// alias, which table_info reports as notnull=0, pk=1.
 	type colSpec struct {
 		typ         string
@@ -479,6 +487,7 @@ func TestSpanContextRebuild(t *testing.T) {
 		"via_id":          {"TEXT", 0, 0},
 		"via_principal":   {"TEXT", 0, 0},
 		"constraint_ops":  {"BLOB", 0, 0},
+		"tags":            {"TEXT", 0, 0},
 	}
 	seen := make(map[string]bool, len(wantCols))
 	colRows, err := s.DB().QueryContext(ctx, `PRAGMA table_info(events)`)
