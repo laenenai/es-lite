@@ -253,3 +253,26 @@ func TestVerifyTagHashesDetectsTamperedHash(t *testing.T) {
 		t.Fatalf("VerifyTagHashes = %+v, want a mismatch", rep)
 	}
 }
+
+// TestVerifyTagsRefusesNonStringValue pins the fail-loud rule for verify as
+// well as rebuild: a stored non-string tag value must be an error, not a
+// silently stringified projection or a mere divergence report.
+func TestVerifyTagsRefusesNonStringValue(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_a")
+	sid, _ := es.NewStreamID("counter", "verify-nonstring")
+
+	appendTagged(t, ctx, ws, sid, 0,
+		map[string]string{"flowdoc.space": "s1"},
+		map[string]string{"flowdoc.block": "b1"},
+	)
+	if _, err := s.Pool().Exec(ctx, `
+		UPDATE events SET tags = '{"k":1}'
+		WHERE workspace_id = 'ws_a' AND stream_id = $1`, sid.Canonical()); err != nil {
+		t.Fatalf("corrupt tags: %v", err)
+	}
+	if _, err := ws.VerifyTags(ctx); err == nil {
+		t.Fatal("VerifyTags with a non-string tag value returned nil, want an error")
+	}
+}

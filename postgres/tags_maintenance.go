@@ -92,6 +92,19 @@ func (w *Workspace) VerifyTags(ctx context.Context) (es.TagsVerifyReport, error)
 		return zero, fmt.Errorf("postgres: verify tags: set workspace: %w", err)
 	}
 
+	// Mirror RebuildTags' fail-loud guard: jsonb_each_text would stringify
+	// a non-string value, turning corruption into a plausible divergence.
+	bad, err := countRows(ctx, tx, `
+		SELECT count(*) FROM events e, jsonb_each(e.tags) kv
+		WHERE e.workspace_id = $1 AND e.tags IS NOT NULL
+		  AND jsonb_typeof(kv.value) <> 'string'`, w.ws)
+	if err != nil {
+		return zero, fmt.Errorf("postgres: verify tags: check values: %w", err)
+	}
+	if bad > 0 {
+		return zero, fmt.Errorf("postgres: verify tags: %d stored tag values are not strings", bad)
+	}
+
 	events, err := countRows(ctx, tx,
 		`SELECT count(*) FROM events WHERE workspace_id = $1 AND tags IS NOT NULL`, w.ws)
 	if err != nil {
