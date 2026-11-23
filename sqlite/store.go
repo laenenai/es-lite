@@ -250,19 +250,45 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 	if err := validateAppend(p); err != nil {
 		return zero, err
 	}
+	if err := s.checkPayload(p); err != nil {
+		return zero, err
+	}
 
-	// Payload cap (production review): reject the whole batch before the
-	// transaction is even opened — nothing is inserted, no position drawn.
-	// A single oversized event otherwise wedges every feed subscription
-	// consuming its type. The error carries stream, version, type URL and
-	// size only — never the payload bytes.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := s.appendTx(ctx, tx, p)
+	if err != nil {
+		return zero, err
+	}
+	if err := tx.Commit(); err != nil {
+		return zero, fmt.Errorf("commit: %w", err)
+	}
+	return res, nil
+}
+
+// checkPayload rejects the whole batch before the transaction is even opened —
+// nothing is inserted, no position drawn. A single oversized event otherwise
+// wedges every feed subscription consuming its type. The error carries stream,
+// version, type URL and size only — never the payload bytes.
+func (s *Store) checkPayload(p es.AppendParams) error {
 	for i, ev := range p.Events {
 		if s.maxPayloadBytes > 0 && len(ev.Payload) > s.maxPayloadBytes {
 			version := p.ExpectedVersion + uint64(i) + 1
-			return zero, fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
+			return fmt.Errorf("%w: stream %s v%d, type %s, payload %d bytes exceeds cap %d",
 				es.ErrPayloadTooLarge, p.StreamID, version, ev.TypeURL, len(ev.Payload), s.maxPayloadBytes)
 		}
 	}
+	return nil
+}
+
+// appendTx is the shared append body. The caller has validated p and owns the
+// transaction boundary.
+func (s *Store) appendTx(ctx context.Context, tx *sql.Tx, p es.AppendParams) (es.AppendResult, error) {
+	var zero es.AppendResult
 
 	// Timestamps are truncated to microseconds — the precision the hash chain
 	// attests and every backend returns (ADR 0029 §2).
@@ -271,12 +297,6 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		occurred = time.Now()
 	}
 	occurred = es.TruncateMicros(occurred)
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return zero, fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback()
 
 	// Optimistic-concurrency guard and chain head in one read (ADR 0029 §1).
 	// With a single connection this check and the inserts are effectively
@@ -470,14 +490,51 @@ func (s *Store) Append(ctx context.Context, p es.AppendParams) (es.AppendResult,
 		return zero, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return zero, fmt.Errorf("commit: %w", err)
-	}
 	return es.AppendResult{
 		FromVersion: p.ExpectedVersion,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
 	}, nil
+}
+
+// AppendMulti appends several streams in one store-owned transaction. SQLite
+// has no caller-owned append transaction, so this is the multi-stream entry
+// point; the contract is es.MultiAppend's. The appends run in input order under
+// one resolved OccurredAt, and any failure rolls the whole set back.
+func (s *Store) AppendMulti(ctx context.Context, m es.MultiAppend) ([]es.AppendResult, error) {
+	if err := es.ValidateMultiAppend(m); err != nil {
+		return nil, err
+	}
+	for i := range m.Appends {
+		if err := validateAppend(m.Appends[i]); err != nil {
+			return nil, err
+		}
+		if err := s.checkPayload(m.Appends[i]); err != nil {
+			return nil, err
+		}
+	}
+
+	occurred := es.MultiOccurredAt(m.Appends, time.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	out := make([]es.AppendResult, len(m.Appends))
+	for i := range m.Appends {
+		p := m.Appends[i]
+		p.OccurredAt = occurred
+		res, err := s.appendTx(ctx, tx, p)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = res
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return out, nil
 }
 
 // validateAppend applies the append-time invariants shared by every append
