@@ -226,7 +226,8 @@ func TestWaitForMiddlewareScopeError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mem := projection.NewMemoryProgressStore()
 			seedProgress(t, mem, 10)
-			waiter := newTestWaiter(t, mem)
+			store := &countingProgressStore{ProgressStore: mem}
+			waiter := newTestWaiter(t, store)
 			spy := &nextSpy{}
 
 			req := httptest.NewRequest(http.MethodGet, "/users", nil)
@@ -239,6 +240,9 @@ func TestWaitForMiddlewareScopeError(t *testing.T) {
 			}
 			if rec.Code != tt.want {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if got := store.loads.Load(); got != 0 {
+				t.Fatalf("LoadProgress calls = %d, want 0 when scopeOf fails", got)
 			}
 		})
 	}
@@ -264,6 +268,29 @@ func TestWaitForMiddlewareBestEffortStoreFailure(t *testing.T) {
 	}
 	if spy.consistent != "false" {
 		t.Fatalf("ES-Consistent = %q, want false", spy.consistent)
+	}
+}
+
+// TestWaitForMiddlewareStoreDeadline asserts a store-side deadline maps to 503
+// rather than being mistaken for the client's cancellation.
+func TestWaitForMiddlewareStoreDeadline(t *testing.T) {
+	store := &countingProgressStore{
+		ProgressStore: projection.NewMemoryProgressStore(),
+		err:           context.DeadlineExceeded,
+	}
+	waiter := newTestWaiter(t, store)
+	spy := &nextSpy{}
+
+	req := httptest.NewRequest(http.MethodGet, "/users", nil)
+	req.Header.Set(ConsistencyHeader, (es.Token{Scope: "ws", Position: 10}).String())
+	rec := httptest.NewRecorder()
+	WaitFor(waiter, testProjection, fixedScope("ws", nil), 50*time.Millisecond, spy).ServeHTTP(rec, req)
+
+	if spy.called {
+		t.Fatal("next ran after a store-side deadline")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
 }
 

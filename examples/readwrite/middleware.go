@@ -28,8 +28,15 @@ var ErrScopeForbidden = errors.New("readwrite: scope forbidden")
 // with scopeOf (the example reads it from the request context), checks the
 // token's scope, waits on the named projection and sets ES-Consistent.
 // Missing header = no wait, no store access and no ES-Consistent claim.
-// Invalid token = 400. Scope mismatch = 403. With WithBestEffort a store
-// failure still calls next with ES-Consistent:false.
+// Invalid token = 400. Scope mismatch = 403. A scopeOf failure is 400, except
+// ErrScopeForbidden, which is 403. With WithBestEffort a store failure still
+// calls next with ES-Consistent:false.
+//
+// ES-Consistent describes the wait, not the response: the header is set before
+// next runs, so it says the projection had reached the token at that moment.
+// It does not promise that next's own read or write succeeds, and a handler
+// that queries a replica or fails after the wait can still return stale data
+// or an error.
 //
 // The same Waiter is shared by every request in the process; create it once at
 // startup (for example projection.NewWaiter(progressStore,
@@ -100,10 +107,11 @@ func writeWaitError(w http.ResponseWriter, err error) {
 		http.Error(w, "invalid consistency token", http.StatusBadRequest)
 	case errors.Is(err, es.ErrScopeMismatch):
 		http.Error(w, "consistency token is for another workspace", http.StatusForbidden)
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		// No response is useful to a cancelled client, but errors from the
-		// store's own deadline are not the request's cancellation.
-		http.Error(w, "consistency check cancelled", http.StatusServiceUnavailable)
+	case errors.Is(err, context.DeadlineExceeded):
+		// A store-side deadline is not the request's cancellation: the
+		// request-cancelled case is caught by the caller's ctx check before
+		// this mapping runs.
+		http.Error(w, "consistency check unavailable", http.StatusServiceUnavailable)
 	default:
 		http.Error(w, "consistency check unavailable", http.StatusServiceUnavailable)
 	}
