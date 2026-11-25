@@ -22,9 +22,9 @@ type Token struct {
 // scope bytes, then a big-endian u64 position, base64url-encoded without
 // padding. "" is the zero token's wire form.
 const (
-	tokenVersion   byte = 1
-	tokenHeaderLen      = 3 // version + u16 scope length
-	tokenTailLen        = 8 // u64 position
+	tokenVersion   = byte(1)
+	tokenHeaderLen = 3 // version + u16 scope length
+	tokenTailLen   = 8 // u64 position
 
 	// maxTokenScopeLen is the largest scope a token may carry. It bounds both
 	// the wire input ParseToken will decode and the scope it returns.
