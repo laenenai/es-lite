@@ -434,7 +434,7 @@ func fgOpenNotifyStore(ctx context.Context, tb testing.TB, dsn string, maxConns 
 		return nil, nil, fmt.Errorf("feedgate: open: %w", err)
 	}
 	if truncate {
-		if _, err := pool.Exec(ctx, `TRUNCATE events, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters`); err != nil {
+		if _, err := pool.Exec(ctx, `TRUNCATE events, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, projection_checkpoints`); err != nil {
 			s.Close()
 			pool.Close()
 			return nil, nil, fmt.Errorf("feedgate: truncate: %w", err)
