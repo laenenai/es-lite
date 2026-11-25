@@ -329,6 +329,52 @@ func TestProgressNotifyStoreCoalescesSaves(t *testing.T) {
 	}
 }
 
+// TestProgressNotifyLowerSaveSuppressesHint pins the write-side suppression
+// rule: a same-state save below the stored position leaves the row unchanged,
+// so it must emit no hint. The notifier's hint volume follows real advances,
+// not save calls.
+func TestProgressNotifyLowerSaveSuppressesHint(t *testing.T) {
+	s := openStore(t)
+	rec := &notifierRecorder{}
+	ps := newProgressStore(s, "es_lite_progress_lower_save", 20*time.Millisecond, rec.exec)
+	defer ps.Close()
+
+	ctx := context.Background()
+	const (
+		scope          = "ws_progress_lower_save"
+		projectionName = "orders"
+	)
+	save := func(position uint64) {
+		t.Helper()
+		if err := ps.SaveProgress(ctx, scope, projectionName, projection.Checkpoint{
+			Position: position, State: projection.StatusLive,
+		}); err != nil {
+			t.Fatalf("save %d: %v", position, err)
+		}
+	}
+
+	save(100)
+	if !waitUntil(2*time.Second, func() bool { return rec.count() == 1 }) {
+		t.Fatalf("flushes after the advancing save = %d, want 1", rec.count())
+	}
+
+	// A lower same-state save does not move the position (GREATEST keeps 100),
+	// so it must not mark the scope.
+	save(50)
+	time.Sleep(100 * time.Millisecond)
+	if got := rec.count(); got != 1 {
+		t.Fatalf("flushes after the lower save = %d, want 1 (a no-op save emits no hint)", got)
+	}
+
+	cp, found, err := ps.LoadProgress(ctx, scope, projectionName)
+	if err != nil || !found {
+		t.Fatalf("load after the lower save = found %v err %v, want the committed row", found, err)
+	}
+	if cp.Position != 100 {
+		t.Fatalf("stored position = %d, want 100 (a lower same-state save is ignored)", cp.Position)
+	}
+}
+
 // TestProgressNotifyInvalidChannelPanics pins the constructor's
 // fail-fast rule: an invalid non-empty channel is a wiring bug, so it
 // panics with the validator's error instead of starting a deaf notifier.

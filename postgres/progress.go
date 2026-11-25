@@ -144,18 +144,22 @@ func (p *ProgressStore) LoadProgress(ctx context.Context, scope, projectionName 
 // when the position does not move.
 //
 // When a hint channel is configured, the scope is marked only after
-// runWorkspace reports a committed transaction: the hint can never
-// describe a save that rolled back, and a failed hint can never fail the
-// save. The payload is the scope alone; see progressNotifier. An
-// oversized scope saves normally and the hint is skipped (NotifyDropped
-// counts it): enabling hints never changes the write contract.
+// runWorkspace reports a committed transaction and only when the upsert moved
+// the position: RETURNING position tells us the row's stored value, and a
+// same-state save at or below it is a no-op that emits no hint. The hint can
+// never describe a save that rolled back, and a failed hint can never fail the
+// save. ResetProgress and SetStatus always mark. The payload is the scope
+// alone; see progressNotifier. An oversized scope saves normally and the hint
+// is skipped (NotifyDropped counts it): enabling hints never changes the
+// write contract.
 func (p *ProgressStore) SaveProgress(ctx context.Context, scope, projectionName string, cp projection.Checkpoint) error {
 	state, err := progressStateText(cp.State)
 	if err != nil {
 		return err
 	}
+	var stored int64
 	err = p.store.runWorkspace(ctx, scope, func(tx DBTX) error {
-		_, err := tx.Exec(ctx,
+		return tx.QueryRow(ctx,
 			`INSERT INTO projection_checkpoints (workspace_id, projection, position, state)
 			 VALUES ($1, $2, $3, $4)
 			 ON CONFLICT (workspace_id, projection) DO UPDATE SET
@@ -164,17 +168,20 @@ func (p *ProgressStore) SaveProgress(ctx context.Context, scope, projectionName 
 			         THEN GREATEST(projection_checkpoints.position, excluded.position)
 			         ELSE excluded.position END,
 			     state = excluded.state,
-			     updated_at = clock_timestamp()`,
+			     updated_at = clock_timestamp()
+			 RETURNING position`,
 			scope, projectionName, int64(cp.Position), state,
-		)
-		return err
+		).Scan(&stored)
 	})
 	if err != nil {
 		return fmt.Errorf("postgres: progress: save: %w", err)
 	}
-	// Emit only after the commit. Mark never blocks and never returns an
-	// error, so the hint is invisible to the save's outcome.
-	p.notifier.Mark(scope)
+	// Emit only after the commit, and only when the save moved the position.
+	// Mark never blocks and never returns an error, so the hint is invisible
+	// to the save's outcome.
+	if stored <= int64(cp.Position) {
+		p.notifier.Mark(scope)
+	}
 	return nil
 }
 
