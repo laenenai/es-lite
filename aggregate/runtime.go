@@ -279,6 +279,13 @@ type Result[S, E any] struct {
 // or an event store with extra invariants appends inside its own transaction
 // and needs the events to commit atomically with its own records.
 //
+// It must populate AppendResult.Position with the highest committed
+// global_position — that value becomes Result.Position and the consistency
+// token. When an AppendFunc leaves Position zero but returns Envelopes, Handle
+// falls back to the last envelope's GlobalPosition. An implementation that
+// returns neither a Position nor envelopes yields the zero token, which
+// silently disables read-your-writes for every command it serves.
+//
 // The function may be called more than once for one command when conflict
 // retry is enabled; it must therefore be idempotent with respect to a retried
 // attempt, exactly as Store.Append is.
@@ -516,6 +523,12 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 	})
 	if err != nil {
 		return zero, err // includes es.ErrConflict
+	}
+	// A custom AppendFunc may return the committed envelopes without filling
+	// Position. Fall back to the last envelope so the token still covers the
+	// append instead of silently becoming the zero token.
+	if res.Position == 0 && len(res.Envelopes) > 0 {
+		res.Position = res.Envelopes[len(res.Envelopes)-1].GlobalPosition
 	}
 
 	// Fold the just-appended events forward so the caller gets

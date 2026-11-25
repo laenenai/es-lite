@@ -80,7 +80,12 @@ func TestTokenFor(t *testing.T) {
 	if got.Position != 8 || got.Scope != "ws" {
 		t.Fatalf("TokenFor = %+v, want {ws 8}", got)
 	}
-	if none := es.TokenFor("ws"); none != (es.Token{Scope: "ws"}) {
-		t.Fatalf("TokenFor with no results = %+v, want {ws 0}", none)
+	// Nothing to wait for: no results, or only zero positions yields the zero
+	// token, so a WaitFor short-circuits without touching the store.
+	if none := es.TokenFor("ws"); none != (es.Token{}) {
+		t.Fatalf("TokenFor with no results = %+v, want the zero token", none)
+	}
+	if zero := es.TokenFor("ws", es.AppendResult{Position: 0}); zero != (es.Token{}) {
+		t.Fatalf("TokenFor with a zero position = %+v, want the zero token", zero)
 	}
 }

@@ -35,7 +35,9 @@ const (
 )
 
 // String returns the URL-safe wire form of the token. The zero token encodes
-// as the empty string.
+// as the empty string. Scopes are limited to 512 bytes: a longer scope is
+// encoded with its u16 length but the result is unusable because ParseToken
+// rejects it (see TokenFor).
 func (t Token) String() string {
 	if t == (Token{}) {
 		return ""
@@ -83,13 +85,19 @@ func ParseToken(s string) (Token, error) {
 }
 
 // TokenFor builds the token for an append (or a batch of them): the highest
-// AppendResult.Position in results, or 0 when there are none, in scope.
+// AppendResult.Position in results, or 0 when there are none. A highest position
+// of 0 yields the zero token, because there is nothing to wait for. Scopes are
+// limited to 512 bytes; a longer scope mints a token that ParseToken rejects,
+// so keep the scope within that bound.
 func TokenFor(scope string, results ...AppendResult) Token {
 	var pos uint64
 	for _, res := range results {
 		if res.Position > pos {
 			pos = res.Position
 		}
+	}
+	if pos == 0 {
+		return Token{}
 	}
 	return Token{Scope: scope, Position: pos}
 }

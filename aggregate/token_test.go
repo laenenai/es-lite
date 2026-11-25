@@ -107,6 +107,34 @@ func TestAppendResultPosition(t *testing.T) {
 	}
 }
 
+// TestAppendFuncPositionFallback pins the custom-append contract: an
+// AppendFunc that returns envelopes but forgets Position must not silently mint
+// a zero token — Handle falls back to the last envelope's GlobalPosition.
+func TestAppendFuncPositionFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	sid, _ := es.NewStreamID("counter", "appendfunc-token")
+	rt := aggregate.NewRuntime(store, counter.Decider, counterv1.EventCodec{})
+
+	res, err := rt.Handle(ctx, sid, counterv1.Command(&counterv1.Init{Min: 0, Max: 100, Initial: 5}), es.Meta{},
+		aggregate.WithAppend(func(_ context.Context, p es.AppendParams) (es.AppendResult, error) {
+			return es.AppendResult{
+				FromVersion: 0,
+				ToVersion:   uint64(len(p.Events)),
+				Envelopes:   []es.Envelope{{GlobalPosition: 77, Workspace: "ws_x"}},
+			}, nil
+		}))
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if res.Position != 77 {
+		t.Fatalf("Position = %d, want 77 from the last returned envelope", res.Position)
+	}
+	if res.Token != (es.Token{Scope: "ws_x", Position: 77}) {
+		t.Fatalf("Token = %+v, want {ws_x 77}", res.Token)
+	}
+}
+
 func TestNoOpToken(t *testing.T) {
 	ctx := context.Background()
 
