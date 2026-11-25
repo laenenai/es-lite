@@ -139,6 +139,54 @@ func (s *ctxCancelStore) LoadProgress(ctx context.Context, scope, projection str
 	return Checkpoint{}, false, ctx.Err()
 }
 
+// blockingReadStore blocks every LoadProgress until its context ends and then
+// returns that context error, emulating a hung store driver. A one-second
+// failsafe surfaces the unbounded read as an error instead of hanging the test
+// forever when the waiter does not bound the read itself.
+type blockingReadStore struct {
+	*MemoryProgressStore
+	failsafe time.Duration
+}
+
+func (s *blockingReadStore) LoadProgress(ctx context.Context, _ string, _ string) (Checkpoint, bool, error) {
+	timer := time.NewTimer(s.failsafe)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return Checkpoint{}, false, ctx.Err()
+	case <-timer.C:
+		return Checkpoint{}, false, errors.New("LoadProgress was not bounded by the wait deadline")
+	}
+}
+
+// deadlineAdvanceStore returns position 0 on the first read and the token's
+// position on every later read, so a wait can only succeed via the final read
+// at its deadline.
+type deadlineAdvanceStore struct {
+	*MemoryProgressStore
+
+	mu    sync.Mutex
+	loads int
+}
+
+func (s *deadlineAdvanceStore) LoadProgress(_ context.Context, scope, projection string) (Checkpoint, bool, error) {
+	s.mu.Lock()
+	s.loads++
+	n := s.loads
+	s.mu.Unlock()
+	position := uint64(7)
+	if n == 1 {
+		position = 0
+	}
+	return Checkpoint{Scope: scope, Projection: projection, Position: position, State: StatusLive}, true, nil
+}
+
+func (s *deadlineAdvanceStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loads
+}
+
 // alwaysFoundStore returns a live checkpoint for every key and counts reads
 // per projection, so the hub-bound test can prove an evicted key is re-read
 // without materialising thousands of rows.
@@ -455,6 +503,100 @@ func TestWaiterTimeout(t *testing.T) {
 	}
 	if elapsed < timeout {
 		t.Fatalf("elapsed = %v, want at least %v", elapsed, timeout)
+	}
+}
+
+// TestWaiterColdReadBoundedByDeadline pins I2: a hung cold read is bounded by
+// the wait deadline, and its expiry is a timeout result (Reached:false, nil),
+// not a store error, even without WithBestEffort.
+func TestWaiterColdReadBoundedByDeadline(t *testing.T) {
+	store := &blockingReadStore{MemoryProgressStore: NewMemoryProgressStore(), failsafe: time.Second}
+	w := newTestWaiter(t, store)
+
+	const timeout = 30 * time.Millisecond
+	start := time.Now()
+	res, err := w.WaitFor(context.Background(), "ws", "users", token("ws", 5), timeout)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("bounded read error = %v, want nil (a wait deadline is not a store error)", err)
+	}
+	if res.Reached {
+		t.Fatalf("Reached = true, want false after a bounded cold read")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("WaitFor returned after %v, want within a small multiple of %v", elapsed, timeout)
+	}
+}
+
+// TestWaiterFinalReadAtDeadline pins I3: when the deadline timer fires the
+// waiter performs one last store read, so a notification lost for the whole
+// wait still ends reached instead of timing out.
+func TestWaiterFinalReadAtDeadline(t *testing.T) {
+	store := &deadlineAdvanceStore{MemoryProgressStore: NewMemoryProgressStore()}
+	w := newTestWaiter(t, store, WithFallback(time.Hour))
+
+	const timeout = 50 * time.Millisecond
+	res, err := w.WaitFor(context.Background(), "ws", "users", token("ws", 7), timeout)
+	if err != nil {
+		t.Fatalf("WaitFor: %v", err)
+	}
+	if !res.Reached || res.Status != StatusLive {
+		t.Fatalf("WaitFor = (reached=%v, status=%v), want reached live via the final read", res.Reached, res.Status)
+	}
+	if res.Checkpoint.Position != 7 {
+		t.Fatalf("final checkpoint position = %d, want 7", res.Checkpoint.Position)
+	}
+	if got := store.count(); got < 2 {
+		t.Fatalf("store reads = %d, want at least 2 (fast path plus the final read)", got)
+	}
+}
+
+// TestWaiterCachedReachedBeatsCap pins M11: an already-satisfied cached token
+// returns reached even when the waiter registry is at its cap; the cap only
+// gates registration, never a decision the cache can make.
+func TestWaiterCachedReachedBeatsCap(t *testing.T) {
+	store := newCountingProgressStore()
+	mustSave(t, store, "ws", "a", 10, StatusLive)
+	w := newTestWaiter(t, store, WithMaxWaiters(1, 1), WithFallback(time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startWait(ctx, w, "ws", "a", token("ws", 20), 5*time.Second)
+	waitRegistered(t, w, "ws", "a", 1)
+
+	start := time.Now()
+	res, err := w.WaitFor(context.Background(), "ws", "a", token("ws", 10), time.Second)
+	if err != nil {
+		t.Fatalf("cached reached wait: %v", err)
+	}
+	if !res.Reached {
+		t.Fatalf("cached reached wait = %+v, want reached despite the cap", res)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("cached reached wait blocked for %v, want an immediate decision", elapsed)
+	}
+
+	cancel()
+	if o := await(t, ch, time.Second); !errors.Is(o.err, context.Canceled) {
+		t.Fatalf("held waiter error = %v, want context.Canceled", o.err)
+	}
+}
+
+// TestWaiterZeroPositionToken pins M7: {Scope: ws, Position: 0} is the zero
+// position for a scope and is reached immediately without touching the store.
+func TestWaiterZeroPositionToken(t *testing.T) {
+	store := newCountingProgressStore()
+	w := newTestWaiter(t, store)
+
+	res, err := w.WaitFor(context.Background(), "ws", "users", es.Token{Scope: "ws", Position: 0}, time.Second)
+	if err != nil {
+		t.Fatalf("WaitFor: %v", err)
+	}
+	if !res.Reached {
+		t.Fatalf("WaitFor = %+v, want reached for a zero-position token", res)
+	}
+	if got := store.count(); got != 0 {
+		t.Fatalf("LoadProgress calls = %d, want 0 for a zero-position token", got)
 	}
 }
 
@@ -842,8 +984,11 @@ func TestWaiterCapsFailOpen(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("cross-key waiter blocked for %v, want an immediate fail-open", elapsed)
 	}
-	if got := store.count(); got != reads {
-		t.Fatalf("store reads under the cap = %d, want unchanged %d", got, reads)
+	// The cap check now follows the cache decision (M11): the cold key b is
+	// read once before the fail-open, while the warm key a (above) added no
+	// read. A cached reached token is decided before the cap regardless.
+	if got := store.count(); got != reads+1 {
+		t.Fatalf("store reads after the cold cross-key fail-open = %d, want %d", got, reads+1)
 	}
 
 	cancel()

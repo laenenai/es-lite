@@ -29,6 +29,9 @@ const (
 	// maxWaitScope matches es's token scope limit. A token scope over this
 	// size is ErrInvalidToken.
 	maxWaitScope = 512
+	// finalReadTimeout bounds the one store read WaitFor performs at its
+	// deadline. It is capped by the wait timeout as well.
+	finalReadTimeout = 200 * time.Millisecond
 	// scopeHintQueue is the bounded size of the non-blocking scope-hint
 	// queue. An overflow drops the hint; the ticker repairs it.
 	scopeHintQueue = 64
@@ -171,7 +174,7 @@ func NewWaiter(store ProgressStore, opts ...WaiterOption) *Waiter {
 // deadline (default 500ms, clamped at 5s) or ctx ends. A timeout is
 // Reached:false with a nil error; store errors are returned unless the Waiter
 // was created WithBestEffort. A zero token is reached immediately without any
-// store access.
+// store access, and so is a token whose position is 0 once its scope matches.
 func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.Token, timeout time.Duration) (WaitResult, error) {
 	start := time.Now()
 
@@ -184,6 +187,11 @@ func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.T
 	if tok.Scope != scope {
 		return WaitResult{Waited: time.Since(start)}, fmt.Errorf("%w: token scope %q, caller scope %q", es.ErrScopeMismatch, tok.Scope, scope)
 	}
+	if tok.Position == 0 {
+		// Nothing to wait for: every projection is at position 0 or beyond.
+		// Return before any store access, like the zero token above.
+		return WaitResult{Reached: true, Waited: time.Since(start)}, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return WaitResult{Waited: time.Since(start)}, err
 	}
@@ -192,21 +200,27 @@ func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.T
 	deadline := start.Add(timeout)
 	key := progressKey{scope: scope, projection: projection}
 
-	// The cap check comes before any store access: an overloaded hub fails
-	// open immediately rather than paying for a read it will throw away.
-	if res, over := w.capResult(key, start); over {
-		return res, nil
-	}
-
-	cp, found, err := w.Checkpoint(ctx, scope, projection)
+	// The cold read is bounded by the wait deadline, not just the caller's
+	// context: a hung store must still produce a timeout result. The readCtx
+	// expiry is distinguishable from a store error because the caller's
+	// context is still alive.
+	readCtx, cancelRead := context.WithTimeout(ctx, timeout)
+	cp, found, err := w.Checkpoint(readCtx, scope, projection)
+	readExpired := readCtx.Err() != nil
+	cancelRead()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return WaitResult{Waited: time.Since(start)}, ctxErr
+		}
+		if readExpired {
+			// The wait deadline bounded the read. That is a timeout result,
+			// not a store failure, even without WithBestEffort.
+			return WaitResult{Reached: false, Waited: time.Since(start)}, nil
+		}
 		// Best effort swallows store failures, but never cancellation: a
 		// ctx-aware store can return ctx.Err() from the read, and that must
 		// surface even when the caller asked to fail open.
 		if w.opts.bestEffort {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return WaitResult{Waited: time.Since(start)}, ctxErr
-			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return WaitResult{Waited: time.Since(start)}, err
 			}
@@ -251,7 +265,7 @@ func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.T
 
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		cp, found, _ = w.snapshot(key)
+		cp, found := w.finalRead(ctx, key, timeout)
 		if res, decided := waitDecision(start, cp, found, tok); decided {
 			return res, nil
 		}
@@ -271,9 +285,11 @@ func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.T
 		case <-ctx.Done():
 			return WaitResult{Reached: false, Checkpoint: cp, Waited: time.Since(start), Status: cp.State}, ctx.Err()
 		case <-timer.C:
-			// A publisher may have won the race with the timer; prefer the
-			// checkpoint it installed over a bare timeout.
-			cp, found, _ = w.snapshot(key)
+			// One last authoritative read at the deadline: a lost hint costs
+			// the wait latency, not a false timeout. A publisher may also
+			// have won the race with the timer; the store read and the cache
+			// decision below cover both.
+			cp, found = w.finalRead(ctx, key, timeout)
 			if res, decided := waitDecision(start, cp, found, tok); decided {
 				return res, nil
 			}
@@ -571,24 +587,45 @@ func (w *Waiter) load(ctx context.Context, scope, projection string) (Checkpoint
 	return w.store.LoadProgress(ctx, scope, projection)
 }
 
-// capResult reports whether registering one more waiter would exceed a cap,
-// and if so the fail-open result. It never touches the store.
-func (w *Waiter) capResult(key progressKey, start time.Time) (WaitResult, bool) {
+// finalRead performs one authoritative store read at the wait deadline and
+// installs a found checkpoint, so a notification lost for the whole wait still
+// ends reached instead of timing out. The read is bounded by the wait timeout
+// (and by finalReadTimeout) and is best-effort: a read error or a store miss
+// leaves the cached checkpoint in place.
+func (w *Waiter) finalRead(ctx context.Context, key progressKey, timeout time.Duration) (Checkpoint, bool) {
+	d := finalReadTimeout
+	if timeout < d {
+		d = timeout
+	}
+	if d <= 0 {
+		return w.snapshotCheckpoint(key)
+	}
+	readCtx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+
+	cp, found, err := w.load(readCtx, key.scope, key.projection)
+	if err != nil || !found {
+		return w.snapshotCheckpoint(key)
+	}
+	cp.Scope, cp.Projection = key.scope, key.projection
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	k := w.keys[key]
-	perKey := 0
-	if k != nil {
-		perKey = k.waiters
+	if k := w.keys[key]; k != nil {
+		// The store is authoritative, but a newer state change installed by a
+		// publisher must stay fail-closed; mergeColdRead keeps the same
+		// precedence as a racing cold read.
+		k.cp, k.found = mergeColdRead(k.cp, k.found, cp, true)
+		w.touchLocked(k)
+		return k.cp, k.found
 	}
-	if w.total < w.opts.maxTotal && perKey < w.opts.maxPerKey {
-		return WaitResult{}, false
-	}
-	var cached Checkpoint
-	if k != nil && k.found {
-		cached = k.cp
-	}
-	return WaitResult{Reached: false, Checkpoint: cached, Waited: time.Since(start), Status: cached.State}, true
+	return cp, true
+}
+
+// snapshotCheckpoint returns the cached checkpoint for key.
+func (w *Waiter) snapshotCheckpoint(key progressKey) (Checkpoint, bool) {
+	cp, found, _ := w.snapshot(key)
+	return cp, found
 }
 
 // snapshot returns the current cached checkpoint and wake channel for a key.
