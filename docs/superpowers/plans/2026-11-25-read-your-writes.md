@@ -253,6 +253,8 @@ A recording publisher and the memory progress store. Assert:
 - `Reset` sets position 0/state `rebuilding`, clears the runner’s cached marker, and publishes the status.
 - `Reset` calls `Discard(name)` when the legacy `Marker` implements it (a buffered pending position must not resurrect the old marker).
 - `Rebuild` over a two-event source sets `live` only on success; a source error leaves `rebuilding`.
+- A failing `SetStatus(live)` during `Rebuild` returns the error and leaves both the row and `r.state` `rebuilding`.
+- A new runner loading a stored `rebuilding` checkpoint seeds `r.state=rebuilding`; its next `advance` persists `rebuilding`, not `live`.
 - The legacy `Marker` path still works with `ProgressStore == nil`.
 
 - [ ] **Step 2: Run to verify failure**
@@ -262,12 +264,12 @@ Expected: build failure — `Runner.Scope`/`ProgressStore`/`Reset` do not exist.
 
 - [ ] **Step 3: Implement**
 
-- `loadMarker`: when `ProgressStore != nil`, call `LoadProgress(ctx, r.Scope, r.Name)`; a found row supplies the marker (position); otherwise 0. Keep the legacy `Marker.Load` path when nil.
+- `loadMarker`: when `ProgressStore != nil`, call `LoadProgress(ctx, r.Scope, r.Name)`; a found row supplies the marker (position) **and the state** (unless the state is `StatusUnknown`), so a restart during a rebuild stays fail-closed; otherwise position 0 and the default `live`. Keep the legacy `Marker.Load` path when nil.
 - `advance`: when `ProgressStore != nil`, call `SaveProgress(ctx, r.Scope, r.Name, Checkpoint{Scope:r.Scope, Projection:r.Name, Position:pos, State:r.state})`; otherwise `Marker.Save`. On success, call `Progress.Advance(cp)` when `Progress != nil`. Never publish before the save returns.
 - **Rebuild state.** Track the runner's state in an unexported field, default `StatusLive`; `Reset` sets `StatusRebuilding`; `Rebuild` sets `StatusLive` only after `Replay` returns nil. `advance` persists that state. Without this, the first replayed page would write `live` mid-rebuild and a `WaitFor` could return reached over a half-rebuilt read model (Review Focus 3).
 - **Batch coalescing.** Split dispatch from save: `Apply` dispatches every envelope in the batch, tracks the last successful position, and calls `advance` **once** at the end — and once with the last successful position before returning a dispatch error (otherwise a redelivery after a partial batch restarts the page). `Rebuild` reuses `Apply`, so a rebuild saves and notifies once per page. `Run`/`Feed` still delivers one envelope at a time and saves per event; that is acceptable because the Postgres store suppresses a notify when the stored position does not move (Task 7) and the listener throttles per scope at 10 ms. Keep the in-memory `r.marker` updated per applied envelope so an in-process redelivery still skips. Call `OnApplied` for every applied envelope **after** the batch save, preserving its documented “called after the marker is saved” ordering while still firing once per envelope.
 - `Reset`: `ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding)` when the store is set, otherwise `Discard(r.Name)` if the `Marker` implements `interface{ Discard(string) }` and then `Marker.Save(...,0)`; set `r.state=StatusRebuilding`, `r.marker=0`, `r.loaded=true`; call `Progress.SetStatus(..., StatusRebuilding)`.
-- `Rebuild`: after `Replay` succeeds, set `r.state=StatusLive`, call `ProgressStore.SetStatus(..., StatusLive)` when the store is set, then `Progress.SetStatus(..., StatusLive)`; on error, return and leave `rebuilding` in both. Keep `OnApplied` after the save and after `Advance`.
+- `Rebuild`: after `Replay` succeeds, call `ProgressStore.SetStatus(..., StatusLive)` when the store is set **first**, and set `r.state=StatusLive` only after it returns nil; then `Progress.SetStatus(..., StatusLive)`. On any error, restore/leave `StatusRebuilding` in both the row and `r.state`, and return. Keep `OnApplied` after the save and after `Advance`.
 
 - [ ] **Step 4: Run to verify pass**
 
