@@ -514,7 +514,11 @@ git commit -m "feat(sqlite): add the projection checkpoint store"
 - A committed `ResetProgress` or `SetStatus` also marks the scope: a rebuild or status change must wake remote waiters, not wait for the fallback.
 - Two saves on the same scope inside one window produce one notification; a Task 3 batch save does not produce one per event.
 - A save that never commits (a failed or rolled-back transaction) produces no notification: `Mark` runs only after `runWorkspace` returns nil.
-- A failing notifier flush (an injected failing executor) does not fail `SaveProgress` and leaves the stored row intact.
+- A failing notifier flush (injected through the notifier constructor seam, not by mutating a live goroutine) does not fail `SaveProgress` and leaves the stored row intact.
+- A scope longer than the notify limit is saved without a hint (counted as dropped), never an error.
+- Two `SaveProgress` calls on the same scope inside one window produce one notification (drive coalescing through the store, not `Mark` directly).
+- `Mark` after `Close` is a no-op; the pending map stays empty and nothing is flushed.
+- `NewProgressStore` panics on an invalid non-empty channel, matching `NewNotifyListener`.
 - `NewProgressListener`'s `OnNotify(payload)` calls `EnqueueScopeRefresh(payload)`; `OnReconnected` calls `EnqueueRefreshAll`; start the listener with `Run`, save, and wait on a fake refresher's channel.
 - The payload carries no position, so a forged notification can only trigger a refresh; the waiter's position always comes from the store.
 
@@ -531,7 +535,7 @@ Use the constructor’s `channel` (Task 5 already accepts it). **Emit after comm
 SELECT pg_notify($1, s) FROM unnest($2::text[]) AS s
 ```
 
-A flush error is counted and the batch dropped — the checkpoint row is already committed, so a hint can never fail or roll back the save. An empty channel disables the notifier entirely.
+A flush error is counted and the batch dropped — the checkpoint row is already committed, so a hint can never fail or roll back the save. An oversized scope (>512 bytes) is skipped and counted the same way. An empty channel disables the notifier entirely. Expose the dropped/failed count (for example `NotifyDropped() uint64`) so the runbook's metric is reachable; `Close` sets a closed flag so a later `Mark` is a no-op rather than an unflushable map entry.
 
 `NewProgressListener(dsn, channel, r ScopeRefresher)` wraps the existing `NotifyListener` with a handler whose `OnNotify(payload string)` calls `r.EnqueueScopeRefresh(payload)` and whose `OnReconnected()` calls `r.EnqueueRefreshAll()`. `NotifyListener` passes the raw payload, and the payload is the scope — the same shape as the two existing channels, so its 10 ms per-scope throttle coalesces a burst. The handler must not block: both calls are bounded, non-blocking queue writes; the store read happens on the waiter's worker, never on the listener goroutine.
 
