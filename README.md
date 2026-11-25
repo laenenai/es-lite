@@ -506,6 +506,12 @@ The plugin needs `strategy: all` in `buf.gen.yaml` so `consumes` resolves
 across packages; `--es-lite_opt=docs=<path>` renders a catalogue of every
 projection and reaction from the descriptors.
 
+To make a read model read-your-writes, return the append's position from the
+command (`aggregate.Result.Token`), have the client pass it back as
+`ES-Consistency`, and wait with `projection.Waiter` before querying. The
+[read-your-writes guide](./docs/guides/read-your-writes.md) covers the wiring,
+the cost on the query path and the fail-open mode.
+
 ## Command services over Connect
 
 Write the service `.proto` by hand, mark it
@@ -582,6 +588,8 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
   client-owned crypto, migrations, hash chain, codegen, caller-owned
   transactions, no-broker boundary, commit-safe feed reads). Start at
   [the index](./docs/adr/README.md).
+- **[Read-your-writes guide](./docs/guides/read-your-writes.md)** — tokens,
+  `projection.Waiter`, and what a query endpoint pays for consistency.
 - **[Migration notes](./docs/migration)** — what downstream repositories
   change when an ADR moves a contract (currently: projection options).
 - **[Backlog](./docs/backlog)** — tracked follow-ups.
