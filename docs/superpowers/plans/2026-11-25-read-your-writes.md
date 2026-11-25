@@ -511,6 +511,7 @@ git commit -m "feat(sqlite): add the projection checkpoint store"
 - [ ] **Step 1: Write the failing tests**
 
 - A committed `SaveProgress` marks the scope; the notifier flushes one `pg_notify(channel, scope)` within the window (poll with a deadline).
+- A committed `ResetProgress` or `SetStatus` also marks the scope: a rebuild or status change must wake remote waiters, not wait for the fallback.
 - Two saves on the same scope inside one window produce one notification; a Task 3 batch save does not produce one per event.
 - A save that never commits (a failed or rolled-back transaction) produces no notification: `Mark` runs only after `runWorkspace` returns nil.
 - A failing notifier flush (an injected failing executor) does not fail `SaveProgress` and leaves the stored row intact.
@@ -524,7 +525,7 @@ Expected: the constructor accepts a channel but ignores it; `NewProgressListener
 
 - [ ] **Step 3: Implement**
 
-Use the constructor’s `channel` (Task 5 already accepts it). **Emit after commit, never inside the save transaction.** `runWorkspace` returns nil, then `Mark(scope)` on a bounded notifier started by `NewProgressStore`; `Close()` stops it. The notifier dedupes scopes in a map, flushes every 10 ms (or when the map is full) with one statement:
+Use the constructor’s `channel` (Task 5 already accepts it). **Emit after commit, never inside the save transaction.** Each of `SaveProgress`, `ResetProgress` and `SetStatus` returns from `runWorkspace` nil and then calls `Mark(scope)` on a bounded notifier started by `NewProgressStore`; `Close()` stops it. The notifier dedupes scopes in a map, flushes every 10 ms (or when the map is full) with one statement:
 
 ```sql
 SELECT pg_notify($1, s) FROM unnest($2::text[]) AS s

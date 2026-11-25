@@ -294,8 +294,8 @@ CREATE TABLE projection_checkpoints (
 with the standard workspace RLS policy (workspace arm plus the role-gated
 `es_relay` arm), `ENABLE` + `FORCE`. The table is small and unpartitioned.
 `postgres.NewProgressStore(store *Store, channel string)` implements
-`projection.ProgressStore`. After a save commits, it marks the scope on a
-bounded notifier; the notifier dedupes scopes and flushes at most every 10 ms
+`projection.ProgressStore`. After any checkpoint mutation commits (`SaveProgress`, `ResetProgress`,
+`SetStatus`), it marks the scope on a bounded notifier; the notifier dedupes scopes and flushes at most every 10 ms
 with `pg_notify(channel, scope)` **outside** the save transaction. A failed
 flush is counted and dropped: a hint never fails or rolls back a checkpoint
 write, and a rolled-back save never marks at all. The payload is the scope
