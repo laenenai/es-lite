@@ -15,10 +15,11 @@ import (
 // runner passed. LoadProgress/SetStatus/ResetProgress read and write the
 // in-memory store, so the runner sees ordinary store semantics.
 type recordingProgressStore struct {
-	inner   *MemoryProgressStore
-	order   *[]string // optional: appends "save" for ordering assertions
-	saves   []Checkpoint
-	saveErr error
+	inner        *MemoryProgressStore
+	order        *[]string // optional: appends "save" for ordering assertions
+	saves        []Checkpoint
+	saveErr      error
+	setStatusErr error
 }
 
 func newRecordingProgressStore() *recordingProgressStore {
@@ -45,6 +46,9 @@ func (s *recordingProgressStore) ResetProgress(ctx context.Context, scope, proje
 }
 
 func (s *recordingProgressStore) SetStatus(ctx context.Context, scope, projection string, state Status) error {
+	if s.setStatusErr != nil {
+		return s.setStatusErr
+	}
 	return s.inner.SetStatus(ctx, scope, projection, state)
 }
 
@@ -384,6 +388,33 @@ func TestRunnerProgressLoadsStoredPosition(t *testing.T) {
 	}
 }
 
+// TestRunnerProgressLoadSeedsRebuildingState pins the fail-closed restart: a
+// row left rebuilding by a crash mid-rebuild must seed both the position and
+// the state, so a fresh runner's first save stays rebuilding instead of
+// flipping the row live over a half-rebuilt read model.
+func TestRunnerProgressLoadSeedsRebuildingState(t *testing.T) {
+	ctx := context.Background()
+	store := newRecordingProgressStore()
+	if err := store.inner.SaveProgress(ctx, "ws", "p", Checkpoint{Position: 10, State: StatusRebuilding}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	r := &Runner{
+		Name:          "p",
+		Scope:         "ws",
+		ProgressStore: store,
+		Dispatch:      func(context.Context, es.Envelope) error { return nil },
+	}
+	if err := r.Apply(ctx, []es.Envelope{{GlobalPosition: 11}}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(store.saves) != 1 || store.saves[0].State != StatusRebuilding {
+		t.Fatalf("saves = %+v, want one save with state %v (seeded from the row)", store.saves, StatusRebuilding)
+	}
+	if got := store.stored(t, "ws", "p"); got.Position != 11 || got.State != StatusRebuilding {
+		t.Fatalf("stored = (%d, %v), want (11, %v)", got.Position, got.State, StatusRebuilding)
+	}
+}
+
 // TestRunnerProgressApplyDuringRebuildKeepsRebuilding pins Review Focus 3: a
 // replay page persists StateRebuilding, so a waiter cannot see "live" over a
 // half-rebuilt read model. Only a successful Rebuild flips the state to live.
@@ -591,6 +622,46 @@ func TestRunnerRebuildStatus(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestRunnerRebuildStatusSetStatusErrorKeepsRebuilding pins the fail-closed
+// live transition: when the store cannot record live, Rebuild returns the
+// error and both the row and the runner's in-memory state stay rebuilding, so
+// the next advance cannot write live over a half-gated rebuild.
+func TestRunnerRebuildStatusSetStatusErrorKeepsRebuilding(t *testing.T) {
+	ctx := context.Background()
+	errStatus := errors.New("status write failed")
+	store := newRecordingProgressStore()
+	pub := &recordingPublisher{}
+	r := &Runner{
+		Name:          "p",
+		Scope:         "ws",
+		ProgressStore: store,
+		Progress:      pub,
+		Dispatch:      func(context.Context, es.Envelope) error { return nil },
+	}
+	if err := r.Reset(ctx); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	store.setStatusErr = errStatus
+	pos, err := r.Rebuild(ctx, progressSource{{GlobalPosition: 1}}, 10)
+	if !errors.Is(err, errStatus) {
+		t.Fatalf("Rebuild error = %v, want the status store error", err)
+	}
+	if pos != 1 {
+		t.Fatalf("Rebuild position = %d, want the applied 1", pos)
+	}
+	if got := store.stored(t, "ws", "p"); got.State != StatusRebuilding {
+		t.Fatalf("stored state = %v, want %v after the failed live write", got.State, StatusRebuilding)
+	}
+	if r.state != StatusRebuilding {
+		t.Fatalf("runner state = %v, want %v after the failed live write", r.state, StatusRebuilding)
+	}
+	for _, s := range pub.statuses {
+		if s.state == StatusLive {
+			t.Fatalf("published statuses = %+v, want no live after the failed live write", pub.statuses)
+		}
+	}
 }
 
 // TestRunnerProgressLegacyMarkerPath pins that a nil ProgressStore keeps the

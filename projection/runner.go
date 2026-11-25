@@ -136,10 +136,10 @@ type Runner struct {
 	// unused when ProgressStore is set.
 	Marker Marker
 	// ProgressStore, when set, persists a scoped checkpoint — position and
-	// state — instead of the single-value Marker. Load seeds the runner from
-	// it, every applied batch saves through it write-through, and Rebuild
-	// marks it rebuilding until the replay succeeds. Nil keeps the legacy
-	// Marker path.
+	// state — instead of the single-value Marker. Load seeds the runner's
+	// position and state from it, every applied batch saves through it
+	// write-through, and Rebuild marks it rebuilding until the replay
+	// succeeds. Nil keeps the legacy Marker path.
 	ProgressStore ProgressStore
 	// Progress, when set, receives each checkpoint after its write-through
 	// save returns and each state change. It feeds the in-process waiters of
@@ -228,6 +228,13 @@ func (r *Runner) loadMarker(ctx context.Context) error {
 		}
 		if found {
 			pos = cp.Position
+			// Seed the lifecycle state too: a row left rebuilding by a crash
+			// mid-rebuild must keep the runner fail-closed, or its first save
+			// would flip the row live over a half-rebuilt read model. An
+			// absent or unknown state keeps the live default.
+			if cp.State != StatusUnknown {
+				r.state = cp.State
+			}
 		}
 	} else {
 		var err error
@@ -441,19 +448,27 @@ func (r *Runner) Reset(ctx context.Context) error {
 // StatusRebuilding, and only a successful Replay marks the scope live. A
 // source error leaves it rebuilding, so a reader waiting on it cannot see
 // "live" over a half-rebuilt read model.
+//
+// The live transition is fail-closed: the store row is marked live first, and
+// the runner's state changes only after that succeeds. If the status write
+// fails, Rebuild returns the error with both the row and the runner still
+// rebuilding, so the next advance cannot write live.
 func (r *Runner) Rebuild(ctx context.Context, src Source, batch int) (uint64, error) {
 	pos, err := Replay(ctx, src, 0, batch, r.Apply)
 	if err != nil {
 		return pos, err
 	}
-	r.mu.Lock()
-	r.state = StatusLive
-	r.mu.Unlock()
 	if r.ProgressStore != nil {
 		if err := r.ProgressStore.SetStatus(ctx, r.Scope, r.Name, StatusLive); err != nil {
+			r.mu.Lock()
+			r.state = StatusRebuilding
+			r.mu.Unlock()
 			return pos, fmt.Errorf("projection %s: mark live: %w", r.Name, err)
 		}
 	}
+	r.mu.Lock()
+	r.state = StatusLive
+	r.mu.Unlock()
 	if r.Progress != nil {
 		r.Progress.SetStatus(r.Scope, r.Name, StatusLive)
 	}
