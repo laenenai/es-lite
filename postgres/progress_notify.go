@@ -94,11 +94,13 @@ type progressNotifier struct {
 	interval time.Duration
 	maxBatch int
 
-	// mu guards pending. Mark runs on every successful save, so it must
-	// stay cheap; the flusher swaps the map out under the same lock, so a
-	// Mark during a flush lands in the next window instead of being lost.
+	// mu guards pending and closed. Mark runs on every successful save, so
+	// it must stay cheap; the flusher swaps the map out under the same
+	// lock, so a Mark during a flush lands in the next window instead of
+	// being lost.
 	mu      sync.Mutex
 	pending map[string]struct{}
+	closed  bool
 
 	// wake is a capacity-1 doorbell: a mark that opens a window or fills
 	// the batch signals it; concurrent signals coalesce.
@@ -108,10 +110,12 @@ type progressNotifier struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	// failures counts flush errors. The hints are already dropped by the
-	// time this increments — there is no retry — so the counter exists
-	// for observability, not recovery.
-	failures atomic.Uint64
+	// dropped counts hints that will never be delivered: an oversized
+	// scope (Mark refuses to widen the payload) and a failed flush (the
+	// batch is already gone; there is no retry). It is observability for
+	// the runbook metric, not a recovery path — ProgressStore.NotifyDropped
+	// exposes it.
+	dropped atomic.Uint64
 }
 
 // newProgressNotifier starts the flusher goroutine. Callers must Close
@@ -135,11 +139,26 @@ func newProgressNotifier(channel string, exec progressNotifyExec, interval time.
 // Mark records scope for the next flush. It never blocks and never
 // touches the database: the flush is entirely the goroutine's. A nil
 // notifier (the channel-disabled case) is a no-op.
+//
+// A scope over maxNotifyWorkspaceBytes would overflow the NOTIFY payload
+// bound. Enabling a hint must not change the save contract, so the hint
+// is skipped and counted as dropped instead of the save failing. Mark
+// after Close is a no-op: the goroutine is gone and nothing may queue
+// behind it.
 func (n *progressNotifier) Mark(scope string) {
 	if n == nil {
 		return
 	}
 	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		return
+	}
+	if len(scope) > maxNotifyWorkspaceBytes {
+		n.dropped.Add(1)
+		n.mu.Unlock()
+		return
+	}
 	opened := len(n.pending) == 0
 	n.pending[scope] = struct{}{}
 	full := len(n.pending) >= n.maxBatch
@@ -156,12 +175,18 @@ func (n *progressNotifier) Mark(scope string) {
 // Close stops the flusher and joins it. The goroutine flushes whatever
 // is still pending once, best-effort, so a save racing shutdown is not
 // guaranteed lost (and a hint nobody needs cannot hang the join: the
-// flush is bounded). Close is idempotent.
+// flush is bounded). Close is idempotent, and a Mark after it is a
+// no-op.
 func (n *progressNotifier) Close() error {
 	if n == nil {
 		return nil
 	}
-	n.closeOnce.Do(func() { close(n.done) })
+	n.closeOnce.Do(func() {
+		n.mu.Lock()
+		n.closed = true
+		n.mu.Unlock()
+		close(n.done)
+	})
 	n.wg.Wait()
 	return nil
 }
@@ -214,8 +239,8 @@ func (n *progressNotifier) run() {
 
 // flush emits the pending set in one statement and drops it. The set is
 // swapped out before the statement runs, so a Mark during the round trip
-// is kept for the next window. An error increments failures and the
-// batch is gone: the checkpoint row is already committed and a hint is
+// is kept for the next window. An error increments dropped and the batch
+// is gone: the checkpoint row is already committed and a hint is
 // optional, so retrying a failed wake would only repeat a failure.
 func (n *progressNotifier) flush() {
 	n.mu.Lock()
@@ -233,7 +258,7 @@ func (n *progressNotifier) flush() {
 	ctx, cancel := context.WithTimeout(context.Background(), progressNotifyFlushTimeout)
 	defer cancel()
 	if err := n.exec(ctx, progressNotifySQL, n.channel, scopes); err != nil {
-		n.failures.Add(1)
+		n.dropped.Add(1)
 	}
 }
 

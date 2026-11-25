@@ -401,3 +401,77 @@ func TestProgressNotifyFailedSaveDoesNotFire(t *testing.T) {
 		t.Fatalf("failed save left a row (found=%v err=%v), want none", found, err)
 	}
 }
+
+// TestProgressNotifyResetAndSetStatusFire pins the mutation coverage: a
+// committed ResetProgress and a committed SetStatus each mark their
+// scope, so a remote waiter stops trusting a cached checkpoint through a
+// rebuild or status change instead of waiting for the fallback ticker.
+func TestProgressNotifyResetAndSetStatusFire(t *testing.T) {
+	const (
+		channel = "es_lite_progress_mutations"
+		scope   = "ws_progress_mutations"
+	)
+	ctx := context.Background()
+	lc := listenConn(t, channel)
+	s := openStore(t)
+	ps := postgres.NewProgressStore(s, channel)
+	defer ps.Close()
+
+	waitScope := func(label string) {
+		t.Helper()
+		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		n, err := lc.WaitForNotification(waitCtx)
+		if err != nil {
+			t.Fatalf("%s: wait for notification: %v", label, err)
+		}
+		if n.Channel != channel {
+			t.Fatalf("%s: notification channel = %q, want %q", label, n.Channel, channel)
+		}
+		if n.Payload != scope {
+			t.Fatalf("%s: notification payload = %q, want the scope %q", label, n.Payload, scope)
+		}
+	}
+
+	if _, err := ps.ResetProgress(ctx, scope, "orders", projection.StatusRebuilding); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	waitScope("reset")
+	assertNoNotification(t, lc, 100*time.Millisecond)
+
+	if err := ps.SetStatus(ctx, scope, "orders", projection.StatusStalled); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+	waitScope("set status")
+	assertNoNotification(t, lc, 100*time.Millisecond)
+}
+
+// TestProgressNotifyFailedMutationsDoNotFire pins the commit boundary
+// for the other two mutations: a reset or status write that never
+// commits marks no scope and leaves no row.
+func TestProgressNotifyFailedMutationsDoNotFire(t *testing.T) {
+	const (
+		channel = "es_lite_progress_mutations_failed"
+		scope   = "ws_progress_mutations_failed"
+	)
+	lc := listenConn(t, channel)
+	s := openStore(t)
+	ps := postgres.NewProgressStore(s, channel)
+	defer ps.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := ps.ResetProgress(ctx, scope, "orders", projection.StatusRebuilding); err == nil {
+		t.Fatal("reset with a cancelled context succeeded, want an error")
+	}
+	if err := ps.SetStatus(ctx, scope, "orders", projection.StatusStalled); err == nil {
+		t.Fatal("set status with a cancelled context succeeded, want an error")
+	}
+
+	assertNoNotification(t, lc, 200*time.Millisecond)
+
+	if _, found, err := ps.LoadProgress(context.Background(), scope, "orders"); err != nil || found {
+		t.Fatalf("failed mutations left a row (found=%v err=%v), want none", found, err)
+	}
+}

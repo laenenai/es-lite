@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -42,9 +43,19 @@ var _ projection.ProgressStore = (*ProgressStore)(nil)
 // construction, a wiring bug rather than a save that silently never
 // hints.
 //
-// The notifier runs one goroutine; Close stops it. Callers that
-// configured a channel must Close the store when done.
+// Every committed mutation of a checkpoint (SaveProgress, ResetProgress,
+// SetStatus) marks its scope. The notifier runs one goroutine; Close
+// stops it. Callers that configured a channel must Close the store when
+// done.
 func NewProgressStore(s *Store, channel string) *ProgressStore {
+	return newProgressStore(s, channel, progressNotifyInterval, storeProgressExec(s))
+}
+
+// newProgressStore is NewProgressStore with the two test seams — the
+// coalescing window and the flush executor — supplied by the caller. The
+// executor is fixed before the notifier goroutine starts, so a test can
+// inject a recorder or a failing executor without racing a field write.
+func newProgressStore(s *Store, channel string, interval time.Duration, exec progressNotifyExec) *ProgressStore {
 	p := &ProgressStore{store: s, channel: channel}
 	if channel == "" {
 		return p
@@ -52,11 +63,17 @@ func NewProgressStore(s *Store, channel string) *ProgressStore {
 	if err := validNotifyChannel("ProgressStore", channel); err != nil {
 		panic(err)
 	}
-	p.notifier = newProgressNotifier(channel, func(ctx context.Context, sql string, args ...any) error {
+	p.notifier = newProgressNotifier(channel, exec, interval, progressNotifyBatchMax)
+	return p
+}
+
+// storeProgressExec binds the notifier's flush to the store's pool. The
+// channel and scopes are bound parameters, never interpolated SQL.
+func storeProgressExec(s *Store) progressNotifyExec {
+	return func(ctx context.Context, sql string, args ...any) error {
 		_, err := s.Pool().Exec(ctx, sql, args...)
 		return err
-	}, progressNotifyInterval, progressNotifyBatchMax)
-	return p
+	}
 }
 
 // Close stops the checkpoint notifier, flushing any pending hint once,
@@ -67,6 +84,18 @@ func (p *ProgressStore) Close() error {
 		return nil
 	}
 	return p.notifier.Close()
+}
+
+// NotifyDropped reports how many checkpoint hints were dropped since the
+// store was created: a scope over maxNotifyWorkspaceBytes (the hint is
+// skipped, never a save failure) and a failed flush (the batch is not
+// retried). It is the runbook's loss metric, not an error to act on, and
+// is 0 when the notifier is disabled. It never blocks.
+func (p *ProgressStore) NotifyDropped() uint64 {
+	if p.notifier == nil {
+		return 0
+	}
+	return p.notifier.dropped.Load()
 }
 
 // progressStateText maps a persisted status to the table's text form,
@@ -117,18 +146,13 @@ func (p *ProgressStore) LoadProgress(ctx context.Context, scope, projectionName 
 // When a hint channel is configured, the scope is marked only after
 // runWorkspace reports a committed transaction: the hint can never
 // describe a save that rolled back, and a failed hint can never fail the
-// save. The payload is the scope alone; see progressNotifier.
+// save. The payload is the scope alone; see progressNotifier. An
+// oversized scope saves normally and the hint is skipped (NotifyDropped
+// counts it): enabling hints never changes the write contract.
 func (p *ProgressStore) SaveProgress(ctx context.Context, scope, projectionName string, cp projection.Checkpoint) error {
 	state, err := progressStateText(cp.State)
 	if err != nil {
 		return err
-	}
-	// A NOTIFY payload is bounded by the server; refuse an oversized scope
-	// before the transaction, so the bound is a save error rather than a
-	// flush that can never succeed. With the notifier off the save path is
-	// unchanged, exactly like the marker channel's Save.
-	if p.notifier != nil && len(scope) > maxNotifyWorkspaceBytes {
-		return fmt.Errorf("postgres: progress: save: workspace id is %d bytes, over the %d-byte notify bound", len(scope), maxNotifyWorkspaceBytes)
 	}
 	err = p.store.runWorkspace(ctx, scope, func(tx DBTX) error {
 		_, err := tx.Exec(ctx,
@@ -156,7 +180,8 @@ func (p *ProgressStore) SaveProgress(ctx context.Context, scope, projectionName 
 
 // ResetProgress implements projection.ProgressStore: it replaces the row
 // with position 0 and state, creating it when absent, and returns the
-// stored checkpoint.
+// stored checkpoint. A committed reset marks its scope — a rewind is
+// progress a waiter must not miss.
 func (p *ProgressStore) ResetProgress(ctx context.Context, scope, projectionName string, state projection.Status) (projection.Checkpoint, error) {
 	text, err := progressStateText(state)
 	if err != nil {
@@ -181,6 +206,10 @@ func (p *ProgressStore) ResetProgress(ctx context.Context, scope, projectionName
 	if err != nil {
 		return projection.Checkpoint{}, fmt.Errorf("postgres: progress: reset: %w", err)
 	}
+	// The row is committed. Mark before validating the returned state: a
+	// parse failure below cannot un-commit the write, so the scope must
+	// still be refreshed.
+	p.notifier.Mark(scope)
 	parsed, ok := projection.ParseStatus(gotState)
 	if !ok || parsed == projection.StatusUnknown {
 		return projection.Checkpoint{}, fmt.Errorf("postgres: progress: reset: unknown state %q for (%s, %s)", gotState, scope, projectionName)
@@ -191,7 +220,8 @@ func (p *ProgressStore) ResetProgress(ctx context.Context, scope, projectionName
 
 // SetStatus implements projection.ProgressStore: it changes only the state
 // and UpdatedAt, creating a zero-position row when absent, and never moves
-// the position.
+// the position. A committed status change marks its scope: a waiter's
+// cached state must not survive a stall or rebuild transition.
 func (p *ProgressStore) SetStatus(ctx context.Context, scope, projectionName string, state projection.Status) error {
 	text, err := progressStateText(state)
 	if err != nil {
@@ -211,5 +241,6 @@ func (p *ProgressStore) SetStatus(ctx context.Context, scope, projectionName str
 	if err != nil {
 		return fmt.Errorf("postgres: progress: set status: %w", err)
 	}
+	p.notifier.Mark(scope)
 	return nil
 }

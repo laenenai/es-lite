@@ -171,8 +171,8 @@ func TestProgressNotifyFlushErrorIsCountedAndDropped(t *testing.T) {
 	if !waitUntil(2*time.Second, func() bool { return calls.Load() == 1 }) {
 		t.Fatalf("flush attempts = %d, want 1", calls.Load())
 	}
-	if !waitUntil(time.Second, func() bool { return n.failures.Load() == 1 }) {
-		t.Fatalf("failure count = %d, want 1", n.failures.Load())
+	if !waitUntil(time.Second, func() bool { return n.dropped.Load() == 1 }) {
+		t.Fatalf("dropped count = %d, want 1", n.dropped.Load())
 	}
 	if err := n.Close(); err != nil {
 		t.Fatalf("close after a failed flush: %v", err)
@@ -180,8 +180,8 @@ func TestProgressNotifyFlushErrorIsCountedAndDropped(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("flush attempts = %d after Close, want 1 — a failed batch is dropped, not retried", got)
 	}
-	if got := n.failures.Load(); got != 1 {
-		t.Fatalf("failure count = %d after Close, want 1", got)
+	if got := n.dropped.Load(); got != 1 {
+		t.Fatalf("dropped count = %d after Close, want 1", got)
 	}
 }
 
@@ -196,46 +196,60 @@ func TestProgressNotifyEmptyChannelDisables(t *testing.T) {
 	if err := ps.Close(); err != nil {
 		t.Fatalf("close on a disabled notifier: %v", err)
 	}
+	if got := ps.NotifyDropped(); got != 0 {
+		t.Fatalf("NotifyDropped on a disabled notifier = %d, want 0", got)
+	}
 }
 
-// TestProgressNotifyOversizedScopeRejected pins the payload bound on
-// the save path: a scope over maxNotifyWorkspaceBytes fails the save
-// before any statement and leaves no row, exactly like the marker
-// channel's Save.
-func TestProgressNotifyOversizedScopeRejected(t *testing.T) {
+// TestProgressNotifyOversizedScopeSavesWithoutHint pins the parallel
+// ruling: enabling hints must not change the write contract. A scope
+// over maxNotifyWorkspaceBytes commits normally; the notifier refuses to
+// widen the payload and counts the skipped hint instead.
+func TestProgressNotifyOversizedScopeSavesWithoutHint(t *testing.T) {
 	s := openStore(t)
-	ps := NewProgressStore(s, "es_lite_progress_oversized")
+	rec := &notifierRecorder{}
+	ps := newProgressStore(s, "es_lite_progress_oversized", progressNotifyInterval, rec.exec)
 	defer ps.Close()
 
 	ctx := context.Background()
 	const projectionName = "orders"
 	scope := strings.Repeat("s", maxNotifyWorkspaceBytes+1)
 
-	err := ps.SaveProgress(ctx, scope, projectionName, projection.Checkpoint{
-		Position: 1, State: projection.StatusLive,
-	})
-	if err == nil || !strings.Contains(err.Error(), "notify bound") {
-		t.Fatalf("oversized scope save = %v, want a notify-bound error", err)
+	if err := ps.SaveProgress(ctx, scope, projectionName, projection.Checkpoint{
+		Position: 5, State: projection.StatusLive,
+	}); err != nil {
+		t.Fatalf("save with an oversized scope failed: %v", err)
 	}
-	if _, found, lerr := ps.LoadProgress(ctx, scope, projectionName); lerr != nil || found {
-		t.Fatalf("oversized save left a row (found=%v err=%v), want none", found, lerr)
+	if got := ps.NotifyDropped(); got != 1 {
+		t.Fatalf("NotifyDropped = %d, want 1 for the skipped hint", got)
+	}
+	// One window is long enough for a wrongly-queued scope to flush.
+	time.Sleep(50 * time.Millisecond)
+	if got := rec.count(); got != 0 {
+		t.Fatalf("oversized scope flushed %d hints, want 0", got)
+	}
+	cp, found, err := ps.LoadProgress(ctx, scope, projectionName)
+	if err != nil || !found {
+		t.Fatalf("load after oversized save = found %v err %v, want the committed row", found, err)
+	}
+	if cp.Position != 5 || cp.State != projection.StatusLive {
+		t.Fatalf("stored row = %+v, want position 5/live", cp)
 	}
 }
 
 // TestProgressNotifyFlushFailureDoesNotFailSave pins the ordering that
 // makes a hint harmless: the checkpoint commits first, then the notifier
 // marks the scope. A failing flush is counted and dropped; SaveProgress
-// still succeeds and the committed row is readable.
+// still succeeds and the committed row is readable. The failing executor
+// is injected through the constructor seam, so no goroutine reads a
+// field a test writes.
 func TestProgressNotifyFlushFailureDoesNotFailSave(t *testing.T) {
 	s := openStore(t)
-	ps := NewProgressStore(s, "es_lite_progress_save_survives")
+	ps := newProgressStore(s, "es_lite_progress_save_survives", progressNotifyInterval,
+		func(context.Context, string, ...any) error {
+			return errors.New("flush unavailable")
+		})
 	defer ps.Close()
-
-	var failures atomic.Int64
-	ps.notifier.exec = func(context.Context, string, ...any) error {
-		failures.Add(1)
-		return errors.New("flush unavailable")
-	}
 
 	ctx := context.Background()
 	const (
@@ -247,7 +261,7 @@ func TestProgressNotifyFlushFailureDoesNotFailSave(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("save failed because a hint flush failed: %v", err)
 	}
-	if !waitUntil(2*time.Second, func() bool { return failures.Load() >= 1 }) {
+	if !waitUntil(2*time.Second, func() bool { return ps.NotifyDropped() >= 1 }) {
 		t.Fatal("notifier never attempted the failing flush")
 	}
 
@@ -258,6 +272,78 @@ func TestProgressNotifyFlushFailureDoesNotFailSave(t *testing.T) {
 	if !found || cp.Position != 9 || cp.State != projection.StatusLive {
 		t.Fatalf("stored row = found %v %+v, want the committed position 9/live", found, cp)
 	}
+}
+
+// TestProgressNotifyMarkAfterCloseIsNoOp pins shutdown: Close ends the
+// notifier, and a Mark that races or follows it neither enters the
+// pending map nor flushes anything.
+func TestProgressNotifyMarkAfterCloseIsNoOp(t *testing.T) {
+	rec := &notifierRecorder{}
+	n := newProgressNotifier("es_lite_progress_closed", rec.exec, 10*time.Millisecond, 64)
+	if err := n.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	n.Mark("ws_after_close")
+	if !n.empty() {
+		t.Fatal("Mark after Close inserted a scope into the pending map")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := rec.count(); got != 0 {
+		t.Fatalf("flushes after Close = %d, want 0", got)
+	}
+}
+
+// TestProgressNotifyStoreCoalescesSaves drives the window through the
+// store: two committed SaveProgress calls on one scope inside the window
+// produce one flush carrying that scope once.
+func TestProgressNotifyStoreCoalescesSaves(t *testing.T) {
+	s := openStore(t)
+	rec := &notifierRecorder{}
+	ps := newProgressStore(s, "es_lite_progress_store_coalesce", 100*time.Millisecond, rec.exec)
+	defer ps.Close()
+
+	ctx := context.Background()
+	const (
+		scope          = "ws_progress_store_coalesce"
+		projectionName = "orders"
+	)
+	for i := 1; i <= 2; i++ {
+		if err := ps.SaveProgress(ctx, scope, projectionName, projection.Checkpoint{
+			Position: uint64(i), State: projection.StatusLive,
+		}); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+
+	if !waitUntil(2*time.Second, func() bool { return rec.count() == 1 }) {
+		t.Fatalf("flushes = %d, want 1 for two saves in one window", rec.count())
+	}
+	_, scopes := notifyScopes(t, rec.snapshot()[0])
+	if len(scopes) != 1 || scopes[0] != scope {
+		t.Fatalf("flush scopes = %q, want exactly [%s]", scopes, scope)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if got := rec.count(); got != 1 {
+		t.Fatalf("flushes = %d after the window, want 1 (no per-save notification)", got)
+	}
+}
+
+// TestProgressNotifyInvalidChannelPanics pins the constructor's
+// fail-fast rule: an invalid non-empty channel is a wiring bug, so it
+// panics with the validator's error instead of starting a deaf notifier.
+func TestProgressNotifyInvalidChannelPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("NewProgressStore with an invalid channel did not panic")
+		}
+		err, ok := r.(error)
+		if !ok || !strings.Contains(err.Error(), "bad-name") {
+			t.Fatalf("panic = %v, want the validator's error naming the channel", r)
+		}
+	}()
+	NewProgressStore(&Store{}, "bad-name")
 }
 
 // fakeScopeRefresher records the listener's refresher calls. Its
