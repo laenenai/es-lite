@@ -345,7 +345,9 @@ role. The deployment check is therefore the C2 trust precondition: enumerate
 who can connect and confirm every role is trusted, or use a dedicated database.
 
 ```sql
-SELECT rolname FROM pg_roles WHERE rolcanconnect;
+SELECT r.rolname
+FROM pg_roles r
+WHERE has_database_privilege(r.rolname, current_database(), 'CONNECT');
 -- plus the database-level CONNECT grants shown by \l in psql
 ```
 
@@ -407,7 +409,7 @@ Export these and alert on the ones marked:
 | dropped hints | `ProgressStore.NotifyDropped()` (counter) | alert on a rising rate; also covers oversized scopes |
 | fallback reads | application-observed (the waiter does not export a counter; count ticks/reads in a store wrapper or the query middleware) | expected when hints are off; a spike means lost hints or a dead listener |
 | active waiters | application gauge (middleware) | watch `waiters × deadline`, not the hint rate; a retry storm doubles it |
-| checkpoint lag / state | `now() - updated_at`, `state != 'live'` | **alert on a sustained non-`live` state**; a crashed rebuild stays `rebuilding` |
+| time since last checkpoint save / state | `now() - updated_at`, `state != 'live'` | **alert on a sustained non-`live` state**; a crashed rebuild stays `rebuilding`. Age grows on an idle `live` projection, so do not alert on age alone |
 
 A listener reconnect is normal and self-repairs (`OnReconnected` refreshes
 every active key); a PID that stays 0, or `NotifyDropped` climbing with queue
@@ -1208,7 +1210,9 @@ roles, plus the database-level `CONNECT` grants shown by `\l` in `psql`
 (`PUBLIC` holds `CONNECT` unless it has been revoked):
 
 ```sql
-SELECT rolname FROM pg_roles WHERE rolcanconnect;
+SELECT r.rolname
+FROM pg_roles r
+WHERE has_database_privilege(r.rolname, current_database(), 'CONNECT');
 ```
 
 A co-tenant database with untrusted roles uses C1 instead. The listener

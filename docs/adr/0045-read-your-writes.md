@@ -267,8 +267,8 @@ until an operator completes or re-runs it.
 The projection runner needs `SELECT, INSERT, UPDATE` on
 `projection_checkpoints`; the query/waiter service needs `SELECT`. **No
 `DELETE` on the normal path** — rows are replaced in place, and a rebuild
-resets rather than deletes. A store-wide projection uses a dedicated scope
-value as its row key and the same grants.
+resets rather than deletes. A store-wide projection uses the scope `"*"` as
+its row key and the same grants.
 
 Placement is a deployment decision: co-locate the table with the read model
 (so the query service uses one pool for both) or grant the query service
