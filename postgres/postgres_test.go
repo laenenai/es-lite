@@ -107,6 +107,43 @@ func TestAppendFoldTimeTravel(t *testing.T) {
 	}
 }
 
+// TestAppendResultPosition pins that the Postgres append path fills
+// AppendResult.Position itself — the highest global_position in the batch —
+// independently of the SQLite append path.
+func TestAppendResultPosition(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_position")
+	sid := streamID(t)
+
+	res, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events: []es.EventData{
+			{TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("a")},
+			{TypeURL: "thing.v1.Updated", SchemaVersion: 1, Payload: []byte("b")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(res.Envelopes) != 2 {
+		t.Fatalf("envelopes = %d, want 2", len(res.Envelopes))
+	}
+	if want := res.Envelopes[len(res.Envelopes)-1].GlobalPosition; res.Position != want || res.Position == 0 {
+		t.Fatalf("Position = %d, want %d", res.Position, want)
+	}
+
+	emptySid, _ := es.NewStreamID("counter", "empty")
+	empty, err := ws.Append(ctx, es.AppendParams{StreamID: emptySid, ExpectedVersion: 0})
+	if err != nil {
+		t.Fatalf("empty append: %v", err)
+	}
+	if empty.Position != 0 {
+		t.Fatalf("empty append Position = %d, want 0", empty.Position)
+	}
+}
+
 func TestWorkspaceIsolationRLS(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t)

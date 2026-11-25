@@ -590,10 +590,15 @@ func (w *Workspace) appendInternal(ctx context.Context, db DBTX, p es.AppendPara
 		}
 	}
 
+	var position uint64
+	if len(envs) > 0 {
+		position = envs[len(envs)-1].GlobalPosition
+	}
 	return es.AppendResult{
 		FromVersion: p.ExpectedVersion,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
+		Position:    position,
 	}, nil
 }
 
