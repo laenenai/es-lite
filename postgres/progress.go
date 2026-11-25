@@ -24,17 +24,49 @@ import (
 type ProgressStore struct {
 	store *Store
 
-	// channel is the opt-in pg_notify channel for checkpoint hints. Task 7
-	// wires the notifier; until then (and when empty) no hint is emitted.
+	// channel is the opt-in pg_notify channel for checkpoint hints. It is
+	// a capability: never logged, never echoed into an error outside
+	// construction validation. nil notifier means "off" — an empty
+	// channel starts no goroutine and issues no statement.
 	channel string
+
+	notifier *progressNotifier
 }
 
 var _ projection.ProgressStore = (*ProgressStore)(nil)
 
 // NewProgressStore returns a ProgressStore backed by s. channel is the
-// pg_notify channel for checkpoint hints; "" disables them (Task 7).
+// pg_notify channel for checkpoint hints; "" disables them entirely. A
+// non-empty channel must be a strict PostgreSQL identifier — the same
+// rule as WithAppendNotify and NotifyListener — and a bad one panics at
+// construction, a wiring bug rather than a save that silently never
+// hints.
+//
+// The notifier runs one goroutine; Close stops it. Callers that
+// configured a channel must Close the store when done.
 func NewProgressStore(s *Store, channel string) *ProgressStore {
-	return &ProgressStore{store: s, channel: channel}
+	p := &ProgressStore{store: s, channel: channel}
+	if channel == "" {
+		return p
+	}
+	if err := validNotifyChannel("ProgressStore", channel); err != nil {
+		panic(err)
+	}
+	p.notifier = newProgressNotifier(channel, func(ctx context.Context, sql string, args ...any) error {
+		_, err := s.Pool().Exec(ctx, sql, args...)
+		return err
+	}, progressNotifyInterval, progressNotifyBatchMax)
+	return p
+}
+
+// Close stops the checkpoint notifier, flushing any pending hint once,
+// best-effort. A store opened with an empty channel has no goroutine, so
+// Close is a no-op. It does not close the underlying Store.
+func (p *ProgressStore) Close() error {
+	if p.notifier == nil {
+		return nil
+	}
+	return p.notifier.Close()
 }
 
 // progressStateText maps a persisted status to the table's text form,
@@ -81,10 +113,22 @@ func (p *ProgressStore) LoadProgress(ctx context.Context, scope, projectionName 
 // cp.Scope and cp.Projection. A same-state save keeps the greater position;
 // a different state replaces it. UpdatedAt refreshes on every save, even
 // when the position does not move.
+//
+// When a hint channel is configured, the scope is marked only after
+// runWorkspace reports a committed transaction: the hint can never
+// describe a save that rolled back, and a failed hint can never fail the
+// save. The payload is the scope alone; see progressNotifier.
 func (p *ProgressStore) SaveProgress(ctx context.Context, scope, projectionName string, cp projection.Checkpoint) error {
 	state, err := progressStateText(cp.State)
 	if err != nil {
 		return err
+	}
+	// A NOTIFY payload is bounded by the server; refuse an oversized scope
+	// before the transaction, so the bound is a save error rather than a
+	// flush that can never succeed. With the notifier off the save path is
+	// unchanged, exactly like the marker channel's Save.
+	if p.notifier != nil && len(scope) > maxNotifyWorkspaceBytes {
+		return fmt.Errorf("postgres: progress: save: workspace id is %d bytes, over the %d-byte notify bound", len(scope), maxNotifyWorkspaceBytes)
 	}
 	err = p.store.runWorkspace(ctx, scope, func(tx DBTX) error {
 		_, err := tx.Exec(ctx,
@@ -104,6 +148,9 @@ func (p *ProgressStore) SaveProgress(ctx context.Context, scope, projectionName 
 	if err != nil {
 		return fmt.Errorf("postgres: progress: save: %w", err)
 	}
+	// Emit only after the commit. Mark never blocks and never returns an
+	// error, so the hint is invisible to the save's outcome.
+	p.notifier.Mark(scope)
 	return nil
 }
 

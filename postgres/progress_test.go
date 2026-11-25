@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/laenenai/es-lite/postgres"
 	"github.com/laenenai/es-lite/projection"
@@ -315,5 +316,88 @@ func TestPostgresProgressStore(t *testing.T) {
 	}
 	if _, found, err = ps.LoadProgress(ctx, other, "fresh"); err != nil || found {
 		t.Fatalf("load absent in other scope = found %v err %v, want absent", found, err)
+	}
+}
+
+// TestProgressNotifyFiresOnSave pins the committed-save wake: with a
+// channel configured, a SaveProgress reaches a LISTENing connection with
+// the channel and the scope as the payload — no position, the same shape
+// as the append and marker channels.
+func TestProgressNotifyFiresOnSave(t *testing.T) {
+	const (
+		channel = "es_lite_progress_fires"
+		scope   = "ws_progress_fires"
+	)
+	ctx := context.Background()
+	lc := listenConn(t, channel)
+	s := openStore(t)
+	ps := postgres.NewProgressStore(s, channel)
+	defer ps.Close()
+
+	if err := ps.SaveProgress(ctx, scope, "orders", projection.Checkpoint{
+		Position: 7, State: projection.StatusLive,
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	n, err := lc.WaitForNotification(waitCtx)
+	if err != nil {
+		t.Fatalf("wait for notification: %v", err)
+	}
+	if n.Channel != channel {
+		t.Fatalf("notification channel = %q, want %q", n.Channel, channel)
+	}
+	if n.Payload != scope {
+		t.Fatalf("notification payload = %q, want the scope %q", n.Payload, scope)
+	}
+}
+
+// TestProgressNotifyDisabled pins the opt-in default: with an empty
+// channel the save commits and issues no notification and starts no
+// notifier goroutine.
+func TestProgressNotifyDisabled(t *testing.T) {
+	const channel = "es_lite_progress_off"
+	ctx := context.Background()
+	lc := listenConn(t, channel)
+	s := openStore(t)
+	ps := postgres.NewProgressStore(s, "")
+	defer ps.Close()
+
+	if err := ps.SaveProgress(ctx, "ws_progress_off", "orders", projection.Checkpoint{
+		Position: 1, State: projection.StatusLive,
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	assertNoNotification(t, lc, 200*time.Millisecond)
+}
+
+// TestProgressNotifyFailedSaveDoesNotFire pins the transaction
+// boundary: a save that never commits marks no scope, so a failed
+// transaction cannot claim progress that does not exist.
+func TestProgressNotifyFailedSaveDoesNotFire(t *testing.T) {
+	const (
+		channel = "es_lite_progress_failed"
+		scope   = "ws_progress_failed"
+	)
+	lc := listenConn(t, channel)
+	s := openStore(t)
+	ps := postgres.NewProgressStore(s, channel)
+	defer ps.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := ps.SaveProgress(ctx, scope, "orders", projection.Checkpoint{
+		Position: 1, State: projection.StatusLive,
+	}); err == nil {
+		t.Fatal("save with a cancelled context succeeded, want an error")
+	}
+
+	assertNoNotification(t, lc, 200*time.Millisecond)
+
+	if _, found, err := ps.LoadProgress(context.Background(), scope, "orders"); err != nil || found {
+		t.Fatalf("failed save left a row (found=%v err=%v), want none", found, err)
 	}
 }
