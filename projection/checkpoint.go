@@ -71,7 +71,7 @@ type Checkpoint struct {
 }
 
 // ProgressStore persists projection checkpoints for read-your-writes (ADR
-// 0040). SaveProgress is write-through and runs after a read-model commit;
+// 0045). SaveProgress is write-through and runs after a read-model commit;
 // readers compare Position and State, never UpdatedAt.
 //
 // Position never goes backwards within a state: a save at or below the stored

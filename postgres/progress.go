@@ -11,7 +11,7 @@ import (
 	"github.com/laenenai/es-lite/projection"
 )
 
-// ProgressStore persists projection checkpoints in Postgres (ADR 0040,
+// ProgressStore persists projection checkpoints in Postgres (ADR 0045,
 // read-your-writes). Every operation runs in one short transaction with
 // app.workspace_id bound to the scope (runWorkspace), so the table's policy
 // applies, and updated_at is the database's clock (clock_timestamp() in

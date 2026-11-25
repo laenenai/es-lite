@@ -10,7 +10,7 @@ import (
 	"github.com/laenenai/es-lite/projection"
 )
 
-// ProgressStore persists projection checkpoints in SQLite (ADR 0040,
+// ProgressStore persists projection checkpoints in SQLite (ADR 0045,
 // read-your-writes). One SQLite database is one workspace, so unlike the
 // Postgres adapter there is no RLS and no workspace column: the scope is
 // the feed ports' parity argument (usually the empty string) and the

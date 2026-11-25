@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// The checkpoint hint (ADR 0040, read-your-writes) reuses the C2 wake
+// The checkpoint hint (ADR 0045, read-your-writes) reuses the C2 wake
 // shape but not its transaction discipline. Two decisions are load-
 // bearing:
 //

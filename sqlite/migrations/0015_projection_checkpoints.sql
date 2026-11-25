@@ -1,4 +1,4 @@
--- Projection checkpoints (ADR 0040, read-your-writes). One row per
+-- Projection checkpoints (ADR 0045, read-your-writes). One row per
 -- (scope, projection) recording the highest global position the projection
 -- has applied, the projector's state and when the row last changed.
 -- This is derived progress, not audit state: a restore resets and replays

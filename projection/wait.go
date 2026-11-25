@@ -84,7 +84,7 @@ func WithMaxWaiters(perKey, total int) WaiterOption {
 	}
 }
 
-// Waiter is the read side of read-your-writes (ADR 0040): WaitFor waits,
+// Waiter is the read side of read-your-writes (ADR 0045): WaitFor waits,
 // bounded by a deadline, until a projection has applied a token's position.
 //
 // One Waiter is shared by every request in a process. It caches checkpoints in

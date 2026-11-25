@@ -13,7 +13,7 @@ import (
 	"github.com/laenenai/es-lite/projection"
 )
 
-// Unit and integration tests for the checkpoint advance hint (ADR 0040,
+// Unit and integration tests for the checkpoint advance hint (ADR 0045,
 // Task 7). Task 5's ProgressStore accepted a channel but emitted
 // nothing; these tests pin the notifier that now does: it marks only
 // after a save commits, dedupes scopes in a bounded window, flushes one

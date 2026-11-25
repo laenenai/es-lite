@@ -128,7 +128,7 @@ func sleep(ctx context.Context, d time.Duration) error {
 type Runner struct {
 	// Name is the spec name: the marker key and the durable name.
 	Name string
-	// Scope names the workspace a ProgressStore row belongs to (ADR 0040).
+	// Scope names the workspace a ProgressStore row belongs to (ADR 0045).
 	// It is unused on the legacy Marker path.
 	Scope string
 	// Marker persists the highest applied global_position. Nil means an
@@ -143,7 +143,7 @@ type Runner struct {
 	ProgressStore ProgressStore
 	// Progress, when set, receives each checkpoint after its write-through
 	// save returns and each state change. It feeds the in-process waiters of
-	// read-your-writes; it must not block (ADR 0040).
+	// read-your-writes; it must not block (ADR 0045).
 	Progress ProgressPublisher
 	// Dispatch decodes an envelope, fetches state if the spec says so, and
 	// calls the handler. Generated.
