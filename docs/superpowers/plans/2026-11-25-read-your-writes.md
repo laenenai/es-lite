@@ -337,7 +337,7 @@ Table tests in `projection/wait_test.go`:
 - reconnect repair: two active keys, `EnqueueRefreshAll`, both are refreshed from the store;
 - caps: with `WithMaxWaiters(1, 1)`, a second waiter on the key and a first waiter on another key each return `Reached:false, err:nil` immediately without blocking;
 - best effort: a store returning an error makes the default `WaitFor` return it, and `WithBestEffort` return `Reached:false, err:nil`; `ErrScopeMismatch` and `context.Canceled` still fail under `WithBestEffort`;
-- 10,000 concurrent waiters on one key are all released by one `Advance`; `goleak.VerifyNone(t)` at the end after `Close()`;
+- 10,000 concurrent waiters on one key are all released by one `Advance` — construct the waiter with `WithMaxWaiters(20000, 20000)` so the default cap does not shed them — and `goleak.VerifyNone(t)` passes at the end after `Close()`;
 - `Status` returns the stored state when the cache is cold;
 - a token whose scope exceeds 512 bytes is `es.ErrInvalidToken`.
 
