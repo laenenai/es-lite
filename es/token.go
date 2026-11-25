@@ -25,6 +25,13 @@ const (
 	tokenVersion   byte = 1
 	tokenHeaderLen      = 3 // version + u16 scope length
 	tokenTailLen        = 8 // u64 position
+
+	// maxTokenScopeLen is the largest scope a token may carry. It bounds both
+	// the wire input ParseToken will decode and the scope it returns.
+	maxTokenScopeLen = 512
+	// maxTokenWireLen is the longest possible valid wire form: a 512-byte
+	// scope plus the header and position, base64url-encoded without padding.
+	maxTokenWireLen = 4 * ((tokenHeaderLen+maxTokenScopeLen+tokenTailLen)/3 + 1)
 )
 
 // String returns the URL-safe wire form of the token. The zero token encodes
@@ -42,10 +49,15 @@ func (t Token) String() string {
 }
 
 // ParseToken decodes a token's wire form. The empty string is the zero token;
-// anything else that is not a well-formed version-1 token is ErrInvalidToken.
+// anything else that is not a well-formed version-1 token — including one
+// whose encoded form or decoded scope exceeds the 512-byte scope limit — is
+// ErrInvalidToken.
 func ParseToken(s string) (Token, error) {
 	if s == "" {
 		return Token{}, nil
+	}
+	if len(s) > maxTokenWireLen {
+		return Token{}, fmt.Errorf("%w: encoded length %d exceeds %d", ErrInvalidToken, len(s), maxTokenWireLen)
 	}
 	b, err := base64.RawURLEncoding.DecodeString(s)
 	if err != nil {
@@ -58,6 +70,9 @@ func ParseToken(s string) (Token, error) {
 		return Token{}, fmt.Errorf("%w: unsupported version %d", ErrInvalidToken, b[0])
 	}
 	scopeLen := int(binary.BigEndian.Uint16(b[1:tokenHeaderLen]))
+	if scopeLen > maxTokenScopeLen {
+		return Token{}, fmt.Errorf("%w: scope length %d exceeds %d", ErrInvalidToken, scopeLen, maxTokenScopeLen)
+	}
 	if len(b) != tokenHeaderLen+scopeLen+tokenTailLen {
 		return Token{}, fmt.Errorf("%w: body length %d, want %d", ErrInvalidToken, len(b), tokenHeaderLen+scopeLen+tokenTailLen)
 	}

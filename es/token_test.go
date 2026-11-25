@@ -27,6 +27,24 @@ func TestParseTokenRejectsMalformed(t *testing.T) {
 	}
 }
 
+func TestParseTokenRejectsOversized(t *testing.T) {
+	// An oversized wire form is rejected before base64-decoding allocates.
+	if _, err := es.ParseToken(strings.Repeat("A", 4096)); !errors.Is(err, es.ErrInvalidToken) {
+		t.Fatalf("oversized wire form: %v, want ErrInvalidToken", err)
+	}
+	// A token carrying a scope over 512 bytes is invalid even though its
+	// wire form is otherwise well-formed.
+	long := es.Token{Scope: strings.Repeat("x", 513), Position: 1}
+	if _, err := es.ParseToken(long.String()); !errors.Is(err, es.ErrInvalidToken) {
+		t.Fatalf("oversized scope: %v, want ErrInvalidToken", err)
+	}
+	// The limit itself is still accepted.
+	max := es.Token{Scope: strings.Repeat("x", 512), Position: 1}
+	if got, err := es.ParseToken(max.String()); err != nil || got != max {
+		t.Fatalf("512-byte scope round trip = (%+v, %v), want %+v", got, err, max)
+	}
+}
+
 func TestZeroTokenAndMaxToken(t *testing.T) {
 	if got, err := es.ParseToken(""); err != nil || got != (es.Token{}) {
 		t.Fatalf("ParseToken(\"\") = (%+v, %v), want zero token", got, err)
