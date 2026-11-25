@@ -38,8 +38,12 @@ func TestRunnerOnAppliedAfterMarkerSave(t *testing.T) {
 		Marker:   m,
 		Dispatch: func(context.Context, es.Envelope) error { return nil },
 		OnApplied: func(_ context.Context, e es.Envelope, position uint64) {
-			if m.pos != position {
-				t.Errorf("OnApplied(%d) while marker is at %d; hook must run after the save", position, m.pos)
+			// Apply coalesces the batch into one save at the last applied
+			// position, so by the time the hook runs the marker covers e:
+			// it may be ahead of e, never behind. The hook must not run
+			// before that save.
+			if m.pos < position {
+				t.Errorf("OnApplied(%d) while marker is at %d; hook must run after the covering save", position, m.pos)
 			}
 			if e.GlobalPosition != position || e.TypeURL != "counter.v1.Incremented" {
 				t.Errorf("OnApplied envelope = {position:%d type:%q}, want {position:%d type:%q}", e.GlobalPosition, e.TypeURL, position, "counter.v1.Incremented")

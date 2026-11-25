@@ -431,8 +431,8 @@ func TestMigrateCancelDoesNotLeakAdvisoryLock(t *testing.T) {
 	if err := probe.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM migrations.goose_migrations WHERE module = 'eventstore'`).Scan(&v); err != nil {
 		t.Fatalf("read shared ledger: %v", err)
 	}
-	if v != 16 {
-		t.Fatalf("after the second Migrate the applied version is %d, want 16 (every embedded migration applied)", v)
+	if v != 17 {
+		t.Fatalf("after the second Migrate the applied version is %d, want 17 (every embedded migration applied)", v)
 	}
 }
 
@@ -512,7 +512,7 @@ func TestSnapshotMigrationRefusesForeignTable(t *testing.T) {
 				PRIMARY KEY (workspace_id, stream_id)
 			)`,
 			wantErr: false,
-			wantV:   16,
+			wantV:   17,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -606,8 +606,8 @@ func TestMigrateWritesTheSharedLedger(t *testing.T) {
 	`).Scan(&n); err != nil {
 		t.Fatalf("read ledger: %v", err)
 	}
-	if n != 16 {
-		t.Fatalf("eventstore ledger rows = %d, want 16", n)
+	if n != 17 {
+		t.Fatalf("eventstore ledger rows = %d, want 17", n)
 	}
 
 	var legacy bool
@@ -664,8 +664,8 @@ func TestMigrateAdoptsLegacySchemaMigrations(t *testing.T) {
 	`).Scan(&total); err != nil {
 		t.Fatalf("read ledger total: %v", err)
 	}
-	if total != 16 {
-		t.Fatalf("ledger rows = %d, want 16 after applying versions 4-16", total)
+	if total != 17 {
+		t.Fatalf("ledger rows = %d, want 17 after applying versions 4-17", total)
 	}
 }
 
@@ -688,8 +688,8 @@ func TestLedgerModuleNameUsesTheOption(t *testing.T) {
 	`).Scan(&eventstore); err != nil {
 		t.Fatalf("read eventstore rows: %v", err)
 	}
-	if custom != 16 {
-		t.Fatalf("custom ledger rows = %d, want 16", custom)
+	if custom != 17 {
+		t.Fatalf("custom ledger rows = %d, want 17", custom)
 	}
 	if eventstore != 0 {
 		t.Fatalf("eventstore ledger rows = %d, want 0 when WithModule(custom) is set", eventstore)

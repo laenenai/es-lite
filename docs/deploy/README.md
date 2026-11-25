@@ -262,6 +262,217 @@ written by the appender in the append transaction, so no grant changes for it.
 On SQLite, migration 0014 is the equivalent; `event_tags` has no
 `workspace_id` because one database is one workspace.
 
+## Projection checkpoints and read-your-writes (migration 0017)
+
+Migration 0017 creates `projection_checkpoints`, the **applied** projection
+checkpoint `projection.Waiter` reads (ADR 0045). It is deliberately not
+`feed_checkpoints`: the delivery ack says a consumer received a page, while
+this row says the read model has applied a position. One row per
+`(workspace_id, projection)` holds the highest applied `position`, the
+projector's `state` (`live`, `rebuilding`, `stalled`) and `updated_at`; the
+`CHECK` admits only those three states, and `StatusUnknown` is represented by
+no row. The table is small and unpartitioned. RLS mirrors `event_tags`:
+`ENABLE` + `FORCE`, the workspace arm plus the role-gated
+`app.bypass_rls` + `es_relay` arm, and **no grants in the migration**.
+
+On SQLite, migration 0015 is the equivalent with `scope` instead of
+`workspace_id`, no RLS, and a text `updated_at`; SQLite is one database per
+workspace and has no cross-process notification.
+
+### Placement
+
+The wait is one primary-key lookup, so put the table where the query service
+already reads. **This runbook's reference deployment co-locates the read model
+with the event database**: the projection runner, the `projection_checkpoints`
+row and the read model share one Postgres database, and the query service
+serves both the wait and the read model over one pool.
+
+If your read model lives in a separate database, the table still belongs to the
+event database (it is the projection's applied progress). The alternative is
+the documented one: grant the query service `SELECT` on
+`projection_checkpoints` in the event database and let it open a second,
+read-only pool for the wait. Do not move the wait to a replica: `WaitFor` never
+reads the read model, so it cannot detect that the replica you query is behind;
+the caller must read the same copy the projection writes. Whichever placement
+you choose, write it down and grant nothing wider.
+
+### Grants
+
+The projection runner is the writer. It needs `SELECT, INSERT, UPDATE`:
+`SaveProgress` upserts, `ResetProgress` replaces the row, and `SetStatus`
+changes only the state. **No `DELETE` on the normal path** — there is no
+delete, and an operator who needs to clear progress truncates/rebuilds rather
+than granting one.
+
+```sql
+GRANT SELECT, INSERT, UPDATE ON projection_checkpoints TO <projection runner>;
+```
+
+The query/waiter service is read-only. It needs `SELECT` and nothing else; the
+workspace predicate and RLS scope every row, so it needs no bypass.
+
+```sql
+GRANT SELECT ON projection_checkpoints TO <read-your-writes reader>;
+```
+
+The reader does not need `events`, `event_tags`, `feed_checkpoints` or any
+sequence. A store-wide projection (scope `"*"`) uses the same grant and writes
+a row whose `workspace_id` is that scope; it does not require `es_relay`.
+
+### The hint channel and its role
+
+Hints are opt-in. `postgres.NewProgressStore(store, channel)` takes the
+`pg_notify` channel for checkpoint progress; `channel == ""` disables hints
+completely (no goroutine, no statement, `NotifyDropped()` stays 0). A
+non-empty channel must be a strict Postgres identifier and is a **capability**:
+generate it high-entropy and never log it, exactly as for the ADR 0039 C2
+channels. The query service runs one `postgres.NewProgressListener(dsn,
+channel, waiter)` at startup — one `LISTEN` connection, not one per request —
+and its `OnNotify`/`OnReconnected` only enqueue a waiter refresh; neither runs a
+store read on the listener goroutine.
+
+The hint is emitted **after the checkpoint transaction commits**, from a
+bounded notifier that coalesces scopes for ~10 ms. It is best-effort: a failed
+flush is counted and dropped and **never fails the checkpoint save**, and a
+scope over 512 bytes skips its hint rather than failing the write. The payload
+is the scope alone — no position — so a forged hint can cost a read but cannot
+produce a false `reached`.
+
+**The privilege check is not a table grant.** Postgres has no per-channel
+`LISTEN`/`NOTIFY` privilege: a login role that can `CONNECT` may `LISTEN` and
+`NOTIFY` by default, and the notification is visible to every connect-capable
+role. The deployment check is therefore the C2 trust precondition: enumerate
+who can connect and confirm every role is trusted, or use a dedicated database.
+
+```sql
+SELECT r.rolname
+FROM pg_roles r
+WHERE has_database_privilege(r.rolname, current_database(), 'CONNECT');
+-- plus the database-level CONNECT grants shown by \l in psql
+```
+
+If an untrusted role can connect, leave the progress channel empty and rely on
+the fallback read. The runner's notifier needs no extra grant (it executes
+`pg_notify` on its existing pool), and the listener needs only `CONNECT`.
+
+### Kill switch
+
+An empty progress channel is the kill switch: it disables notifier and hint
+emission, and the waiter's 100 ms fallback re-read still satisfies every wait —
+more slowly, but correctly. Use it when:
+
+- `pg_notification_queue_usage()` alarms. The queue is bounded, and an
+  exhausted queue fails `NOTIFY` statements. The progress hint is post-commit,
+  so the checkpoint save still succeeds and the hint is dropped; an append
+  path using ADR 0039 C2 is the one that can see its **commits** fail. Disable
+  progress hints first, then investigate the listener/queue — not the
+  checkpoint writer.
+- a listener stays disconnected and the pool churn is unwanted;
+- the database is shared with untrusted connect-capable roles.
+
+Restarting with the channel empty is a supported steady state, not an outage.
+
+### Connection budget
+
+A listener owns **one dedicated backend per channel per listening process**,
+for the listener's whole life. It is never returned to a pool. Budget:
+
+```text
+LISTEN backends = processes_that_listen × channels
+```
+
+A process that serves queries needs one channel (progress). A process that
+also runs a feed C2 listener on another channel needs two backends. Options
+when the budget is large:
+
+- **Elect a gateway.** One process listens and relays wakes to the fleet over
+  the application's own bus; the direct connection stays at one process. This
+  is the same shape as ADR 0039 C2's gateway.
+- **Run both listeners in one process.** Still one backend per channel (two in
+  total), not one connection multiplexed across channels.
+- **Omit hints.** Empty channel, fallback only, zero listener backends.
+
+**PgBouncer must be in session mode or bypassed for this connection.**
+Transaction pooling breaks `LISTEN` because the session must outlive the
+statement; use a direct connection (or a session-pooled one) for the listener.
+The connection sets `application_name = es-lite-notify`, so it is identifiable
+in `pg_stat_activity`.
+
+### Health and metrics
+
+Export these and alert on the ones marked:
+
+| Signal | Source | Alert |
+|---|---|---|
+| listener backend PID | `NotifyListener.PID()`; `0` = disconnected | **alert if it stays 0** (e.g. 1 min) |
+| notification queue usage | `pg_notification_queue_usage()` (0–1) | **alert on sustained growth** before it becomes an append outage |
+| dropped hints | `ProgressStore.NotifyDropped()` (counter) | alert on a rising rate; also covers oversized scopes |
+| fallback reads | application-observed (the waiter does not export a counter; count ticks/reads in a store wrapper or the query middleware) | expected when hints are off; a spike means lost hints or a dead listener |
+| active waiters | application gauge (middleware) | watch `waiters × deadline`, not the hint rate; a retry storm doubles it |
+| time since last checkpoint save / state | `now() - updated_at`, `state != 'live'` | **alert on a sustained non-`live` state**; a crashed rebuild stays `rebuilding`. Age grows on an idle `live` projection, so do not alert on age alone |
+
+A listener reconnect is normal and self-repairs (`OnReconnected` refreshes
+every active key); a PID that stays 0, or `NotifyDropped` climbing with queue
+usage, is the actionable case.
+
+### Rebuild order
+
+A rebuild is an operational sequence; the library does not run it for you
+(ADR 0005). Follow this order exactly:
+
+1. **Set `rebuilding`**: `runner.Reset(ctx)` replaces the row with position 0
+   and state `rebuilding` before anything reads it.
+2. **Clear or swap the read model.** For reads during the rebuild, build the
+   new version alongside the old and route to the old one (blue/green).
+   Otherwise quiesce reads for the duration.
+3. **Replay**: `runner.Rebuild(ctx, source, batch)` applies every page while
+   the state remains `rebuilding`.
+4. **Set `live`**: `Rebuild` writes `live` only after the replay succeeds and
+   the status write commits; a failure leaves the row and runner `rebuilding`.
+
+While `rebuilding`, `WaitFor` returns `Reached:false, StatusRebuilding`
+immediately, even if a stale position is above the token. A token outstanding
+across a non-blue/green rebuild is stale; the client treats it as such. A
+crashed rebuild stays `rebuilding` after restart (the runner seeds the state
+from the row), so a half-rebuilt read model cannot be reported fresh: complete
+or re-run the rebuild, then let `Rebuild` write `live`.
+
+### Stalled projections
+
+`StatusStalled` has no producer in the library: the runner writes only `live`
+and `rebuilding`. It is an operator signal that a projection should stop
+answering waits as fresh. To set it:
+
+1. **Stop the runner.** A running runner re-persists its in-memory state on the
+   next save, which would erase the operator's change.
+2. Write the state with the position unchanged (and `live` to clear it):
+
+   ```sql
+   UPDATE projection_checkpoints
+      SET state = 'stalled', updated_at = clock_timestamp()
+    WHERE workspace_id = $1 AND projection = $2;
+   ```
+
+3. Restart the runner. `loadMarker` seeds the state from the row, so it stays
+   fail-closed until the row is set `live` again (or a rebuild completes).
+
+While the row is `stalled`, `WaitFor` returns `Reached:false, StatusStalled`
+immediately.
+
+### Backup
+
+`projection_checkpoints` is **derived progress, not state**. A restore resets
+and replays it; a checkpoint row restored ahead of the read model would make
+waiters claim freshness the read model does not have. Do not treat it as a
+backup set:
+
+- a logical backup may exclude it: `pg_dump --exclude-table=projection_checkpoints …`;
+- a physical restore that leaves the old rows must truncate them (or re-run
+  `Reset`) before serving waits, then let the rebuild repopulate;
+- a clone that loads events into an empty read model must not copy checkpoint
+  rows from another cut. Rebuild the projection and let the runner write the
+  checkpoint.
+
 ## Relay role and RLS bypass (migration 0005)
 
 `Drain` — the delivery relay — and the anchor/verify path (`Anchor`,
@@ -417,6 +628,30 @@ tag-driven consumer under the same role.
 GRANT SELECT ON event_tags TO <tag reader>;
 ```
 
+**Projection checkpoint writer** — the projection runner persisting applied
+progress (ADR 0045). It needs `SELECT, INSERT, UPDATE` on
+`projection_checkpoints` — `SaveProgress` upserts, `ResetProgress` replaces
+the row, `SetStatus` changes only the state — and **no `DELETE` on the normal
+path**. It reads no event table for this write, so the grant is independent of
+whether the runner also appends or drains. It is also the role that issues the
+progress hint, which needs no extra grant: `pg_notify` runs on its existing
+pool after the checkpoint commits.
+
+```sql
+GRANT SELECT, INSERT, UPDATE ON projection_checkpoints TO <projection runner>;
+```
+
+**Read-your-writes reader** — any query service calling
+`projection.Waiter.WaitFor`: `SELECT` on `projection_checkpoints` only. RLS
+scopes it to the session's workspace, so it needs no bypass, no `events`
+access and no sequence. Co-locate the table with the read model so this is the
+same pool; if the read model is in another database, this is a second
+read-only pool (see *Projection checkpoints and read-your-writes*).
+
+```sql
+GRANT SELECT ON projection_checkpoints TO <read-your-writes reader>;
+```
+
 **Feed process** — `feed.Server` over the Postgres adapters: the
 checkpoint/lease/dead-letter state is the feed's own, and the horizon
 fence's first statement reads the position sequence through
@@ -570,8 +805,10 @@ event log:
 
 Everything else is derived or optional. `unique_claims` is a derived index —
 the ops on the events replay into an empty one. `event_tags` is a derived index
-— `RebuildTags` projects the tags on the events into an empty one. `snapshots`
-is a cache.
+— `RebuildTags` projects the tags on the events into an empty one.
+`projection_checkpoints` is derived **progress**, not state: a restore resets
+and replays it, and a row ahead of the restored read model would make waiters
+claim freshness the read model does not have. `snapshots` is a cache.
 `anchors` recompute (the exported JSON is the durable evidence).
 `feed_checkpoints` and `feed_dead_letters` are optional; `feed_leases` is
 ephemeral. `command_dedup` is a post-commit response cache: exclude it, and read
@@ -708,6 +945,12 @@ event are one row, so an event cut is internally consistent; loading
    exported anchor JSON as the evidence, or record new anchors only after
    `log_order` is present. Leaving `published_at` unset causes projection
    re-delivery — at-least-once, which projections already handle.
+
+   Do **not** restore `projection_checkpoints` from another cut. It is derived
+   applied progress: truncate it, or let `runner.Reset` replace the rows before
+   serving waits, then let the rebuild repopulate them. The projection runner
+   writes the checkpoint as it replays; a stale row would make `WaitFor` report
+   `reached` for a read model that is not there.
 8. Resume writers. Snapshots are absent and rebuild lazily; warm explicitly
    with `Runtime.WarmSnapshot` if the first reads matter.
 
@@ -989,7 +1232,9 @@ roles, plus the database-level `CONNECT` grants shown by `\l` in `psql`
 (`PUBLIC` holds `CONNECT` unless it has been revoked):
 
 ```sql
-SELECT rolname FROM pg_roles WHERE rolcanconnect;
+SELECT r.rolname
+FROM pg_roles r
+WHERE has_database_privilege(r.rolname, current_database(), 'CONNECT');
 ```
 
 A co-tenant database with untrusted roles uses C1 instead. The listener

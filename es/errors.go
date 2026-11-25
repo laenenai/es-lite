@@ -40,6 +40,17 @@ var (
 	// ErrInvalidStreamID reports that a StreamID failed validation.
 	ErrInvalidStreamID = errors.New("es-lite: invalid stream id")
 
+	// ErrInvalidToken reports a malformed consistency token: not base64url,
+	// truncated, an unsupported version, or a body length that disagrees with
+	// its scope length.
+	ErrInvalidToken = errors.New("es-lite: invalid consistency token")
+
+	// ErrScopeMismatch reports two consistency tokens from different
+	// non-empty scopes. A token from one workspace can never be satisfied by
+	// another workspace's progress, so the comparison fails closed instead of
+	// silently picking one.
+	ErrScopeMismatch = errors.New("es-lite: consistency token scope mismatch")
+
 	// ErrVersionOutOfRange reports that a time-travel read asked for a stream
 	// version the stream has not reached. It is distinct from ErrConflict: no
 	// write was attempted.

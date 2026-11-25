@@ -265,6 +265,12 @@ type Result[S, E any] struct {
 	FromVersion uint64
 	ToVersion   uint64
 	Envelopes   []es.Envelope
+
+	// Position is the highest global_position the command committed (the
+	// head position for a no-op); Token carries it as a consistency token.
+	// Both are zero on an empty stream.
+	Position uint64
+	Token    es.Token
 }
 
 // AppendFunc performs the append for one Handle call.
@@ -272,6 +278,13 @@ type Result[S, E any] struct {
 // It exists so a caller can own the transaction: an audited store, an outbox
 // or an event store with extra invariants appends inside its own transaction
 // and needs the events to commit atomically with its own records.
+//
+// It must populate AppendResult.Position with the highest committed
+// global_position — that value becomes Result.Position and the consistency
+// token. When an AppendFunc leaves Position zero but returns Envelopes, Handle
+// falls back to the last envelope's GlobalPosition. An implementation that
+// returns neither a Position nor envelopes yields the zero token, which
+// silently disables read-your-writes for every command it serves.
 //
 // The function may be called more than once for one command when conflict
 // retry is enabled; it must therefore be idempotent with respect to a retried
@@ -452,8 +465,18 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 		return zero, fmt.Errorf("%w: %s", es.ErrConstraintWithoutEvent, sid)
 	}
 	if len(events) == 0 && len(constraints) == 0 {
-		// A no-op command: nothing to append. Return current state.
-		return Result[S, E]{State: state, FromVersion: version, ToVersion: version}, nil
+		// A no-op command: nothing to append. Return current state, and the
+		// stream's head as the token so a read-your-writes wait still has a
+		// position to wait on. The read is best-effort: a failure yields a
+		// zero token (and never fails the command).
+		pos, ws := r.headPosition(ctx, sid, version)
+		return Result[S, E]{
+			State:       state,
+			FromVersion: version,
+			ToVersion:   version,
+			Position:    pos,
+			Token:       es.Token{Scope: ws, Position: pos},
+		}, nil
 	}
 
 	encoded := make([]es.EventData, len(events))
@@ -501,6 +524,12 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 	if err != nil {
 		return zero, err // includes es.ErrConflict
 	}
+	// A custom AppendFunc may return the committed envelopes without filling
+	// Position. Fall back to the last envelope so the token still covers the
+	// append instead of silently becoming the zero token.
+	if res.Position == 0 && len(res.Envelopes) > 0 {
+		res.Position = res.Envelopes[len(res.Envelopes)-1].GlobalPosition
+	}
 
 	// Fold the just-appended events forward so the caller gets
 	// read-your-writes state without re-reading the store.
@@ -532,7 +561,34 @@ func (r *Runtime[S, C, E]) handleOnce(ctx context.Context, sid es.StreamID, cmd 
 		FromVersion: res.FromVersion,
 		ToVersion:   res.ToVersion,
 		Envelopes:   res.Envelopes,
+		Position:    res.Position,
+		Token:       es.TokenFor(workspaceOf(res.Envelopes), res),
 	}, nil
+}
+
+// headPosition returns a stream's head global position and workspace, for the
+// no-op command's token. A missing stream (version 0), an empty range or a
+// read error yields (0, ""): the token then has no scope and a reader treats
+// it as the zero token, failing closed only for a real scope mismatch.
+func (r *Runtime[S, C, E]) headPosition(ctx context.Context, sid es.StreamID, version uint64) (uint64, string) {
+	if version == 0 {
+		return 0, ""
+	}
+	envs, err := r.store.ReadStream(ctx, sid, version-1, version)
+	if err != nil || len(envs) == 0 {
+		return 0, ""
+	}
+	return envs[len(envs)-1].GlobalPosition, envs[len(envs)-1].Workspace
+}
+
+// workspaceOf returns the workspace carried by an append's envelopes. The
+// StreamID itself has no workspace; a batch's envelopes all carry the same
+// one (empty for a single-workspace backend such as SQLite).
+func workspaceOf(envs []es.Envelope) string {
+	if len(envs) == 0 {
+		return ""
+	}
+	return envs[len(envs)-1].Workspace
 }
 
 // Load returns the current folded state of a stream and its version.

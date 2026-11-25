@@ -48,6 +48,7 @@ transport, authentication, encryption and business rules.
 | Per-workspace data isolation (Postgres) | RLS + hash partitioning; the caller supplies the workspace |
 | Cross-stream uniqueness | transactional `unique_claims` → `ErrConstraintViolated` |
 | Indexed event tags | `events.tags` as the source plus a synchronous `event_tags` projection; `ReadByTags` with AND semantics in global-position order (ADR 0044) |
+| Read-your-writes waits | `es.Token` carries the append's highest committed position; `projection.Waiter` waits, bounded, on the applied `projection_checkpoints` row before the query reads the same model (ADR 0045) |
 | At-least-once delivery, fenced | `feed` core + Postgres adapters; consumer adapter in `eventfeed`; legacy in-process `delivery.Poller`/`Relay`; Postgres feed reads are commit-safe via the horizon fence (ADR 0037) |
 | Opaque payloads | stores only the bytes the caller supplies; never encrypts or decrypts |
 | Tamper evidence | per-stream SHA-256 hash chain over the sealed bytes plus per-batch log-order and tag attestation, all computed in the append transaction; keyless verification (`es-verify stream\|order\|tags\|all`) and exportable anchors (ADRs 0029, 0038 and 0044) |
@@ -72,7 +73,7 @@ transport, authentication, encryption and business rules.
 | `es` | storage-neutral `Store`, `Envelope`, `StreamID`, decider/codec interfaces, hash-chain verification |
 | `postgres` | multi-workspace Postgres backend (RLS, partitioning, claim relay) |
 | `sqlite` | single-workspace, pure-Go SQLite backend |
-| `projection` | projection runner, rebuild/replay, `LogFeed`, marker |
+| `projection` | projection runner, rebuild/replay, `LogFeed`, marker, applied checkpoint and `Waiter` |
 | `feed` | transport-neutral feed core: checkpoint/lease/log ports and the subscribe loop |
 | `eventfeed` | the consumer adapter: binds `feed.Server` to `projection.Feed` — ack strictly after a successful handler, acks coalesced at page boundaries |
 | `feedtest` | the shared conformance suite for `Log`/`CheckpointStore`/`LeaseStore` adapters |
@@ -416,6 +417,14 @@ are client responsibilities (ADR 0025).
   caller supplies. That is isolation, not authentication: the application must
   authenticate callers and derive the workspace from trusted identity, never
   from an unverified client field.
+- **Consistency tokens are position hints, not authorization.** An `es.Token`
+  carries a scope and a position and grants no access. The scope a query waits
+  in comes from the authenticated workspace, never from the token; a token for
+  another scope is rejected (`ErrScopeMismatch`). A wait can only delay a read
+  until the named projection has applied that position — it cannot reveal data,
+  and a forged or replayed hint cannot raise a checkpoint, because hints carry
+  no position and the waiter re-reads the authoritative row
+  ([ADR 0045](docs/adr/0045-read-your-writes.md)).
 - **Append-only by API contract, tamper-evident by hash chain.** The library
   never updates event payloads; on Postgres, `published_at` is the delivery
   path's one mutable column (SQLite tails in-process and has none). Since ADR 0029 every row carries `prev_hash`/`hash`: a
@@ -506,6 +515,12 @@ The plugin needs `strategy: all` in `buf.gen.yaml` so `consumes` resolves
 across packages; `--es-lite_opt=docs=<path>` renders a catalogue of every
 projection and reaction from the descriptors.
 
+To make a read model read-your-writes, return the append's position from the
+command (`aggregate.Result.Token`), have the client pass it back as
+`ES-Consistency`, and wait with `projection.Waiter` before querying. The
+[read-your-writes guide](./docs/guides/read-your-writes.md) covers the wiring,
+the cost on the query path and the fail-open mode.
+
 ## Command services over Connect
 
 Write the service `.proto` by hand, mark it
@@ -582,6 +597,8 @@ git tag -a v0.2.0 -m "…" && git push origin v0.2.0
   client-owned crypto, migrations, hash chain, codegen, caller-owned
   transactions, no-broker boundary, commit-safe feed reads). Start at
   [the index](./docs/adr/README.md).
+- **[Read-your-writes guide](./docs/guides/read-your-writes.md)** — tokens,
+  `projection.Waiter`, and what a query endpoint pays for consistency.
 - **[Migration notes](./docs/migration)** — what downstream repositories
   change when an ADR moves a contract (currently: projection options).
 - **[Backlog](./docs/backlog)** — tracked follow-ups.

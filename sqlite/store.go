@@ -490,10 +490,15 @@ func (s *Store) appendTx(ctx context.Context, tx *sql.Tx, p es.AppendParams) (es
 		return zero, err
 	}
 
+	var position uint64
+	if len(envs) > 0 {
+		position = envs[len(envs)-1].GlobalPosition
+	}
 	return es.AppendResult{
 		FromVersion: p.ExpectedVersion,
 		ToVersion:   p.ExpectedVersion + uint64(len(p.Events)),
 		Envelopes:   envs,
+		Position:    position,
 	}, nil
 }
 

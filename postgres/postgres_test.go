@@ -61,7 +61,7 @@ func openStoreWithOptions(t testing.TB, opts ...postgres.Option) *postgres.Store
 	// truncated here. snapshots joins the list (0013, ADR 0042): it is
 	// derived, droppable cache state — not the audit log — so each test
 	// starts from no cached snapshots instead of the previous test's rows.
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, event_tags, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, event_tags, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, command_dedup, snapshots, projection_checkpoints`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
@@ -104,6 +104,43 @@ func TestAppendFoldTimeTravel(t *testing.T) {
 	}
 	if past.GetCount() != 5 {
 		t.Fatalf("as-of v1: count=%d, want 5", past.GetCount())
+	}
+}
+
+// TestAppendResultPosition pins that the Postgres append path fills
+// AppendResult.Position itself — the highest global_position in the batch —
+// independently of the SQLite append path.
+func TestAppendResultPosition(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t)
+	ws := s.WorkspaceStore("ws_position")
+	sid := streamID(t)
+
+	res, err := ws.Append(ctx, es.AppendParams{
+		StreamID:        sid,
+		ExpectedVersion: 0,
+		Events: []es.EventData{
+			{TypeURL: "thing.v1.Created", SchemaVersion: 1, Payload: []byte("a")},
+			{TypeURL: "thing.v1.Updated", SchemaVersion: 1, Payload: []byte("b")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(res.Envelopes) != 2 {
+		t.Fatalf("envelopes = %d, want 2", len(res.Envelopes))
+	}
+	if want := res.Envelopes[len(res.Envelopes)-1].GlobalPosition; res.Position != want || res.Position == 0 {
+		t.Fatalf("Position = %d, want %d", res.Position, want)
+	}
+
+	emptySid, _ := es.NewStreamID("counter", "empty")
+	empty, err := ws.Append(ctx, es.AppendParams{StreamID: emptySid, ExpectedVersion: 0})
+	if err != nil {
+		t.Fatalf("empty append: %v", err)
+	}
+	if empty.Position != 0 {
+		t.Fatalf("empty append Position = %d, want 0", empty.Position)
 	}
 }
 
@@ -400,9 +437,10 @@ func TestMigrateIdempotentAndConcurrent(t *testing.T) {
 		t.Fatalf("shared ledger: %v", err)
 	}
 	// Every embedded migration is applied on Open; 0014 (event constraint ops),
-	// 0015 (the op-bearing partial index) and 0016 (event tags) made it sixteen.
-	if v != 16 {
-		t.Fatalf("applied version = %d, want 16", v)
+	// 0015 (the op-bearing partial index), 0016 (event tags) and 0017
+	// (projection checkpoints) made it seventeen.
+	if v != 17 {
+		t.Fatalf("applied version = %d, want 17", v)
 	}
 
 	// Concurrent migrators serialize on the advisory lock and all no-op safely.

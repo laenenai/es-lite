@@ -127,4 +127,8 @@ type AppendResult struct {
 	FromVersion uint64 // stream version before the append (== ExpectedVersion)
 	ToVersion   uint64 // stream version after the append
 	Envelopes   []Envelope
+
+	// Position is the highest GlobalPosition in Envelopes — the append's
+	// consistency-token position — or 0 for a batch with no events.
+	Position uint64
 }

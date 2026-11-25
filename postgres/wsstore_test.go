@@ -43,7 +43,7 @@ func openStore(t testing.TB) *Store {
 		END $$`); err != nil {
 		t.Fatalf("ensure es_relay: %v", err)
 	}
-	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, event_tags, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, snapshots`); err != nil {
+	if _, err := s.Pool().Exec(ctx, `TRUNCATE events, event_tags, log_order, unique_claims, anchors, feed_checkpoints, feed_leases, feed_dead_letters, snapshots, projection_checkpoints`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	t.Cleanup(s.Close)
