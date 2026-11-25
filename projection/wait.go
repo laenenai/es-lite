@@ -2,6 +2,7 @@ package projection
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -31,6 +32,10 @@ const (
 	// scopeHintQueue is the bounded size of the non-blocking scope-hint
 	// queue. An overflow drops the hint; the ticker repairs it.
 	scopeHintQueue = 64
+	// maxHubKeys bounds the checkpoint cache. When it is full, the most-idle
+	// key with no waiters is evicted. Keys with waiters are never evicted;
+	// those are bounded by WithMaxWaiters instead.
+	maxHubKeys = 8192
 )
 
 // WaitResult is the outcome of WaitFor. Reached reports whether the projection
@@ -99,6 +104,7 @@ type Waiter struct {
 	mu      sync.Mutex
 	keys    map[progressKey]*waiterKey
 	total   int
+	use     uint64
 	closed  bool
 	started bool
 
@@ -116,13 +122,14 @@ type Waiter struct {
 // waiter count and its broadcast channel. A wake closes the channel and
 // installs a fresh one, so every waiter sees the broadcast. gen changes on
 // every Advance/SetStatus; the refresher uses it to discard a store read that
-// overlapped a newer publisher value.
+// overlapped a newer publisher value. lastUsed drives idle-key eviction.
 type waiterKey struct {
-	cp      Checkpoint
-	found   bool
-	gen     uint64
-	waiters int
-	wake    chan struct{}
+	cp       Checkpoint
+	found    bool
+	gen      uint64
+	lastUsed uint64
+	waiters  int
+	wake     chan struct{}
 }
 
 // NewWaiter returns a Waiter over store. The refresh worker starts on the
@@ -193,7 +200,16 @@ func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.T
 
 	cp, found, err := w.Checkpoint(ctx, scope, projection)
 	if err != nil {
+		// Best effort swallows store failures, but never cancellation: a
+		// ctx-aware store can return ctx.Err() from the read, and that must
+		// surface even when the caller asked to fail open.
 		if w.opts.bestEffort {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return WaitResult{Waited: time.Since(start)}, ctxErr
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return WaitResult{Waited: time.Since(start)}, err
+			}
 			return WaitResult{Waited: time.Since(start)}, nil
 		}
 		return WaitResult{Waited: time.Since(start)}, err
@@ -219,12 +235,13 @@ func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.T
 		return WaitResult{Reached: false, Checkpoint: cached, Waited: time.Since(start), Status: cached.State}, nil
 	}
 	if !ok {
-		k = &waiterKey{wake: make(chan struct{})}
+		k = w.newKeyLocked()
 		w.keys[key] = k
 	} else if found && !k.found {
 		// Seed a key another path created while our store read was in flight.
 		k.cp, k.found = cp, true
 	}
+	w.touchLocked(k)
 	k.waiters++
 	w.total++
 	w.mu.Unlock()
@@ -273,6 +290,7 @@ func (w *Waiter) Checkpoint(ctx context.Context, scope, projection string) (Chec
 
 	w.mu.Lock()
 	if k := w.keys[key]; k != nil {
+		w.touchLocked(k)
 		cp, found := k.cp, k.found
 		w.mu.Unlock()
 		return cp, found, nil
@@ -291,14 +309,22 @@ func (w *Waiter) Checkpoint(ctx context.Context, scope, projection string) (Chec
 
 	w.mu.Lock()
 	if k := w.keys[key]; k != nil {
-		// Another goroutine cached while our read was in flight; its value is
-		// at least as fresh as ours.
-		cp, found = k.cp, k.found
+		// Two cold reads raced. Merge fail-closed: a fail-closed cached state
+		// (rebuilding/stalled) sticks against a live read, otherwise a state
+		// change wins and a same-state read takes the higher position.
+		merged, mergedFound := mergeColdRead(k.cp, k.found, cp, found)
+		if mergedFound != k.found || merged.State != k.cp.State || merged.Position != k.cp.Position {
+			k.cp, k.found = merged, mergedFound
+			w.broadcastLocked(k)
+		}
+		w.touchLocked(k)
 		w.mu.Unlock()
-		return cp, found, nil
+		return merged, mergedFound, nil
 	}
 	if found {
-		w.keys[key] = &waiterKey{cp: cp, found: true, wake: make(chan struct{})}
+		k := w.newKeyLocked()
+		k.cp, k.found = cp, true
+		w.keys[key] = k
 	}
 	w.mu.Unlock()
 	return cp, found, nil
@@ -328,13 +354,14 @@ func (w *Waiter) Advance(cp Checkpoint) {
 	key := progressKey{scope: cp.Scope, projection: cp.Projection}
 	k := w.keys[key]
 	if k == nil {
-		k = &waiterKey{wake: make(chan struct{})}
+		k = w.newKeyLocked()
 		w.keys[key] = k
 	} else if k.found && k.cp.State == cp.State && cp.Position < k.cp.Position {
 		return
 	}
 	k.cp, k.found = cp, true
 	k.gen++
+	w.touchLocked(k)
 	w.broadcastLocked(k)
 }
 
@@ -346,13 +373,14 @@ func (w *Waiter) SetStatus(scope, projection string, state Status) {
 	key := progressKey{scope: scope, projection: projection}
 	k := w.keys[key]
 	if k == nil {
-		k = &waiterKey{wake: make(chan struct{})}
+		k = w.newKeyLocked()
 		w.keys[key] = k
 	}
 	k.cp.Scope, k.cp.Projection = scope, projection
 	k.cp.State = state
 	k.found = true
 	k.gen++
+	w.touchLocked(k)
 	w.broadcastLocked(k)
 }
 
@@ -496,13 +524,17 @@ func (w *Waiter) refreshKeys(keys []progressKey) {
 // Advance it can move the cached position backwards: the store is the source
 // of truth, so a forged or stale publisher value is corrected here. A read
 // that overlapped a newer Advance/SetStatus is discarded, because that
-// publisher value is newer than the snapshot the read returned.
+// publisher value is newer than the snapshot the read returned. A key with no
+// waiters is skipped before the read, and an unchanged checkpoint is not
+// broadcast: fallback ticks must not wake blocked waiters for nothing.
 func (w *Waiter) refreshKey(key progressKey) {
 	w.mu.Lock()
-	var gen uint64
-	if k := w.keys[key]; k != nil {
-		gen = k.gen
+	k := w.keys[key]
+	if k == nil || k.waiters == 0 {
+		w.mu.Unlock()
+		return
 	}
+	gen := k.gen
 	w.mu.Unlock()
 
 	cp, found, err := w.load(w.workerCtx, key.scope, key.projection)
@@ -513,17 +545,21 @@ func (w *Waiter) refreshKey(key progressKey) {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	k := w.keys[key]
+	k = w.keys[key]
 	if k == nil || k.waiters == 0 || k.gen != gen {
 		return
 	}
-	if found {
-		cp.Scope, cp.Projection = key.scope, key.projection
-		k.cp, k.found = cp, true
+	if !found {
+		// A store miss keeps the cached checkpoint. Rows are not deleted on
+		// the normal path, and keeping it avoids erasing a just-published
+		// advance when a replica or a lagging read returns "no row".
+		return
 	}
-	// A store miss keeps the cached checkpoint. Rows are not deleted on the
-	// normal path, and keeping it avoids erasing a just-published advance when
-	// a replica or a lagging read returns "no row".
+	cp.Scope, cp.Projection = key.scope, key.projection
+	if k.found && k.cp.State == cp.State && k.cp.Position == cp.Position {
+		return
+	}
+	k.cp, k.found = cp, true
 	w.broadcastLocked(k)
 }
 
@@ -578,9 +614,83 @@ func (w *Waiter) unregister(key progressKey) {
 	}
 	k.waiters--
 	w.total--
-	if k.waiters == 0 && !k.found {
-		delete(w.keys, key)
+	if k.waiters == 0 {
+		if !k.found {
+			delete(w.keys, key)
+		} else {
+			w.touchLocked(k)
+		}
 	}
+}
+
+// newKeyLocked allocates a key with a fresh wake channel, evicting the
+// most-idle waiter-free key first when the hub is at its cap. It must be
+// called with w.mu held and the caller must insert the key.
+func (w *Waiter) newKeyLocked() *waiterKey {
+	w.evictIdleLocked()
+	k := &waiterKey{wake: make(chan struct{})}
+	w.touchLocked(k)
+	return k
+}
+
+// touchLocked records a use for idle-key LRU ordering. It must be called with
+// w.mu held.
+func (w *Waiter) touchLocked(k *waiterKey) {
+	w.use++
+	k.lastUsed = w.use
+}
+
+// evictIdleLocked drops the least-recently-used key without waiters when the
+// hub is at its cap. Keys with waiters are never evicted: their number is
+// bounded by WithMaxWaiters instead. It must be called with w.mu held.
+func (w *Waiter) evictIdleLocked() {
+	if len(w.keys) < maxHubKeys {
+		return
+	}
+	var evictKey progressKey
+	var evict *waiterKey
+	for key, k := range w.keys {
+		if k.waiters != 0 {
+			continue
+		}
+		if evict == nil || k.lastUsed < evict.lastUsed {
+			evictKey, evict = key, k
+		}
+	}
+	if evict != nil {
+		delete(w.keys, evictKey)
+	}
+}
+
+// mergeColdRead merges a cold store read into the cache installed by a racing
+// cold read. It fails closed: a cached rebuilding/stalled state is not
+// replaced by a live (or unknown) read, because the read may have observed the
+// projection before it entered the rebuild. Otherwise a state change wins and
+// a same-state read takes the higher position. A store miss never erases a
+// cached row.
+func mergeColdRead(cached Checkpoint, cachedFound bool, incoming Checkpoint, incomingFound bool) (Checkpoint, bool) {
+	if !incomingFound {
+		return cached, cachedFound
+	}
+	if !cachedFound {
+		return incoming, true
+	}
+	if failClosedState(cached.State) && !failClosedState(incoming.State) {
+		return cached, true
+	}
+	if cached.State != incoming.State {
+		return incoming, true
+	}
+	if incoming.Position > cached.Position {
+		return incoming, true
+	}
+	return cached, true
+}
+
+// failClosedState reports whether s forbids reporting a stale position as
+// reached.
+func failClosedState(s Status) bool {
+	return s == StatusRebuilding || s == StatusStalled
 }
 
 // broadcastLocked wakes every waiter on k by closing its channel and

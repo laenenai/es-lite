@@ -119,6 +119,103 @@ func (s *gatedLoadStore) SetStatus(ctx context.Context, scope, projection string
 	return s.inner.SetStatus(ctx, scope, projection, state)
 }
 
+// ctxCancelStore blocks its one LoadProgress until the caller's context ends
+// and then returns that context error, emulating a ctx-aware database driver.
+type ctxCancelStore struct {
+	*MemoryProgressStore
+	started chan struct{}
+}
+
+func newCtxCancelStore() *ctxCancelStore {
+	return &ctxCancelStore{
+		MemoryProgressStore: NewMemoryProgressStore(),
+		started:             make(chan struct{}),
+	}
+}
+
+func (s *ctxCancelStore) LoadProgress(ctx context.Context, scope, projection string) (Checkpoint, bool, error) {
+	close(s.started)
+	<-ctx.Done()
+	return Checkpoint{}, false, ctx.Err()
+}
+
+// alwaysFoundStore returns a live checkpoint for every key and counts reads
+// per projection, so the hub-bound test can prove an evicted key is re-read
+// without materialising thousands of rows.
+type alwaysFoundStore struct {
+	mu       sync.Mutex
+	position uint64
+	loads    map[string]int
+}
+
+func newAlwaysFoundStore(position uint64) *alwaysFoundStore {
+	return &alwaysFoundStore{position: position, loads: make(map[string]int)}
+}
+
+func (s *alwaysFoundStore) LoadProgress(_ context.Context, scope, projection string) (Checkpoint, bool, error) {
+	s.mu.Lock()
+	s.loads[projection]++
+	s.mu.Unlock()
+	return Checkpoint{Scope: scope, Projection: projection, Position: s.position, State: StatusLive}, true, nil
+}
+
+func (s *alwaysFoundStore) SaveProgress(context.Context, string, string, Checkpoint) error {
+	return nil
+}
+
+func (s *alwaysFoundStore) ResetProgress(_ context.Context, scope, projection string, state Status) (Checkpoint, error) {
+	return Checkpoint{Scope: scope, Projection: projection, State: state}, nil
+}
+
+func (s *alwaysFoundStore) SetStatus(context.Context, string, string, Status) error { return nil }
+
+func (s *alwaysFoundStore) loadsFor(projection string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loads[projection]
+}
+
+// scriptedLoadStore returns scripted checkpoints in call order and lets the
+// test hold each read open, so two cold reads can be installed in a chosen
+// order.
+type scriptedLoadStore struct {
+	*MemoryProgressStore
+
+	mu       sync.Mutex
+	results  []Checkpoint
+	calls    int
+	started  chan int
+	releases []chan struct{}
+}
+
+func newScriptedLoadStore(results ...Checkpoint) *scriptedLoadStore {
+	s := &scriptedLoadStore{
+		MemoryProgressStore: NewMemoryProgressStore(),
+		results:             results,
+		started:             make(chan int, len(results)),
+		releases:            make([]chan struct{}, len(results)),
+	}
+	for i := range s.releases {
+		s.releases[i] = make(chan struct{})
+	}
+	return s
+}
+
+func (s *scriptedLoadStore) LoadProgress(_ context.Context, scope, projection string) (Checkpoint, bool, error) {
+	s.mu.Lock()
+	i := s.calls
+	s.calls++
+	s.mu.Unlock()
+	if i >= len(s.results) {
+		return Checkpoint{}, false, nil
+	}
+	s.started <- i
+	<-s.releases[i]
+	cp := s.results[i]
+	cp.Scope, cp.Projection = scope, projection
+	return cp, true, nil
+}
+
 func mustSave(t *testing.T, store ProgressStore, scope, projection string, position uint64, state Status) {
 	t.Helper()
 	if err := store.SaveProgress(context.Background(), scope, projection, Checkpoint{
@@ -856,5 +953,229 @@ func TestWaiterStatusColdCache(t *testing.T) {
 	}
 	if status != StatusUnknown {
 		t.Fatalf("Status on a missing row = %v, want unknown", status)
+	}
+}
+
+func TestWaiterBestEffortDoesNotSwallowCancellation(t *testing.T) {
+	t.Run("canceled mid-read", func(t *testing.T) {
+		store := newCtxCancelStore()
+		w := newTestWaiter(t, store, WithBestEffort())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ch := startWait(ctx, w, "ws", "users", token("ws", 5), 2*time.Second)
+		select {
+		case <-store.started:
+		case <-time.After(time.Second):
+			t.Fatalf("LoadProgress was not called")
+		}
+		cancel()
+
+		o := await(t, ch, time.Second)
+		if !errors.Is(o.err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled even with best effort", o.err)
+		}
+		if o.result.Reached {
+			t.Fatalf("Reached = true, want false")
+		}
+	})
+
+	t.Run("deadline exceeded from the store", func(t *testing.T) {
+		store := newCountingProgressStore()
+		store.setLoadErr(context.DeadlineExceeded)
+		w := newTestWaiter(t, store, WithBestEffort())
+
+		res, err := w.WaitFor(context.Background(), "ws", "users", token("ws", 5), 20*time.Millisecond)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want context.DeadlineExceeded even with best effort", err)
+		}
+		if res.Reached {
+			t.Fatalf("Reached = true, want false")
+		}
+	})
+}
+
+func TestWaiterHubBounded(t *testing.T) {
+	const hubCap = 8192
+	store := newAlwaysFoundStore(1)
+	w := newTestWaiter(t, store, WithFallback(time.Hour))
+
+	projection := func(i int) string { return fmt.Sprintf("p%d", i) }
+	for i := 0; i < hubCap; i++ {
+		res, err := w.WaitFor(context.Background(), "ws", projection(i), token("ws", 1), 20*time.Millisecond)
+		if err != nil || !res.Reached {
+			t.Fatalf("fill key %d = (%+v, %v), want reached", i, res, err)
+		}
+	}
+
+	w.mu.Lock()
+	n := len(w.keys)
+	w.mu.Unlock()
+	if n > hubCap {
+		t.Fatalf("hub size = %d, want at most %d", n, hubCap)
+	}
+
+	// Touch key 0 so it is no longer the most idle; the next insert must evict
+	// the colder key 1 instead.
+	if _, found, err := w.Checkpoint(context.Background(), "ws", projection(0)); err != nil || !found {
+		t.Fatalf("touch key 0 = (found %v, err %v)", found, err)
+	}
+	res, err := w.WaitFor(context.Background(), "ws", projection(hubCap), token("ws", 1), 20*time.Millisecond)
+	if err != nil || !res.Reached {
+		t.Fatalf("overflow key = (%+v, %v), want reached", res, err)
+	}
+
+	w.mu.Lock()
+	_, has0 := w.keys[progressKey{scope: "ws", projection: projection(0)}]
+	_, has1 := w.keys[progressKey{scope: "ws", projection: projection(1)}]
+	n = len(w.keys)
+	w.mu.Unlock()
+	if !has0 {
+		t.Fatalf("hot key 0 was evicted")
+	}
+	if has1 {
+		t.Fatalf("cold key 1 survived the cap")
+	}
+	if n > hubCap {
+		t.Fatalf("hub size after overflow = %d, want at most %d", n, hubCap)
+	}
+
+	// The evicted key must re-read the store on its next wait.
+	before := store.loadsFor(projection(1))
+	res, err = w.WaitFor(context.Background(), "ws", projection(1), token("ws", 1), 20*time.Millisecond)
+	if err != nil || !res.Reached {
+		t.Fatalf("evicted key = (%+v, %v), want reached", res, err)
+	}
+	if got := store.loadsFor(projection(1)); got <= before {
+		t.Fatalf("evicted key loads = %d, want more than %d", got, before)
+	}
+
+	// The hot key stays warm: a cache hit must not read the store.
+	before = store.loadsFor(projection(0))
+	if _, found, err := w.Checkpoint(context.Background(), "ws", projection(0)); err != nil || !found {
+		t.Fatalf("hot key checkpoint = (found %v, err %v)", found, err)
+	}
+	if got := store.loadsFor(projection(0)); got != before {
+		t.Fatalf("hot key loads = %d, want unchanged %d", got, before)
+	}
+}
+
+func TestWaiterColdReadMergeFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		results []Checkpoint
+	}{
+		{
+			name: "live then rebuilding",
+			results: []Checkpoint{
+				{Position: 10, State: StatusLive},
+				{Position: 0, State: StatusRebuilding},
+			},
+		},
+		{
+			name: "rebuilding then live",
+			results: []Checkpoint{
+				{Position: 0, State: StatusRebuilding},
+				{Position: 10, State: StatusLive},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newScriptedLoadStore(tc.results...)
+			w := newTestWaiter(t, store, WithFallback(time.Hour))
+
+			type callResult struct {
+				cp    Checkpoint
+				found bool
+				err   error
+			}
+			out := make(chan callResult, 2)
+			call := func() {
+				cp, found, err := w.Checkpoint(context.Background(), "ws", "users")
+				out <- callResult{cp: cp, found: found, err: err}
+			}
+
+			go call()
+			if i := <-store.started; i != 0 {
+				t.Fatalf("first LoadProgress index = %d, want 0", i)
+			}
+			// The second call starts while the first read is still held open,
+			// so both observe a cold cache.
+			go call()
+			if i := <-store.started; i != 1 {
+				t.Fatalf("second LoadProgress index = %d, want 1", i)
+			}
+
+			close(store.releases[0])
+			r0 := <-out
+			if r0.err != nil || !r0.found {
+				t.Fatalf("first cold read = (%+v, err %v), want found", r0.cp, r0.err)
+			}
+			close(store.releases[1])
+			r1 := <-out
+			if r1.err != nil || !r1.found {
+				t.Fatalf("second cold read = (%+v, err %v), want found", r1.cp, r1.err)
+			}
+
+			cp, found, err := w.Checkpoint(context.Background(), "ws", "users")
+			if err != nil || !found {
+				t.Fatalf("merged checkpoint = (found %v, err %v)", found, err)
+			}
+			if cp.State != StatusRebuilding || cp.Position != 0 {
+				t.Fatalf("merged checkpoint = {pos %d, %v}, want {pos 0, rebuilding}", cp.Position, cp.State)
+			}
+
+			res, err := w.WaitFor(context.Background(), "ws", "users", token("ws", 10), 50*time.Millisecond)
+			if err != nil {
+				t.Fatalf("WaitFor error = %v", err)
+			}
+			if res.Reached {
+				t.Fatalf("Reached = true during a rebuild, want false")
+			}
+			if res.Status != StatusRebuilding {
+				t.Fatalf("Status = %v, want rebuilding", res.Status)
+			}
+		})
+	}
+}
+
+func TestWaiterNoSpuriousWakeOrIdleRead(t *testing.T) {
+	store := newCountingProgressStore()
+	mustSave(t, store, "ws", "users", 0, StatusLive)
+	w := newTestWaiter(t, store, WithFallback(5*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := startWait(ctx, w, "ws", "users", token("ws", 5), 2*time.Second)
+	waitRegistered(t, w, "ws", "users", 1)
+
+	key := progressKey{scope: "ws", projection: "users"}
+	_, _, wake := w.snapshot(key)
+	before := store.count()
+
+	// Wait for at least three fallback ticks. They read the store, but an
+	// unchanged checkpoint must not broadcast to the blocked waiter.
+	deadline := time.Now().Add(time.Second)
+	for store.count()-before < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("fallback ticks = %d, want at least 3", store.count()-before)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, _, after := w.snapshot(key); after != wake {
+		t.Fatalf("an unchanged checkpoint woke the waiter")
+	}
+
+	cancel()
+	o := await(t, ch, time.Second)
+	if !errors.Is(o.err, context.Canceled) {
+		t.Fatalf("waiter error = %v, want context.Canceled", o.err)
+	}
+
+	// Once the last waiter leaves, the ticker must skip the idle key without a
+	// store read. Let any read already in flight settle first.
+	time.Sleep(20 * time.Millisecond)
+	idle := store.count()
+	time.Sleep(30 * time.Millisecond)
+	if got := store.count() - idle; got != 0 {
+		t.Fatalf("idle hub performed %d store reads", got)
 	}
 }
