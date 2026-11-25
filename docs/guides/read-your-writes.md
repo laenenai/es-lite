@@ -131,14 +131,16 @@ Additional properties:
 - **One `LISTEN` connection per process**, created once
   (`postgres.NewProgressListener`), not one per request. Ten API pods = ten
   connections.
-- **One notification per checkpoint write.** The runner saves once per applied
-  batch and a rebuild once per page; a save that does not move the position
-  emits nothing; the listener throttles per scope at 10 ms.
-- **One fallback refresher per `(scope, projection)` key**, shared by every
-  waiter on that key. If notifications are lost, 100 waiters cost one read per
-  tick, not 100.
-- **Wake-ups are free.** `Advance` updates the hub cache before closing the
-  channel, so 100 waiters wake and return without a database read.
+- **One hint per scope per window, after commit.** The hint is emitted outside
+  the checkpoint transaction and coalesced for ~10 ms; a failed hint is
+  dropped and never propagated to the save.
+- **One refresh worker per process**, and it reads only keys with local
+  waiters. A hint for a scope where nothing is waiting performs no read.
+- **Hints are never data.** The payload carries no position; a wake re-reads
+  `projection_checkpoints`, so a forged hint can only cost a read, never
+  produce a false `reached`.
+- **Wake-ups are cheap.** One read per coalesced wake updates the cache; 100
+  waiters on that key then wake and return without touching the database.
 
 That is the answer to “do all my query APIs now depend on es-lite?”: they
 depend on one row in a table you can co-locate with the read model, and they
@@ -203,10 +205,11 @@ it.
 
 | Scenario | Cost |
 |---|---|
-| 100 concurrent queries, one key, one advance | 1 notification, 1 wake broadcast, 0 reads on wake |
-| 100 waiters on one key, notifications lost | 1 store read per ≤100 ms tick (shared refresher) |
-| 10,000 waiters | ~2 KB stack + one timer each; avoid unbounded long-polling |
-| 10 API pods | 10 `LISTEN` connections |
+| 100 concurrent queries, one key, one advance | 1 hint, 1 store read, 100 wake-ups |
+| 100 waiters on one key, hints lost | 1 store read per ≤100 ms tick (shared worker) |
+| Hints with no local waiters | 0 store reads |
+| 10,000 waiters | ~2 KB stack + one timer each; the cap sheds the rest |
+| 10 API pods | 10 `LISTEN` connections per enabled channel |
 
 The number to watch is **waiters × deadline**, i.e. how many requests are
 simultaneously blocked, not the notification rate. A client that retries a

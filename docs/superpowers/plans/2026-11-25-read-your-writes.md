@@ -303,15 +303,19 @@ git commit -m "feat(projection): persist scoped progress and rebuild status"
   }
 
   type WaiterOption func(*waiterOptions)
-  func WithFallback(d time.Duration) WaiterOption // default 100ms, jittered
-  func WithBestEffort() WaiterOption              // store errors -> Reached:false
+  func WithFallback(d time.Duration) WaiterOption     // refresh interval; default 100ms, jittered
+  func WithBestEffort() WaiterOption                  // store errors -> Reached:false
+  func WithMaxWaiters(perKey, total int) WaiterOption // 0 uses the defaults (1024 / 16384)
 
   func NewWaiter(store ProgressStore, opts ...WaiterOption) *Waiter
   func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.Token, timeout time.Duration) (WaitResult, error)
   func (w *Waiter) Checkpoint(ctx context.Context, scope, projection string) (Checkpoint, bool, error)
   func (w *Waiter) Status(ctx context.Context, scope, projection string) (Status, error)
-  func (w *Waiter) Advance(cp Checkpoint)   // ProgressPublisher
+  func (w *Waiter) Advance(cp Checkpoint)   // ProgressPublisher: cache + wake
   func (w *Waiter) SetStatus(scope, projection string, state Status)
+  func (w *Waiter) EnqueueScopeRefresh(scope string) // non-blocking hint from the listener
+  func (w *Waiter) EnqueueRefreshAll()               // listener reconnect repair
+  func (w *Waiter) Close()                           // stop the refresh worker
   ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -328,9 +332,14 @@ Table tests in `projection/wait_test.go`:
 - a missing checkpoint row → does not short-circuit: it waits and is released by an `Advance`; `Status` on a missing row returns `StatusUnknown` with a nil error;
 - a lost notification: do not call `Advance`; advance the memory store behind the waiter and set `WithFallback(5*time.Millisecond)`; the wait returns reached;
 - a shared refresher: after warming the cache, 100 waiters on one key waiting for a position above it, with a 5 ms fallback, perform roughly one store read per tick, not one per waiter (count `LoadProgress` calls);
+- a notification is a hint, not data: `Advance` a forged position 10^9, then `EnqueueScopeRefresh(scope)`; the cached and returned position is the store's authoritative one, and a token at 10^9 is not reached;
+- no local waiters: `EnqueueScopeRefresh` and `EnqueueRefreshAll` perform no store read (count calls) and do not block;
+- reconnect repair: two active keys, `EnqueueRefreshAll`, both are refreshed from the store;
+- caps: with `WithMaxWaiters(1, 1)`, a second waiter on the key and a first waiter on another key each return `Reached:false, err:nil` immediately without blocking;
 - best effort: a store returning an error makes the default `WaitFor` return it, and `WithBestEffort` return `Reached:false, err:nil`; `ErrScopeMismatch` and `context.Canceled` still fail under `WithBestEffort`;
-- 10,000 concurrent waiters on one key are all released by one `Advance`; `goleak.VerifyNone(t)` at the end;
-- `Status` returns the stored state when the cache is cold.
+- 10,000 concurrent waiters on one key are all released by one `Advance`; `goleak.VerifyNone(t)` at the end after `Close()`;
+- `Status` returns the stored state when the cache is cold;
+- a token whose scope exceeds 512 bytes is `es.ErrInvalidToken`.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -339,19 +348,27 @@ Expected: build failure — `Waiter`/`WaitResult` do not exist.
 
 - [ ] **Step 3: Implement**
 
-A hub keyed by `(scope, projection)` holding the cached `Checkpoint` and a `chan struct{}` that is closed and replaced on each advance. `WaitFor`:
-1. A zero token (empty scope and position) returns reached immediately.
-2. If `tok.Scope != scope` → `es.ErrScopeMismatch`. An empty token scope matches only an empty caller scope, which is the SQLite case; a workspace token never matches another workspace.
-3. Read the cache; on a miss, `store.LoadProgress`. A missing row (`found=false`) is position 0 in a live-like state: continue waiting, do not short-circuit. If the state is `rebuilding` or `stalled`, return false immediately with that status. If the position is at or above the token, return reached.
-4. Lock, register the key’s channel, unlock, re-read; if the advance happened, return reached.
-5. Loop on `select` of the key's channel, `ctx.Done()`, the key's refresher signal and the deadline. On each wake, read the cache. The refresher, not the waiter, loads from the store and `Advance`s it.
-6. Remove the registration; stop the key's refresher when its waiter count reaches zero.
+A hub keyed by `(scope, projection)` holding the cached `Checkpoint`, the key's wake channel, and its waiter count. One refresh worker per `Waiter` owns every store read:
 
-Clamp a timeout above 5 s to 5 s; `0` uses 500 ms. `Advance` ignores a checkpoint with a lower position in the same state and replaces on a state change. `SetStatus` updates the cache and broadcasts. `Status` returns `StatusUnknown` when no row exists.
+- It selects on a bounded scope-refresh queue, a refresh-all signal, a jittered ticker (`WithFallback`, default 100 ms) and `Close`.
+- On any wake it computes the keys that currently have waiters, dedupes them, `LoadProgress`es each, `Advance`s the authoritative checkpoint, and closes the keys' channels.
+- An instance with no waiters performs no reads, and a hint for a scope with no local waiters is dropped before any store access.
+- A read error is counted and ignored; the next signal retries. Hint queue overflow drops the hint; the ticker repairs it.
 
-**The fallback is hub-level, not waiter-level.** The first waiter on a key starts one refresher goroutine (jittered ≤100 ms) that serves every waiter on that key and stops when the last one leaves. 100 waiters on one key cost one store read per tick, not 1,000 per second, and the refresher is the only place that re-reads after the initial lookup. A refresher read error is not returned to anyone: it retries on the next tick, and `WithBestEffort` only governs the waiter's own lookup. Waiting never holds a pooled connection: the initial `LoadProgress` returns it, and the waiter blocks on Go channels only.
+`WaitFor`:
+1. A zero token returns reached immediately, before any store access.
+2. If `tok.Scope != scope` → `es.ErrScopeMismatch`; an empty token scope matches only an empty caller scope (SQLite), and a token scope longer than 512 bytes is `es.ErrInvalidToken`. `ParseToken` also caps its input length before allocating.
+3. Enforce `WithMaxWaiters`: above the per-key or total cap, return `Reached:false, err:nil` immediately (fail open; the caller serves stale data). Never queue an unbounded waiter.
+4. Read the cache; on a miss, `store.LoadProgress`. A missing row (`found=false`) is position 0 in a live-like state: continue waiting. `rebuilding` or `stalled` returns false immediately with that status. A position at or above the token returns reached.
+5. Lock, register the key, unlock, re-read the cache; if the advance happened, return reached.
+6. Wait on the key's channel, `ctx.Done()` and the deadline. The worker, not the waiter, reads the store.
+7. Unregister; the worker idles when no key has waiters.
 
-`WithBestEffort()` converts store errors (but not `ErrInvalidToken`, `ErrScopeMismatch` or context cancellation) into `Reached:false, err:nil`, so a query endpoint can fail open to stale data. It is for the read path; commands and health checks should keep the default.
+Clamp a timeout above 5 s to 5 s; `0` uses 500 ms. `Advance` stores the checkpoint as authoritative (it must never be called with a value the store did not return), ignores a lower position in the same state and replaces on a state change. `SetStatus` updates the cache and broadcasts. `Status` returns `StatusUnknown` when no row exists.
+
+**Hints are never trusted.** The listener payload carries only a scope; `EnqueueScopeRefresh` turns it into a store read, so a forged or replayed notification cannot raise a cached position and cannot produce a false `reached`. `EnqueueRefreshAll` (listener reconnect) does the same for every key with waiters. Both are non-blocking and bounded; the 100 ms ticker is the repair path for anything dropped.
+
+`WithBestEffort()` converts store errors (but not `ErrInvalidToken`, `ErrScopeMismatch` or context cancellation) into `Reached:false, err:nil`, so a query endpoint can fail open to stale data. It is for the read path; commands and health checks should keep the default. `Close()` stops the worker; it does not cancel in-flight waits.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -478,17 +495,23 @@ git commit -m "feat(sqlite): add the projection checkpoint store"
 - Produces:
   ```go
   func NewProgressStore(s *Store, channel string) *ProgressStore
-  func NewProgressListener(dsn, channel string, advance func(projection.Checkpoint)) *NotifyListener
+  func (p *ProgressStore) Close() error
+
+  type ScopeRefresher interface {
+      EnqueueScopeRefresh(scope string)
+      EnqueueRefreshAll()
+  }
+  func NewProgressListener(dsn, channel string, r ScopeRefresher) *NotifyListener
   ```
 
 - [ ] **Step 1: Write the failing tests**
 
-- A committed `SaveProgress` sends one JSON notification on `channel` with the scope, projection, position and state.
-- A rolled-back transaction sends none: run the same upsert+notify statements in a transaction, `ROLLBACK`, and assert no notification arrives. An invalid-state failure is a separate validation test — it fails before the notify and does not prove `pg_notify` is transactional.
-- Saving the same position *and* state twice emits one notification; the second save is a no-op. Run the two saves sequentially; two concurrent first inserts may legitimately both notify, which is harmless.
-- A batch save from Task 3 (`Apply` over three envelopes) produces one notification, not three.
-- `NewProgressListener` decodes the payload and calls `advance` with the `Checkpoint`; start it with `Run`, save, and wait on a channel.
-- A notification for another scope/projection does not call the wrong advance callback (the callback receives the payload; the waiter keys it).
+- A committed `SaveProgress` marks the scope; the notifier flushes one `pg_notify(channel, scope)` within the window (poll with a deadline).
+- Two saves on the same scope inside one window produce one notification; a Task 3 batch save does not produce one per event.
+- A save that never commits (a failed or rolled-back transaction) produces no notification: `Mark` runs only after `runWorkspace` returns nil.
+- A failing notifier flush (an injected failing executor) does not fail `SaveProgress` and leaves the stored row intact.
+- `NewProgressListener`'s `OnNotify(payload)` calls `EnqueueScopeRefresh(payload)`; `OnReconnected` calls `EnqueueRefreshAll`; start the listener with `Run`, save, and wait on a fake refresher's channel.
+- The payload carries no position, so a forged notification can only trigger a refresh; the waiter's position always comes from the store.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -497,11 +520,17 @@ Expected: the constructor accepts a channel but ignores it; `NewProgressListener
 
 - [ ] **Step 3: Implement**
 
-Use the constructor’s `channel` (Task 5 already accepts it). In the `runWorkspace` callback, read the current `(position, state)` in the same transaction (`SELECT ... FOR UPDATE`), then upsert, then call `SELECT pg_notify($1,$2)` with a JSON payload **only when the position or state actually changed**; `pg_notify` is transactional, so a rollback sends nothing. Skip when the channel is empty or the row did not move. Cap the payload at the NOTIFY limit; return an error if it is over 7 KB (the workspace/projection lengths are not otherwise bounded by the library).
+Use the constructor’s `channel` (Task 5 already accepts it). **Emit after commit, never inside the save transaction.** `runWorkspace` returns nil, then `Mark(scope)` on a bounded notifier started by `NewProgressStore`; `Close()` stops it. The notifier dedupes scopes in a map, flushes every 10 ms (or when the map is full) with one statement:
 
-`NewProgressListener` wraps the existing `NotifyListener` with a handler whose `OnNotify(payload string)` unmarshals the JSON and calls `advance`. (`NotifyListener` passes the raw payload to `OnNotify`; the parameter is named `scope` in the feed use, but nothing validates that shape.) Its `OnReconnected` is a no-op: the 100 ms fallback repairs a notification lost during a reconnect. It validates the channel through `NotifyListener` and returns a listener the caller runs.
+```sql
+SELECT pg_notify($1, s) FROM unnest($2::text[]) AS s
+```
 
-The listener's 10 ms throttle keys on the whole payload, so it drops exact duplicates but not distinct positions. Notification volume is bounded by the runner's batch save (Task 3) and the no-op suppression above, not by the listener.
+A flush error is counted and the batch dropped — the checkpoint row is already committed, so a hint can never fail or roll back the save. An empty channel disables the notifier entirely.
+
+`NewProgressListener(dsn, channel, r ScopeRefresher)` wraps the existing `NotifyListener` with a handler whose `OnNotify(payload string)` calls `r.EnqueueScopeRefresh(payload)` and whose `OnReconnected()` calls `r.EnqueueRefreshAll()`. `NotifyListener` passes the raw payload, and the payload is the scope — the same shape as the two existing channels, so its 10 ms per-scope throttle coalesces a burst. The handler must not block: both calls are bounded, non-blocking queue writes; the store read happens on the waiter's worker, never on the listener goroutine.
+
+Add a `Close` path (store or notifier) that flushes once, best-effort, and stops the goroutine; the waiter tests use it to satisfy `goleak`.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -582,7 +611,10 @@ Follow the ADR 0044 shape: context, decision (token, applied checkpoint vs deliv
 
 Add:
 - the `projection_checkpoints` table, RLS and grants: the projection runner needs `SELECT, INSERT, UPDATE`; the query/waiter service needs `SELECT`; no `DELETE` on the normal path. State the placement contract: co-locate the table with the read model (one pool for the query service) or grant the query service `SELECT` on the event database — and say which one the deployment uses;
-- the notification channel/role: the projection process and waiters need `LISTEN`/`NOTIFY` privileges (Postgres grants `NOTIFY` on the database and `LISTEN` on the channel by default for a login role; document the deployment check);
+- the notification channel/role: the projection process and waiters need `LISTEN`/`NOTIFY` privileges (Postgres grants `NOTIFY` on the database and `LISTEN` on the channel by default for a login role; document the deployment check). The progress hint is emitted **after commit, best-effort**; a failed hint never fails the checkpoint write;
+- the kill switch: an empty progress channel disables hints, and the fallback read still satisfies waits. When `pg_notification_queue_usage()` alarms, disable hints first;
+- the connection budget: one dedicated backend per channel per listening process (`processes_that_listen × channels`); document the gateway/relay or multi-channel-listener option, and the PgBouncer session/direct requirement;
+- health and metrics to export: listener PID (0 = disconnected), queue usage, dropped hints, fallback reads, active waiters; alert when a listener stays disconnected;
 - the rebuild order: set `rebuilding`, clear/swap the read model, replay, set `live`; blue/green or quiesced reads;
 - backup: `projection_checkpoints` is derived progress, not state; a restore resets/replays it; do not treat it as a backup set.
 

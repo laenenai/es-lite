@@ -43,14 +43,17 @@ on a checkpoint channel, built on the existing `postgres.NotifyListener`
 shape. If the read model lives outside Postgres, the application supplies a
 `Notifier`; the fallback still works without one. SQLite is in-process only.
 
-Notifications are coalesced, not one per waiter. A checkpoint write emits at
-most one notification; the runner saves progress once per applied batch (a
-rebuild: once per page); and a save that does not advance the position emits
-nothing. The listener's throttle drops exact duplicate payloads within 10 ms,
-but distinct positions are distinct payloads, so the write-side coalescing
-above is what bounds the volume. Waiting never holds a database connection:
-`WaitFor` reads the checkpoint, releases it, and blocks on a Go channel. One
-process needs one `LISTEN` connection, not one per request.
+A hint must never fail a write and must never make a read lie. The progress
+hint is therefore emitted **after** the checkpoint transaction commits, from a
+bounded notifier that dedupes scopes and flushes at most every 10 ms; a failed
+flush is counted and dropped, never propagated to the save. The payload is the
+**scope only** — no position and no state — so the listener cannot be tricked
+into raising a cached position; a wake turns into a store read for the keys
+that have local waiters. The listener's 10 ms per-scope throttle now coalesces
+a burst, because the payload is stable per scope. Waiting never holds a
+database connection: the worker reads the checkpoint, releases it, and waiters
+block on Go channels. One process needs one `LISTEN` connection, not one per
+request.
 
 ### 3.2 The applied checkpoint is not the delivery cursor
 
@@ -194,13 +197,18 @@ type ProgressPublisher interface {
 type Waiter struct{ /* hub, source, options */ }
 
 type WaiterOption func(*waiterOptions)
-func WithFallback(d time.Duration) WaiterOption // default 100ms, jittered
+func WithFallback(d time.Duration) WaiterOption     // refresh interval; default 100ms, jittered
 // WithBestEffort turns store errors into Reached:false (stale data) instead of
 // an error, so a query endpoint can fail open. Token and scope errors still
 // fail, as does context cancellation.
 func WithBestEffort() WaiterOption
+// WithMaxWaiters bounds the registry; above the cap WaitFor fails open.
+func WithMaxWaiters(perKey, total int) WaiterOption
 
 func NewWaiter(store ProgressStore, opts ...WaiterOption) *Waiter
+func (w *Waiter) EnqueueScopeRefresh(scope string) // non-blocking hint from the listener
+func (w *Waiter) EnqueueRefreshAll()               // listener reconnect repair
+func (w *Waiter) Close()                           // stop the refresh worker
 func (w *Waiter) WaitFor(ctx context.Context, scope, projection string, tok es.Token, timeout time.Duration) (WaitResult, error)
 func (w *Waiter) Checkpoint(ctx context.Context, scope, projection string) (Checkpoint, bool, error)
 func (w *Waiter) Status(ctx context.Context, scope, projection string) (Status, error)
@@ -241,30 +249,31 @@ through the publisher and the stored state.
 
 For `WaitFor(ctx, scope, projection, tok, timeout)`:
 
-1. Validate `tok.Scope == scope` (`ErrScopeMismatch`) and parse validity.
-2. A zero token returns `Reached: true` immediately.
-3. Read the cached checkpoint; if it is at or above the token, return reached.
-4. If the cached/stored state is `rebuilding` or `stalled`, return
-   `Reached: false` with that status (the caller serves stale/optimistic
-   data). A missing row is position 0 in a live-like state: it waits rather
-   than short-circuiting, or the first read after the first command would
-   never wait at all.
-5. Register for the `(scope, projection)` wake-up, then re-check (the advance
-   may have happened between 3 and 5).
-6. Wait on wake-up, `ctx`, a jittered fallback tick (≤100 ms) and the deadline.
-   On each wake, compare; the fallback re-reads the store.
+1. A zero token returns `Reached: true` immediately, before any store access.
+2. Validate `tok.Scope == scope` (`ErrScopeMismatch`) and parse validity; a
+   token scope over 512 bytes is invalid.
+3. Enforce the waiter caps (`WithMaxWaiters`); above them return
+   `Reached:false, err:nil` (fail open).
+4. Read the cached checkpoint; on a miss, `LoadProgress`. A missing row is
+   position 0 in a live-like state and waits. If the state is `rebuilding` or
+   `stalled`, return `Reached:false` with that status (the caller serves
+   stale/optimistic data). Only then compare the position.
+5. Register for the `(scope, projection)` wake-up, then re-check (an advance
+   may have landed between 4 and 5).
+6. Wait on the wake-up, `ctx` and the deadline. Compare on each wake.
 7. Unregister on return.
 
-The fallback read is per `(scope, projection)` key, not per waiter: the first
-waiter on a key starts one refresher goroutine (jittered, ≤100 ms) that serves
-every waiter blocked on it and stops when the key has no waiters. N waiters on
-one key therefore cost one read per tick, not N.
+One refresh worker per `Waiter` owns every store read: it drains non-blocking
+scope hints and a jittered ticker (≤100 ms), reads only keys with local
+waiters, and advances the cache with the authoritative checkpoint. A
+notification for a scope with no local waiters performs no read. The payload
+never carries a position, so a forged hint can only cause a read, never a false
+`reached`. On reconnect the listener enqueues every active key.
 
-A zero token returns before any store access, and a warm hub cache serves
-without one, so a query endpoint whose callers send no token never touches the
-checkpoint store. `WaitFor` never reads the read model; it only observes the
-checkpoint. The caller must read the same read-model copy that the projection
-writes.
+A zero token returns before any store access, so a query endpoint whose callers
+send no token never touches the checkpoint store. `WaitFor` never reads the
+read model; it only observes the checkpoint. The caller must read the same
+read-model copy that the projection writes.
 
 ## 6. Backends, migrations, notifications
 
@@ -285,11 +294,17 @@ CREATE TABLE projection_checkpoints (
 with the standard workspace RLS policy (workspace arm plus the role-gated
 `es_relay` arm), `ENABLE` + `FORCE`. The table is small and unpartitioned.
 `postgres.NewProgressStore(store *Store, channel string)` implements
-`projection.ProgressStore`; its `SaveProgress`/`ResetProgress`/`SetStatus`
-publish a JSON payload on `channel` with `pg_notify` **in the same
-transaction** as the row write, so a waiter never sees a notification for a
-rolled-back checkpoint. `postgres.NewProgressListener(dsn, channel, advance)`
-wraps the existing `NotifyListener` and calls `advance` for each payload.
+`projection.ProgressStore`. After a save commits, it marks the scope on a
+bounded notifier; the notifier dedupes scopes and flushes at most every 10 ms
+with `pg_notify(channel, scope)` **outside** the save transaction. A failed
+flush is counted and dropped: a hint never fails or rolls back a checkpoint
+write, and a rolled-back save never marks at all. The payload is the scope
+only, so a forged notification cannot raise a cached position. The listener's
+per-scope throttle now coalesces a burst. `postgres.NewProgressListener(dsn,
+channel, refresher)` wraps the existing `NotifyListener`: `OnNotify(scope)`
+enqueues a scope refresh and `OnReconnected()` enqueues a refresh of every
+active key; neither runs a store read on the listener goroutine. `Close()`
+flushes once, best-effort, and stops the notifier.
 
 **SQLite.** Migration `0015_projection_checkpoints.sql` creates the same table
 with `scope` instead of `workspace_id`, no RLS, and `updated_at TEXT`.
@@ -391,9 +406,13 @@ Unit:
   turns a store error into `Reached:false, err:nil` while the default returns
   it; N waiters on one key share one refresher (the store read count is per
   tick, not per waiter); no waiter holds a connection or a `store` call while
-  blocked.
-- Postgres: migration shape/RLS, save/load/reset, notification emitted only on
-  commit (rollback emits none), listener advances a waiter.
+  blocked; the waiter caps fail open; a forged `Advance` is corrected by the
+  next refresh; a scope with no local waiters performs no read; a refresh-all
+  repairs every active key.
+- Postgres: migration shape/RLS, save/load/reset; the hint is emitted after
+  commit and coalesced per scope; a rolled-back save emits none; a failed
+  flush does not fail the save; the listener enqueues a refresh and a
+  reconnect enqueues a refresh-all; a forged payload can only cause a read.
 - SQLite: migration shape, save/load/reset, in-process advance.
 - Rebuild: waiters see `rebuilding`, then `live`; an outstanding token is
   satisfied after the rebuilt projection passes it.
@@ -414,8 +433,11 @@ Integration (Postgres-gated):
   single and multi-append.
 - `projection.ProgressStore` and `Waiter` exist for Postgres and SQLite, with
   in-process and Postgres cross-process notification.
-- The checkpoint is written after the read-model write commits; a rolled-back
-  notification is never emitted; a lost notification falls back.
+- The checkpoint is written after the read-model write commits; the hint is
+  emitted after the commit, never inside it, so a hint cannot fail a write; a
+  rolled-back save emits none; a lost hint falls back.
+- A hint cannot make a read lie: the payload carries only a scope, and the
+  waiter always re-reads the authoritative position before advancing.
 - Waiting is cheap at the read edge: no connection is held while blocked, a
   tokenless or warm-cache read performs no store access, N waiters on one key
   share one fallback refresher, and notifications are coalesced per batch with
