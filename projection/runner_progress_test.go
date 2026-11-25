@@ -438,8 +438,11 @@ func TestRunnerProgressApplyDuringRebuildKeepsRebuilding(t *testing.T) {
 	if got := store.stored(t, "ws", "p"); got.Position != 5 || got.State != StatusRebuilding {
 		t.Fatalf("stored = (%d, %v), want (5, %v)", got.Position, got.State, StatusRebuilding)
 	}
-	if len(pub.advances) != 1 || pub.advances[0].State != StatusRebuilding {
-		t.Fatalf("advances = %+v, want one with state rebuilding", pub.advances)
+	if len(pub.advances) != 2 || pub.advances[0].Position != 0 || pub.advances[0].State != StatusRebuilding {
+		t.Fatalf("advances = %+v, want the reset checkpoint (0, rebuilding) then the apply", pub.advances)
+	}
+	if last := pub.advances[len(pub.advances)-1]; last.Position != 5 || last.State != StatusRebuilding {
+		t.Fatalf("last advance = %+v, want (5, rebuilding)", last)
 	}
 
 	if _, err := r.Rebuild(ctx, progressSource{}, 10); err != nil {
@@ -458,7 +461,8 @@ func TestRunnerProgressApplyDuringRebuildKeepsRebuilding(t *testing.T) {
 
 // TestRunnerResetSetsPositionStateAndStatus pins Reset's store path: it replaces
 // the row with position 0 / rebuilding, clears the runner's cached marker so
-// nothing below the old position is skipped, and publishes the status change.
+// nothing below the old position is skipped, and publishes the checkpoint the
+// store returned (position and state).
 func TestRunnerResetSetsPositionStateAndStatus(t *testing.T) {
 	ctx := context.Background()
 	store := newRecordingProgressStore()
@@ -486,8 +490,12 @@ func TestRunnerResetSetsPositionStateAndStatus(t *testing.T) {
 	if got := store.stored(t, "ws", "p"); got.Position != 0 || got.State != StatusRebuilding {
 		t.Fatalf("stored after Reset = (%d, %v), want (0, %v)", got.Position, got.State, StatusRebuilding)
 	}
-	if want := []statusCall{{scope: "ws", projection: "p", state: StatusRebuilding}}; !reflect.DeepEqual(pub.statuses, want) {
-		t.Fatalf("published statuses = %+v, want %+v", pub.statuses, want)
+	if len(pub.advances) != 1 || pub.advances[0].Scope != "ws" || pub.advances[0].Projection != "p" ||
+		pub.advances[0].Position != 0 || pub.advances[0].State != StatusRebuilding {
+		t.Fatalf("published advances = %+v, want one (ws, p, 0, rebuilding): Reset must publish the returned checkpoint, not just the state", pub.advances)
+	}
+	if len(pub.statuses) != 0 {
+		t.Fatalf("published statuses = %+v, want none from the store path", pub.statuses)
 	}
 	if r.marker != 0 || !r.loaded || r.state != StatusRebuilding {
 		t.Fatalf("runner after Reset = {marker:%d loaded:%v state:%v}, want {0 true rebuilding}", r.marker, r.loaded, r.state)
@@ -581,10 +589,9 @@ func TestRunnerRebuildStatus(t *testing.T) {
 			t.Fatalf("stored after Rebuild = (%d, %v), want (2, %v)", got.Position, got.State, StatusLive)
 		}
 		if want := []statusCall{
-			{scope: "ws", projection: "p", state: StatusRebuilding},
 			{scope: "ws", projection: "p", state: StatusLive},
 		}; !reflect.DeepEqual(pub.statuses, want) {
-			t.Fatalf("published statuses = %+v, want %+v", pub.statuses, want)
+			t.Fatalf("published statuses = %+v, want %+v (Reset publishes an advance, not a status)", pub.statuses, want)
 		}
 	})
 

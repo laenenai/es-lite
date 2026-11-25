@@ -409,21 +409,39 @@ func (r *Runner) notifyAppliedBatch(ctx context.Context, batch []es.Envelope) {
 // state — the reset half of rebuild (ADR 0005): reset the read model, call
 // Reset, then Rebuild. With a ProgressStore it replaces the row; otherwise it
 // discards any buffered pending marker position and saves 0. The cached marker
-// is cleared so the replay cannot be skipped, and the status change is
-// published.
+// is cleared so the replay cannot be skipped.
+//
+// The published progress is the checkpoint the store returned, not just the
+// new state: a warm waiter cache must move to the reset position, or a rebuild
+// below the old high-water mark would return a false "reached". The legacy
+// Marker path has no returned checkpoint, so it publishes the state change
+// only (the marker is not part of the waiter cache).
 func (r *Runner) Reset(ctx context.Context) error {
 	r.init()
 	if r.ProgressStore != nil {
-		if _, err := r.ProgressStore.ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding); err != nil {
+		cp, err := r.ProgressStore.ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding)
+		if err != nil {
 			return fmt.Errorf("projection %s: reset progress: %w", r.Name, err)
 		}
-	} else {
-		if d, ok := r.Marker.(interface{ Discard(string) }); ok {
-			d.Discard(r.Name)
+		cp.Scope, cp.Projection = r.Scope, r.Name
+		r.mu.Lock()
+		r.state = StatusRebuilding
+		r.marker = 0
+		r.loaded = true
+		r.mu.Unlock()
+		// Advance, not SetStatus: a state change replaces the position, so a
+		// warm live@100 becomes rebuilding@0 and a replay advance below 100
+		// is visible.
+		if r.Progress != nil {
+			r.Progress.Advance(cp)
 		}
-		if err := r.Marker.Save(ctx, r.Name, 0); err != nil {
-			return fmt.Errorf("projection %s: reset marker: %w", r.Name, err)
-		}
+		return nil
+	}
+	if d, ok := r.Marker.(interface{ Discard(string) }); ok {
+		d.Discard(r.Name)
+	}
+	if err := r.Marker.Save(ctx, r.Name, 0); err != nil {
+		return fmt.Errorf("projection %s: reset marker: %w", r.Name, err)
 	}
 	r.mu.Lock()
 	r.state = StatusRebuilding
