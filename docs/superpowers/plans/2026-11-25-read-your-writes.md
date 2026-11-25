@@ -20,7 +20,7 @@
 - **Wait policy.** Default timeout 500 ms; values above 5 s clamp to 5 s. A timeout is `Reached:false, err == nil`. Errors are reserved for a malformed token, scope mismatch, context cancellation and store errors.
 - **Fallback.** One refresher per `(scope, projection)` key re-reads at most every 100 ms, jittered, and once at the deadline; every waiter on that key shares it. Notifications are an optimization.
 - **Query-path cost.** A waiter holds no database connection while blocked. A tokenless request and a warm-cache hit perform no store access. `WithBestEffort` is the query path's fail-open mode; commands and health checks keep the default.
-- **Notification volume.** One notification per checkpoint write: `Apply`/`Rebuild` save once per batch/page, and a save that does not move the position emits nothing.
+- **Notification volume.** One notification per coalesced window per scope: the live `Run`/`Feed` path saves once per event, an `Apply` batch and each `Rebuild` page save once, and a lower same-state save (one that does not move the position) emits nothing.
 - **Migrations.** Postgres `0017_projection_checkpoints.sql`; SQLite `0015_projection_checkpoints.sql`. Existing applied migrations are not edited.
 - **Backward compatibility.** `projection.Marker`, `eventfeed`, `feed`, `Drain` and the feed checkpoint schema keep their current behavior. The new paths are additive and opt-in.
 - **Rebuilds.** `rebuilding` is set before the read model is cleared; `WaitFor` returns `Reached:false` with that status. Blue/green or quiesced reads are a deployment contract.
@@ -130,7 +130,7 @@ Expected: build failures — `Token`, `AppendResult.Position`, `Result.Token` un
 
 - [ ] **Step 3: Implement**
 
-`es/token.go`: a 1-byte version, u16 scope length, scope, u64 position; base64url. `ParseToken("")` returns the zero token; any other length/version is `ErrInvalidToken`. `TokenFor` takes the highest `AppendResult.Position` (0 if none). `MaxToken` treats a zero token as compatible with any scope (returns the other one) and rejects two different non-empty scopes with `ErrScopeMismatch`.
+`es/token.go`: a 1-byte version, u16 scope length, scope, u64 position; base64url. `ParseToken("")` returns the zero token; any other length/version is `ErrInvalidToken`. `TokenFor` takes the highest `AppendResult.Position` and returns the zero token when it is 0 (nothing to wait for). `MaxToken` treats a zero token as compatible with any scope (returns the other one) and rejects two different non-empty scopes with `ErrScopeMismatch`.
 
 `es/errors.go`: add `ErrInvalidToken`, `ErrScopeMismatch`.
 
@@ -250,7 +250,7 @@ A recording publisher and the memory progress store. Assert:
 - A filtered event saves and publishes too.
 - A save error does not call `Advance` and is returned.
 - `Apply` while the runner is rebuilding persists the new position with `StateRebuilding`; the state becomes `live` only after a successful `Rebuild`.
-- `Reset` sets position 0/state `rebuilding`, clears the runner’s cached marker, and publishes the status.
+- `Reset` sets position 0/state `rebuilding`, clears the runner’s cached marker, and publishes the checkpoint the store returned (position and state), so a warm cache cannot keep an old high-water mark.
 - `Reset` calls `Discard(name)` when the legacy `Marker` implements it (a buffered pending position must not resurrect the old marker).
 - `Rebuild` over a two-event source sets `live` only on success; a source error leaves `rebuilding`.
 - A failing `SetStatus(live)` during `Rebuild` returns the error and leaves both the row and `r.state` `rebuilding`.
@@ -267,8 +267,8 @@ Expected: build failure — `Runner.Scope`/`ProgressStore`/`Reset` do not exist.
 - `loadMarker`: when `ProgressStore != nil`, call `LoadProgress(ctx, r.Scope, r.Name)`; a found row supplies the marker (position) **and the state** (unless the state is `StatusUnknown`), so a restart during a rebuild stays fail-closed; otherwise position 0 and the default `live`. Keep the legacy `Marker.Load` path when nil.
 - `advance`: when `ProgressStore != nil`, call `SaveProgress(ctx, r.Scope, r.Name, Checkpoint{Scope:r.Scope, Projection:r.Name, Position:pos, State:r.state})`; otherwise `Marker.Save`. On success, call `Progress.Advance(cp)` when `Progress != nil`. Never publish before the save returns.
 - **Rebuild state.** Track the runner's state in an unexported field, default `StatusLive`; `Reset` sets `StatusRebuilding`; `Rebuild` sets `StatusLive` only after `Replay` returns nil. `advance` persists that state. Without this, the first replayed page would write `live` mid-rebuild and a `WaitFor` could return reached over a half-rebuilt read model (Review Focus 3).
-- **Batch coalescing.** Split dispatch from save: `Apply` dispatches every envelope in the batch, tracks the last successful position, and calls `advance` **once** at the end — and once with the last successful position before returning a dispatch error (otherwise a redelivery after a partial batch restarts the page). `Rebuild` reuses `Apply`, so a rebuild saves and notifies once per page. `Run`/`Feed` still delivers one envelope at a time and saves per event; that is acceptable because the Postgres store suppresses a notify when the stored position does not move (Task 7) and the listener throttles per scope at 10 ms. Keep the in-memory `r.marker` updated per applied envelope so an in-process redelivery still skips. Call `OnApplied` for every applied envelope **after** the batch save, preserving its documented “called after the marker is saved” ordering while still firing once per envelope.
-- `Reset`: `ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding)` when the store is set, otherwise `Discard(r.Name)` if the `Marker` implements `interface{ Discard(string) }` and then `Marker.Save(...,0)`; set `r.state=StatusRebuilding`, `r.marker=0`, `r.loaded=true`; call `Progress.SetStatus(..., StatusRebuilding)`.
+- **Batch coalescing.** Split dispatch from save: `Apply` dispatches every envelope in the batch, tracks the last successful position, and calls `advance` **once** at the end — and once with the last successful position before returning a dispatch error (otherwise a redelivery after a partial batch restarts the page). `Rebuild` reuses `Apply`, so a rebuild saves and notifies once per page. `Run`/`Feed` delivers one envelope at a time, so the live path saves once per event; that is acceptable because the Postgres store suppresses a notify when the save does not move the position (Task 7) and the listener throttles per scope at 10 ms. Keep the in-memory `r.marker` updated per applied envelope so an in-process redelivery still skips. Call `OnApplied` for every applied envelope **after** the batch save, preserving its documented “called after the marker is saved” ordering while still firing once per envelope.
+- `Reset`: `ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding)` when the store is set and publish the returned checkpoint with `Progress.Advance(cp)` — a state change replaces the cached position, so a warm cache moves to 0. Otherwise `Discard(r.Name)` if the `Marker` implements `interface{ Discard(string) }` and then `Marker.Save(...,0)`, publishing `Progress.SetStatus(..., StatusRebuilding)`. Set `r.state=StatusRebuilding`, `r.marker=0`, `r.loaded=true` in both paths.
 - `Rebuild`: after `Replay` succeeds, call `ProgressStore.SetStatus(..., StatusLive)` when the store is set **first**, and set `r.state=StatusLive` only after it returns nil; then `Progress.SetStatus(..., StatusLive)`. On any error, restore/leave `StatusRebuilding` in both the row and `r.state`, and return. Keep `OnApplied` after the save and after `Advance`.
 
 - [ ] **Step 4: Run to verify pass**
@@ -322,6 +322,8 @@ git commit -m "feat(projection): persist scoped progress and rebuild status"
 
 Table tests in `projection/wait_test.go`:
 - zero token → `Reached:true`, no store read;
+- a token with `Position: 0` and a matching scope → `Reached:true`, no store read;
+- a cold read that blocks past the deadline → a timeout result (`Reached:false, err == nil`) without `WithBestEffort`;
 - already satisfied → returns without blocking;
 - `Advance` past the token releases a waiter, an advance below it does not;
 - the register/re-check race: loop 1,000 times, `Advance` between the fast path and registration, every wait returns reached (`-race`);
@@ -331,11 +333,12 @@ Table tests in `projection/wait_test.go`:
 - a checkpoint at a position at or above the token but in `rebuilding` or `stalled` → `Reached:false`, the matching `Status`, no timeout (the status check must beat the position check);
 - a missing checkpoint row → does not short-circuit: it waits and is released by an `Advance`; `Status` on a missing row returns `StatusUnknown` with a nil error;
 - a lost notification: do not call `Advance`; advance the memory store behind the waiter and set `WithFallback(5*time.Millisecond)`; the wait returns reached;
+- a lost notification for the whole wait: a store that returns the token's position only on a second read, with `WithFallback(time.Hour)` and a short timeout, ends reached via the one read at the deadline;
 - a shared refresher: after warming the cache, 100 waiters on one key waiting for a position above it, with a 5 ms fallback, perform roughly one store read per tick, not one per waiter (count `LoadProgress` calls);
 - a notification is a hint, not data: `Advance` a forged position 10^9, then `EnqueueScopeRefresh(scope)`; the cached and returned position is the store's authoritative one, and a token at 10^9 is not reached;
 - no local waiters: `EnqueueScopeRefresh` and `EnqueueRefreshAll` perform no store read (count calls) and do not block;
 - reconnect repair: two active keys, `EnqueueRefreshAll`, both are refreshed from the store;
-- caps: with `WithMaxWaiters(1, 1)`, a second waiter on the key and a first waiter on another key each return `Reached:false, err:nil` immediately without blocking;
+- caps: with `WithMaxWaiters(1, 1)`, a second waiter on the key and a first waiter on another key each return `Reached:false, err:nil` immediately without blocking; an already-satisfied cached token still returns reached under the same cap;
 - best effort: a store returning an error makes the default `WaitFor` return it, and `WithBestEffort` return `Reached:false, err:nil`; `ErrScopeMismatch` and `context.Canceled` still fail under `WithBestEffort` — including a context error returned by a ctx-aware `LoadProgress` that is gated and cancelled mid-read;
 - idle eviction: after waits on more distinct keys than the idle cap, the hub stays bounded, and an evicted key re-reads the store on its next wait;
 - status stickiness: two gated cold reads, `live@10` and `rebuilding@0`, installed in either order, leave the cache `rebuilding`; a token at 10 is not reached;
@@ -360,12 +363,12 @@ A hub keyed by `(scope, projection)` holding the cached `Checkpoint`, the key's 
 - Idle keys are bounded by an internal cap (8192) with LRU eviction of keys that have no waiters; active keys are bounded by `WithMaxWaiters`. An evicted key re-reads on its next wait.
 
 `WaitFor`:
-1. A zero token returns reached immediately, before any store access.
+1. A zero token returns reached immediately, before any store access; after the scope check, a token with `Position: 0` does the same.
 2. If `tok.Scope != scope` → `es.ErrScopeMismatch`; an empty token scope matches only an empty caller scope (SQLite), and a token scope longer than 512 bytes is `es.ErrInvalidToken`. `ParseToken` also caps its input length before allocating.
-3. Enforce `WithMaxWaiters`: above the per-key or total cap, return `Reached:false, err:nil` immediately (fail open; the caller serves stale data). Never queue an unbounded waiter.
-4. Read the cache; on a miss, `store.LoadProgress`. A missing row (`found=false`) is position 0 in a live-like state: continue waiting. `rebuilding` or `stalled` returns false immediately with that status. A position at or above the token returns reached. A cold read installs fail-closed: `rebuilding`/`stalled` sticks against a `live` read, otherwise a state change wins and a same-state read takes the higher position (two concurrent cold reads must not let a stale `live` erase a fresh `rebuilding`).
+3. Read the cache; on a miss, `store.LoadProgress` under a context bounded by the wait deadline. A read that expires with that deadline is a timeout result, not a store error. A missing row (`found=false`) is position 0 in a live-like state: continue waiting. `rebuilding` or `stalled` returns false immediately with that status. A position at or above the token returns reached. A cold read installs fail-closed: `rebuilding`/`stalled` sticks against a `live` read, otherwise a state change wins and a same-state read takes the higher position (two concurrent cold reads must not let a stale `live` erase a fresh `rebuilding`).
+4. Enforce `WithMaxWaiters` only for a token the cache did not satisfy: above the per-key or total cap, return `Reached:false, err:nil` immediately (fail open; the caller serves stale data). Never queue an unbounded waiter, and never let the cap turn an already-satisfied token into a fail-open.
 5. Lock, register the key, unlock, re-read the cache; if the advance happened, return reached.
-6. Wait on the key's channel, `ctx.Done()` and the deadline. The worker, not the waiter, reads the store.
+6. Wait on the key's channel, `ctx.Done()` and the deadline. The worker, not the waiter, reads the store. When the deadline fires, perform one last bounded `LoadProgress` (`min(200ms, timeout)`), install a found checkpoint and decide; a lost hint then costs latency, not a false timeout.
 7. Unregister; the worker idles when no key has waiters.
 
 Clamp a timeout above 5 s to 5 s; `0` uses 500 ms. `Advance` stores the checkpoint as authoritative (it must never be called with a value the store did not return), ignores a lower position in the same state and replaces on a state change. `SetStatus` updates the cache and broadcasts. `Status` returns `StatusUnknown` when no row exists.
@@ -512,7 +515,8 @@ git commit -m "feat(sqlite): add the projection checkpoint store"
 
 - A committed `SaveProgress` marks the scope; the notifier flushes one `pg_notify(channel, scope)` within the window (poll with a deadline).
 - A committed `ResetProgress` or `SetStatus` also marks the scope: a rebuild or status change must wake remote waiters, not wait for the fallback.
-- Two saves on the same scope inside one window produce one notification; a Task 3 batch save does not produce one per event.
+- Two saves on the same scope inside one window produce one notification; a lower same-state save (the upsert does not move the position) emits no hint at all.
+- The live path's per-event saves coalesce per scope: many close saves produce one notification per window, so hint volume does not scale with the save rate.
 - A save that never commits (a failed or rolled-back transaction) produces no notification: `Mark` runs only after `runWorkspace` returns nil.
 - A failing notifier flush (injected through the notifier constructor seam, not by mutating a live goroutine) does not fail `SaveProgress` and leaves the stored row intact.
 - A scope longer than the notify limit is saved without a hint (counted as dropped), never an error.
@@ -529,7 +533,7 @@ Expected: the constructor accepts a channel but ignores it; `NewProgressListener
 
 - [ ] **Step 3: Implement**
 
-Use the constructor’s `channel` (Task 5 already accepts it). **Emit after commit, never inside the save transaction.** Each of `SaveProgress`, `ResetProgress` and `SetStatus` returns from `runWorkspace` nil and then calls `Mark(scope)` on a bounded notifier started by `NewProgressStore`; `Close()` stops it. The notifier dedupes scopes in a map, flushes every 10 ms (or when the map is full) with one statement:
+Use the constructor’s `channel` (Task 5 already accepts it). **Emit after commit, never inside the save transaction.** Each of `SaveProgress`, `ResetProgress` and `SetStatus` returns from `runWorkspace` nil and then calls `Mark(scope)` on a bounded notifier started by `NewProgressStore`; `SaveProgress` adds `RETURNING position` and skips `Mark` when the returned position is greater than the requested one (a lower same-state save moved nothing). `Close()` stops it. The notifier dedupes scopes in a map, flushes every 10 ms (or when the map is full) with one statement:
 
 ```sql
 SELECT pg_notify($1, s) FROM unnest($2::text[]) AS s
@@ -614,7 +618,7 @@ git commit -m "feat(projection): gate rebuilds and add a read-your-writes exampl
 
 - [ ] **Step 1: Write the ADR**
 
-Follow the ADR 0044 shape: context, decision (token, applied checkpoint vs delivery cursor, write-through guarantee, scope, status/blue-green, Postgres NOTIFY), consequences (one extra checkpoint write per batch, grants, rebuild contract), alternatives (NATS, same-transaction checkpoint, token epoch, feed-checkpoint reuse), rollout (migrations 0017/0015, version v0.24.0, example).
+Follow the ADR 0044 shape: context, decision (token, applied checkpoint vs delivery cursor, write-through guarantee, scope, status/blue-green, Postgres NOTIFY), consequences (one extra checkpoint write per `Apply` — per event on the live path — grants, rebuild contract), alternatives (NATS, same-transaction checkpoint, token epoch, feed-checkpoint reuse), rollout (migrations 0017/0015, version v0.24.0, example).
 
 - [ ] **Step 2: Update the runbook**
 

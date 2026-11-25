@@ -49,9 +49,10 @@ clamped to 5 s. A timeout is **not an error** — it returns `Reached:false` wit
 stale data.
 
 The zero token (`Token{}`, wire form `""`) is reached immediately, before any
-store access, so a tokenless request never touches the checkpoint store. Do
-not claim freshness for it: `ES-Consistent` is only meaningful when the caller
-supplied a token.
+store access, so a tokenless request never touches the checkpoint store. A
+token with `Position: 0` for a matching scope is treated the same way. Do not
+claim freshness for either: `ES-Consistent` is only meaningful when the caller
+supplied a token with a position.
 
 The token is a **position hint, not an authorization claim**. It carries no
 rights and no data; the scope a query waits in comes from authentication. A
@@ -76,15 +77,24 @@ GET /users   ES-Consistency: <token>
 ### Step 1 — the command returns a token
 
 ```go
-res, err := runtime.Handle(ctx, sid, CreateUser{Name: "alice"}, es.Meta{Workspace: ws})
+// Postgres: the runtime's store is workspace-scoped, so every operation
+// (including the append and the RLS setting) runs as this workspace.
+wsStore := store.WorkspaceStore(ws)
+runtime := aggregate.NewRuntime(wsStore, decider, codec)
+res, err := runtime.Handle(ctx, sid, CreateUser{Name: "alice"}, es.Meta{})
 if err != nil { /* ... */ }
 w.Header().Set("ES-Consistency", res.Token.String())
 ```
 
+`es.Meta` carries audit fields, not the workspace: the scope comes from the
+store handle the runtime was built over. On SQLite the store is
+single-workspace and the scope is `""`.
+
 `res.Token` carries `res.Position`, the highest position in the append. A
 multi-event command therefore yields a token that covers the whole command:
 the read never observes half of it. An append that bypasses `aggregate` can
-build the same token with `es.TokenFor(scope, results...)`.
+build the same token with `es.TokenFor(scope, results...)`; a highest position
+of 0 yields the zero token, because there is nothing to wait for.
 
 ### Step 2 — the client passes it back
 
@@ -92,7 +102,7 @@ The client keeps the latest token per workspace and sends it on the next read:
 
 ```
 GET /users
-ES-Consistency: AQACd3NfYQAAAAAAAATc
+ES-Consistency: AQAEd3NfYQAAAAAAAATS
 ```
 
 If the client has no token, it sends nothing. The endpoint skips the wait and
@@ -196,7 +206,19 @@ Additional properties:
   statement, `NotifyDropped() == 0`; the ~100 ms jittered fallback read still
   satisfies every wait, more slowly but correctly.
 - **Wake-ups are cheap.** One read per coalesced wake updates the cache; 100
-  waiters on that key then wake and return without touching the database.
+  waiters on that key then wake and return without touching the database. At
+  the deadline each waiter also performs one last bounded store read, so a
+  hint lost for the whole wait still ends reached.
+- **Save volume on the live path.** `Run`/`Feed` call `Apply` with one envelope
+  at a time, so the live path saves the checkpoint **once per event**. An
+  explicit multi-event `Apply` batch and each `Rebuild` page save once each.
+  That is cheap and write-through, and hints are coalesced per scope, so the
+  hint volume follows scopes and windows, not saves. A lower same-state save
+  (one that does not move the position) emits nothing.
+- **`LogFeed` is the single-writer path.** Over Postgres, `projection.LogFeed`
+  pages raw `ReadAll` without a settlement fence. Run it with a single writer
+  or a quiescent log; with concurrent appenders use `eventfeed`, which owns the
+  fenced delivery cursor.
 - **Co-locate the table with the read model.** The same database, one pool for
   the wait and the query. `WaitFor` never reads the read model, so it cannot
   detect that you then query a lagging replica: read the same copy the
@@ -224,7 +246,9 @@ mismatch or context cancellation.
 `WithMaxWaiters(perKey, total)` bounds the hub. The defaults are 1024 waiters
 on one `(scope, projection)` key and 16384 overall; above either cap `WaitFor`
 returns `Reached:false, err:nil` immediately — fail open rather than queue
-unbounded blocked requests. A non-positive value keeps the default.
+unbounded blocked requests. A non-positive value keeps the default. The cap is
+checked after the cached-checkpoint decision, so an already-satisfied token
+still returns `Reached:true` when the hub is full.
 `WithFallback(d)` changes the fallback refresh interval (100 ms default,
 jittered ±20%).
 
@@ -279,14 +303,17 @@ spans a non-blue/green rebuild is treated as stale by the client.
 `Reset` is explicit; `Rebuild` does not reset on its own (ADR 0005). A crashed
 rebuild leaves `rebuilding` set, which is fail-closed until an operator clears
 it. Both `ResetProgress` and `SetStatus` mark the scope, so a wait blocked on
-the old position is woken to observe `rebuilding` (and later `live`).
+the old position is woken to observe `rebuilding` (and later `live`). `Reset`
+publishes the checkpoint the store returned (position 0, `rebuilding`), so a
+warm waiter cache cannot keep the old high-water mark and report a rebuild
+below it as reached.
 
 ## 8. Sizing
 
 | Scenario | Cost |
 |---|---|
 | 100 concurrent queries, one key, one advance | 1 coalesced notification, 1 store read by the refresher, 100 wake-ups, **0 reads on wake**, no extra connections |
-| 100 waiters on one key, hints lost | 1 store read per ≤100 ms tick (one shared worker) |
+| 100 waiters on one key, hints lost | 1 store read per ~100 ms tick (jittered ±20%), one shared worker |
 | Hints with no local waiters | 0 store reads |
 | 1,024 waiters on one key (the default per-key cap) | ~2 KB stack + one timer each; above the cap the rest fail open immediately |
 | 10 API pods | 10 `LISTEN` connections per enabled channel; 0 with hints disabled |

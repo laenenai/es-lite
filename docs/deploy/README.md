@@ -437,6 +437,28 @@ crashed rebuild stays `rebuilding` after restart (the runner seeds the state
 from the row), so a half-rebuilt read model cannot be reported fresh: complete
 or re-run the rebuild, then let `Rebuild` write `live`.
 
+### Stalled projections
+
+`StatusStalled` has no producer in the library: the runner writes only `live`
+and `rebuilding`. It is an operator signal that a projection should stop
+answering waits as fresh. To set it:
+
+1. **Stop the runner.** A running runner re-persists its in-memory state on the
+   next save, which would erase the operator's change.
+2. Write the state with the position unchanged (and `live` to clear it):
+
+   ```sql
+   UPDATE projection_checkpoints
+      SET state = 'stalled', updated_at = clock_timestamp()
+    WHERE workspace_id = $1 AND projection = $2;
+   ```
+
+3. Restart the runner. `loadMarker` seeds the state from the row, so it stays
+   fail-closed until the row is set `live` again (or a rebuild completes).
+
+While the row is `stalled`, `WaitFor` returns `Reached:false, StatusStalled`
+immediately.
+
 ### Backup
 
 `projection_checkpoints` is **derived progress, not state**. A restore resets

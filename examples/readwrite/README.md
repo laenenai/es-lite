@@ -49,5 +49,11 @@ never the delivery cursor. This example uses `projection.LogFeed` directly over
 SQLite so it runs with no feed server, broker or external service; the waiter
 and checkpoint code exercised here are the same.
 
+`LogFeed` is the single-writer path. Over Postgres it pages raw `ReadAll`
+without a settlement fence, so run it with a single writer or a quiescent log,
+or use `eventfeed` for concurrent appenders. The progress store's checkpoint is
+unaffected either way: it describes what the read model applied, not what the
+consumer was delivered.
+
 The example has no command runtime, so it does not exercise a no-op command's
 token (Task 1 owns that case).

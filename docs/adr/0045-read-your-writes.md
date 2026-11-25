@@ -60,9 +60,14 @@ same bound the feed uses for a workspace id).
 `0` for an append with no events. `aggregate.Result.Token` carries the token —
 `TokenFor(scope, results...)` takes the highest position across several
 appends — so a multi-event command yields one token covering the whole
-command: a reader never observes half of it. `MaxToken(a, b)` returns the
-further-along token and is `ErrScopeMismatch` for two different non-empty
+command: a reader never observes half of it. A highest position of 0 yields
+the zero token, because there is nothing to wait for. `MaxToken(a, b)` returns
+the further-along token and is `ErrScopeMismatch` for two different non-empty
 scopes, which is the client-side bug worth catching.
+
+Scopes are limited to 512 bytes: `Token.String` still encodes a longer scope,
+but `ParseToken` rejects it, so `TokenFor` with an oversized scope produces an
+unusable token. Keep the scope (the workspace id) within that bound.
 
 The token is a **position hint, not an authorization claim**. It carries no
 rights and no data; the scope a query waits in comes from the authenticated
@@ -129,16 +134,23 @@ The guarantee is therefore:
 
 Specifics that make this hold:
 
-- **One save per batch.** `Apply` saves once at the last successfully applied
-  position, not once per envelope; a failed dispatch saves the applied prefix
-  once before returning the error. `Run` and `Rebuild` share that path.
+- **One save per `Apply` call, one per event on the live path.** `Apply` saves
+  once at the last successfully applied position of its batch, not once per
+  envelope, and a failed dispatch saves the applied prefix once before
+  returning the error. `Run`/`Feed` deliver one envelope at a time, so the live
+  path makes one save per event; `Rebuild` saves once per page. Hints are
+  coalesced per scope, so the hint rate does not follow the save rate.
 - **Publish after the save.** The in-process `Progress` publisher is called
   only after `SaveProgress` returns, so a waiter cannot see a position the
   store does not hold. A `BufferedMarker` is not a `ProgressStore`; progress
   stores are write-through by contract.
-- **`Reset` marks rebuilding first.** `Runner.Reset` replaces the row with
-  position 0 and state `rebuilding` before the application clears or swaps the
-  read model, then clears the cached marker so the replay cannot be skipped.
+- **`Reset` publishes what the store returned.** `Runner.Reset` replaces the
+  row with position 0 and state `rebuilding` before the application clears or
+  swaps the read model, then publishes that returned checkpoint to in-process
+  waiters. Publishing the state alone would leave a warm cache at the old
+  high-water mark, so a rebuild below it could be reported as reached. The
+  legacy `Marker` path, which has no checkpoint row, publishes the status
+  change only.
 - **`Rebuild` goes live last, fail-closed.** The replay runs entirely in
   `rebuilding`; the row is set `live` only after the store's `SetStatus`
   succeeds, and a failed status write leaves both row and runner
@@ -169,22 +181,33 @@ means — no cross-projection or cross-workspace claim.
 The algorithm and its bounds:
 
 1. A zero token returns `Reached: true` immediately, before any store access,
-   so a client that sends no token never touches the checkpoint store.
+   so a client that sends no token never touches the checkpoint store. Once
+   the scope check passes, a token with `Position: 0` is likewise reached
+   immediately.
 2. A token scope over 512 bytes is `ErrInvalidToken`; a token scope that
    differs from the caller's scope is `ErrScopeMismatch`; both fail even under
    best effort.
-3. The waiter caps apply next (`1024` per key, `16384` total by default): above
-   either cap, `Reached:false` with a nil error — shed load rather than queue
-   an unbounded number of blocked requests.
-4. On a cold key the waiter reads `projection_checkpoints` once. A missing row
-   is position 0: it waits, because "never ran" is not "caught up".
-5. The **status gate comes before the position gate**. A `rebuilding` or
+3. On a cold key the waiter reads `projection_checkpoints` once, bounded by the
+   wait deadline rather than only the caller's context. A read that expires
+   with the wait deadline is a timeout result, not a store error, even without
+   `WithBestEffort`. A missing row is position 0: it waits, because "never ran"
+   is not "caught up".
+4. The **status gate comes before the position gate**. A `rebuilding` or
    `stalled` checkpoint returns `Reached:false` with that status even when its
    stale position is at or above the token.
+5. Only a token the cache did not satisfy reaches the waiter caps (`1024` per
+   key, `16384` total by default). Above either cap, the result is
+   `Reached:false` with a nil error — shed load rather than queue an unbounded
+   number of blocked requests. A cached reached token still returns reached
+   under load.
 6. The waiter registers for the key, re-checks (an advance may have landed in
    between), then blocks on a Go channel, its context, and the deadline. It
    holds no connection, transaction or lock while blocked.
-7. The default deadline is 500 ms; values above 5 s are clamped to 5 s. A
+7. When the deadline fires, the waiter performs one last bounded store read
+   (at most `min(200 ms, timeout)`), installs a found checkpoint and decides
+   against it. A hint lost for the whole wait therefore costs latency, not a
+   false timeout.
+8. The default deadline is 500 ms; values above 5 s are clamped to 5 s. A
    timeout is `Reached:false` with a nil error, carrying the last checkpoint
    and `Waited`.
 
@@ -203,9 +226,10 @@ commits. Three properties are load-bearing:
   scope only after the transaction commits. The notifier coalesces scopes and
   flushes on a ~10 ms window (early when its batch fills) with
   `pg_notify(channel, scope)` on the pool. A failed flush is counted
-  (`NotifyDropped`) and dropped; a rolled-back save never marks; an oversized
-  scope (over 512 bytes) skips the hint instead of failing the save. **A hint
-  can never fail or roll back a checkpoint write.**
+  (`NotifyDropped`) and dropped; a rolled-back save never marks; a same-state
+  save at or below the stored position does not move the row and marks
+  nothing; an oversized scope (over 512 bytes) skips the hint instead of
+  failing the save. **A hint can never fail or roll back a checkpoint write.**
 - **The payload is the scope alone.** There is no position and no state in
   the notification. A forged or replayed hint can cause a store read; it
   cannot raise a cached position or produce a false `reached`.
@@ -246,21 +270,35 @@ token outstanding across a non-blue/green rebuild is stale and is treated as
 such by the client. A crashed rebuild leaves `rebuilding` set — fail-closed
 until an operator completes or re-runs it.
 
+`StatusStalled` has no producer in the library: the runner writes only `live`
+and `rebuilding`. To mark a projection stalled, stop its runner, write
+`state='stalled'` (or `live` to clear) with the position unchanged, then
+restart. `loadMarker` seeds the state from the row, so the restart stays
+fail-closed; a still-running runner would re-persist its in-memory state on the
+next save, which is why it must be stopped first.
+
 ## 3. Consequences
 
 ### 3.1 Write and read cost
 
-- **One checkpoint write per applied batch**, after the read-model write. A
-  high-batch projector amortises it; a low-latency projector pays one small
-  upsert per page. There is no extra append-path statement: the checkpoint
-  belongs to the projection, not the append.
+- **One checkpoint write per `Apply` call**, after the read-model write. The
+  live `Run`/`Feed` path calls `Apply` with one envelope at a time, so it pays
+  one small upsert **per event**; an explicit multi-event `Apply` batch and
+  each `Rebuild` page pay one each. There is no extra append-path statement:
+  the checkpoint belongs to the projection, not the append.
 - **The query path pays one primary-key read** on a cold key, then none while a
   cached checkpoint is warm. A blocked wait holds no connection; 100 waiters on
-  one key share one store read per wake or fallback tick. Tokenless requests
-  pay nothing.
+  one key share one store read per wake or fallback tick, and each waiter does
+  one bounded read at its own deadline. Tokenless requests pay nothing.
 - **Hints add one `pg_notify` per coalesced window per scope**, emitted after
-  the checkpoint commit. They are optional; the fallback tick is the safety
-  net.
+  the checkpoint commit. They are coalesced per scope, so the hint volume does
+  not scale with the per-event save rate, and a lower same-state save emits
+  nothing. They are optional; the fallback tick and the deadline read are the
+  safety net.
+- **`LogFeed` is the single-writer path.** Over Postgres it pages raw `ReadAll`
+  without a settlement fence. Run it with a single writer or a quiescent log;
+  with concurrent appenders use `eventfeed`, which owns the fenced delivery
+  cursor.
 
 ### 3.2 Grants and placement
 
