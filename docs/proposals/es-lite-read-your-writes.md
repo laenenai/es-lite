@@ -45,11 +45,12 @@ shape. If the read model lives outside Postgres, the application supplies a
 
 Notifications are coalesced, not one per waiter. A checkpoint write emits at
 most one notification; the runner saves progress once per applied batch (a
-rebuild: once per page); a save that does not advance the position emits
-nothing; and the listener's per-scope throttle (10 ms) folds a burst into one
-wake-up. Waiting never holds a database connection: `WaitFor` reads the
-checkpoint, releases it, and blocks on a Go channel. One process needs one
-`LISTEN` connection, not one per request.
+rebuild: once per page); and a save that does not advance the position emits
+nothing. The listener's throttle drops exact duplicate payloads within 10 ms,
+but distinct positions are distinct payloads, so the write-side coalescing
+above is what bounds the volume. Waiting never holds a database connection:
+`WaitFor` reads the checkpoint, releases it, and blocks on a Go channel. One
+process needs one `LISTEN` connection, not one per request.
 
 ### 3.2 The applied checkpoint is not the delivery cursor
 
@@ -243,8 +244,11 @@ For `WaitFor(ctx, scope, projection, tok, timeout)`:
 1. Validate `tok.Scope == scope` (`ErrScopeMismatch`) and parse validity.
 2. A zero token returns `Reached: true` immediately.
 3. Read the cached checkpoint; if it is at or above the token, return reached.
-4. If the cached/stored state is `rebuilding`, return `Reached: false` with
-   that status (the caller serves stale/optimistic data).
+4. If the cached/stored state is `rebuilding` or `stalled`, return
+   `Reached: false` with that status (the caller serves stale/optimistic
+   data). A missing row is position 0 in a live-like state: it waits rather
+   than short-circuiting, or the first read after the first command would
+   never wait at all.
 5. Register for the `(scope, projection)` wake-up, then re-check (the advance
    may have happened between 3 and 5).
 6. Wait on wake-up, `ctx`, a jittered fallback tick (≤100 ms) and the deadline.

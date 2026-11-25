@@ -100,14 +100,24 @@ func TestTokenFor(t *testing.T) {
 }
 ```
 
-In `aggregate/token_test.go`:
+Add `TestMaxTokenZero` to the `es` block: a zero token (empty scope, position
+0) is compatible with any scope and returns the other token.
+
+In `aggregate/token_test.go`, name the tests so the Step 2 filter runs them:
 ```go
-// append two events; Handle returns Position == last envelope position and a
-// token whose scope is the envelope workspace and position matches.
-// A direct openStore(t).Append also returns Position == the last envelope.
-// Then a no-op command (Decide returns nil) returns the same head position.
-// Repeat with the snapshot cache warmed so the no-op has no tail envelopes.
-// An empty stream's no-op returns the zero token.
+func TestHandleToken(t *testing.T) {
+    // append two events; Handle returns Position == the last envelope position
+    // and a token whose scope is the envelope workspace and position matches.
+}
+func TestAppendResultPosition(t *testing.T) {
+    // a direct openStore(t).Append returns Position == the last envelope.
+}
+func TestNoOpToken(t *testing.T) {
+    // a no-op command (Decide returns nil) returns the same head position and
+    // a token whose scope is the stream's workspace; repeat with the snapshot
+    // cache warmed so the no-op has no tail envelopes; an empty stream's no-op
+    // returns the zero token.
+}
 ```
 Use the existing `openStore`, `newSnapshotRuntime` and simple counter/decider fixtures from `aggregate/*_test.go`.
 
@@ -120,7 +130,7 @@ Expected: build failures — `Token`, `AppendResult.Position`, `Result.Token` un
 
 - [ ] **Step 3: Implement**
 
-`es/token.go`: a 1-byte version, u16 scope length, scope, u64 position; base64url. `ParseToken("")` returns the zero token; any other length/version is `ErrInvalidToken`. `TokenFor` takes the highest `AppendResult.Position` (0 if none). `MaxToken` rejects different non-empty scopes with `ErrScopeMismatch`.
+`es/token.go`: a 1-byte version, u16 scope length, scope, u64 position; base64url. `ParseToken("")` returns the zero token; any other length/version is `ErrInvalidToken`. `TokenFor` takes the highest `AppendResult.Position` (0 if none). `MaxToken` treats a zero token as compatible with any scope (returns the other one) and rejects two different non-empty scopes with `ErrScopeMismatch`.
 
 `es/errors.go`: add `ErrInvalidToken`, `ErrScopeMismatch`.
 
@@ -135,7 +145,7 @@ func (r *Runtime[S, C, E]) headPosition(ctx context.Context, sid es.StreamID, ve
     return envs[len(envs)-1].GlobalPosition, envs[len(envs)-1].Workspace
 }
 ```
-and use it in the `len(events)==0 && len(constraints)==0` branch. A read error must not fail the no-op command; it yields a zero token.
+and use it in the `len(events)==0 && len(constraints)==0` branch: set `Position` and `Token = es.Token{Scope: ws, Position: pos}` from the returned workspace (`es.StreamID` carries no workspace, so the head envelope is the only source). A read error must not fail the no-op command; it yields a zero token.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -145,7 +155,7 @@ Expected: PASS. Then `go test ./es ./aggregate ./postgres ./sqlite` (Postgres wi
 - [ ] **Step 5: Commit**
 
 ```bash
-git add es/token.go es/token_test.go es/store.go es/errors.go postgres/wsstore.go sqlite/store.go aggregate/runtime.go aggregate/token_test.go
+git add es/token.go es/token_test.go es/store.go es/errors.go postgres/wsstore.go sqlite/store.go postgres/postgres_test.go aggregate/runtime.go aggregate/token_test.go
 git commit -m "feat(es): add consistency tokens and append positions"
 ```
 
@@ -196,7 +206,7 @@ Expected: build failure — the types do not exist.
 
 - [ ] **Step 3: Implement**
 
-A mutex-guarded map keyed by `(scope, projection)`. `SaveProgress` enforces: same state → `max(position)`; different state → replace the position. `ResetProgress` replaces with `{Position: 0, State: state}`. `SetStatus` creates a zero-position row when absent and only changes state. Timestamps use `time.Now().UTC()` in memory; the SQL stores use their database clocks.
+A mutex-guarded map keyed by `(scope, projection)`. `SaveProgress` enforces: same state → `max(position)`; different state → replace the position. `ResetProgress` replaces with `{Position: 0, State: state}`. `SetStatus` creates a zero-position row when absent and, when present, changes only `State` and `UpdatedAt` — never the position. `UpdatedAt` reflects the last successful save even when the position did not move; Task 7's change detection compares position and state, not the timestamp. Timestamps use `time.Now().UTC()` in memory; the SQL stores use their database clocks.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -239,7 +249,9 @@ A recording publisher and the memory progress store. Assert:
 - `Apply` stops at a failing event: it saves once with the last successfully applied position, publishes only that, and returns the error.
 - A filtered event saves and publishes too.
 - A save error does not call `Advance` and is returned.
+- `Apply` while the runner is rebuilding persists the new position with `StateRebuilding`; the state becomes `live` only after a successful `Rebuild`.
 - `Reset` sets position 0/state `rebuilding`, clears the runner’s cached marker, and publishes the status.
+- `Reset` calls `Discard(name)` when the legacy `Marker` implements it (a buffered pending position must not resurrect the old marker).
 - `Rebuild` over a two-event source sets `live` only on success; a source error leaves `rebuilding`.
 - The legacy `Marker` path still works with `ProgressStore == nil`.
 
@@ -251,10 +263,11 @@ Expected: build failure — `Runner.Scope`/`ProgressStore`/`Reset` do not exist.
 - [ ] **Step 3: Implement**
 
 - `loadMarker`: when `ProgressStore != nil`, call `LoadProgress(ctx, r.Scope, r.Name)`; a found row supplies the marker (position); otherwise 0. Keep the legacy `Marker.Load` path when nil.
-- `advance`: when `ProgressStore != nil`, call `SaveProgress(ctx, r.Scope, r.Name, Checkpoint{Scope:r.Scope, Projection:r.Name, Position:pos, State:StatusLive})`; otherwise `Marker.Save`. On success, call `Progress.Advance(cp)` when `Progress != nil`. Never publish before the save returns.
+- `advance`: when `ProgressStore != nil`, call `SaveProgress(ctx, r.Scope, r.Name, Checkpoint{Scope:r.Scope, Projection:r.Name, Position:pos, State:r.state})`; otherwise `Marker.Save`. On success, call `Progress.Advance(cp)` when `Progress != nil`. Never publish before the save returns.
+- **Rebuild state.** Track the runner's state in an unexported field, default `StatusLive`; `Reset` sets `StatusRebuilding`; `Rebuild` sets `StatusLive` only after `Replay` returns nil. `advance` persists that state. Without this, the first replayed page would write `live` mid-rebuild and a `WaitFor` could return reached over a half-rebuilt read model (Review Focus 3).
 - **Batch coalescing.** Split dispatch from save: `Apply` dispatches every envelope in the batch, tracks the last successful position, and calls `advance` **once** at the end — and once with the last successful position before returning a dispatch error (otherwise a redelivery after a partial batch restarts the page). `Rebuild` reuses `Apply`, so a rebuild saves and notifies once per page. `Run`/`Feed` still delivers one envelope at a time and saves per event; that is acceptable because the Postgres store suppresses a notify when the stored position does not move (Task 7) and the listener throttles per scope at 10 ms. Keep the in-memory `r.marker` updated per applied envelope so an in-process redelivery still skips. Call `OnApplied` for every applied envelope **after** the batch save, preserving its documented “called after the marker is saved” ordering while still firing once per envelope.
-- `Reset`: `ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding)` when the store is set, otherwise `Marker.Save(...,0)`; set `r.marker=0`, `r.loaded=true`; call `Progress.SetStatus(..., StatusRebuilding)`.
-- `Rebuild`: after `Replay` succeeds, call `ProgressStore.SetStatus(..., StatusLive)` when the store is set, then `Progress.SetStatus(..., StatusLive)`; on error, return and leave `rebuilding` in both. Keep `OnApplied` after the save and after `Advance`.
+- `Reset`: `ResetProgress(ctx, r.Scope, r.Name, StatusRebuilding)` when the store is set, otherwise `Discard(r.Name)` if the `Marker` implements `interface{ Discard(string) }` and then `Marker.Save(...,0)`; set `r.state=StatusRebuilding`, `r.marker=0`, `r.loaded=true`; call `Progress.SetStatus(..., StatusRebuilding)`.
+- `Rebuild`: after `Replay` succeeds, set `r.state=StatusLive`, call `ProgressStore.SetStatus(..., StatusLive)` when the store is set, then `Progress.SetStatus(..., StatusLive)`; on error, return and leave `rebuilding` in both. Keep `OnApplied` after the save and after `Advance`.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -309,7 +322,8 @@ Table tests in `projection/wait_test.go`:
 - timeout 20 ms → `Reached:false`, `err == nil`, `Waited` ≥ the timeout;
 - context cancellation → `context.Canceled`;
 - a token for another scope → `errors.Is(err, es.ErrScopeMismatch)`; a token with the empty scope is accepted when the caller scope is empty (SQLite) and rejected against a real workspace;
-- a checkpoint in `rebuilding` or `stalled` → `Reached:false`, the matching `Status`, no timeout;
+- a checkpoint at a position at or above the token but in `rebuilding` or `stalled` → `Reached:false`, the matching `Status`, no timeout (the status check must beat the position check);
+- a missing checkpoint row → does not short-circuit: it waits and is released by an `Advance`; `Status` on a missing row returns `StatusUnknown` with a nil error;
 - a lost notification: do not call `Advance`; advance the memory store behind the waiter and set `WithFallback(5*time.Millisecond)`; the wait returns reached;
 - a shared refresher: after warming the cache, 100 waiters on one key waiting for a position above it, with a 5 ms fallback, perform roughly one store read per tick, not one per waiter (count `LoadProgress` calls);
 - best effort: a store returning an error makes the default `WaitFor` return it, and `WithBestEffort` return `Reached:false, err:nil`; `ErrScopeMismatch` and `context.Canceled` still fail under `WithBestEffort`;
@@ -326,12 +340,12 @@ Expected: build failure — `Waiter`/`WaitResult` do not exist.
 A hub keyed by `(scope, projection)` holding the cached `Checkpoint` and a `chan struct{}` that is closed and replaced on each advance. `WaitFor`:
 1. A zero token (empty scope and position) returns reached immediately.
 2. If `tok.Scope != scope` → `es.ErrScopeMismatch`. An empty token scope matches only an empty caller scope, which is the SQLite case; a workspace token never matches another workspace.
-3. Read the cache; on a miss, `store.LoadProgress`. If the state is not `live`, return false immediately with that status (`rebuilding` or `stalled`). If the position is at or above the token, return reached.
+3. Read the cache; on a miss, `store.LoadProgress`. A missing row (`found=false`) is position 0 in a live-like state: continue waiting, do not short-circuit. If the state is `rebuilding` or `stalled`, return false immediately with that status. If the position is at or above the token, return reached.
 4. Lock, register the key’s channel, unlock, re-read; if the advance happened, return reached.
 5. Loop on `select` of the key's channel, `ctx.Done()`, the key's refresher signal and the deadline. On each wake, read the cache. The refresher, not the waiter, loads from the store and `Advance`s it.
 6. Remove the registration; stop the key's refresher when its waiter count reaches zero.
 
-Clamp a timeout above 5 s to 5 s; `0` uses 500 ms. `Advance` ignores a checkpoint with a lower position in the same state and replaces on a state change. `SetStatus` updates the cache and broadcasts.
+Clamp a timeout above 5 s to 5 s; `0` uses 500 ms. `Advance` ignores a checkpoint with a lower position in the same state and replaces on a state change. `SetStatus` updates the cache and broadcasts. `Status` returns `StatusUnknown` when no row exists.
 
 **The fallback is hub-level, not waiter-level.** The first waiter on a key starts one refresher goroutine (jittered ≤100 ms) that serves every waiter on that key and stops when the last one leaves. 100 waiters on one key cost one store read per tick, not 1,000 per second, and the refresher is the only place that re-reads after the initial lookup. A refresher read error is not returned to anyone: it retries on the next tick, and `WithBestEffort` only governs the waiter's own lookup. Waiting never holds a pooled connection: the initial `LoadProgress` returns it, and the waiter blocks on Go channels only.
 
@@ -393,7 +407,7 @@ ON CONFLICT (workspace_id, projection) DO UPDATE SET
   updated_at = clock_timestamp()
 ```
 
-`ResetProgress` writes `(0, state)`. `SetStatus` upserts `(0, state)` when absent. Map the `state` text to `projection.Status` and reject unknown values on read. Store the constructor’s `channel` on the struct; Task 7 uses it. Add `projection_checkpoints` to the test truncate lists and update the migration-count tests (17).
+`ResetProgress` writes `(0, state)`. `SetStatus` upserts `(0, state)` when absent and, when present, updates only `state` and `updated_at` (never `position`). Map the `state` text to `projection.Status` and reject unknown values on read. Store the constructor’s `channel` on the struct; Task 7 uses it. Task 5's tests construct with `""` (notify is off until Task 7). Add `projection_checkpoints` to the test truncate lists and update the migration-count tests (17).
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -434,7 +448,7 @@ Expected: no table; `NewProgressStore` undefined.
 
 - [ ] **Step 3: Implement**
 
-The SQLite table uses `scope` and `updated_at TEXT` (the store’s timestamp format). The same upsert semantics, using `s.db` directly. No RLS, no notification. Update the migration-count tests.
+The SQLite table uses `scope` and `updated_at TEXT` (the store’s timestamp format). The same upsert semantics, using `s.db` directly: `SetStatus` updates only `state` (and the timestamp) when the row exists. No RLS, no notification. Update the migration-count tests.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -468,8 +482,8 @@ git commit -m "feat(sqlite): add the projection checkpoint store"
 - [ ] **Step 1: Write the failing tests**
 
 - A committed `SaveProgress` sends one JSON notification on `channel` with the scope, projection, position and state.
-- A rolled-back/failed save sends none (use an invalid state to fail before the notify, or a tx that rolls back near the write).
-- Saving the same position *and* state twice emits one notification; the second save is a no-op.
+- A rolled-back transaction sends none: run the same upsert+notify statements in a transaction, `ROLLBACK`, and assert no notification arrives. An invalid-state failure is a separate validation test — it fails before the notify and does not prove `pg_notify` is transactional.
+- Saving the same position *and* state twice emits one notification; the second save is a no-op. Run the two saves sequentially; two concurrent first inserts may legitimately both notify, which is harmless.
 - A batch save from Task 3 (`Apply` over three envelopes) produces one notification, not three.
 - `NewProgressListener` decodes the payload and calls `advance` with the `Checkpoint`; start it with `Run`, save, and wait on a channel.
 - A notification for another scope/projection does not call the wrong advance callback (the callback receives the payload; the waiter keys it).
@@ -483,9 +497,9 @@ Expected: the constructor accepts a channel but ignores it; `NewProgressListener
 
 Use the constructor’s `channel` (Task 5 already accepts it). In the `runWorkspace` callback, read the current `(position, state)` in the same transaction (`SELECT ... FOR UPDATE`), then upsert, then call `SELECT pg_notify($1,$2)` with a JSON payload **only when the position or state actually changed**; `pg_notify` is transactional, so a rollback sends nothing. Skip when the channel is empty or the row did not move. Cap the payload at the NOTIFY limit; return an error if it is over 7 KB (the workspace/projection lengths are not otherwise bounded by the library).
 
-`NewProgressListener` wraps the existing `NotifyListener` with a handler that unmarshals the JSON and calls `advance`. It validates the channel through `NotifyListener` and returns a listener the caller runs.
+`NewProgressListener` wraps the existing `NotifyListener` with a handler whose `OnNotify(payload string)` unmarshals the JSON and calls `advance`. (`NotifyListener` passes the raw payload to `OnNotify`; the parameter is named `scope` in the feed use, but nothing validates that shape.) Its `OnReconnected` is a no-op: the 100 ms fallback repairs a notification lost during a reconnect. It validates the channel through `NotifyListener` and returns a listener the caller runs.
 
-Update Task 5’s call sites/tests to pass `""` for the no-notify cases.
+The listener's 10 ms throttle keys on the whole payload, so it drops exact duplicates but not distinct positions. Notification volume is bounded by the runner's batch save (Task 3) and the no-op suppression above, not by the listener.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -515,13 +529,12 @@ git commit -m "feat(postgres): notify checkpoint advances"
 - [ ] **Step 1: Write the failing tests**
 
 `projection/rebuild_progress_test.go`:
-- Reset a runner with a memory progress store, clear a fake read model, and start a `WaitFor` for a token that the old checkpoint satisfied; assert `Reached:false, Status:rebuilding`.
+- Reset a runner with a memory progress store, then advance the checkpoint to a position **above** the token while the state is still `rebuilding`, and clear a fake read model; a `WaitFor` for that token must return `Reached:false, Status:rebuilding` — the position alone would satisfy it, so the test isolates the status gate.
 - Rebuild over a two-event source; assert the state becomes `live` and a wait for the last position is reached.
 - A source error leaves the state `rebuilding`.
 
 `examples/readwrite/main_test.go`:
-- Append two events to a SQLite store with a projection runner; take the token; `WaitFor`; read the projection; assert the rows and `Reached && live`.
-- A no-op command’s token (from Task 1) is reached immediately.
+- Append two events to a SQLite store with a projection runner; take the token; `WaitFor`; read the projection; assert the rows and `Reached && live`. A no-op token is not exercised here — the example has no command runtime; Task 1 owns that case.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -573,7 +586,7 @@ Add:
 
 - [ ] **Step 3: Update the README**
 
-Mention the token/`WaitFor` capability in the responsibilities table and the security model (tokens are position hints, not authorization; scope comes from the authenticated workspace).
+Mention the token/`WaitFor` capability in the responsibilities table and the security model (tokens are position hints, not authorization; scope comes from the authenticated workspace). Keep the Documentation link and the read-your-writes pointer that already exist in the README from the plan commit.
 
 - [ ] **Step 4: Verify**
 
@@ -602,7 +615,7 @@ git commit -m "docs: record read-your-writes and checkpoint progress"
 
 - [ ] **Step 1: Write the guide**
 
-`docs/guides/read-your-writes.md` covers, in this order:
+The guide already exists (committed with the plan); update it against the shipped API, keeping this coverage, in this order:
 - the contract: what `Reached` means, scope, the deadline, rebuilds;
 - the four integration steps: command returns the token → client sends `ES-Consistency` → `WaitFor` → read the same read model;
 - **the dependency model**: tokenless requests never touch the store, a warm cache needs no read, one `LISTEN` per process, no connection held while blocked, and co-locating `projection_checkpoints` with the read model;
@@ -621,12 +634,13 @@ git commit -m "docs: record read-your-writes and checkpoint progress"
 const ConsistencyHeader = "ES-Consistency"
 const ConsistentHeader = "ES-Consistent"
 
-// WaitFor wraps next: it parses the token, checks the authenticated scope,
-// waits on the named projection and sets ES-Consistent. Missing header = no
-// wait, no store access and no ES-Consistent claim. Invalid token = 400.
-// Scope mismatch = 403. With WithBestEffort a store failure still calls next
-// with ES-Consistent:false.
-func WaitFor(w *projection.Waiter, projectionName string, timeout time.Duration, next http.Handler) http.Handler
+// WaitFor wraps next: it parses the token, resolves the authenticated scope
+// with scopeOf (the example reads it from the request context), checks the
+// token's scope, waits on the named projection and sets ES-Consistent.
+// Missing header = no wait, no store access and no ES-Consistent claim.
+// Invalid token = 400. Scope mismatch = 403. With WithBestEffort a store
+// failure still calls next with ES-Consistent:false.
+func WaitFor(w *projection.Waiter, projectionName string, scopeOf func(*http.Request) (string, error), timeout time.Duration, next http.Handler) http.Handler
 ```
 
 `middleware_test.go` asserts: no header → `next` runs with no `LoadProgress` call (counting store); a reached token → `next` sees `ES-Consistent: true`; a timeout → `false`; a malformed token → 400; a token for another workspace → 403.
