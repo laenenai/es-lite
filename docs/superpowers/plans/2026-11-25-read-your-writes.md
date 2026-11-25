@@ -336,7 +336,10 @@ Table tests in `projection/wait_test.go`:
 - no local waiters: `EnqueueScopeRefresh` and `EnqueueRefreshAll` perform no store read (count calls) and do not block;
 - reconnect repair: two active keys, `EnqueueRefreshAll`, both are refreshed from the store;
 - caps: with `WithMaxWaiters(1, 1)`, a second waiter on the key and a first waiter on another key each return `Reached:false, err:nil` immediately without blocking;
-- best effort: a store returning an error makes the default `WaitFor` return it, and `WithBestEffort` return `Reached:false, err:nil`; `ErrScopeMismatch` and `context.Canceled` still fail under `WithBestEffort`;
+- best effort: a store returning an error makes the default `WaitFor` return it, and `WithBestEffort` return `Reached:false, err:nil`; `ErrScopeMismatch` and `context.Canceled` still fail under `WithBestEffort` — including a context error returned by a ctx-aware `LoadProgress` that is gated and cancelled mid-read;
+- idle eviction: after waits on more distinct keys than the idle cap, the hub stays bounded, and an evicted key re-reads the store on its next wait;
+- status stickiness: two gated cold reads, `live@10` and `rebuilding@0`, installed in either order, leave the cache `rebuilding`; a token at 10 is not reached;
+- no spurious wake-ups: with an unchanged checkpoint, three fallback ticks do not wake a blocked waiter (the worker broadcasts only on a change);
 - 10,000 concurrent waiters on one key are all released by one `Advance` — construct the waiter with `WithMaxWaiters(20000, 20000)` so the default cap does not shed them — and `goleak.VerifyNone(t)` passes at the end after `Close()`;
 - `Status` returns the stored state when the cache is cold;
 - a token whose scope exceeds 512 bytes is `es.ErrInvalidToken`.
@@ -351,15 +354,16 @@ Expected: build failure — `Waiter`/`WaitResult` do not exist.
 A hub keyed by `(scope, projection)` holding the cached `Checkpoint`, the key's wake channel, and its waiter count. One refresh worker per `Waiter` owns every store read:
 
 - It selects on a bounded scope-refresh queue, a refresh-all signal, a jittered ticker (`WithFallback`, default 100 ms) and `Close`.
-- On any wake it computes the keys that currently have waiters, dedupes them, `LoadProgress`es each, `Advance`s the authoritative checkpoint, and closes the keys' channels.
+- On any wake it computes the keys that currently have waiters, dedupes them, drops any whose waiter count already fell to zero, `LoadProgress`es each, `Advance`s the authoritative checkpoint, and wakes a key **only when found, state or position changed**.
 - An instance with no waiters performs no reads, and a hint for a scope with no local waiters is dropped before any store access.
 - A read error is counted and ignored; the next signal retries. Hint queue overflow drops the hint; the ticker repairs it.
+- Idle keys are bounded by an internal cap (8192) with LRU eviction of keys that have no waiters; active keys are bounded by `WithMaxWaiters`. An evicted key re-reads on its next wait.
 
 `WaitFor`:
 1. A zero token returns reached immediately, before any store access.
 2. If `tok.Scope != scope` → `es.ErrScopeMismatch`; an empty token scope matches only an empty caller scope (SQLite), and a token scope longer than 512 bytes is `es.ErrInvalidToken`. `ParseToken` also caps its input length before allocating.
 3. Enforce `WithMaxWaiters`: above the per-key or total cap, return `Reached:false, err:nil` immediately (fail open; the caller serves stale data). Never queue an unbounded waiter.
-4. Read the cache; on a miss, `store.LoadProgress`. A missing row (`found=false`) is position 0 in a live-like state: continue waiting. `rebuilding` or `stalled` returns false immediately with that status. A position at or above the token returns reached.
+4. Read the cache; on a miss, `store.LoadProgress`. A missing row (`found=false`) is position 0 in a live-like state: continue waiting. `rebuilding` or `stalled` returns false immediately with that status. A position at or above the token returns reached. A cold read installs fail-closed: `rebuilding`/`stalled` sticks against a `live` read, otherwise a state change wins and a same-state read takes the higher position (two concurrent cold reads must not let a stale `live` erase a fresh `rebuilding`).
 5. Lock, register the key, unlock, re-read the cache; if the advance happened, return reached.
 6. Wait on the key's channel, `ctx.Done()` and the deadline. The worker, not the waiter, reads the store.
 7. Unregister; the worker idles when no key has waiters.
@@ -368,7 +372,7 @@ Clamp a timeout above 5 s to 5 s; `0` uses 500 ms. `Advance` stores the checkpoi
 
 **Hints are never trusted.** The listener payload carries only a scope; `EnqueueScopeRefresh` turns it into a store read, so a forged or replayed notification cannot raise a cached position and cannot produce a false `reached`. `EnqueueRefreshAll` (listener reconnect) does the same for every key with waiters. Both are non-blocking and bounded; the 100 ms ticker is the repair path for anything dropped.
 
-`WithBestEffort()` converts store errors (but not `ErrInvalidToken`, `ErrScopeMismatch` or context cancellation) into `Reached:false, err:nil`, so a query endpoint can fail open to stale data. It is for the read path; commands and health checks should keep the default. `Close()` stops the worker; it does not cancel in-flight waits.
+`WithBestEffort()` converts store errors into `Reached:false, err:nil`, so a query endpoint can fail open to stale data — but never `ErrInvalidToken`, `ErrScopeMismatch`, or context cancellation: check `ctx.Err()` and `errors.Is(err, context.Canceled/DeadlineExceeded)` before swallowing, because a ctx-aware store can return those from the read itself. It is for the read path; commands and health checks should keep the default. `Close()` stops the worker; it does not cancel in-flight waits.
 
 - [ ] **Step 4: Run to verify pass**
 
